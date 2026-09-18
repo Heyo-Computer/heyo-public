@@ -242,6 +242,7 @@ Config via env (all optional):
 | `PG_VM_POOL_DUMP_DIR` | `~/.heyo/pg-vm-pool/dumps` | where local dump files live |
 | `PG_VM_POOL_DUMP_LISTEN` | `0.0.0.0:6433` | local dump server bind; guests reach it at their default gateway, access is token-gated |
 | `PG_VM_POOL_WARM_SPARES` | `0` (off) | keep N pre-booted, initdb-complete spare VMs (`spare-pg-*`) for cold bring-ups to claim — an S3 restore skips create+boot+initdb and goes straight to download+load; capped at 16, each parked spare holds its size class's RAM |
+| `PG_VM_POOL_CHILLED_VEHICLES` | `2` (0 when the pool is off) | of those spares, keep N parked **stopped** as image-restore vehicles — a thaw overwrites its vehicle's disk, so it wants a stopped VM and a chilled one saves it the stop plus the disk-release wait (~4.8s of a ~6.9s thaw). Stopped VMs hold no RAM, so these cost a thin disk each, not memory |
 | `PG_VM_POOL_PRESSURE_PATH` | unset (off) | filesystem to watch (the heyvmd run dir); setting it enables emergency disk-pressure eviction — see "S3 eviction tier" |
 | `PG_VM_POOL_PRESSURE_HIGH_PCT` / `PG_VM_POOL_PRESSURE_LOW_PCT` | `85` / `75` | start emergency-archiving oldest-idle schemas at/above high; stop below low |
 | `PG_VM_POOL_PRESSURE_CHECK_SECS` | `60` | how often the pressure watchdog reads disk usage |
@@ -493,6 +494,44 @@ claim wakes the replenisher immediately instead of leaving the pool short until
 its next tick. Stranded *stopped* spares — the residue of a daemon restart — are
 restarted in preference to creating new ones, and are only counted once they are
 genuinely up.
+
+#### Chilled vehicles (`PG_VM_POOL_CHILLED_VEHICLES`)
+
+An **image** restore does not want a running VM. It overwrites its vehicle's
+data disk with the archived filesystem and boots on that, so every bit of the
+boot and `initdb` a warm spare paid for is discarded — and handing it a running
+spare means stopping that VM first and waiting for Firecracker to release the
+disk file before the swap can start. Measured on a production host, that
+stop-and-wait was **~4.8s of a ~6.9s thaw**, against ~2.8s of actual work
+(decompress + one boot).
+
+So `PG_VM_POOL_CHILLED_VEHICLES` of the spares are parked **stopped**, already
+in the state a restore wants. A thaw claims one, writes the disk, and starts
+the VM once. They are chilled by the replenisher, off any client's critical
+path, and only ever from spares whose Postgres answered while running — a
+vehicle that never booted would also have no readable `PG_VERSION` for the
+major-compatibility gate to check the archive against. Stopped VMs hold no RAM,
+so the vehicle shelf does not compete with the warm one for memory; it costs a
+thin data disk each.
+
+Three properties keep the two shelves from fighting:
+
+- **The replenish plan can't see them.** A chilled vehicle is stopped, unbound
+  and unclaimed — exactly the shape the plan restarts as deficit or deletes as
+  surplus. They are exempt from both, or the pool would spend every pass
+  undoing its own vehicles.
+- **Chilling shrinks the warm shelf, and the next pass refills it.** The pool
+  settles at `WARM_SPARES` running plus `CHILLED_VEHICLES` stopped. Nothing is
+  chilled while clients are queued for bring-ups, for the same reason nothing
+  is built then.
+- **The disk-release check still runs.** Skipping the *stop* is safe on the
+  pool's promise; skipping the check that nothing holds the disk open is not,
+  and it costs one fd scan when the disk is already free.
+
+With the shelf empty a restore falls back to the old path — claim a running
+spare, stop it — which is correct, just slower. The dashboard reports vehicle
+depth next to warm-spare depth; zero chilled is the image-restore equivalent of
+zero warm spares.
 
 ### Local freeze tier
 
@@ -1724,8 +1763,11 @@ The note under the table splits an image restore further, into the download and
 everything after it (decompress, `e2fsck`, disk swap, boot) — which is the
 reading that separates "the bucket is slow" from "this host is busy", and points
 at what to tune: the bucket's throughput on one side, or the run-dir filesystem
-(the decompress and the in-place copy are disk-bound) and the warm-spare pool
-that supplies the vehicle on the other.
+(the decompress and the in-place copy are disk-bound) and the spare pool that
+supplies the vehicle on the other. For that last one, check **chilled-vehicle
+depth** before anything else: an adopt figure several seconds above the work it
+describes usually means the shelf was empty and every restore in the window
+paid to stop a running spare and wait out its disk release.
 
 Bounded exactly as the create figures are: the admission wait is excluded (it
 measures how many other clients arrived at once, not what this restore costs),

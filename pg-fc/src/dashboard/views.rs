@@ -381,6 +381,7 @@ pub fn monitoring_page(
     let queued_bringups = crate::vm::bringups_waiting();
     let reclaim_running = crate::reclaim::pass_running();
     let spare_depth = st.registry.spare_pool_depth();
+    let chilled_depth = st.registry.chilled_vehicle_depth();
 
     shell(
         "Monitoring",
@@ -472,6 +473,11 @@ pub fn monitoring_page(
                 @if let Some((ready, target)) = spare_depth {
                     (stat("warm spares ready", &ready.to_string(),
                         Some(&format!("target {target}{}", if ready == 0 { " — cold creates!" } else { "" }))))
+                }
+                @if let Some((chilled, target)) = chilled_depth && target > 0 {
+                    (stat("chilled vehicles", &chilled.to_string(),
+                        Some(&format!("target {target}{}",
+                            if chilled == 0 { " — image restores pay a stop!" } else { "" }))))
                 }
                 (stat("running, untracked", &untracked.to_string(),
                     if untracked > 0 { Some("no warm entry — reaper stops these in ≤2 passes") } else { None }))

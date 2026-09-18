@@ -51,8 +51,22 @@ use crate::registry::{GIB, GrowVerdict, grow_verdict};
 use crate::s3::S3Config;
 
 /// How long to wait after a stop for the Firecracker process to release the
-/// disk file (the daemon acks the stop before the process exits).
+/// disk file, in the case where it has not already exited.
 const DISK_RELEASE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Gap between the first free fd-scan and the confirming one — see
+/// [`wait_disk_released`]. Short on purpose: the two scans are what span the
+/// window, not the sleep between them (each is a full `/proc/*/fd` sweep,
+/// ~0.3s on a host running ~90 VMs), so a long sleep here buys no extra
+/// safety and is paid by every waiting client.
+const DISK_RELEASE_SETTLE: Duration = Duration::from_millis(50);
+
+/// First poll gap when the disk *is* still held, doubling to
+/// [`DISK_RELEASE_POLL_MAX`]. A disk still open is the rare case; resolving it
+/// in tens of milliseconds rather than on a multi-second cadence is what keeps
+/// a straggler from rounding up to seconds of client wait.
+const DISK_RELEASE_POLL_MIN: Duration = Duration::from_millis(50);
+const DISK_RELEASE_POLL_MAX: Duration = Duration::from_millis(500);
 
 /// Largest object uploaded as one PUT; anything bigger goes multipart. Well
 /// under S3's 5GB single-PUT cap, and also the bound on pooler memory per
@@ -1228,7 +1242,7 @@ async fn adopt_zst_image_inner(
     // image, then booted on the real data.
     let (sandbox, provenance) =
         crate::vm::claim_restore_vehicle(cfg, schema, spares, pinned).await?;
-    if let Err(e) = swap_and_boot(cfg, &sandbox, schema, raw).await {
+    if let Err(e) = swap_and_boot(cfg, &sandbox, schema, raw, provenance.is_stopped()).await {
         // The half-adopted VM must not survive at all: merely *stopping* it
         // leaves a sandbox holding an empty-or-torn database that a later
         // find-by-name would happily serve as the schema, and a stopped
@@ -1248,7 +1262,7 @@ async fn adopt_zst_image_inner(
             sandbox.sandbox_id()
         );
         match provenance {
-            crate::vm::Provenance::Spare => {
+            crate::vm::Provenance::Spare | crate::vm::Provenance::ChilledSpare => {
                 if let Some((pool, _)) = spares {
                     pool.release_failed(sandbox.sandbox_id()).await;
                 }
@@ -1489,19 +1503,33 @@ pub(crate) async fn disk_held_open(disk: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// `already_stopped` is the vehicle's promise that it arrived stopped — a
+/// chilled spare. The stop is then skipped entirely, which is the single
+/// biggest saving available to an image restore: on a production host the stop
+/// costs ~2.1s (the daemon SIGKILLs Firecracker and waits for the process)
+/// before the swap can even be considered.
+///
+/// The disk-release check is *not* skipped with it. It is what stands between
+/// this `cp` and a live Firecracker still holding the file, it costs one fd
+/// scan when the disk is already free, and a vehicle chilled a tick ago passes
+/// it on the first look. Trusting a promise where a cheap check exists is how
+/// a torn disk gets written under a booting VM.
 async fn swap_and_boot(
     cfg: &Config,
     sandbox: &heyo_sdk::Sandbox,
     schema: &str,
     raw: &Path,
+    already_stopped: bool,
 ) -> Result<()> {
     let run_dir = cfg.run_dir.as_ref().expect("checked by materialize_from_image");
     let disk = run_dir.join(sandbox.sandbox_id()).join("data.ext4");
 
-    tokio::time::timeout(Duration::from_secs(30), sandbox.stop())
-        .await
-        .context("stopping the fresh VM for the disk swap timed out")?
-        .context("stopping the fresh VM for the disk swap")?;
+    if !already_stopped {
+        tokio::time::timeout(Duration::from_secs(30), sandbox.stop())
+            .await
+            .context("stopping the fresh VM for the disk swap timed out")?
+            .context("stopping the fresh VM for the disk swap")?;
+    }
     wait_disk_released(&disk).await?;
 
     // Refuse a cross-major adoption before it overwrites anything. Postgres
@@ -1516,9 +1544,12 @@ async fn swap_and_boot(
     // per schema.
     //
     // The server major comes from the vehicle itself. Its data disk was
-    // initdb'd by this host's image moments ago (a warm spare, or the create
-    // just now), so its PG_VERSION is exactly what this image serves — read the
-    // same way as the archive's, with no config to drift from the rootfs.
+    // initdb'd by this host's image (a warm spare, a chilled vehicle, or the
+    // create just now), so its PG_VERSION is exactly what this image serves —
+    // read the same way as the archive's, with no config to drift from the
+    // rootfs. This is also why only *verified* spares are ever chilled: a
+    // vehicle that never booted Postgres would have nothing here to check the
+    // archive against.
     match major_verdict(pg_version_of(raw).await, pg_version_of(&disk).await) {
         MajorVerdict::Compatible => {}
         MajorVerdict::Mismatch { archived, server } => bail!(
@@ -1624,6 +1655,19 @@ async fn download(
 /// the same (device, inode) sweep the orphan sweep trusts; a scan that can
 /// see nothing (no /proc visibility) degrades to reporting "free", so a short
 /// settle-and-recheck follows the first free reading either way.
+///
+/// This sits in the middle of every image restore — between the vehicle's
+/// stop and the disk swap — so its cadence is client-visible latency, not
+/// background housekeeping. It used to sleep a flat 2s after the first free
+/// reading and poll every 3s otherwise, on the premise (stated in the comment
+/// it carried) that "the daemon acks stops before Firecracker exits". Measured
+/// on a production pool host, that premise is backwards: across 3045 stops in
+/// the heyvmd log, Firecracker exited *before* the stop was acked every single
+/// time, with a median of 0.29s to spare. The disk is therefore already free
+/// on the first scan, and the 2s was pure client wait guarding a race that
+/// does not occur. The settle-and-recheck is kept — it costs one extra scan
+/// and covers the ordering flipping back on some other daemon build — but the
+/// sleeps around it are now short enough to be noise.
 async fn wait_disk_released(disk: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let md = tokio::fs::metadata(disk)
@@ -1636,11 +1680,14 @@ async fn wait_disk_released(disk: &Path) -> Result<()> {
             .unwrap_or(false)
     };
     let deadline = tokio::time::Instant::now() + DISK_RELEASE_TIMEOUT;
+    let mut poll = DISK_RELEASE_POLL_MIN;
     loop {
         if !held().await {
-            // The daemon acks stops before Firecracker exits; give a straggler
-            // a beat to close, then confirm.
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Settle and confirm: a straggler closing its fd between the two
+            // scans is what this catches. The scans themselves are what make
+            // the window wide (each sweeps every fd on the host); the sleep
+            // only has to be non-zero.
+            tokio::time::sleep(DISK_RELEASE_SETTLE).await;
             if !held().await {
                 return Ok(());
             }
@@ -1652,7 +1699,8 @@ async fn wait_disk_released(disk: &Path) -> Result<()> {
                 disk.display()
             );
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(poll).await;
+        poll = (poll * 2).min(DISK_RELEASE_POLL_MAX);
     }
 }
 

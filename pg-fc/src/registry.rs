@@ -614,7 +614,8 @@ impl SchemaRegistry {
             .reclaim
             .as_ref()
             .map(|r| Arc::new(Reclaimer::new(r.cmd.clone(), cfg.run_dir.clone())));
-        let spares = (cfg.warm_spares > 0).then(|| Arc::new(SparePool::new(cfg.warm_spares)));
+        let spares = (cfg.warm_spares > 0)
+            .then(|| Arc::new(SparePool::new(cfg.warm_spares, cfg.chilled_vehicles)));
         // The dump server has two consumers: the frozen tier (freeze + thaw)
         // and the S3 archive tier, whose dumps *stream* through it so they
         // never touch the guest's data disk. Either one enables it.
@@ -5017,6 +5018,14 @@ impl SchemaRegistry {
     /// new-schema connect pays a full create + boot instead of a spare claim.
     pub fn spare_pool_depth(&self) -> Option<(usize, usize)> {
         self.spares.as_ref().map(|p| p.depth())
+    }
+
+    /// Chilled-vehicle depth `(chilled, target)`; `None` when the pool is
+    /// disabled. Zero chilled is the image-restore equivalent of zero warm
+    /// spares: the next thaw falls back to stopping a running spare and
+    /// waiting out the disk release, which is several seconds a client feels.
+    pub fn chilled_vehicle_depth(&self) -> Option<(usize, usize)> {
+        self.spares.as_ref().map(|p| p.chilled_depth())
     }
 
     /// The schemas currently claimed by an offload, whatever started it

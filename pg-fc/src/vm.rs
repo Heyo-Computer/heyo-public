@@ -801,7 +801,10 @@ pub async fn ensure_vm(
 
     if result.is_err() {
         match provenance {
-            Provenance::Spare => {
+            // Chilled or running, a claimed spare goes back through the pool:
+            // `release_failed` kills it AND drops the claim, so the
+            // replenisher rebuilds instead of the id staying claimed forever.
+            Provenance::Spare | Provenance::ChilledSpare => {
                 if let Some((pool, _)) = spares {
                     pool.release_failed(&sandbox_id).await;
                 }
@@ -2611,7 +2614,25 @@ async fn probe_pg_window(pool: &Pool, window: Duration) -> PgProbe {
 pub(crate) enum Provenance {
     Existing,
     Spare,
+    /// A spare claimed off the pool's *chilled* shelf: already stopped, so an
+    /// image restore can overwrite its disk without stopping anything first.
+    /// Disposed of exactly like [`Provenance::Spare`] — it is a claimed spare,
+    /// and a failed restore leaves its disk just as ambiguous.
+    ChilledSpare,
     Created,
+}
+
+impl Provenance {
+    /// Whether the VM is already stopped and the caller may skip its own stop.
+    /// Only a chilled spare promises this; everything else arrives running.
+    ///
+    /// Disposal does *not* go through a helper like this one: both spare
+    /// variants must be released through the pool rather than killed behind
+    /// its back, and spelling them out at each `match` is what makes the
+    /// compiler point at those sites when a variant is added.
+    pub(crate) fn is_stopped(self) -> bool {
+        matches!(self, Provenance::ChilledSpare)
+    }
 }
 
 /// The warm-spare pool and the set of sandbox ids already bound to a schema,
@@ -2735,11 +2756,31 @@ pub(crate) async fn claim_restore_vehicle(
     spares: Spares<'_>,
     pinned: bool,
 ) -> Result<(Sandbox, Provenance)> {
+    // A chilled vehicle first: it is already stopped, which is the state this
+    // restore wants and the only one it can use without paying for a
+    // transition. Taking a *running* spare means stopping it (~2.1s for the
+    // daemon to SIGKILL Firecracker and ack) and then waiting for the disk fd
+    // to be released before the swap — ~4.8s of a ~6.9s thaw, spent undoing a
+    // boot whose every result the restore is about to overwrite.
+    if let Some((pool, bound)) = spares
+        && let Some(sb) = pool.take_chilled(bound).await
+    {
+        info!(
+            "schema {schema}: claiming chilled vehicle {} for the image restore (already \
+             stopped — no stop, no disk-release wait)",
+            sb.sandbox_id()
+        );
+        return Ok((sb, Provenance::ChilledSpare));
+    }
+    // Fallback: a running spare, stopped on the client's time. Still far
+    // cheaper than a create, and the only stop-free alternative would be a
+    // sandbox created without booting, which the daemon does not offer.
     if let Some((pool, bound)) = spares
         && let Some(sb) = pool.take(bound).await
     {
         info!(
-            "schema {schema}: claiming warm spare {} as the image-restore vehicle",
+            "schema {schema}: no chilled vehicle free — claiming running warm spare {} and \
+             stopping it for the image restore",
             sb.sandbox_id()
         );
         return Ok((sb, Provenance::Spare));
@@ -3284,6 +3325,18 @@ async fn wait_pg_ready(pool: &Pool, timeout: Duration, name: &str) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `swap_and_boot` skips its stop on this answer alone, so only the
+    /// variant that is genuinely handed over stopped may say yes. A `Spare`
+    /// answering true here would send a `cp` at the disk of a running
+    /// Firecracker.
+    #[test]
+    fn only_a_chilled_vehicle_reports_itself_already_stopped() {
+        assert!(Provenance::ChilledSpare.is_stopped());
+        assert!(!Provenance::Spare.is_stopped());
+        assert!(!Provenance::Created.is_stopped());
+        assert!(!Provenance::Existing.is_stopped());
+    }
 
     #[test]
     fn physical_exec_preserves_one_shell_body_and_exit_status() {
