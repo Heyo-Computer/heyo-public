@@ -246,7 +246,9 @@ pub(crate) struct DeploymentHealthcheckUrls {
 
 impl DeploymentHealthcheckUrls {
     pub(crate) fn probe_url(&self) -> Option<String> {
-        [&self.public_url, &self.url, &self.internal_url]
+        // Readiness is a backend check; the public URL can require end-user
+        // authentication even when the candidate itself is healthy.
+        [&self.internal_url, &self.url, &self.public_url]
             .into_iter()
             .flatten()
             .map(|url| url.trim())
@@ -876,7 +878,7 @@ mod tests {
     #[test]
     fn preserves_distinct_internal_and_public_healthcheck_urls() {
         let urls: DeploymentHealthcheckUrls = serde_json::from_value(serde_json::json!({
-            "url": "http://10.88.0.1:2238",
+            "url": "https://legacy-candidate.stage.heyo.computer",
             "internalUrl": "http://10.88.0.1:2238",
             "publicUrl": "https://candidate.stage.heyo.computer"
         }))
@@ -888,8 +890,20 @@ mod tests {
         );
         assert_eq!(
             urls.probe_url().as_deref(),
-            Some("https://candidate.stage.heyo.computer")
+            Some("http://10.88.0.1:2238")
         );
+    }
+
+    #[test]
+    fn falls_back_when_internal_healthcheck_url_is_blank() {
+        let urls: DeploymentHealthcheckUrls = serde_json::from_value(serde_json::json!({
+            "internalUrl": "  ",
+            "url": " http://backend.example:2238 ",
+            "publicUrl": "https://candidate.stage.heyo.computer"
+        }))
+        .unwrap();
+
+        assert_eq!(urls.probe_url().as_deref(), Some("http://backend.example:2238"));
     }
 
     #[test]

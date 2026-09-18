@@ -331,6 +331,27 @@ pub async fn api_promote(State(st): State<DashState>, Path(db): Path<String>) ->
     }
 }
 
+pub async fn api_fence(State(st): State<DashState>, Path(db): Path<String>) -> Response {
+    match orchestrate::fence(&st.registry, &db).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_fence_selective(State(st): State<DashState>, Path(db): Path<String>) -> Response {
+    match orchestrate::fence_selective(&st.registry, &db).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_unfence(State(st): State<DashState>, Path(db): Path<String>) -> Response {
+    match orchestrate::unfence(&st.registry, &db).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => api_err(&e).into_response(),
+    }
+}
+
 pub async fn api_refresh(State(st): State<DashState>, Path(db): Path<String>) -> Response {
     match orchestrate::refresh(&st.registry, &db).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -363,6 +384,10 @@ pub async fn api_forget(State(st): State<DashState>, Path(db): Path<String>) -> 
 // Node-to-node
 // ---------------------------------------------------------------------------
 
+pub async fn api_writer_tunnel(State(st): State<DashState>, mut request: axum::extract::Request) -> Response {
+    crate::writer_routing::accept(&st.registry, st.cfg.basic_auth.is_some(), &mut request).await
+}
+
 /// The handshake a peer performs before creating anything. Deliberately says
 /// nothing about which databases exist here — a peer is trusted to drive this
 /// node, but the handshake itself is the least it needs.
@@ -374,7 +399,49 @@ pub async fn api_node_info(State(st): State<DashState>) -> Json<wire::NodeInfo> 
         server_version_num: None,
         tls: st.registry.tls_enabled(),
         pg_listen_port: Some(st.registry.listen_port()),
+        physical_prepare: true,
+        physical_handoff: true,
+        physical_successor: true,
     })
+}
+
+pub async fn api_physical_prepare(State(st): State<DashState>, Path(db): Path<String>, Json(req): Json<wire::PhysicalPrepareRequest>) -> Response {
+    match crate::replication::physical::prepare_source(&st.registry, &db, &req.generation).await {
+        Ok(record) => (StatusCode::ACCEPTED, Json(record)).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_physical_handoff(State(st): State<DashState>, Path(db): Path<String>, Json(mut req): Json<wire::PhysicalHandoffRequest>) -> Response {
+    if req.database != db { return api_err(&anyhow::anyhow!("path database does not match handoff request")).into_response(); }
+    req.database = db;
+    match crate::replication::physical::handoff_source(&st.registry, req).await {
+        Ok(record) => Json(record).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_accept_physical_handoff(State(st): State<DashState>, Json(req): Json<wire::PhysicalHandoffRequest>) -> Response {
+    match crate::replication::physical::accept_handoff(&st.registry, req).await {
+        Ok(record) => Json(record).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_physical_grant(State(st): State<DashState>, Path(db): Path<String>) -> Response {
+    match crate::replication::physical::source_grant(&st.registry, &db).await {
+        Ok(grant) => Json(grant).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_accept_physical_replica(State(st): State<DashState>, Json(req): Json<wire::PhysicalReplicaRequest>) -> Response {
+    match crate::replication::physical::accept_candidate(&st.registry, req).await {
+        Ok(record) => (StatusCode::ACCEPTED, Json(wire::PhysicalRecordJson::from(&record))).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_physical_get(State(st): State<DashState>, Path(db): Path<String>) -> Response {
+    match st.registry.physical().get(&db) {
+        Some(record) => Json(wire::PhysicalRecordJson::from(&record)).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(ApiError { error: format!("no physical preparation for {db}") })).into_response(),
+    }
 }
 
 /// A primary asking this node to build the replica. Validates synchronously

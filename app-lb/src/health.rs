@@ -15,7 +15,8 @@ use tokio::net::TcpStream;
 /// Probe `addr`, returning whether the guest is serving.
 ///
 /// With `check.path` set this does a minimal HTTP GET and requires a non-5xx
-/// status; otherwise a successful TCP connect is enough. Any error is just
+/// status; otherwise a successful TCP connect is enough. `expected_header`
+/// instead requires 2xx and one exact identity header, within 16 KiB. Any error is just
 /// "not ready" — a booting VM refuses connections, which is expected, so this
 /// deliberately doesn't distinguish failure modes.
 pub async fn probe(addr: SocketAddr, check: &HealthCheck) -> bool {
@@ -25,7 +26,7 @@ pub async fn probe(addr: SocketAddr, check: &HealthCheck) -> bool {
     };
     let timeout = Duration::from_secs(check.timeout_secs.max(1));
 
-    match tokio::time::timeout(timeout, probe_inner(target, check.path.as_deref())).await {
+    match tokio::time::timeout(timeout, probe_inner(target, check.path.as_deref(), check.expected_header.as_ref())).await {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
             tracing::trace!(%target, error = %e, "health probe failed");
@@ -38,9 +39,45 @@ pub async fn probe(addr: SocketAddr, check: &HealthCheck) -> bool {
     }
 }
 
-async fn probe_inner(target: SocketAddr, path: Option<&str>) -> std::io::Result<()> {
+/// Probe an HTTPS static upstream by hostname, retaining normal CA/hostname
+/// verification (and therefore using `host` as TLS SNI). Unlike the plaintext
+/// probe, DNS must not be replaced with a resolved IP or certificate checking
+/// would verify the wrong identity.
+pub async fn probe_https(address: &str, host: &str, check: &HealthCheck) -> bool {
+    let port = check.port.unwrap_or_else(|| {
+        address.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(443)
+    });
+    let path = check.path.as_deref().unwrap_or("/");
+    let host = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
+    let url = format!("https://{host}:{port}{path}");
+    let timeout = Duration::from_secs(check.timeout_secs.max(1));
+    let client = match reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    match client.get(url).send().await {
+        Ok(response) => match &check.expected_header {
+            None => response.status().as_u16() < 500,
+            Some(expected) => response.status().is_success() && {
+                let values: Vec<_> = response.headers().get_all(&expected.name).iter().collect();
+                values.len() == 1 && values[0].as_bytes() == expected.value.as_bytes()
+            },
+        },
+        Err(error) => {
+            tracing::trace!(%address, %error, "HTTPS health probe failed");
+            false
+        }
+    }
+}
+
+async fn probe_inner(target: SocketAddr, path: Option<&str>, expected: Option<&crate::config::ExpectedHeader>) -> std::io::Result<()> {
     let mut stream = TcpStream::connect(target).await?;
     let Some(path) = path else {
+        if expected.is_some() { return Err(std::io::Error::other("identity assertion requires HTTP")); }
         return Ok(()); // TCP connect was the whole check.
     };
 
@@ -49,6 +86,22 @@ async fn probe_inner(target: SocketAddr, path: Option<&str>) -> std::io::Result<
     );
     stream.write_all(req.as_bytes()).await?;
     stream.flush().await?;
+
+    if let Some(expected) = expected {
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 { return Err(std::io::Error::other("incomplete readiness headers")); }
+            head.extend_from_slice(&chunk[..n]);
+            if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                if end + 4 > 16 * 1024 { return Err(std::io::Error::other("readiness headers exceed 16 KiB")); }
+                return if expected_response(&head[..end + 4], expected) { Ok(()) }
+                    else { Err(std::io::Error::other("readiness identity or status mismatch")) };
+            }
+            if head.len() >= 16 * 1024 { return Err(std::io::Error::other("readiness headers exceed 16 KiB")); }
+        }
+    }
 
     // The status line is all we need, and it arrives in the first packet.
     let mut buf = [0u8; 256];
@@ -68,6 +121,23 @@ async fn probe_inner(target: SocketAddr, path: Option<&str>) -> std::io::Result<
             "malformed HTTP response",
         )),
     }
+}
+
+fn expected_response(head: &[u8], expected: &crate::config::ExpectedHeader) -> bool {
+    if !head.starts_with(b"HTTP/1.1 ") && !head.starts_with(b"HTTP/1.0 ") { return false; }
+    if !parse_status(head).is_some_and(|code| (200..300).contains(&code)) { return false; }
+    if http::HeaderName::from_bytes(expected.name.as_bytes()).is_err() || http::HeaderValue::from_str(&expected.value).is_err() { return false; }
+    let Ok(text) = std::str::from_utf8(head) else { return false; };
+    let mut matched = false;
+    for line in text.split("\r\n").skip(1).take_while(|line| !line.is_empty()) {
+        let Some((name, value)) = line.split_once(':') else { return false; };
+        if http::HeaderName::from_bytes(name.as_bytes()).is_err() { return false; }
+        if name.eq_ignore_ascii_case(&expected.name) {
+            if matched || value.trim() != expected.value { return false; }
+            matched = true;
+        }
+    }
+    matched
 }
 
 /// Pull the status code out of an HTTP status line: `HTTP/1.1 200 OK`.
@@ -108,6 +178,7 @@ mod tests {
         });
 
         let check = HealthCheck {
+            expected_header: None,
             path: None,
             port: None,
             timeout_secs: 2,
@@ -171,10 +242,43 @@ mod tests {
         });
 
         let check = HealthCheck {
+            expected_header: None,
             path: Some("/".into()),
             port: None,
             timeout_secs: 1,
         };
         assert!(!probe(addr, &check).await);
+    }
+
+    #[tokio::test]
+    async fn rollout_identity_requires_exact_header_2xx_and_complete_bounded_headers() {
+        let check = HealthCheck { expected_header: Some(crate::config::ExpectedHeader {
+            name: "x-heyo-revision".into(), value: "abc123".into(),
+        }), ..Default::default() };
+        for (response, expected) in [
+            ("HTTP/1.1 200 OK\r\nX-Heyo-Revision: abc123\r\n\r\n".to_string(), true),
+            ("HTTP/1.1 204 OK\r\nx-heyo-revision: abc123\r\n\r\n".into(), true),
+            ("HTTP/1.1 200 OK\r\n\r\n".into(), false), // old baked-in listener
+            ("HTTP/1.1 200 OK\r\nx-heyo-revision: old\r\n\r\n".into(), false),
+            ("HTTP/1.1 404 Missing\r\nx-heyo-revision: abc123\r\n\r\n".into(), false),
+            ("HTTP/1.1 302 Found\r\nx-heyo-revision: abc123\r\n\r\n".into(), false),
+            ("HTTP/1.1 503 Error\r\nx-heyo-revision: abc123\r\n\r\n".into(), false),
+            ("HTTP/1.1 200 OK\r\nx-heyo-revision: abc123\r\nx-heyo-revision: abc123\r\n\r\n".into(), false),
+            ("HTTP/1.1 200 OK\r\nx-heyo-revision: abc123".into(), false),
+            (format!("HTTP/1.1 200 OK\r\nx-pad: {}\r\nx-heyo-revision: abc123\r\n\r\n", "x".repeat(17 * 1024)), false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut req = [0; 1024]; let _ = socket.read(&mut req).await;
+                for fragment in response.as_bytes().chunks(7) {
+                    if socket.write_all(fragment).await.is_err() { break; }
+                    tokio::task::yield_now().await;
+                }
+            });
+            assert_eq!(probe(addr, &check).await, expected);
+            server.await.unwrap();
+        }
     }
 }

@@ -33,7 +33,14 @@ export interface ScalingPolicy {
   boot_timeout_secs?: number;
 }
 
+export interface ExpectedHeader {
+  name: string;
+  value: string;
+}
+
 export interface HealthCheck {
+  /** Require 2xx and one exact response header; rollout requires x-heyo-revision. */
+  expected_header?: ExpectedHeader;
   /** `null` means a bare TCP connect rather than an HTTP probe. */
   path?: string | null;
   port?: number;
@@ -288,6 +295,15 @@ export interface AuthGate {
   forward_identity?: boolean;
   /** How to verify a JWT, when `jwt` is among the providers. */
   jwt?: JwtSpec;
+  /**
+   * Inherit the identity half of this gate — `provider`, the OAuth credentials
+   * and allow-lists, `jwt`, `cookie_domain` — from a named provider declared on
+   * the deployment's namespace, resolved live on every request. When set, this
+   * gate carries only the route-scoped fields (`public_paths`, `session_scope`,
+   * `base_path`, `cookie_name`, `redirect_url`, `forward_identity`,
+   * `session_ttl_secs`); setting an identity field alongside it is refused.
+   */
+  provider_ref?: string;
 }
 
 export type AuthProvider = "google" | "app-token" | "jwt";
@@ -342,6 +358,21 @@ export interface JwtSpec {
    * both are present.
    */
   cookie?: string;
+  /**
+   * Heyo Auth `/api/auth/login` endpoint for browser email/password sign-in.
+   * Requires `cookie`; app-lb stores neither passwords nor refresh tokens.
+   */
+  login_endpoint?: string;
+  /**
+   * Hosted sign-in: where to redirect a token-less *browser* (a request that
+   * accepts HTML). The issuer signs the person in, sets the JWT in `cookie`, and
+   * redirects back to the URL passed in `login_redirect_param`; app-lb keeps no
+   * session of its own. A program still gets a 401. Requires `cookie`, and must
+   * be `https://` (loopback `http://` aside).
+   */
+  login_url?: string;
+  /** The query parameter the hosted sign-in reads the return URL from. Only with `login_url`; defaults to `redirect_uri`. */
+  login_redirect_param?: string;
 }
 
 export interface DeploymentSpec {
@@ -361,6 +392,8 @@ export interface DeploymentSpec {
   account_id?: string;
   user_id?: string;
   routes: RouteRule[];
+  /** Return HTTP 503 for routed proxy traffic while admin management remains available. */
+  maintenance?: boolean;
   vm?: VmSpec;
   scaling?: ScalingPolicy;
   health?: HealthCheck;
@@ -407,6 +440,8 @@ export interface VmStatus {
 }
 
 export interface DeploymentStatus {
+  /** Opaque persisted token for conditional service rollout; absent on older servers. */
+  rollout_revision?: string;
   spec: DeploymentSpec;
   kind: DeploymentKind;
   desired_replicas: number;

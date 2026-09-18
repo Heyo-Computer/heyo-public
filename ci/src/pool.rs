@@ -36,7 +36,7 @@ use crate::vm::VmSpec;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::fmt;
-use std::path::Path;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Who is holding a VM, and how long the claim is good for without a renewal.
@@ -67,7 +67,27 @@ const FINGERPRINT_LEN: usize = 12;
 /// `workspace` is the materialized checkout; `cache_key_files` are resolved
 /// relative to it. They are validated as relative, `..`-free paths when the
 /// workflow is parsed, and re-checked here because this function reads files.
-pub fn fingerprint(spec: &VmSpec, workspace: &Path) -> Result<String, PoolError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedContent {
+    Sha256([u8; 32]),
+    Absent,
+}
+
+/// Inputs proved by the runner after it reconstructed and verified the exact
+/// submitted tree. Production deliberately has no filesystem implementation.
+pub trait FingerprintInputs {
+    fn verified(&self, path: &str) -> Result<VerifiedContent, PoolError>;
+}
+
+impl FingerprintInputs for BTreeMap<String, VerifiedContent> {
+    fn verified(&self, path: &str) -> Result<VerifiedContent, PoolError> {
+        self.get(path)
+            .cloned()
+            .ok_or_else(|| PoolError::MissingVerifiedDigest(path.to_string()))
+    }
+}
+
+pub fn fingerprint<I: FingerprintInputs + ?Sized>(spec: &VmSpec, inputs: &I) -> Result<String, PoolError> {
     let mut hashable = spec.clone();
     // Removed before serializing — see the module doc.
     hashable.cache_key_files = Vec::new();
@@ -87,23 +107,24 @@ pub fn fingerprint(spec: &VmSpec, workspace: &Path) -> Result<String, PoolError>
         }
         h.update(rel.as_bytes());
         h.update([0u8]);
-        match std::fs::read(workspace.join(rel)) {
-            Ok(bytes) => {
-                let mut fh = Sha256::new();
-                fh.update(&bytes);
-                h.update(fh.finalize());
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => h.update(ABSENT.as_bytes()),
-            Err(e) => {
-                return Err(PoolError::UnreadableFile {
-                    path: rel.clone(),
-                    reason: e.to_string(),
-                });
-            }
+        match inputs.verified(rel)? {
+            VerifiedContent::Sha256(digest) => h.update(digest),
+            VerifiedContent::Absent => h.update(ABSENT.as_bytes()),
         }
     }
 
     Ok(hex::encode(h.finalize())[..FINGERPRINT_LEN].to_string())
+}
+
+#[cfg(test)]
+impl FingerprintInputs for std::path::PathBuf {
+    fn verified(&self, path: &str) -> Result<VerifiedContent, PoolError> {
+        match std::fs::read(self.join(path)) {
+            Ok(bytes) => Ok(VerifiedContent::Sha256(Sha256::digest(bytes).into())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(VerifiedContent::Absent),
+            Err(e) => Err(PoolError::UnreadableFile { path: path.to_string(), reason: e.to_string() }),
+        }
+    }
 }
 
 /// A VM this orchestrator owns.
@@ -294,6 +315,7 @@ impl Pool {
             "DELETE FROM ci_vm_pool
               WHERE status = 'building'
                 AND runner_hd_id = ANY($1)
+                AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase<>'passed')
                 AND leased_by IS DISTINCT FROM $2
                 AND (leased_until IS NULL OR leased_until < now())",
         )
@@ -603,6 +625,25 @@ impl Pool {
         Ok(rows.iter().map(PooledVm::from_row).collect())
     }
 
+    /// Take just the oldest idle cache on this host under disk pressure.
+    /// Locking and marking it draining atomically excludes concurrent claims.
+    pub async fn take_oldest_idle(&self, runner: &str) -> Result<Option<PooledVm>, PoolError> {
+        let row = sqlx::query(
+            "UPDATE ci_vm_pool SET status = 'draining'
+              WHERE sandbox_id = (
+                    SELECT sandbox_id FROM ci_vm_pool
+                     WHERE status = 'idle' AND runner_hd_id = $1
+                     ORDER BY last_used_at ASC, sandbox_id ASC
+                     LIMIT 1 FOR UPDATE SKIP LOCKED
+              ) RETURNING *",
+        )
+        .bind(runner)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PoolError::sql)?;
+        Ok(row.as_ref().map(PooledVm::from_row))
+    }
+
     /// Idle VMs whose fingerprint is no longer wanted, or which have sat unused
     /// too long.
     ///
@@ -633,6 +674,7 @@ impl Pool {
                     SELECT sandbox_id FROM ci_vm_pool
                      WHERE status = 'idle'
                        AND runner_hd_id = ANY($1)
+                       AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase<>'passed')
                        AND (NOT (fingerprint = ANY($2))
                             OR last_used_at < now() - make_interval(secs => $3))
                      FOR UPDATE SKIP LOCKED
@@ -675,7 +717,8 @@ impl Pool {
         let result = sqlx::query(
             "UPDATE ci_vm_pool
                 SET leased_until = now() + make_interval(secs => $2)
-              WHERE leased_by = $1 AND status IN ('claimed','building')",
+              WHERE leased_by = $1 AND status IN ('claimed','building')
+                AND leased_until IS DISTINCT FROM 'infinity'::timestamptz",
         )
         .bind(lease.instance)
         .bind(lease.ttl.as_secs() as f64)
@@ -736,6 +779,8 @@ impl Pool {
                 SET status='idle', claimed_by_job=NULL, leased_by=NULL, leased_until=NULL
               WHERE p.status = 'claimed'
                 AND p.runner_hd_id = ANY($1)
+                AND NOT EXISTS (SELECT 1 FROM ci_vm_cleanup c WHERE c.sandbox_id=p.sandbox_id)
+                AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase<>'passed' AND (h.runner_hd_id=p.runner_hd_id OR s.job_id=p.claimed_by_job))
                 AND p.leased_by IS DISTINCT FROM $2
                 AND (
                      p.leased_until < now()
@@ -761,6 +806,7 @@ pub enum PoolError {
     Encode(String),
     EscapingPath(String),
     UnreadableFile { path: String, reason: String },
+    MissingVerifiedDigest(String),
     Sql(String),
 }
 
@@ -784,6 +830,10 @@ impl fmt::Display for PoolError {
                 "could not read cache_key_files entry {path:?}: {reason}. A missing \
                  file is fine and busts the pool when it appears; this one exists \
                  but could not be read."
+            ),
+            Self::MissingVerifiedDigest(path) => write!(
+                f,
+                "runner source preparation omitted requested cache key {path:?}; upgrade the runner backend"
             ),
             Self::Sql(e) => write!(f, "database error: {e}"),
         }
@@ -1530,6 +1580,41 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn disk_pressure_takes_oldest_idle_only_on_requested_host() {
+        let (pool, _) = test_pool().await;
+        let runner = runner_id();
+        let other = runner_id();
+        for (host, name, age, idle) in [
+            (&runner, "new", 1, true),
+            (&runner, "old", 2, true),
+            (&runner, "claimed", 3, false),
+            (&other, "foreign", 4, true),
+        ] {
+            let id = sb(host, name);
+            pool.register(&id, host, name, "wf", None, "j", held()).await.unwrap();
+            if idle { pool.release(&id).await.unwrap(); }
+            sqlx::query("UPDATE ci_vm_pool SET last_used_at = now() - make_interval(secs => $2) WHERE sandbox_id = $1")
+                .bind(id).bind(f64::from(age)).execute(&pool.db).await.unwrap();
+        }
+        let building = pool.begin_build("j", &runner, "building", "wf", None, held()).await.unwrap();
+        // A concurrent claim holding the oldest row wins; eviction skips it.
+        let mut claim = pool.db.begin().await.unwrap();
+        sqlx::query("SELECT sandbox_id FROM ci_vm_pool WHERE sandbox_id = $1 FOR UPDATE")
+            .bind(sb(&runner, "old")).fetch_one(&mut *claim).await.unwrap();
+        let taken = pool.take_oldest_idle(&runner).await.unwrap().unwrap();
+        assert_eq!(taken.sandbox_id, sb(&runner, "new"));
+        assert_eq!(taken.status, "draining");
+        claim.rollback().await.unwrap();
+        assert_eq!(pool.take_oldest_idle(&runner).await.unwrap().unwrap().sandbox_id, sb(&runner, "old"));
+        assert!(pool.take_oldest_idle(&runner).await.unwrap().is_none());
+        assert!(pool.claim(&runner, "old", "j2", held()).await.unwrap().is_none());
+        assert_eq!(pool.get(&sb(&runner, "claimed")).await.unwrap().unwrap().status, "claimed");
+        assert_eq!(pool.get(&sb(&other, "foreign")).await.unwrap().unwrap().status, "idle");
+        assert_eq!(pool.get(&building).await.unwrap().unwrap().status, "building");
     }
 
     /// Sweeping marks VMs `draining` so a concurrent claim cannot take one that

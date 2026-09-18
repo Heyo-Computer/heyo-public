@@ -16,6 +16,7 @@ mod acme;
 mod admin;
 mod artifact;
 mod auth;
+mod auth_providers;
 mod autoscale;
 mod config;
 mod deployment;
@@ -26,6 +27,8 @@ mod federated;
 mod feed;
 mod guard;
 mod health;
+mod host_bundle;
+mod host_update;
 mod incus;
 mod jobs;
 mod jwt;
@@ -35,6 +38,7 @@ mod namespaces;
 mod obs;
 mod proxy;
 mod registry;
+mod rollout;
 mod runtime;
 mod secrets;
 mod siem;
@@ -243,6 +247,9 @@ fn config_from_env() -> LbConfig {
     if let Ok(v) = std::env::var("APP_LB_ROUTE53_ZONE_ID") {
         cfg.route53_zone_id = Some(v.trim().to_string()).filter(|z| !z.is_empty());
     }
+    if let Ok(v) = std::env::var("APP_LB_DEPLOY_BASE_DOMAIN") {
+        cfg.deploy_base_domain = Some(v.trim().to_string()).filter(|d| !d.is_empty());
+    }
     if let Ok(v) = std::env::var("APP_LB_UPDATE_SHELL") {
         cfg.update_shell = v;
     }
@@ -279,6 +286,7 @@ fn init_tracing(events: Option<obs::LogSink>) {
 }
 
 fn main() {
+    if let Some(code) = host_update::helper_main() { std::process::exit(code); }
     // Before the subscriber, because shipping app-lb's own events means adding a
     // layer to it, and a subscriber can only be built once. Reads the environment
     // and allocates a channel — no threads, nothing that a later fork would lose.
@@ -487,6 +495,20 @@ fn main() {
             "restored declared namespaces; some objects were unreadable and were left on disk"
         ),
     }
+    let auth_providers = Arc::new(crate::auth_providers::AuthProviderStore::new(
+        crate::auth_providers::auth_provider_dir(&cfg.state_path),
+    ));
+    match auth_providers.load() {
+        (0, 0) => tracing::debug!(dir = %auth_providers.dir().display(), "no declared auth providers"),
+        (n, 0) => tracing::info!(count = n, "restored declared auth providers"),
+        (n, skipped) => tracing::warn!(
+            count = n,
+            skipped,
+            dir = %auth_providers.dir().display(),
+            "restored declared auth providers; some objects were unreadable and were left on disk"
+        ),
+    }
+
     // A deregistration whose file removal failed would otherwise resurrect the
     // deployment on this start. Declines to run if the load above skipped
     // anything, so it can never delete a spec it merely failed to understand.
@@ -787,7 +809,8 @@ fn main() {
     let autoscaler = autoscaler_svc.task();
 
     let disks = {
-        let store = Arc::new(disks::DiskStore::new(disk_cfg, vms.clone(), registry.clone()));
+        let store = Arc::new(disks::DiskStore::new(disk_cfg, vms.clone(), registry.clone()).with_workspaces(workspaces.clone()));
+        workspaces.attach_disk_store(&store);
         match store.load() {
             Ok(0) => {}
             Ok(n) => tracing::info!(count = n, "loaded disk retention policies"),
@@ -881,6 +904,18 @@ fn main() {
     });
     let acme_signal = acme_svc.as_ref().map(|svc| svc.task().signal());
 
+    match cfg.deploy_host_base() {
+        Some(base) => tracing::info!(
+            base = %base,
+            explicit = cfg.deploy_base_domain.is_some(),
+            "a deployment that names no host will be routed at <id>.{base}"
+        ),
+        None => tracing::info!(
+            "no deploy base domain (APP_LB_DEPLOY_BASE_DOMAIN or a wildcard); a hostless \
+             deployment is handled as before"
+        ),
+    }
+
     let admin_svc = background_service(
         "admin",
         AdminApi::new(
@@ -910,6 +945,7 @@ fn main() {
             secrets,
             workflows,
             namespaces,
+            auth_providers.clone(),
             tokens,
             jobs,
             obs.as_ref().map(|o| o.stats.clone()),
@@ -919,6 +955,7 @@ fn main() {
             admin::PublicUrl::from_config(cfg.tls_enabled(), &cfg.proxy_addr, &cfg.tls_addr),
             event_feed.clone(),
             &cfg.public_ips,
+            cfg.deploy_host_base().map(str::to_string),
         ),
     );
 
@@ -933,6 +970,7 @@ fn main() {
             siem.as_ref().map(|s| s.sink.clone()),
             guard.clone(),
             event_feed,
+            auth_providers.clone(),
         ),
     );
     proxy_svc.add_tcp(&cfg.proxy_addr);

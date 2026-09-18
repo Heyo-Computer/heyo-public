@@ -25,6 +25,7 @@ use base64::Engine;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -149,6 +150,7 @@ fn html_escape(s: &str) -> String {
 
 #[derive(Clone)]
 struct AdminState {
+    rollouts: Arc<crate::rollout::Rollouts>,
     registry: Arc<Registry>,
     autoscaler: Arc<Autoscaler>,
     metrics: Arc<Metrics>,
@@ -192,6 +194,10 @@ struct AdminState {
     /// mention are not in here — `GET /namespaces` reports the union, and
     /// `declared` on each row is what tells them apart.
     namespaces: Arc<crate::namespaces::NamespaceStore>,
+    /// Reusable, namespace-scoped auth providers. A deployment inherits one with
+    /// `auth.provider_ref`; the proxy resolves it live. Managed through this API,
+    /// walled by namespace exactly as `secrets` is.
+    auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
     /// App-tokens. Verified on every gated request, so reads are lock-free.
     tokens: Arc<crate::tokens::TokenStore>,
     /// Resolves bearers the Heyo auth service issued. `None` when
@@ -228,6 +234,10 @@ struct AdminState {
     /// The per-namespace event feed, read by `GET /feeds/:namespace` and
     /// written by the deployment lifecycle handlers.
     feed: Arc<crate::feed::Feed>,
+    /// Base domain a hostless deployment's `<id>.<base>` route is built under,
+    /// already resolved from config (explicit, else the first wildcard). `None`
+    /// disables host synthesis. See [`assume_host`].
+    deploy_base_domain: Option<Arc<str>>,
 }
 
 impl AdminState {
@@ -263,6 +273,7 @@ impl AdminApi {
         secrets: Arc<SecretStore>,
         workflows: Arc<crate::workflows::WorkflowStore>,
         namespaces: Arc<crate::namespaces::NamespaceStore>,
+        auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
         tokens: Arc<crate::tokens::TokenStore>,
         jobs: Arc<Jobs>,
         obs: Option<Arc<crate::obs::Stats>>,
@@ -272,6 +283,7 @@ impl AdminApi {
         public_url: PublicUrl,
         feed: Arc<crate::feed::Feed>,
         public_ips: &[std::net::IpAddr],
+        deploy_base_domain: Option<String>,
     ) -> Self {
         let ingress = Arc::new(Ingress::from_ips(public_ips));
         // Render the display name into the page once; the placeholder appears in
@@ -307,6 +319,7 @@ impl AdminApi {
         Self {
             addr,
             state: AdminState {
+                rollouts: Arc::new(crate::rollout::Rollouts::new(registry.clone(), autoscaler.clone(), jobs.clone())),
                 registry,
                 autoscaler,
                 metrics,
@@ -323,6 +336,7 @@ impl AdminApi {
                 ingress,
                 workflows,
                 namespaces,
+                auth_providers,
                 tokens,
                 jobs,
                 obs,
@@ -336,6 +350,10 @@ impl AdminApi {
                 disks_html,
                 public_url,
                 feed,
+                deploy_base_domain: deploy_base_domain
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .map(Arc::from),
             },
         }
     }
@@ -468,6 +486,23 @@ impl Caller {
             Self::Federated(_) => None,
         }
     }
+
+    /// The single namespace this caller is confined to, when it reaches exactly
+    /// one — the namespace a deployment spec may omit and have filled in. A
+    /// namespace token always has exactly one; a federated grant may name
+    /// several, so it qualifies only when it names one. An unconfined or
+    /// fleet caller has no single namespace to assume, so it gets `None` and the
+    /// spec keeps whatever it said (`default` when it said nothing).
+    fn sole_namespace(&self) -> Option<&str> {
+        match self {
+            Self::Ungated | Self::Operator => None,
+            Self::Token(t) => t.namespace.as_deref(),
+            Self::Federated(g) if !g.fleet && g.namespaces.len() == 1 => {
+                g.namespaces.keys().next().map(String::as_str)
+            }
+            Self::Federated(_) => None,
+        }
+    }
 }
 
 /// The deployment ids `caller` may see, or `None` for all of them.
@@ -518,6 +553,7 @@ fn narrows_itself(matched: &str) -> bool {
             | "/siem"
             | "/ingress"
             | "/namespaces"
+            | "/auth-providers"
             | "/whoami"
     )
 }
@@ -525,6 +561,15 @@ fn narrows_itself(matched: &str) -> bool {
 /// The secret store's routes, which are walled by namespace in their handlers.
 fn is_secret_route(matched: &str) -> bool {
     matches!(matched, "/secrets" | "/secrets/:id")
+}
+
+/// The auth-provider routes, walled by namespace in their handlers for the same
+/// reason the secret ones are: for `POST /auth-providers` the namespace is in
+/// the body, and for the item routes it is a path parameter the gate does not
+/// read, so the handler checks reach rather than the gate. `GET /auth-providers`
+/// is handled by `narrows_itself` instead, like `/secrets` on `GET`.
+fn is_auth_provider_route(matched: &str) -> bool {
+    matches!(matched, "/auth-providers" | "/auth-providers/:namespace/:name")
 }
 
 /// The deployment a matched route acts on, if it acts on one.
@@ -721,6 +766,10 @@ fn decide_access(
             // reach — the gate cannot, because for `/secrets` the namespace is
             // in the body or the query, not the path.
             None if is_secret_route(matched) && caller.confined() => {}
+            // Auth providers, walled the same way: the `:namespace` is a path
+            // parameter the gate does not read (and the body names it on
+            // `POST`), so the handler measures the caller's reach against it.
+            None if is_auth_provider_route(matched) && caller.confined() => {}
             None if !narrows_itself(matched) && !caller.covers_fleet() => {
                 return Verdict::Forbidden(
                     "this token is scoped to specific deployments, so it cannot use a \
@@ -921,6 +970,7 @@ struct VmStatus {
 
 #[derive(Serialize)]
 struct DeploymentStatus {
+    rollout_revision: String,
     spec: DeploymentSpec,
     /// `"vm"` (managed pool) or `"static"` (fixed proxy_pass upstreams).
     kind: &'static str,
@@ -1024,6 +1074,7 @@ fn pull_mounts_if_needed(state: &AdminState, spec: &DeploymentSpec) {
 fn status_of(state: &AdminState, d: &Arc<crate::deployment::Deployment>) -> DeploymentStatus {
     let backends = d.backends();
     DeploymentStatus {
+        rollout_revision: d.state().rollout_revision.clone(),
         workspace: state.autoscaler.workspaces().status(d),
         spec: d.spec.clone(),
         kind: deployment_kind(d),
@@ -2171,6 +2222,270 @@ async fn delete_namespace(
     }
 }
 
+// ---- auth providers -----------------------------------------------------
+
+/// Whether `caller` may read (`admin == false`) or change (`admin == true`) the
+/// auth providers of `ns`. Walled exactly as secrets are: an ungated or operator
+/// caller may do anything; a confined credential is measured against its reach.
+fn may_use_auth_providers(caller: Option<&Caller>, ns: &str, admin: bool) -> Result<(), Response> {
+    let Some(caller) = caller else {
+        return Ok(());
+    };
+    if !caller.reaches_namespace(ns) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            format!("this credential cannot reach the \"{ns}\" namespace's auth providers"),
+        )
+        .into_response());
+    }
+    if admin && !caller.satisfies_in(crate::tokens::AdminScope::Admin, Some(ns)) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            format!(
+                "this credential may only view the \"{ns}\" namespace, not change its auth providers"
+            ),
+        )
+        .into_response());
+    }
+    Ok(())
+}
+
+/// Deployments in `ns` whose sign-in gate inherits the provider `name`. Used to
+/// keep a delete from pulling a provider out from under a live gate — which,
+/// because resolution fails closed, would take those deployments offline.
+fn auth_provider_users(state: &AdminState, ns: &str, name: &str) -> Vec<String> {
+    let mut users: Vec<String> = state
+        .registry
+        .deployments()
+        .values()
+        .filter(|d| {
+            d.spec.namespace == ns
+                && d.spec.auth.as_ref().and_then(|g| g.provider_ref.as_deref()) == Some(name)
+        })
+        .map(|d| d.spec.id.clone())
+        .collect();
+    users.sort();
+    users
+}
+
+/// The body of `POST /auth-providers`: an [`AuthProviderSpec`] plus two
+/// request-only conveniences that never reach the store.
+///
+/// `preset` expands a known template — currently only `"heyo"`, which builds the
+/// JWT policy for the Heyo auth API from `secret` alone — so "the Heyo app works
+/// out of the box once the secret is provided" is one POST rather than a dozen
+/// fields nobody should have to know.
+#[derive(Deserialize)]
+struct CreateProviderBody {
+    #[serde(flatten)]
+    spec: crate::config::AuthProviderSpec,
+    /// Expand a provider template before validation. Request-only.
+    #[serde(default)]
+    preset: Option<String>,
+    /// The signing secret a preset needs. Request-only.
+    #[serde(default)]
+    secret: Option<crate::secrets::SecretRef>,
+}
+
+/// `GET /auth-providers[?namespace=]` — the providers this caller may see.
+///
+/// View tier, and it narrows itself: with a namespace it answers only that one
+/// (refusing a caller that cannot reach it), and without, only the namespaces
+/// the caller reaches — the same shape as `list_secrets`.
+async fn list_auth_providers(
+    State(state): State<AdminState>,
+    Query(q): Query<SecretQuery>,
+    caller: Option<axum::Extension<Caller>>,
+) -> impl IntoResponse {
+    let caller = caller.as_deref();
+    if let Some(ns) = q.namespace.as_deref().map(str::trim).filter(|ns| !ns.is_empty()) {
+        if let Err(refused) = may_use_auth_providers(caller, ns, false) {
+            return refused;
+        }
+        return Json(state.auth_providers.list(ns)).into_response();
+    }
+    let visible: Vec<_> = state
+        .auth_providers
+        .list_all()
+        .into_iter()
+        .filter(|p| caller.is_none_or(|c| c.reaches_namespace(&p.namespace)))
+        .collect();
+    Json(visible).into_response()
+}
+
+/// `POST /auth-providers` — declare or replace one in the namespace the body
+/// names (`default` when it names none). A confined caller must reach that
+/// namespace as an admin, exactly as it must to write a secret there.
+async fn create_auth_provider(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+    Json(body): Json<CreateProviderBody>,
+) -> Response {
+    let mut spec = body.spec;
+
+    // Apply the preset before validation, so what is stored and what is checked
+    // are the fully materialised provider — no preset expansion lives on the hot
+    // path or in the state file.
+    if let Some(preset) = body.preset.as_deref() {
+        match preset {
+            "heyo" => {
+                let Some(secret) = body.secret else {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        "the \"heyo\" preset needs a `secret` reference to the JWT signing key, \
+                         e.g. {\"secret\": \"heyo-auth\", \"key\": \"jwt_secret\"}",
+                    )
+                    .into_response();
+                };
+                spec.provider = crate::config::Providers::one(crate::config::AuthProvider::Jwt);
+                spec.jwt = Some(crate::config::JwtSpec::heyo(secret));
+            }
+            other => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    crate::config::SpecError::UnknownAuthPreset(other.to_string()).to_string(),
+                )
+                .into_response();
+            }
+        }
+    }
+
+    let ns = spec.namespace.clone();
+    if let Err(refused) = may_use_auth_providers(caller.as_deref(), &ns, true) {
+        return refused;
+    }
+    if let Err(e) = spec.validate() {
+        return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    // Stamped here, never from the body; re-declaring keeps the original clock so
+    // `apply` is idempotent.
+    let existing = state.auth_providers.get(&ns, &spec.name);
+    spec.created_at = match &existing {
+        Some(p) => p.created_at,
+        None => now_secs(),
+    };
+    let existed = existing.is_some();
+    match state.auth_providers.upsert(spec) {
+        Ok(p) => (
+            if existed { StatusCode::OK } else { StatusCode::CREATED },
+            Json(p),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "auth provider write failed");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not persist the auth provider",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `GET /auth-providers/:namespace/:name`. The client secret is a reference,
+/// never a value, so the object is safe to echo — the same reason a deployment
+/// spec is.
+async fn get_auth_provider(
+    State(state): State<AdminState>,
+    Path((namespace, name)): Path<(String, String)>,
+    caller: Option<axum::Extension<Caller>>,
+) -> Response {
+    if let Err(refused) = may_use_auth_providers(caller.as_deref(), &namespace, false) {
+        return refused;
+    }
+    match state.auth_providers.get(&namespace, &name) {
+        Some(p) => Json(p).into_response(),
+        None => err(
+            StatusCode::NOT_FOUND,
+            format!("no auth provider {name:?} in namespace {namespace:?}"),
+        )
+        .into_response(),
+    }
+}
+
+/// `DELETE /auth-providers/:namespace/:name`.
+///
+/// Refused while a deployment's gate still inherits it: resolution fails closed,
+/// so removing a referenced provider would take those deployments offline. The
+/// message names them, exactly as deleting a still-referenced secret does.
+async fn delete_auth_provider(
+    State(state): State<AdminState>,
+    Path((namespace, name)): Path<(String, String)>,
+    caller: Option<axum::Extension<Caller>>,
+) -> Response {
+    if let Err(refused) = may_use_auth_providers(caller.as_deref(), &namespace, true) {
+        return refused;
+    }
+    if state.auth_providers.get(&namespace, &name).is_none() {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no auth provider {name:?} in namespace {namespace:?}"),
+        )
+        .into_response();
+    }
+    let users = auth_provider_users(&state, &namespace, &name);
+    if !users.is_empty() {
+        return err(
+            StatusCode::CONFLICT,
+            format!(
+                "auth provider {name:?} is inherited by deployment(s) {}; their sign-in gates \
+                 would fail closed. Repoint or remove them first",
+                users.join(", ")
+            ),
+        )
+        .into_response();
+    }
+    match state.auth_providers.remove(&namespace, &name) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err(
+            StatusCode::NOT_FOUND,
+            format!("no auth provider {name:?} in namespace {namespace:?}"),
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "auth provider delete failed");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not remove the auth provider",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// If `spec`'s gate inherits an auth provider, resolve it against the store now
+/// and validate the merged deployment — so a reference to a missing or
+/// incompatible provider is refused at registration (400) with the provider
+/// named, rather than surfacing as a 500 on the first gated request.
+fn check_provider_ref(state: &AdminState, spec: &DeploymentSpec) -> Result<(), Response> {
+    let Some(name) = spec.auth.as_ref().and_then(|g| g.provider_ref.as_deref()) else {
+        return Ok(());
+    };
+    let Some(provider) = state.auth_providers.get(&spec.namespace, name) else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            crate::config::SpecError::UnknownAuthProvider {
+                namespace: spec.namespace.clone(),
+                name: name.to_string(),
+            }
+            .to_string(),
+        )
+        .into_response());
+    };
+    // Validate the deployment as though the inherited identity had been written
+    // inline: the resolved gate goes through the same `DeploymentSpec::validate`,
+    // so an incompatible provider is caught here with the gate error named.
+    let mut resolved = spec.clone();
+    resolved.auth = Some(provider.resolve(spec.auth.as_ref().expect("gate present")));
+    resolved.validate().map_err(|e| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("auth.provider_ref {name:?} resolves to a provider this deployment cannot use: {e}"),
+        )
+        .into_response()
+    })
+}
+
 #[derive(Deserialize)]
 struct FeedQuery {
     /// `json` returns the events as structured data instead of RSS — what
@@ -2248,6 +2563,7 @@ async fn patch_disk(
     let Some(store) = state.disks.as_ref() else {
         return disks_off();
     };
+    let _retention = state.autoscaler.workspaces().lifecycle_guard().await;
     if let Err(e) = store.set_policy(&id, body.retain, body.note) {
         return disk_error(e);
     }
@@ -2680,10 +2996,119 @@ fn warn_about(spec: &DeploymentSpec) {
 /// An operator, a local token or an ungated caller keeps what the body said:
 /// on a self-hosted app-lb there is no meter, and on the managed one those are
 /// the platform's own hands.
+/// Fill in the namespace a confined caller could have named but didn't.
+///
+/// A credential that reaches exactly one namespace should not have to repeat it
+/// in every spec: an unnamed spec (which serde parses as the `default`
+/// namespace) is taken to mean "my namespace". This never widens what a token
+/// can reach — it writes only the one namespace the caller could already have
+/// named — and it deliberately leaves an *explicit* namespace alone, so a token
+/// confined to `team-a` that writes `team-b` is still refused by the scope check
+/// downstream rather than silently rewritten. The one case it cannot serve is a
+/// confined token that genuinely wants the literal `default` namespace, which is
+/// only reachable by a token actually confined to `default` (a no-op here) —
+/// every other confined token is walled out of `default` regardless.
+///
+/// Runs before `normalize`, so secret refs bind to the assumed namespace, and
+/// before `stamp_owner`, so a federated grant meters to the right account.
+fn assume_namespace(spec: &mut DeploymentSpec, caller: Option<&Caller>) {
+    if spec.namespace == crate::config::DEFAULT_NAMESPACE
+        && let Some(sole) = caller.and_then(Caller::sole_namespace)
+    {
+        spec.namespace = sole.to_string();
+    }
+}
+
+/// Give a deployment that names no host one of its own: `<id>.<base>`.
+///
+/// So a deployment need not restate the fleet's domain to be reachable: with a
+/// base domain configured (an explicit one, else the wildcard zone that already
+/// has a certificate and DNS pointing here — see
+/// [`LbConfig::deploy_host_base`]), a spec that pins no hostname gets a route to
+/// `<id>.<base>`. Ids are globally unique, so the name is too.
+///
+/// Two shapes are left exactly as written:
+/// - one that already pins a `host` or `host_suffix` — there is nothing to
+///   assume; and
+/// - a *routeless VM*, the intentional headless-sandbox shape reached only
+///   through `exec`/`shell`. A VM earns a host only once it exposes a port with
+///   a route (even a path-only one); every other backend is unreachable without
+///   a route, so a routeless site or static deployment does get one rather than
+///   being dead weight.
+///
+/// Runs before `validate`, so the generated route is checked like any other and
+/// an auth callback resolves against it. Off entirely when no base is
+/// configured, leaving a hostless deployment to be handled exactly as before.
+///
+/// [`LbConfig::deploy_host_base`]: crate::config::LbConfig::deploy_host_base
+fn assume_host(spec: &mut DeploymentSpec, base: Option<&str>) {
+    let Some(base) = base else { return };
+    // A pinned hostname is respected; an empty id is left for `validate` to
+    // reject rather than baked into a nonsense `.base` name.
+    if spec.has_host_route() || spec.id.trim().is_empty() {
+        return;
+    }
+    // A routeless VM is private on purpose. Any other backend, or a VM that has
+    // exposed a port with a route, is reached through the proxy and gets a name.
+    if spec.routes.is_empty() && spec.vm.is_some() {
+        return;
+    }
+    spec.routes.push(crate::config::RouteRule {
+        host: Some(format!("{}.{}", spec.id.trim(), base)),
+        ..Default::default()
+    });
+}
+
 pub(crate) fn stamp_owner(spec: &mut DeploymentSpec, caller: Option<&Caller>) {
     if let Some(Caller::Federated(g)) = caller {
         spec.account_id = g.account_for(&spec.namespace).map(str::to_string);
         spec.user_id = Some(g.subject.user_id.clone());
+    }
+}
+
+/// A strong validator for the complete, normalized spec as represented on the
+/// wire. Explicitly sort every object: serde_json's `preserve_order` feature
+/// can be enabled transitively and must not change the validator protocol.
+fn deployment_etag(spec: &DeploymentSpec) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(spec)?;
+    value.sort_all_objects();
+    let bytes = serde_json::to_vec(&value)?;
+    Ok(format!("\"{:x}\"", Sha256::digest(bytes)))
+}
+
+/// Accept only the one conditional-update form app-lb implements: one exact,
+/// strong tag emitted by `GET`. Lists, wildcards and weak validators have
+/// semantics this endpoint does not promise and are rejected rather than
+/// approximated.
+fn if_match(headers: &axum::http::HeaderMap) -> Result<Option<&str>, Response> {
+    let mut values = headers.get_all(header::IF_MATCH).iter();
+    let Some(value) = values.next() else { return Ok(None) };
+    if values.next().is_some() {
+        return Err(err(StatusCode::BAD_REQUEST, "If-Match must contain exactly one strong ETag").into_response());
+    }
+    let value = value.to_str().map_err(|_| {
+        err(StatusCode::BAD_REQUEST, "If-Match is not a valid HTTP header value").into_response()
+    })?;
+    let valid = value.len() == 66
+        && value.starts_with('"')
+        && value.ends_with('"')
+        && value[1..65].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !valid {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "If-Match must be one quoted lowercase SHA256 ETag from GET /deployments/:id",
+        ).into_response());
+    }
+    Ok(Some(value))
+}
+
+fn check_etag_precondition(expected: Option<&str>, current: &DeploymentSpec) -> Result<(), StatusCode> {
+    let Some(expected) = expected else { return Ok(()) };
+    let current = deployment_etag(current).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if expected == current {
+        Ok(())
+    } else {
+        Err(StatusCode::PRECONDITION_FAILED)
     }
 }
 
@@ -2692,6 +3117,12 @@ async fn register(
     caller: Option<axum::Extension<Caller>>,
     Json(mut spec): Json<DeploymentSpec>,
 ) -> impl IntoResponse {
+    // A namespace token may omit the namespace and have its own filled in.
+    // Runs first, so the assumed namespace is what secret refs bind to.
+    assume_namespace(&mut spec, caller.as_ref().map(|c| &c.0));
+    // A spec that pins no hostname gets `<id>.<base>`, so a route is checked
+    // and an auth callback resolves against it below.
+    assume_host(&mut spec, state.deploy_base_domain.as_deref());
     // Bind secret references to the spec's namespace before anything reads
     // them; see `DeploymentSpec::normalize`.
     spec.normalize();
@@ -2699,6 +3130,9 @@ async fn register(
     // no guest_ip) from ever being booted.
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(refused) = check_provider_ref(&state, &spec) {
+        return refused;
     }
     warn_about(&spec);
 
@@ -2745,15 +3179,26 @@ async fn register(
     // Replacing a deployment abandons its old pool; tear it down explicitly so
     // the VMs don't linger until their TTL.
     //
-    // The swap happens *first*, for the same reason `deregister` removes before
-    // tearing down: while the old deployment is still the registry's, a
-    // concurrent autoscaler tick will happily boot VMs into it, and those would
-    // be orphaned by the swap that follows. Once it is no longer live the
-    // autoscaler stops creating for it and kills anything it created (see
-    // `Autoscaler::unclaimed`).
+    // For a workspace, first drain the autoscaler's create slots and persist a
+    // stale-seed fence. The registry swap still precedes teardown, so the old
+    // object cannot create orphan VMs; the fence keeps the newly exposed object
+    // from booting until teardown's final old-state capture has published.
     let change = state.registry.change_guard().await;
     let old = state.registry.get(&id);
+    if old.as_ref().is_some_and(|d| crate::rollout::reserved(d)) {
+        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
+    if state.autoscaler.workspaces().recovery_active(&id) {
+        return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
+    }
     let replaced = old.is_some();
+    let workspace_replacement = match &old {
+        Some(old) => match state.autoscaler.fence_workspace_replacement(old).await {
+            Ok(fence) => fence,
+            Err(message) => return err(StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+        },
+        None => None,
+    };
     let deployment = state.registry.upsert(spec);
     if let Err(e) = state.registry.persist_one(&id) {
         tracing::error!(deployment = %id, error = %e, "failed to persist state");
@@ -2761,6 +3206,9 @@ async fn register(
     drop(change);
     if let Some(old) = old {
         state.autoscaler.teardown(&old).await;
+    }
+    if let Some(fence) = workspace_replacement {
+        fence.finish();
     }
     tracing::info!(deployment = %id, "registered");
     state.feed.announce(
@@ -2793,12 +3241,25 @@ async fn update(
     State(state): State<AdminState>,
     Path(id): Path<String>,
     caller: Option<axum::Extension<Caller>>,
+    headers: axum::http::HeaderMap,
     Json(mut spec): Json<DeploymentSpec>,
 ) -> impl IntoResponse {
+    let expected_etag = match if_match(&headers) {
+        Ok(value) => value.map(str::to_owned),
+        Err(response) => return response,
+    };
     spec.id = id.clone();
+    // A namespace token may omit the namespace and have its own filled in,
+    // rather than trip the cross-namespace refusal below with an unnamed spec.
+    assume_namespace(&mut spec, caller.as_ref().map(|c| &c.0));
+    // A spec that pins no hostname gets `<id>.<base>`, as at registration.
+    assume_host(&mut spec, state.deploy_base_domain.as_deref());
     spec.normalize();
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Err(refused) = check_provider_ref(&state, &spec) {
+        return refused;
     }
     warn_about(&spec);
 
@@ -2821,20 +3282,52 @@ async fn update(
     }
 
     stamp_owner(&mut spec, caller.as_ref().map(|c| &c.0));
+    let response_etag = match deployment_etag(&spec) {
+        Ok(etag) => etag,
+        Err(e) => {
+            tracing::error!(deployment = %id, error = %e, "failed to serialize deployment ETag");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "failed to serialize deployment ETag").into_response();
+        }
+    };
     let change = state.registry.change_guard().await;
     let Some(old) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
+    if crate::rollout::reserved(&old) {
+        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
+    // Compare while holding the same writer guard that covers fencing, the
+    // registry swap, persistence and teardown scheduling. A stale request must
+    // leave all of those untouched.
+    if state.autoscaler.workspaces().recovery_active(&id) {
+        return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
+    }
+    if let Err(status) = check_etag_precondition(expected_etag.as_deref(), &old.spec) {
+        let message = if status == StatusCode::PRECONDITION_FAILED {
+            "If-Match does not match the current deployment spec"
+        } else {
+            "failed to serialize deployment ETag"
+        };
+        return err(status, message).into_response();
+    }
 
     // The owner is not part of the template, so a stamp never recycles a pool.
     let rebuild = old.spec.vm != spec.vm || old.spec.upstreams != spec.upstreams;
+    let workspace_replacement = if rebuild {
+        match state.autoscaler.fence_workspace_replacement(&old).await {
+            Ok(fence) => fence,
+            Err(message) => return err(StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+        }
+    } else {
+        None
+    };
     let deployment = if rebuild {
         // The backend set changed — a managed VM *template*, or a static
         // deployment's upstream list (or a switch between the two kinds). The
         // running backends no longer match the spec, so rebuild from scratch
         // (`teardown` is a no-op-that-clears-routing for the static kind).
         //
-        // Swap first, tear down second: see the note in `register`.
+        // Fence, swap, then tear down: see the note in `register`.
         tracing::info!(deployment = %id, "updating deployment (backends changed; rebuilding)");
         state.registry.upsert(spec)
     } else {
@@ -2853,6 +3346,9 @@ async fn update(
     if rebuild {
         state.autoscaler.teardown(&old).await;
     }
+    if let Some(fence) = workspace_replacement {
+        fence.finish();
+    }
     // Reconcile to the new policy immediately (scale up/down, warm pool).
     deployment.scale_signal.notify_one();
     // An edit can introduce a hostname, so this needs the same nudge as
@@ -2868,7 +3364,7 @@ async fn update(
         now_secs(),
     );
 
-    Json(status_of(&state, &deployment)).into_response()
+    ([(header::ETAG, response_etag)], Json(status_of(&state, &deployment))).into_response()
 }
 
 /// Manually scale a deployment: `PATCH /deployments/:id/scaling`.
@@ -2887,9 +3383,15 @@ async fn scale(
     let Some(old) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
+    if crate::rollout::reserved(&old) {
+        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
 
     // Only a managed deployment is autoscaled; for the others the scaling policy
     // is inert, so a scale request is a mistake rather than a no-op.
+    if state.autoscaler.workspaces().recovery_active(&id) {
+        return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
+    }
     if !old.spec.is_managed() {
         let fix = if old.spec.is_site() {
             "a site serves files off disk and has nothing to scale"
@@ -2972,8 +3474,23 @@ async fn list(
 }
 
 async fn get_one(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
+    let _change = state.registry.change_guard().await;
+    if let Some(d) = state.registry.get(&id) {
+        if d.state().rollout_revision.is_empty() { d.mutate_state(|s| s.rollout_revision = crate::rollout::revision()); }
+    }
+    if state.registry.get(&id).is_some() && !state.registry.get(&id).is_some_and(|d| crate::rollout::reserved(&d)) {
+        if state.registry.persist_one(&id).is_err() {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "could not persist rollout revision").into_response();
+        }
+    }
     match state.registry.get(&id) {
-        Some(d) => Json(status_of(&state, &d)).into_response(),
+        Some(d) => match deployment_etag(&d.spec) {
+            Ok(etag) => ([(header::ETAG, etag)], Json(status_of(&state, &d))).into_response(),
+            Err(e) => {
+                tracing::error!(deployment = %id, error = %e, "failed to serialize deployment ETag");
+                err(StatusCode::INTERNAL_SERVER_ERROR, "failed to serialize deployment ETag").into_response()
+            }
+        },
         None => err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response(),
     }
 }
@@ -3239,6 +3756,12 @@ async fn uncordon_upstream(
 
 async fn deregister(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
     let change = state.registry.change_guard().await;
+    if state.registry.get(&id).is_some_and(|d| crate::rollout::reserved(&d) || !d.state().rollouts.is_empty()) {
+        return err(StatusCode::CONFLICT, "rollout generations must be explicitly reconciled before deregistration").into_response();
+    }
+    if state.autoscaler.workspaces().has_recovery(&id) {
+        return err(StatusCode::CONFLICT, "workspace recovery history and retained source must be preserved").into_response();
+    }
     let Some(d) = state.registry.remove(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
@@ -3285,9 +3808,13 @@ async fn evict_vm(
     Path((id, sandbox_id)): Path<(String, String)>,
     Query(params): Query<EvictParams>,
 ) -> impl IntoResponse {
+    let _change = state.registry.change_guard().await;
     let Some(d) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
+    if crate::rollout::reserved(&d) {
+        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
 
     // Eviction recycles a VM and lets the autoscaler boot a replacement, which
     // only means something for a managed deployment. A static one's upstreams are
@@ -3761,8 +4288,8 @@ async fn pump_shell(
     let _ = tx.send(Message::Close(None)).await;
 }
 
-async fn healthz() -> &'static str {
-    "ok\n"
+async fn healthz() -> impl IntoResponse {
+    ([("x-heyo-revision", env!("APP_LB_BUILD_REVISION"))], "ok\n")
 }
 
 /// Issued certificates: `GET /certs`.
@@ -4196,6 +4723,9 @@ struct PullRequest {
     /// without making that digest the deployment's default.
     #[serde(default, rename = "ref")]
     artifact_ref: Option<String>,
+    /// Enables durable idempotency and replacement-readiness verification.
+    #[serde(default)]
+    operation_id: Option<String>,
     /// Re-fetch even when the image is already on disk. Rarely wanted — the
     /// filename is the digest, so the image being there is proof the bytes are
     /// right — and it exists for the case where the file was damaged after it
@@ -4211,8 +4741,11 @@ fn job_start_error(e: StartError) -> Response {
         e @ StartError::NoDeployment(_) => {
             err(StatusCode::NOT_FOUND, e.to_string()).into_response()
         }
-        e @ StartError::AlreadyRunning(_) => {
+        e @ (StartError::AlreadyRunning(_) | StartError::ConflictingOperation(_)) => {
             err(StatusCode::CONFLICT, e.to_string()).into_response()
+        }
+        e @ StartError::Persistence(_) => {
+            err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
         }
         e => err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
@@ -4259,7 +4792,14 @@ async fn start_pull(
     body: Option<Json<PullRequest>>,
 ) -> impl IntoResponse {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    match state.jobs.start_pull(&id, req.artifact_ref, req.force) {
+    let result = match req.operation_id {
+        Some(operation_id) => match req.artifact_ref {
+            Some(digest) => state.jobs.start_correlated_pull(&id, operation_id, digest, req.force),
+            None => Err(StartError::BadRef("operation_id requires an explicit pinned `ref` digest".into())),
+        },
+        None => state.jobs.start_pull(&id, req.artifact_ref, req.force),
+    };
+    match result {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "artifact pull started");
             (StatusCode::ACCEPTED, Json(record)).into_response()
@@ -4306,12 +4846,59 @@ async fn start_update(
     State(state): State<AdminState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if std::env::var_os("APP_LB_HOST_UPDATE_CONFIG").is_some() {
+        match crate::host_update::configured() {
+            Ok((_, config)) if config.deployment != id => {}
+            _ => return err(StatusCode::CONFLICT, "mapped host requires correlated /update/rollouts, not legacy commands").into_response(),
+        }
+    }
     match state.jobs.start_update(&id) {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "host update started");
             (StatusCode::ACCEPTED, Json(record)).into_response()
         }
         Err(e) => job_start_error(e),
+    }
+}
+
+fn host_update_mapping(state: &AdminState, caller: &Caller, id: &str) -> Result<(std::path::PathBuf, crate::host_update::Config), Response> {
+    let (path, config) = crate::host_update::configured().map_err(|e| err(StatusCode::CONFLICT, e).into_response())?;
+    let d = state.registry.get(id).ok_or_else(|| err(StatusCode::NOT_FOUND, "deployment not found").into_response())?;
+    if config.deployment != id || config.namespace != d.spec.namespace || !recovery_authorized(caller, &d.spec) {
+        return Err(forbidden("authenticated mapped namespace admin required"));
+    }
+    Ok((path, config))
+}
+
+async fn host_update_snapshot(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>, Path(id): Path<String>) -> Response {
+    let (_, config) = match host_update_mapping(&state, &caller, &id) { Ok(c) => c, Err(e) => return e };
+    match crate::host_update::snapshot(&config).await {
+        Ok(value) => Json(value).into_response(), Err(e) => err(StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+async fn start_host_rollout(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>, Path(id): Path<String>, Json(request): Json<crate::host_update::Request>) -> Response {
+    let (path, config) = match host_update_mapping(&state, &caller, &id) { Ok(c) => c, Err(e) => return e };
+    match crate::host_update::start(&path, &config, request).await {
+        Ok(value) => (StatusCode::ACCEPTED, Json(value)).into_response(), Err(e) => err(StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+async fn get_host_rollout(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>, Path((id, operation)): Path<(String,String)>) -> Response {
+    let (_, config) = match host_update_mapping(&state, &caller, &id) { Ok(c) => c, Err(e) => return e };
+    match crate::host_update::get(&config, &operation).await {
+        Ok(value) => Json(value).into_response(),
+        Err(e) if e == "operation not found" => err(StatusCode::NOT_FOUND, e).into_response(),
+        Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
+async fn get_host_bootstrap(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>, Path((id, operation)): Path<(String,String)>) -> Response {
+    let (path, config) = match host_update_mapping(&state, &caller, &id) { Ok(c) => c, Err(e) => return e };
+    match crate::host_update::bootstrap::get(&config, &path, &operation).await {
+        Ok(value) => Json(value).into_response(),
+        Err(e) if e == "operation not found" => err(StatusCode::NOT_FOUND, e).into_response(),
+        Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
     }
 }
 
@@ -4345,6 +4932,57 @@ async fn get_job(
     }
 }
 
+async fn start_rollout(State(state): State<AdminState>, Path(id): Path<String>, Json(mut request): Json<crate::rollout::Request>) -> Response {
+    if request.spec.id != id { return err(StatusCode::BAD_REQUEST, "spec.id must match deployment").into_response(); }
+    request.spec.normalize();
+    if let Err(refused) = check_provider_ref(&state, &request.spec) { return refused; }
+    let _lifecycle = state.autoscaler.rollout_guard().await;
+    let _change = state.registry.change_guard().await;
+    let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    match state.jobs.with_rollout_slot(&id, || state.rollouts.admit(&d, request)) {
+        Ok(o) => (StatusCode::ACCEPTED, Json(o.view())).into_response(),
+        Err(e) => err(StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+async fn get_rollout(State(state): State<AdminState>, Path((id, operation)): Path<(String, String)>) -> Response {
+    let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    match d.state().rollouts.iter().find(|o| o.operation_id == operation) {
+        Some(o) => Json(o.view()).into_response(),
+        None => err(StatusCode::NOT_FOUND, "rollout not found").into_response(),
+    }
+}
+
+fn recovery_authorized(caller: &Caller, spec: &DeploymentSpec) -> bool {
+    !matches!(caller, Caller::Ungated)
+        && caller.satisfies_in(crate::tokens::AdminScope::Admin, Some(&spec.namespace))
+        && caller.may_touch(&spec.id, Some(&spec.namespace))
+}
+
+async fn recover_workspace(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path(id): Path<String>, Json(request): Json<crate::workspace::RecoveryRequest>) -> Response {
+    let _writer = state.registry.change_guard().await;
+    let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    if !recovery_authorized(&caller, &d.spec) { return forbidden("authenticated namespace admin required"); }
+    let _creates = state.autoscaler.workspace_recovery_guard().await;
+    let ws = state.autoscaler.workspaces();
+    let _lifecycle = ws.lifecycle_guard().await;
+    match ws.admit_recovery(&d, request).await {
+        Ok(operation) => (StatusCode::ACCEPTED, Json(operation)).into_response(),
+        Err(message) => err(StatusCode::CONFLICT, message).into_response(),
+    }
+}
+
+async fn get_workspace_recovery(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path((id, operation_id)): Path<(String, String)>) -> Response {
+    let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    if !recovery_authorized(&caller, &d.spec) { return forbidden("authenticated namespace admin required"); }
+    match state.autoscaler.workspaces().recovery(&id, &operation_id) {
+        Some(operation) if operation.namespace == d.spec.namespace => Json(operation).into_response(),
+        _ => err(StatusCode::NOT_FOUND, "recovery not found in this namespace").into_response(),
+    }
+}
+
 fn router(state: AdminState) -> Router {
     // The dashboard view + its data source are always behind the optional gate.
     let view = Router::new()
@@ -4375,6 +5013,10 @@ fn router(state: AdminState) -> Router {
         // it names only namespaces whose deployments the caller can already
         // list, so it is the directory's own information regrouped.
         .route("/namespaces", get(namespaces))
+        // View tier, and it narrows itself to the caller's namespaces exactly as
+        // `/namespaces` does — a scoped token gets its own providers rather than
+        // a 403. The item reads and every write are on the CRUD side below.
+        .route("/auth-providers", get(list_auth_providers))
         .route("/feeds", get(feeds_index))
         .route("/feeds/:namespace", get(feed_rss))
         // Where DNS should point. View tier: it is the answer to "what do I
@@ -4388,6 +5030,8 @@ fn router(state: AdminState) -> Router {
     // `admin_auth` is on; otherwise it stays open, as before.
     let crud = Router::new()
         .route("/deployments", post(register).get(list))
+        .route("/deployments/:id/rollouts", post(start_rollout))
+        .route("/deployments/:id/rollouts/:operation", get(get_rollout))
         .route("/deployments/:id", get(get_one).put(update).delete(deregister))
         .route("/deployments/:id/scaling", patch(scale))
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
@@ -4443,6 +5087,9 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/pull", post(start_pull))
         .route("/deployments/:id/mounts/pull", post(start_mount_pull))
         .route("/deployments/:id/update", post(start_update))
+        .route("/deployments/:id/update/rollouts", get(host_update_snapshot).post(start_host_rollout))
+        .route("/deployments/:id/update/rollouts/:operation", get(get_host_rollout))
+        .route("/deployments/:id/update/bootstrap/:operation", get(get_host_bootstrap))
         .route("/deployments/:id/jobs", get(deployment_jobs))
         .route("/jobs", get(list_jobs))
         .route("/jobs/:job_id", get(get_job))
@@ -4455,6 +5102,15 @@ fn router(state: AdminState) -> Router {
         // matches on path, not method.
         .route("/namespaces", post(create_namespace))
         .route("/namespaces/:name", delete(delete_namespace))
+        // Auth providers. `POST` shares its path with the view-tier list above,
+        // exactly as `/namespaces` does; the item read sits here beside its
+        // delete so one path lives on one tier. The item GET is CRUD-tier out of
+        // the same caution that keeps a deployment spec there.
+        .route("/auth-providers", post(create_auth_provider))
+        .route(
+            "/auth-providers/:namespace/:name",
+            get(get_auth_provider).delete(delete_auth_provider),
+        )
         .route("/tokens", post(mint_token).get(list_tokens))
         .route(
             "/tokens/:id",
@@ -4495,8 +5151,15 @@ fn router(state: AdminState) -> Router {
             require_any_credential,
         ));
 
+    // Unlike legacy CRUD, explicit data recovery is never available ungated.
+    let recovery = Router::new()
+        .route("/deployments/:id/workspace/recoveries", post(recover_workspace))
+        .route("/deployments/:id/workspace/recoveries/:operation_id", get(get_workspace_recovery))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
+
     Router::new()
         .route("/healthz", get(healthz))
+        .merge(recovery)
         .merge(view)
         .merge(whoami)
         .merge(crud)
@@ -4515,6 +5178,15 @@ impl BackgroundService for AdminApi {
             }
         };
         tracing::info!(addr = %self.addr, "admin API listening");
+        let rollouts = self.state.rollouts.clone();
+        let mut rollout_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop { tokio::select! {
+                _ = tick.tick() => rollouts.tick().await,
+                _ = rollout_shutdown.changed() => break,
+            } }
+        });
 
         // `into_make_service_with_connect_info` rather than the bare router:
         // without it there is no `ConnectInfo` extension anywhere in the admin
@@ -4793,6 +5465,109 @@ async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn healthz_reports_compiled_revision() {
+        let response = healthz().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-heyo-revision"], env!("APP_LB_BUILD_REVISION"));
+        let body = axum::body::to_bytes(response.into_body(), 32).await.unwrap();
+        assert_eq!(body.as_ref(), b"ok\n");
+    }
+
+    mod deployment_etags {
+        use super::*;
+
+        fn spec(route: &str) -> DeploymentSpec {
+            let mut spec: DeploymentSpec = serde_json::from_value(serde_json::json!({
+                "id": "web",
+                "routes": [{"host": route}],
+                "upstreams": ["127.0.0.1:8080"]
+            }))
+            .unwrap();
+            spec.normalize();
+            spec
+        }
+
+        fn headers(value: Option<&str>) -> axum::http::HeaderMap {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(header::IF_MATCH, value.parse().unwrap());
+            }
+            headers
+        }
+
+        #[test]
+        fn validator_uses_lexical_keys_even_with_preserve_order() {
+            // Independent canonical encoder: sort keys at each object, keeping
+            // arrays ordered. Do not use the production sort_all_objects call.
+            fn canonical(value: &serde_json::Value) -> String {
+                match value {
+                    serde_json::Value::Object(map) => {
+                        let sorted: std::collections::BTreeMap<_, _> = map.iter().collect();
+                        format!("{{{}}}", sorted.into_iter().map(|(k, v)|
+                            format!("{}:{}", serde_json::to_string(k).unwrap(), canonical(v))
+                        ).collect::<Vec<_>>().join(","))
+                    }
+                    serde_json::Value::Array(items) => format!("[{}]", items.iter().map(canonical).collect::<Vec<_>>().join(",")),
+                    other => other.to_string(),
+                }
+            }
+            let current = spec("test.example.com");
+            let expected = format!("\"{:x}\"", Sha256::digest(canonical(&serde_json::to_value(&current).unwrap()).as_bytes()));
+            assert_eq!(deployment_etag(&current).unwrap(), expected);
+        }
+
+        #[test]
+        fn matching_tag_succeeds_and_unconditioned_update_stays_compatible() {
+            let current = spec("old.example.com");
+            let tag = deployment_etag(&current).unwrap();
+            assert!(check_etag_precondition(if_match(&headers(Some(&tag))).unwrap(), &current).is_ok());
+            assert!(check_etag_precondition(if_match(&headers(None)).unwrap(), &current).is_ok());
+        }
+
+        #[tokio::test]
+        async fn stale_tag_does_not_replace_the_deployment_or_its_pool() {
+            let registry = crate::registry::Registry::new("unused-etag-test-state.json");
+            let first = registry.upsert(spec("first.example.com"));
+            let stale = deployment_etag(&first.spec).unwrap();
+            let current = registry.upsert(spec("current.example.com"));
+
+            let _change = registry.change_guard().await;
+            let observed = registry.get("web").unwrap();
+            assert_eq!(
+                check_etag_precondition(Some(&stale), &observed.spec),
+                Err(StatusCode::PRECONDITION_FAILED)
+            );
+            // The failed CAS never calls update/upsert: the exact Deployment
+            // object (and therefore its backend pool) remains installed.
+            assert!(Arc::ptr_eq(&current, &registry.get("web").unwrap()));
+            assert_eq!(registry.get("web").unwrap().spec.routes[0].host.as_deref(), Some("current.example.com"));
+        }
+
+        #[test]
+        fn malformed_weak_wildcard_and_list_tags_are_refused() {
+            for value in [
+                "not-an-etag",
+                "W/\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+                "*",
+                "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
+                "\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"",
+            ] {
+                assert_eq!(if_match(&headers(Some(value))).unwrap_err().status(), StatusCode::BAD_REQUEST, "{value}");
+            }
+        }
+
+        #[test]
+        fn tag_hashes_the_serialized_value_of_the_full_spec() {
+            let spec = spec("hash.example.com");
+            let mut value = serde_json::to_value(&spec).unwrap();
+            value.sort_all_objects();
+            let expected = format!("\"{:x}\"", Sha256::digest(serde_json::to_vec(&value).unwrap()));
+            assert_eq!(deployment_etag(&spec).unwrap(), expected);
+            assert_eq!(expected.len(), 66);
+        }
+    }
 
     mod upstream_drains {
         use super::*;
@@ -5835,6 +6610,20 @@ mod tests {
             assert!(matches!(at("/secrets/:id", "/secrets/github"), Verdict::Allow(_)));
         }
 
+        #[test]
+        fn workspace_recovery_requires_explicit_namespace_admin_even_when_ungated() {
+            let spec: DeploymentSpec = serde_json::from_value(serde_json::json!({"id":"svc","namespace":"team-a","routes":[]})).unwrap();
+            assert!(!recovery_authorized(&Caller::Ungated, &spec));
+            assert!(recovery_authorized(&Caller::Operator, &spec));
+            let t = store();
+            for (namespace, tier, allowed) in [("team-a", AdminScope::Admin, true), ("team-b", AdminScope::Admin, false), ("team-a", AdminScope::View, false)] {
+                let token = mint_in_namespace(&t, tier, namespace);
+                let caller = Caller::Token(t.verify(&token, NOW).unwrap());
+                assert_eq!(recovery_authorized(&caller, &spec), allowed);
+            }
+            assert_eq!(deployment_of("/deployments/:id/workspace/recoveries", "/deployments/svc/workspace/recoveries"), Some("svc"));
+        }
+
         /// The handler-side wall: a confined caller reaches its own
         /// namespace's secrets at its own tier, and nothing past it.
         #[test]
@@ -5914,6 +6703,119 @@ mod tests {
                 stamp_owner(&mut spec, caller.as_ref());
                 assert_eq!(spec.account_id, None);
             }
+        }
+
+        /// A confined credential reaching exactly one namespace has an unnamed
+        /// spec (the `default` namespace) filled in with its own; an explicit,
+        /// different namespace is left for the scope check to refuse; and a
+        /// caller with no single namespace rewrites nothing.
+        #[test]
+        fn a_confined_caller_has_its_lone_namespace_assumed() {
+            let t = store();
+            let raw = mint_in_namespace(&t, AdminScope::Admin, "team-a");
+            let token = Caller::Token(t.verify(&raw, NOW).unwrap());
+
+            // Unnamed spec (default) → the token's own namespace.
+            let mut spec = spec_in("default", None);
+            assume_namespace(&mut spec, Some(&token));
+            assert_eq!(spec.namespace, "team-a");
+
+            // An explicit, different namespace is untouched — the downstream
+            // scope check refuses it rather than have it silently rewritten.
+            let mut spec = spec_in("team-b", None);
+            assume_namespace(&mut spec, Some(&token));
+            assert_eq!(spec.namespace, "team-b");
+
+            // A federated grant naming exactly one namespace is assumed too...
+            let one = Caller::Federated(grant(&[("team-a", AdminScope::Admin)], false));
+            let mut spec = spec_in("default", None);
+            assume_namespace(&mut spec, Some(&one));
+            assert_eq!(spec.namespace, "team-a");
+
+            // ...but one naming several has no lone namespace to assume, and a
+            // fleet, operator, ungated or absent caller never assumes at all.
+            let many = Caller::Federated(grant(
+                &[("team-a", AdminScope::Admin), ("team-b", AdminScope::Admin)],
+                false,
+            ));
+            for caller in [
+                Some(many),
+                Some(Caller::Federated(grant(&[], true))),
+                Some(Caller::Operator),
+                Some(Caller::Ungated),
+                None,
+            ] {
+                let mut spec = spec_in("default", None);
+                assume_namespace(&mut spec, caller.as_ref());
+                assert_eq!(spec.namespace, "default");
+            }
+        }
+
+        fn spec_json(v: serde_json::Value) -> DeploymentSpec {
+            serde_json::from_value(v).unwrap()
+        }
+
+        fn only_host(spec: &DeploymentSpec) -> Option<&str> {
+            match spec.routes.as_slice() {
+                [one] => one.host.as_deref(),
+                _ => None,
+            }
+        }
+
+        /// A backend that cannot be reached without a route — a site or a static
+        /// upstream list — gets `<id>.<base>` when it names no host, and a VM
+        /// gets one only once it has exposed a port with a route. A routeless VM
+        /// stays private, and a pinned host or an absent base is left alone.
+        #[test]
+        fn a_hostless_deployment_is_routed_under_the_base_domain() {
+            let base = Some("us2.heyo.work");
+
+            // A routeless site is dead weight without a host — it gets one.
+            let mut site = spec_json(serde_json::json!({
+                "id": "docs", "routes": [], "site": { "root": "/srv/docs" },
+            }));
+            assume_host(&mut site, base);
+            assert_eq!(only_host(&site), Some("docs.us2.heyo.work"));
+
+            // So does a routeless static upstream list.
+            let mut api = spec_json(serde_json::json!({
+                "id": "api", "routes": [], "upstreams": ["127.0.0.1:9000"],
+            }));
+            assume_host(&mut api, base);
+            assert_eq!(only_host(&api), Some("api.us2.heyo.work"));
+
+            // A routeless VM is a headless sandbox on purpose — no host.
+            let mut headless = spec_json(serde_json::json!({
+                "id": "agent", "routes": [], "vm": { "driver": "firecracker", "port": 8080 },
+            }));
+            assume_host(&mut headless, base);
+            assert!(headless.routes.is_empty());
+
+            // A VM that has exposed a port with a (host-less) route gets a host
+            // route added beside it, leaving the original route untouched.
+            let mut web = spec_json(serde_json::json!({
+                "id": "web", "routes": [{ "path_prefix": "/" }],
+                "vm": { "driver": "firecracker", "port": 8080 },
+            }));
+            assume_host(&mut web, base);
+            assert!(web.has_host_route());
+            assert!(web.routes.iter().any(|r| r.host.as_deref() == Some("web.us2.heyo.work")));
+            assert!(web.routes.iter().any(|r| r.path_prefix.as_deref() == Some("/")));
+
+            // A pinned host is respected; nothing is added.
+            let mut pinned = spec_json(serde_json::json!({
+                "id": "x", "routes": [{ "host": "chosen.example.com" }],
+                "site": { "root": "/srv/x" },
+            }));
+            assume_host(&mut pinned, base);
+            assert_eq!(only_host(&pinned), Some("chosen.example.com"));
+
+            // No base configured ⇒ host synthesis is off entirely.
+            let mut no_base = spec_json(serde_json::json!({
+                "id": "docs", "routes": [], "site": { "root": "/srv/docs" },
+            }));
+            assume_host(&mut no_base, None);
+            assert!(no_base.routes.is_empty());
         }
 
         fn host_sandbox(id: &str, account: Option<&str>) -> HostSandboxView {

@@ -1,0 +1,16 @@
+{
+  "name": "corp-google",
+  "namespace": "team-a",
+  "description": "Workspace sign-in for team-a's apps",
+  "created_at": 1722400000,
+  "provider": "google",
+  "client_id": "1234.apps.googleusercontent.com",
+  "client_secret": {
+    "secret": "google-oauth",
+    "key": "client_secret"
+  },
+  "allowed_domains": [
+    "example.com"
+  ],
+  "cookie_domain": ".example.com"
+}

@@ -1014,6 +1014,10 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_COMPACT_SWEEP_SECS",
     "PG_VM_POOL_COMPACT_DIR",
     "PG_VM_POOL_MAX_CONCURRENT_BRINGUPS",
+    // Read by `vm.rs`'s admission gate; the first was historically missing
+    // here too, so tuning the pending-bring-up cap logged a spurious warning.
+    "PG_VM_POOL_MAX_PENDING_BRINGUPS",
+    "PG_VM_POOL_ADMISSION_WAIT_SECS",
     "PG_VM_POOL_ARCHIVE_VIA_GUEST",
     // Cross-host logical replication (see `crate::replication`).
     "PG_VM_POOL_REPLICATION",

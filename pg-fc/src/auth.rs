@@ -74,6 +74,34 @@ pub const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
 /// reaching into a dedicated one). See [`crate::dedicated::Credentials::authorize`].
 pub const SQLSTATE_INSUFFICIENT_PRIVILEGE: &str = "42501";
 
+/// `57P03 cannot_connect_now` — the pooler could not bring the database up: a
+/// failed or held-off bring-up, or a host out of capacity. Retryable.
+pub const SQLSTATE_CANNOT_CONNECT_NOW: &str = "57P03";
+
+/// `53300 too_many_connections` — the pooler shed this connect because every
+/// bring-up slot stayed busy past `PG_VM_POOL_ADMISSION_WAIT_SECS`.
+pub const SQLSTATE_TOO_MANY_CONNECTIONS: &str = "53300";
+
+/// Make free-form error text safe to hand [`send_fatal`]: no NULs, which would
+/// end the field early, and capped so a long error chain can't build an
+/// oversized frame.
+pub fn client_message(text: &str) -> String {
+    const MAX: usize = 1024;
+    let mut out: String = text
+        .chars()
+        .map(|c| if c == '\0' { ' ' } else { c })
+        .collect();
+    if out.len() > MAX {
+        let mut end = MAX;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out.push('…');
+    }
+    out
+}
+
 /// Send a Postgres `ErrorResponse` with severity FATAL, so a rejected client
 /// sees a real error message (`psql`/libpq print the `M` field) instead of a
 /// dropped connection. `message` must not contain a NUL; everything the pooler
@@ -197,5 +225,15 @@ mod tests {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"secre1"));
         assert!(!constant_time_eq(b"secret", b"short"));
+    }
+
+    #[test]
+    fn client_message_drops_nuls_and_caps_length() {
+        assert_eq!(client_message("a\0b"), "a b");
+        assert_eq!(client_message("short"), "short");
+        // Multi-byte text is cut on a character boundary, never mid-char.
+        let capped = client_message(&"é".repeat(1000));
+        assert!(capped.ends_with('…'));
+        assert!(capped.len() <= 1024 + '…'.len_utf8());
     }
 }

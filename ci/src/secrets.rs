@@ -143,6 +143,11 @@ pub struct Secrets {
 }
 
 impl Secrets {
+    #[cfg(test)]
+    pub fn unconfigured() -> Self {
+        Self { http: reqwest::Client::new(), base_url: None, token: None }
+    }
+
     pub fn new(config: &Config) -> Self {
         Self {
             http: reqwest::Client::builder()
@@ -217,6 +222,14 @@ impl Secrets {
             }
         }
         Ok(out)
+    }
+
+    /// Operator configuration is outside every workflow's secret prefix.
+    pub async fn host_app_lb_targets(&self) -> Result<String, SecretsError> {
+        self.read(&SecretMetadata {
+            path: "ci-controller/host-app-lb-targets".into(),
+            tags: Vec::new(),
+        }).await
     }
 
     async fn read(&self, meta: &SecretMetadata) -> Result<String, SecretsError> {
@@ -439,6 +452,29 @@ mod tests {
     // is exercised: the two route spellings, the camelCase `valueBase64`, the
     // base64 decode, and the `tags[]` classification. A hand-rolled fake of the
     // *client* would only test the fake.
+
+    #[tokio::test]
+    async fn host_targets_only_read_operator_path() {
+        let base = stub_heyosecret(vec![
+            ("ci-controller/host-app-lb-targets", vec![], "operator mapping"),
+            ("ci/heyo-public/default/CI_HOST_APP_LB_TARGETS", vec![], "workflow spoof"),
+        ]).await;
+        let secrets = Secrets {
+            http: reqwest::Client::new(), base_url: Some(base), token: Some("test".into()),
+        };
+        assert_eq!(secrets.host_app_lb_targets().await.unwrap(), "operator mapping");
+        let workflow = secrets.resolve("ci/heyo-public/default").await.unwrap();
+        assert_eq!(workflow.secrets.len(), 1);
+        assert_eq!(workflow.secrets["CI_HOST_APP_LB_TARGETS"], "workflow spoof");
+
+        let base = stub_heyosecret(vec![
+            ("ci/heyo-public/default/CI_HOST_APP_LB_TARGETS", vec![], "workflow spoof"),
+        ]).await;
+        let secrets = Secrets {
+            http: reqwest::Client::new(), base_url: Some(base), token: Some("test".into()),
+        };
+        assert!(secrets.host_app_lb_targets().await.is_err());
+    }
 
     async fn stub_heyosecret(
         entries: Vec<(&'static str, Vec<&'static str>, &'static str)>,

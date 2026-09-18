@@ -100,8 +100,8 @@ pub struct LbConfig {
     pub auth_timeout_secs: u64,
     /// HTTPS listener for the proxy data plane, bound *in addition to* the
     /// plaintext `proxy_addr`. Enabled when ACME is on or a static cert pair is
-    /// configured. Upstreams stay plaintext regardless — the guest IP is on a
-    /// host-local tap network.
+    /// configured. Managed VM upstreams stay plaintext on their host-local tap
+    /// network; static upstreams may explicitly use HTTPS.
     #[serde(default = "default_tls_addr")]
     pub tls_addr: String,
     /// Whether `tls_addr` was configured explicitly rather than defaulted.
@@ -202,6 +202,20 @@ pub struct LbConfig {
     /// challenge records are written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route53_zone_id: Option<String>,
+    /// Base domain under which a deployment that names no host of its own is
+    /// given one: `<id>.<base>`. Set with `APP_LB_DEPLOY_BASE_DOMAIN`.
+    ///
+    /// Left unset it falls back to the first `acme_wildcards` entry (see
+    /// [`deploy_host_base`]), which is the domain that already has a wildcard
+    /// certificate and DNS pointing at this LB — so a synthesized host gets TLS
+    /// and resolves with no further setup. Point it elsewhere only if a
+    /// different base should carry the generated names, and then make sure that
+    /// domain is covered by a certificate and resolves here, since app-lb writes
+    /// neither DNS nor a per-host cert for a name outside its wildcards.
+    ///
+    /// [`deploy_host_base`]: LbConfig::deploy_host_base
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_base_domain: Option<String>,
     /// Shell that a static deployment's `update.commands` run through. They are
     /// written as shell lines (`git pull && cargo build --release`), so there is
     /// one; pointing this at `bash` buys bashisms.
@@ -295,6 +309,7 @@ impl Default for LbConfig {
             acme_wildcards: Vec::new(),
             public_ips: Vec::new(),
             route53_zone_id: None,
+            deploy_base_domain: None,
             update_shell: default_update_shell(),
             build_timeout_secs: default_build_timeout_secs(),
             heyvm_home: None,
@@ -303,6 +318,19 @@ impl Default for LbConfig {
 }
 
 impl LbConfig {
+    /// The base domain a hostless deployment's name is built under, or `None`
+    /// when there is nowhere sensible to put one. An explicit
+    /// `deploy_base_domain` wins; otherwise the first wildcard is used, because
+    /// a name under it already has a certificate and DNS. With neither, host
+    /// synthesis is simply off and a hostless deployment is handled as before.
+    pub fn deploy_host_base(&self) -> Option<&str> {
+        self.deploy_base_domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.acme_wildcards.iter().map(|w| w.trim()).find(|w| !w.is_empty()))
+    }
+
     /// ACME is on iff a contact address was configured.
     pub fn acme_enabled(&self) -> bool {
         self.acme_email.is_some()
@@ -582,7 +610,7 @@ impl Default for LxcConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ScalingPolicy {
     /// Replicas kept running even with no traffic. Defaults to 0, which lets
     /// the pool scale to zero and makes the next request pay a cold start.
@@ -658,12 +686,23 @@ fn default_health_timeout_secs() -> u64 {
     2
 }
 
+/// A response identity assertion, in addition to HTTP success.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ExpectedHeader {
+    pub name: String,
+    pub value: String,
+}
+
 /// How a freshly-booted VM is proven ready before it joins the pool.
 ///
 /// This exists because the SDK's readiness signal is not trustworthy on its own
 /// (see `vm::wait_until_running`), so we always probe the guest ourselves.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct HealthCheck {
+    /// With an identity assertion, require a 2xx response and exactly one
+    /// matching header. An old baked-in listener must not verify a new release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_header: Option<ExpectedHeader>,
     /// `None` means a bare TCP connect is enough.
     #[serde(default = "default_health_path")]
     pub path: Option<String>,
@@ -679,6 +718,7 @@ pub struct HealthCheck {
 impl Default for HealthCheck {
     fn default() -> Self {
         Self {
+            expected_header: None,
             path: default_health_path(),
             port: None,
             timeout_secs: default_health_timeout_secs(),
@@ -2155,6 +2195,27 @@ pub struct AuthGate {
     /// How to verify a JWT, when `jwt` is among the providers. See [`JwtSpec`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt: Option<JwtSpec>,
+    /// Inherit the *identity* half of this gate from a named provider declared on
+    /// the deployment's namespace. See [`AuthProviderSpec`].
+    ///
+    /// When set, this gate carries only the route-scoped fields — `public_paths`,
+    /// `session_scope`, `base_path`, `cookie_name`, `redirect_url`,
+    /// `forward_identity`, `session_ttl_secs` — and the provider supplies who may
+    /// enter and how they are verified (`provider`, `client_id`, `client_secret`,
+    /// `allowed_domains`, `allowed_emails`, `jwt`, `cookie_domain`). Setting any
+    /// of those inline *and* a reference is refused
+    /// ([`SpecError::ProviderRefWithInlineIdentity`]) rather than silently
+    /// overridden, because whoever wrote them believes they take effect.
+    ///
+    /// Resolution is live: app-lb looks the provider up on every gated request,
+    /// so rotating the client secret or tightening the allow-list on the provider
+    /// propagates to every deployment that names it — and, because the resolved
+    /// gate's [`policy_fingerprint`](Self::policy_fingerprint) changes with it,
+    /// re-signs the sessions issued under the old policy. A reference that names
+    /// no provider in the namespace is refused at registration, and if one is
+    /// removed out from under a live deployment the gate fails *closed*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_ref: Option<String>,
 }
 
 /// The default claim a subject is read from, and the default leeway.
@@ -2296,6 +2357,39 @@ pub struct JwtSpec {
     /// when both are present: a request that says what it is presenting means it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie: Option<String>,
+    /// Optional Heyo Auth `/api/auth/login` endpoint for browser email/password
+    /// sign-in. The returned access token must pass this JWT policy before a
+    /// host-only HttpOnly cookie is set. Requires `cookie`; never stores refresh
+    /// tokens or passwords. Existing bearer-only gates remain unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_endpoint: Option<String>,
+    /// Where to send a browser that reaches a gated path holding no valid token.
+    ///
+    /// The `jwt` provider is otherwise stateless: it verifies a token that is
+    /// already being carried and, finding none, answers `401`. That is right for
+    /// a program, and a dead end for a person — a browser cannot set an
+    /// `Authorization` header on a navigation, so it has no way to *acquire* one.
+    ///
+    /// Set this to the issuer's hosted sign-in page and a token-less **browser**
+    /// (a request whose `Accept` includes HTML) is redirected there instead, with
+    /// the URL it was trying to reach passed in `login_redirect_param`. The issuer
+    /// signs the user in, sets the JWT in the `cookie` named above, and redirects
+    /// back; the gate then reads the cookie and admits the request. app-lb mints
+    /// no session and keeps no flow state — the cookie the issuer set *is* the
+    /// session. A program (no HTML in `Accept`) still gets the `401`, which it can
+    /// act on and would only fail to parse as a sign-in page.
+    ///
+    /// Requires `cookie`: the return trip is a navigation, and a navigation can
+    /// carry a credential only in a cookie ([`SpecError::LoginUrlWithoutCookie`]).
+    /// Must be `https://` (or a loopback `http://` for an issuer on this host),
+    /// for the same reason `jwks_url` must.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_url: Option<String>,
+    /// The query parameter the hosted sign-in reads the return URL from. Only
+    /// meaningful with `login_url`; unset means `redirect_uri`. Set it to whatever
+    /// the issuer expects — `return_to`, `next`, `rd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_redirect_param: Option<String>,
 }
 
 fn default_subject_claim() -> String {
@@ -2309,6 +2403,44 @@ fn default_name_claim() -> String {
 }
 
 impl JwtSpec {
+    /// The JWT policy for the Heyo auth API, given only where its signing secret
+    /// lives — the "works out of the box" case behind the `heyo` provider preset.
+    ///
+    /// Every field but the secret is fixed by that service's tokens, and matches
+    /// the worked example in this type's own documentation: `HS256`, issuer
+    /// `auth-service`, audience `heyo-app`, the id in `userId`, and `role` in
+    /// `{user, admin}`. Anything unusual — a different audience, a narrower
+    /// `require` — is set by editing the resulting provider; this only removes
+    /// the need to know the rest to get started.
+    pub fn heyo(secret: SecretRef) -> Self {
+        JwtSpec {
+            secret: Some(secret),
+            public_key: None,
+            jwks_url: None,
+            algorithms: vec!["HS256".to_string()],
+            issuer: "auth-service".to_string(),
+            audience: Some("heyo-app".to_string()),
+            require: BTreeMap::from([(
+                "role".to_string(),
+                serde_json::json!(["user", "admin"]),
+            )]),
+            subject_claim: "userId".to_string(),
+            email_claim: DEFAULT_EMAIL_CLAIM.to_string(),
+            name_claim: DEFAULT_NAME_CLAIM.to_string(),
+            leeway_secs: None,
+            cookie: None,
+            login_endpoint: None,
+            login_url: None,
+            login_redirect_param: None,
+        }
+    }
+
+    /// The query parameter the hosted sign-in reads the return URL from. See
+    /// [`login_url`](Self::login_url); `redirect_uri` unless overridden.
+    pub fn login_redirect_param(&self) -> &str {
+        self.login_redirect_param.as_deref().unwrap_or("redirect_uri")
+    }
+
     /// Whether this gate accepts a token signed with `alg`.
     ///
     /// Compared against the configured names rather than a parsed set, so the
@@ -2461,6 +2593,36 @@ impl JwtSpec {
         {
             return Err(SpecError::BadCookieName(cookie.clone()));
         }
+        if let Some(endpoint) = &self.login_endpoint {
+            let valid = reqwest::Url::parse(endpoint).is_ok_and(|url| {
+                (url.scheme() == "https"
+                    || (url.scheme() == "http" && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))))
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            });
+            if !valid || self.cookie.is_none() {
+                return Err(SpecError::BadJwtLoginEndpoint);
+            }
+        }
+        if let Some(url) = &self.login_url {
+            // The same transport rule as jwks_url: a browser redirected to
+            // plaintext http on another host is a downgrade an attacker on the
+            // path can exploit, and loopback is the only http exception.
+            match jwks_url_problem(url.trim()) {
+                None => {}
+                Some(_) => return Err(SpecError::BadLoginUrl(url.trim().to_string())),
+            }
+            // Without a cookie the return navigation has nowhere to carry the
+            // token, so the browser would be redirected to sign in, come back
+            // with no header the gate can read, and be redirected again — a loop
+            // that is impossible to diagnose from the outside.
+            if self.cookie.is_none() {
+                return Err(SpecError::LoginUrlWithoutCookie);
+            }
+        }
         Ok(())
     }
 }
@@ -2520,6 +2682,88 @@ fn is_valid_cookie_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
+/// Validate the *identity* half of a gate — who may enter and how they are
+/// verified — independent of any route-scoped configuration.
+///
+/// This is the part an [`AuthGate`] and an [`AuthProviderSpec`] hold in common:
+/// a provider is exactly this subset given a name, and a gate that inherits one
+/// is validated against the merged result. Factoring it out is what keeps the
+/// two from drifting — a rule tightened here tightens for both.
+fn validate_identity(
+    provider: &Providers,
+    client_id: &Option<String>,
+    client_secret: &Option<SecretRef>,
+    allowed_domains: &[String],
+    allowed_emails: &[String],
+    jwt: &Option<JwtSpec>,
+) -> Result<(), SpecError> {
+    if provider.is_empty() {
+        return Err(SpecError::NoAuthProvider);
+    }
+    let accepts_google = provider.contains(AuthProvider::Google);
+    let accepts_jwt = provider.contains(AuthProvider::Jwt);
+
+    if accepts_google {
+        let Some(client_id) = client_id else {
+            return Err(SpecError::EmptyClientId);
+        };
+        if client_id.trim().is_empty() {
+            return Err(SpecError::EmptyClientId);
+        }
+        let Some(client_secret) = client_secret else {
+            return Err(SpecError::EmptyClientId);
+        };
+        client_secret.validate().map_err(|e| SpecError::BadSecretRef {
+            field: "auth.client_secret",
+            detail: e.to_string(),
+        })?;
+
+        // An empty allow-list would gate the deployment behind "has a Google
+        // account", which is nearly everyone. That is a legitimate thing to
+        // want, so it can be asked for — but only in writing.
+        if allowed_domains.is_empty() && allowed_emails.is_empty() {
+            return Err(SpecError::EmptyAllowList);
+        }
+    } else if client_id.is_some() || client_secret.is_some() {
+        // OAuth credentials on a gate that will never run an OAuth flow.
+        // Rejected rather than ignored: whoever wrote them believes this
+        // deployment is behind Google sign-in, and it is not.
+        return Err(SpecError::OauthWithoutGoogle);
+    }
+
+    match (accepts_jwt, jwt) {
+        (true, Some(jwt)) => {
+            jwt.validate()?;
+            // These describe a Google identity and are checked against a
+            // Google identity; a JWT gate's allow-list is `jwt.require`.
+            // Refused rather than ignored, because somebody writing them
+            // believes this deployment is restricted and it would not be.
+            if !accepts_google && (!allowed_domains.is_empty() || !allowed_emails.is_empty()) {
+                return Err(SpecError::AllowListOnJwtGate);
+            }
+        }
+        (true, None) => return Err(SpecError::JwtWithoutPolicy),
+        // A `jwt` block on a gate that will never verify one, for the same
+        // reason OAuth credentials without `google` are refused.
+        (false, Some(_)) => return Err(SpecError::JwtPolicyWithoutProvider),
+        (false, None) => {}
+    }
+    for d in allowed_domains {
+        // Surrounding whitespace is rejected rather than trimmed: the match
+        // is exact, so a stored " example.com " would let nobody in while
+        // looking exactly like a rule that does.
+        if d.trim().len() != d.len() || d.is_empty() || (d != "*" && !d.contains('.')) {
+            return Err(SpecError::BadAllowedDomain(d.clone()));
+        }
+    }
+    for e in allowed_emails {
+        if !e.contains('@') || e.trim().len() != e.len() {
+            return Err(SpecError::BadAllowedEmail(e.clone()));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthProvider {
@@ -2562,6 +2806,11 @@ impl Default for Providers {
 }
 
 impl Providers {
+    /// A provider list of exactly one kind — what a preset builds.
+    pub fn one(p: AuthProvider) -> Self {
+        Self(vec![p])
+    }
+
     pub fn contains(&self, p: AuthProvider) -> bool {
         self.0.contains(&p)
     }
@@ -2853,72 +3102,41 @@ impl AuthGate {
         }
     }
 
+    /// Whether this gate carries any of the identity fields a `provider_ref`
+    /// would supply. `provider` is deliberately not among them — it defaults to
+    /// `[google]`, so serde cannot distinguish an omitted field from one written
+    /// as its default, and the resolved provider replaces it regardless. Every
+    /// field checked here has an unambiguous absent state.
+    fn has_inline_identity(&self) -> bool {
+        self.client_id.is_some()
+            || self.client_secret.is_some()
+            || !self.allowed_domains.is_empty()
+            || !self.allowed_emails.is_empty()
+            || self.jwt.is_some()
+            || self.cookie_domain.is_some()
+    }
+
     fn validate(&self, routes: &[RouteRule]) -> Result<(), SpecError> {
-        if self.provider.is_empty() {
-            return Err(SpecError::NoAuthProvider);
-        }
-
-        if self.accepts_google() {
-            let Some(client_id) = &self.client_id else {
-                return Err(SpecError::EmptyClientId);
-            };
-            if client_id.trim().is_empty() {
-                return Err(SpecError::EmptyClientId);
+        // A gate that inherits its identity from a namespace provider carries no
+        // identity of its own: the provider owns `provider`, `client_id`,
+        // `client_secret`, the allow-lists, `jwt` and `cookie_domain`. Setting
+        // any of them here alongside a reference is refused rather than silently
+        // overridden. The identity checks then run against the *resolved* gate
+        // at registration (see `AuthProviderSpec::resolve`); here only the
+        // route-scoped half is this gate's to validate.
+        if self.provider_ref.is_some() {
+            if self.has_inline_identity() {
+                return Err(SpecError::ProviderRefWithInlineIdentity);
             }
-            let Some(client_secret) = &self.client_secret else {
-                return Err(SpecError::EmptyClientId);
-            };
-            client_secret
-                .validate()
-                .map_err(|e| SpecError::BadSecretRef {
-                    field: "auth.client_secret",
-                    detail: e.to_string(),
-                })?;
-
-            // An empty allow-list would gate the deployment behind "has a Google
-            // account", which is nearly everyone. That is a legitimate thing to
-            // want, so it can be asked for — but only in writing.
-            if self.allowed_domains.is_empty() && self.allowed_emails.is_empty() {
-                return Err(SpecError::EmptyAllowList);
-            }
-        } else if self.client_id.is_some() || self.client_secret.is_some() {
-            // OAuth credentials on a gate that will never run an OAuth flow.
-            // Rejected rather than ignored: whoever wrote them believes this
-            // deployment is behind Google sign-in, and it is not.
-            return Err(SpecError::OauthWithoutGoogle);
-        }
-
-        match (self.accepts_jwt(), &self.jwt) {
-            (true, Some(jwt)) => {
-                jwt.validate()?;
-                // These describe a Google identity and are checked against a
-                // Google identity; a JWT gate's allow-list is `jwt.require`.
-                // Refused rather than ignored, because somebody writing them
-                // believes this deployment is restricted and it would not be.
-                if !self.accepts_google()
-                    && (!self.allowed_domains.is_empty() || !self.allowed_emails.is_empty())
-                {
-                    return Err(SpecError::AllowListOnJwtGate);
-                }
-            }
-            (true, None) => return Err(SpecError::JwtWithoutPolicy),
-            // A `jwt` block on a gate that will never verify one, for the same
-            // reason OAuth credentials without `google` are refused.
-            (false, Some(_)) => return Err(SpecError::JwtPolicyWithoutProvider),
-            (false, None) => {}
-        }
-        for d in &self.allowed_domains {
-            // Surrounding whitespace is rejected rather than trimmed: the match
-            // is exact, so a stored " example.com " would let nobody in while
-            // looking exactly like a rule that does.
-            if d.trim().len() != d.len() || d.is_empty() || (d != "*" && !d.contains('.')) {
-                return Err(SpecError::BadAllowedDomain(d.clone()));
-            }
-        }
-        for e in &self.allowed_emails {
-            if !e.contains('@') || e.trim().len() != e.len() {
-                return Err(SpecError::BadAllowedEmail(e.clone()));
-            }
+        } else {
+            validate_identity(
+                &self.provider,
+                &self.client_id,
+                &self.client_secret,
+                &self.allowed_domains,
+                &self.allowed_emails,
+                &self.jwt,
+            )?;
         }
 
         let base = self.base_path.trim_end_matches('/');
@@ -2958,7 +3176,7 @@ impl AuthGate {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct DeploymentSpec {
     /// Unique name for this deployment, and its handle in every other call.
     /// Registering an id that already exists REPLACES that deployment.
@@ -2987,6 +3205,12 @@ pub struct DeploymentSpec {
     /// and shell but takes no HTTP traffic. A static deployment and a site are
     /// reachable only through the proxy, so both need at least one.
     pub routes: Vec<RouteRule>,
+    /// Temporarily fence this deployment's public data plane. Routed requests
+    /// receive HTTP 503 before auth or backend selection, while deployment
+    /// management and VM exec remain available on the separate admin listener.
+    /// Persisted as part of the deployment spec and safe to toggle with PUT.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maintenance: bool,
     /// The VM template for a *managed* deployment: app-lb boots and autoscales a
     /// pool of microVMs. Mutually exclusive with `upstreams`; exactly one of the
     /// two must be set.
@@ -3463,7 +3687,7 @@ pub enum SpecError {
     NoBackendKind,
     EmptyDiscoveryServiceId,
     DiscoveryWithOtherBackend,
-    /// A static upstream address is not a valid `host:port`.
+    /// A static upstream address is not a valid plaintext `host:port` or HTTPS URL.
     BadUpstream(String),
     /// A static deployment declared a `build` block; there is no image to build.
     BuildOnStaticDeployment,
@@ -3518,6 +3742,12 @@ pub enum SpecError {
     },
     BadJwtIssuer(String),
     BadJwtAudience(String),
+    BadJwtLoginEndpoint,
+    /// A `jwt.login_url` that is not an `https://` URL (or a loopback `http://`).
+    BadLoginUrl(String),
+    /// `jwt.login_url` set with no `jwt.cookie` to carry the token back on the
+    /// return navigation — the redirect would loop forever.
+    LoginUrlWithoutCookie,
     EmptyJwtClaimName,
     JwtLeewayTooLarge {
         secs: u64,
@@ -3534,6 +3764,21 @@ pub enum SpecError {
     BadCookieDomain(String),
     /// The provider's redirect would not route back to this deployment.
     AuthCallbackUnroutable(String),
+    /// `auth.provider_ref` set alongside an inline identity field, which the
+    /// referenced provider would supply. Refused rather than silently overridden.
+    ProviderRefWithInlineIdentity,
+    /// An auth provider name outside the id alphabet; it appears in a filename
+    /// and in the deployments that reference it.
+    BadAuthProviderName(String),
+    /// `auth.provider_ref` names a provider that is not declared in the
+    /// deployment's namespace. Carries both so the message can name what was
+    /// looked up and where.
+    UnknownAuthProvider {
+        namespace: String,
+        name: String,
+    },
+    /// A `POST /auth-providers` body named a `preset` app-lb does not know.
+    UnknownAuthPreset(String),
     EmptyRepo,
     UnsupportedRepoUrl(String),
     BadBuildRef(String),
@@ -3784,7 +4029,7 @@ impl std::fmt::Display for SpecError {
             ),
             Self::BadUpstream(a) => write!(
                 f,
-                "static upstream {a:?} is not a valid `host:port` address"
+                "static upstream {a:?} is not a valid `host:port` address or HTTPS URL"
             ),
             Self::BuildOnStaticDeployment => write!(
                 f,
@@ -3936,6 +4181,21 @@ impl std::fmt::Display for SpecError {
                 "auth.jwt.audience {a:?} must be the exact `aud` the tokens carry, with no \
                  surrounding whitespace"
             ),
+            Self::BadJwtLoginEndpoint => write!(f, "auth.jwt.login_endpoint requires a cookie and an HTTPS URL without credentials, query or fragment (HTTP loopback is allowed)"),
+            Self::BadLoginUrl(u) => write!(
+                f,
+                "auth.jwt.login_url {u:?} must be an https:// URL — the hosted sign-in page a \
+                 token-less browser is redirected to. http:// is allowed only to a loopback \
+                 address, for an issuer running on this host: a browser redirected to \
+                 plaintext elsewhere can have the sign-in intercepted"
+            ),
+            Self::LoginUrlWithoutCookie => write!(
+                f,
+                "auth.jwt.login_url is set but auth.jwt.cookie is not. The browser is redirected \
+                 to sign in and comes back on a navigation, which can carry the token only in a \
+                 cookie — with none named, the gate cannot read it and redirects again, forever. \
+                 Set auth.jwt.cookie to the cookie the issuer writes the token into"
+            ),
             Self::EmptyJwtClaimName => write!(
                 f,
                 "auth.jwt names an empty claim; subject_claim, email_claim, name_claim and \
@@ -3993,6 +4253,32 @@ impl std::fmt::Display for SpecError {
                 "no route would match the sign-in callback {c:?}, so the provider's redirect \
                  would 404 and the login could never finish. Set `auth.base_path` under a \
                  path prefix this deployment serves"
+            ),
+            Self::ProviderRefWithInlineIdentity => write!(
+                f,
+                "auth sets `provider_ref` and also an identity field (client_id, \
+                 client_secret, allowed_domains, allowed_emails, jwt or cookie_domain). The \
+                 referenced provider supplies all of those, so an inline one would be \
+                 overridden — set them on the provider, and keep only the route-scoped \
+                 fields (public_paths, session_scope, base_path, cookie_name, redirect_url, \
+                 forward_identity, session_ttl_secs) here"
+            ),
+            Self::BadAuthProviderName(n) => write!(
+                f,
+                "auth provider name {n:?} is not usable: it appears in a filename and in \
+                 every deployment that references it, so it takes the namespace alphabet — \
+                 letters, digits, '-', '_' and '.'"
+            ),
+            Self::UnknownAuthProvider { namespace, name } => write!(
+                f,
+                "auth.provider_ref names {name:?}, but no such auth provider is declared in \
+                 the {namespace:?} namespace. A deployment may inherit only a provider in \
+                 its own namespace — declare it with POST /auth-providers first"
+            ),
+            Self::UnknownAuthPreset(p) => write!(
+                f,
+                "auth provider preset {p:?} is not one app-lb knows. The only preset is \
+                 \"heyo\", which builds the JWT policy for the Heyo auth API from a `secret`"
             ),
             Self::EmptyRepo => write!(f, "build.repo must not be empty"),
             Self::UnsupportedRepoUrl(r) => write!(
@@ -4408,6 +4694,15 @@ impl DeploymentSpec {
         Ok(())
     }
 
+    /// Whether any route pins a hostname — an exact `host` or a `host_suffix`.
+    /// A deployment with none either is reached without one (a path-only route,
+    /// or a headless routeless VM) or is a candidate for a synthesized host.
+    pub fn has_host_route(&self) -> bool {
+        self.routes
+            .iter()
+            .any(|r| r.host.is_some() || r.host_suffix.is_some())
+    }
+
     pub fn validate(&self) -> Result<(), SpecError> {
         if self.id.trim().is_empty() {
             return Err(SpecError::EmptyId);
@@ -4575,12 +4870,13 @@ impl DeploymentSpec {
             if let Some(update) = &self.update {
                 update.validate()?;
             }
-            // Static: every upstream must be a well-formed `host:port`. Actual
+            // Static: every upstream must be a well-formed plaintext `host:port`
+            // or HTTPS URL. Actual
             // name resolution happens at request time (pingora) and per tick (the
             // health re-probe), so a temporarily-unresolvable name is not a
             // registration error — only a malformed address is.
             for addr in &self.upstreams {
-                if !is_valid_host_port(addr) {
+                if StaticUpstream::parse(addr).is_none() {
                     return Err(SpecError::BadUpstream(addr.clone()));
                 }
             }
@@ -4603,6 +4899,53 @@ fn is_valid_host_port(s: &str) -> bool {
         return false;
     }
     matches!(port.parse::<u16>(), Ok(p) if p > 0)
+}
+
+/// The connection details encoded by a static upstream string. Bare addresses
+/// retain their historical plaintext meaning; an `https://` URL opts into TLS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StaticUpstream {
+    pub address: String,
+    pub tls: bool,
+    pub sni: String,
+}
+
+impl StaticUpstream {
+    pub fn parse(value: &str) -> Option<Self> {
+        if !value.contains("://") {
+            return is_valid_host_port(value).then(|| Self {
+                address: value.to_string(),
+                tls: false,
+                sni: String::new(),
+            });
+        }
+
+        // URL parsing normalizes dot segments and backslashes. Refuse them
+        // before parsing rather than silently accepting a non-origin input.
+        let (_, authority) = value.split_once("://")?;
+        let authority = authority.strip_suffix('/').unwrap_or(authority);
+        if authority.contains(['/', '\\', '?', '#', '@'])
+            || value.chars().any(char::is_whitespace)
+        {
+            return None;
+        }
+        let parsed = url::Url::parse(value).ok()?;
+        if parsed.scheme() != "https"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return None;
+        }
+        let port = parsed.port_or_known_default()?;
+        if port == 0 { return None; }
+        // Pingora verifies DNS names with X509_VERIFY_PARAM_add1_host, not
+        // the IP-SAN verifier. Do not promise IP-literal certificate support.
+        let url::Host::Domain(host) = parsed.host()? else { return None; };
+        Some(Self { address: format!("{host}:{port}"), tls: true, sni: host.to_string() })
+    }
 }
 
 // ---- namespace objects --------------------------------------------------
@@ -4650,6 +4993,125 @@ impl NamespaceSpec {
             return Err(SpecError::DescriptionTooLong);
         }
         Ok(())
+    }
+}
+
+// ---- auth provider objects ----------------------------------------------
+
+/// A named, reusable auth *identity* declared on a namespace, inherited by the
+/// deployments in it.
+///
+/// A gate has always been two things wearing one name: the *identity* half — who
+/// may enter and how they are verified (`provider`, the OAuth credentials and
+/// allow-lists, the `jwt` policy) — and the *route-scoped* half — where the
+/// callback lives, which paths skip the gate, what token a session mints. The
+/// first is an organisation's fact and rarely differs between two services; the
+/// second is each deployment's own. Written inline they were copied together, so
+/// rotating a client secret or tightening a domain meant editing every spec, out
+/// of step until the last one was done.
+///
+/// This object is the identity half on its own, given a name and an owning
+/// namespace. A deployment inherits it with `auth.provider_ref`, keeping only
+/// its route-scoped fields. Resolution is live — app-lb reads the provider on
+/// every gated request — so an edit here reaches every deployment that names it
+/// at once, and (because it changes the resolved gate's
+/// [`policy_fingerprint`](AuthGate::policy_fingerprint)) re-signs the sessions
+/// issued under the old policy rather than leaving a removed user signed in.
+///
+/// The fields are exactly [`AuthGate`]'s identity subset, validated by the same
+/// [`validate_identity`] both call.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct AuthProviderSpec {
+    /// The provider's name, unique within its namespace. Appears in a filename
+    /// and in every deployment that references it, so it takes the namespace
+    /// alphabet.
+    pub name: String,
+    /// The namespace that owns it. A deployment may reference only a provider in
+    /// its own namespace. Absent means `"default"`.
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+    /// Free text for whoever finds it later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Stamped by app-lb when the object is created, never read from the body.
+    #[serde(default)]
+    pub created_at: u64,
+    /// Which credentials get past a gate inheriting this provider. See
+    /// [`AuthGate::provider`].
+    #[serde(default)]
+    pub provider: Providers,
+    /// OAuth client id, for the `google` provider. See [`AuthGate::client_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// Where the OAuth client secret is stored. See [`AuthGate::client_secret`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<SecretRef>,
+    /// Google Workspace domains admitted. See [`AuthGate::allowed_domains`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_domains: Vec<String>,
+    /// Individual addresses admitted. See [`AuthGate::allowed_emails`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_emails: Vec<String>,
+    /// How to verify a JWT, for the `jwt` provider. See [`JwtSpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt: Option<JwtSpec>,
+    /// The session-cookie realm shared across the deployments that inherit this
+    /// provider — the natural place for it, since one provider is one sign-in
+    /// realm. See [`AuthGate::cookie_domain`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie_domain: Option<String>,
+}
+
+impl AuthProviderSpec {
+    pub fn validate(&self) -> Result<(), SpecError> {
+        if !is_valid_namespace(&self.name) {
+            return Err(SpecError::BadAuthProviderName(self.name.clone()));
+        }
+        if !is_valid_namespace(&self.namespace) {
+            return Err(SpecError::BadNamespace(self.namespace.clone()));
+        }
+        if self.description.as_ref().is_some_and(|d| d.len() > 400) {
+            return Err(SpecError::DescriptionTooLong);
+        }
+        if let Some(d) = &self.cookie_domain
+            && normalize_cookie_domain(d).is_none()
+        {
+            return Err(SpecError::BadCookieDomain(d.clone()));
+        }
+        validate_identity(
+            &self.provider,
+            &self.client_id,
+            &self.client_secret,
+            &self.allowed_domains,
+            &self.allowed_emails,
+            &self.jwt,
+        )
+    }
+
+    /// The effective gate when `gate` inherits this provider: the identity comes
+    /// from here, everything route-scoped stays on `gate`, and `provider_ref` is
+    /// cleared so the result is a plain, self-contained [`AuthGate`] — the same
+    /// shape it would have been written inline, which is what lets the resolved
+    /// gate go through the unchanged `Authenticator` and `policy_fingerprint`.
+    pub fn resolve(&self, gate: &AuthGate) -> AuthGate {
+        AuthGate {
+            provider: self.provider.clone(),
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            allowed_domains: self.allowed_domains.clone(),
+            allowed_emails: self.allowed_emails.clone(),
+            jwt: self.jwt.clone(),
+            cookie_domain: self.cookie_domain.clone(),
+            provider_ref: None,
+            // Route-scoped, this deployment's own — kept verbatim.
+            public_paths: gate.public_paths.clone(),
+            session_scope: gate.session_scope,
+            base_path: gate.base_path.clone(),
+            session_ttl_secs: gate.session_ttl_secs,
+            cookie_name: gate.cookie_name.clone(),
+            redirect_url: gate.redirect_url.clone(),
+            forward_identity: gate.forward_identity,
+        }
     }
 }
 
@@ -4737,6 +5199,25 @@ impl WorkflowSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The base domain a hostless deployment is routed under: an explicit
+    /// setting wins, else the first wildcard (which already has a cert and DNS),
+    /// else nothing — and blank strings count as nothing on either side.
+    #[test]
+    fn deploy_host_base_prefers_explicit_then_the_first_wildcard() {
+        let mut cfg = LbConfig::default();
+        assert_eq!(cfg.deploy_host_base(), None);
+
+        cfg.acme_wildcards = vec!["sb.example.com".into(), "other.example.com".into()];
+        assert_eq!(cfg.deploy_host_base(), Some("sb.example.com"));
+
+        cfg.deploy_base_domain = Some("apps.example.com".into());
+        assert_eq!(cfg.deploy_host_base(), Some("apps.example.com"));
+
+        // A blank explicit value falls back rather than producing ".<id>".
+        cfg.deploy_base_domain = Some("  ".into());
+        assert_eq!(cfg.deploy_host_base(), Some("sb.example.com"));
+    }
 
     /// A declared namespace is an object with a name and very little else, so
     /// validation is where all of its rules live.
@@ -4967,6 +5448,7 @@ mod tests {
                 ttl_seconds: 3600,
             }),
             scaling: ScalingPolicy::default(),
+            maintenance: false,
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
@@ -5022,6 +5504,7 @@ mod tests {
             }],
             vm: None,
             scaling: ScalingPolicy::default(),
+            maintenance: false,
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
             discovery: None,
@@ -5699,6 +6182,7 @@ mod tests {
             redirect_url: None,
             forward_identity: true,
             jwt: None,
+            provider_ref: None,
         }
     }
 
@@ -5931,6 +6415,167 @@ mod tests {
         let plain: DeploymentSpec =
             serde_json::from_str(&serde_json::to_string(&spec()).unwrap()).unwrap();
         assert!(plain.auth.is_none());
+    }
+
+    /// A valid Google provider, mirroring `auth_gate`'s identity half.
+    fn google_provider() -> AuthProviderSpec {
+        AuthProviderSpec {
+            name: "corp".into(),
+            namespace: "team-a".into(),
+            description: None,
+            created_at: 1,
+            provider: Providers::default(),
+            client_id: Some("cid.apps.googleusercontent.com".into()),
+            client_secret: Some(crate::secrets::SecretRef {
+                namespace: None,
+                secret: "google".into(),
+                key: "client_secret".into(),
+                username: None,
+            }),
+            allowed_domains: vec!["example.com".into()],
+            allowed_emails: vec![],
+            jwt: None,
+            cookie_domain: None,
+        }
+    }
+
+    #[test]
+    fn a_provider_validates_by_the_same_rules_as_an_inline_gate() {
+        // Good.
+        assert_eq!(google_provider().validate(), Ok(()));
+
+        // The same empty-allow-list refusal an inline Google gate gets.
+        let no_list = AuthProviderSpec { allowed_domains: vec![], ..google_provider() };
+        assert_eq!(no_list.validate(), Err(SpecError::EmptyAllowList));
+
+        // A Google allow-list on a jwt-only provider is refused, exactly as on a
+        // gate — the identity checks are the same function.
+        let jwt_with_google_list = AuthProviderSpec {
+            provider: Providers::one(AuthProvider::Jwt),
+            client_id: None,
+            client_secret: None,
+            allowed_domains: vec!["example.com".into()],
+            jwt: Some(JwtSpec::heyo(crate::secrets::SecretRef {
+                namespace: None,
+                secret: "heyo-auth".into(),
+                key: "jwt_secret".into(),
+                username: None,
+            })),
+            ..google_provider()
+        };
+        assert_eq!(jwt_with_google_list.validate(), Err(SpecError::AllowListOnJwtGate));
+
+        // A name outside the alphabet is refused: it becomes a filename.
+        let bad_name = AuthProviderSpec { name: "has space".into(), ..google_provider() };
+        assert!(matches!(bad_name.validate(), Err(SpecError::BadAuthProviderName(_))));
+    }
+
+    #[test]
+    fn the_heyo_preset_is_a_valid_jwt_provider_from_a_secret_alone() {
+        let secret = crate::secrets::SecretRef {
+            namespace: None,
+            secret: "heyo-auth".into(),
+            key: "jwt_secret".into(),
+            username: None,
+        };
+        let jwt = JwtSpec::heyo(secret.clone());
+        // The documented shape of the Heyo auth API's tokens.
+        assert_eq!(jwt.algorithms, vec!["HS256".to_string()]);
+        assert_eq!(jwt.issuer, "auth-service");
+        assert_eq!(jwt.audience.as_deref(), Some("heyo-app"));
+        assert_eq!(jwt.subject_claim, "userId");
+
+        let provider = AuthProviderSpec {
+            provider: Providers::one(AuthProvider::Jwt),
+            client_id: None,
+            client_secret: None,
+            allowed_domains: vec![],
+            jwt: Some(jwt),
+            ..google_provider()
+        };
+        assert_eq!(provider.validate(), Ok(()), "the preset must validate on its own");
+    }
+
+    #[test]
+    fn a_reference_gate_refuses_inline_identity_but_keeps_route_scoped_fields() {
+        // Only route-scoped fields alongside a reference: fine.
+        let ok: DeploymentSpec = {
+            let mut s = spec();
+            s.auth = Some(AuthGate {
+                provider_ref: Some("corp".into()),
+                client_id: None,
+                client_secret: None,
+                allowed_domains: vec![],
+                allowed_emails: vec![],
+                jwt: None,
+                cookie_domain: None,
+                public_paths: vec![PublicPath::public("/healthz")],
+                ..auth_gate()
+            });
+            s
+        };
+        assert_eq!(ok.validate(), Ok(()));
+
+        // Any inline identity field alongside the reference is refused.
+        for gate in [
+            AuthGate { provider_ref: Some("corp".into()), ..auth_gate() }, // carries client_id
+            AuthGate {
+                provider_ref: Some("corp".into()),
+                client_id: None,
+                client_secret: None,
+                allowed_domains: vec![],
+                allowed_emails: vec![],
+                jwt: None,
+                cookie_domain: Some("example.com".into()),
+                ..auth_gate()
+            },
+        ] {
+            let mut s = spec();
+            s.auth = Some(gate);
+            assert_eq!(s.validate(), Err(SpecError::ProviderRefWithInlineIdentity));
+        }
+    }
+
+    #[test]
+    fn resolving_a_reference_overlays_identity_and_tracks_the_policy() {
+        // A bare reference gate — route-scoped fields only.
+        let gate = AuthGate {
+            provider_ref: Some("corp".into()),
+            client_id: None,
+            client_secret: None,
+            allowed_domains: vec![],
+            allowed_emails: vec![],
+            jwt: None,
+            cookie_domain: None,
+            public_paths: vec![PublicPath::public("/healthz")],
+            ..auth_gate()
+        };
+        let provider = google_provider();
+        let resolved = provider.resolve(&gate);
+
+        // Identity came from the provider; route-scoped fields stayed on the gate;
+        // the reference is cleared so the result is a plain gate.
+        assert_eq!(resolved.provider_ref, None);
+        assert_eq!(resolved.client_id, provider.client_id);
+        assert_eq!(resolved.allowed_domains, provider.allowed_domains);
+        assert_eq!(resolved.public_paths, gate.public_paths);
+        // A resolved gate validates exactly like an inline one.
+        let mut s = spec();
+        s.auth = Some(resolved.clone());
+        assert_eq!(s.validate(), Ok(()));
+
+        // The live-inheritance invariant: tightening the provider's allow-list
+        // moves the resolved gate's fingerprint, so sessions issued under the old
+        // policy stop being accepted — without the deployment being touched.
+        let tightened = AuthProviderSpec {
+            allowed_emails: vec!["only-me@example.com".into()],
+            ..provider.clone()
+        };
+        assert_ne!(
+            resolved.policy_fingerprint(),
+            tightened.resolve(&gate).policy_fingerprint(),
+            "a change to the provider must re-sign inheriting deployments' sessions",
+        );
     }
 
     /// The minimum a spec has to say: everything else defaults.
@@ -6294,6 +6939,9 @@ mod tests {
         let s = static_spec(&["10.0.0.9:8080", "backend.internal:8080", "[::1]:9000"]);
         assert!(s.is_static());
         assert_eq!(s.validate(), Ok(()));
+
+        let https = static_spec(&["https://ci.eu1.heyo.work:443"]);
+        assert_eq!(https.validate(), Ok(()));
     }
 
     #[test]
@@ -6311,7 +6959,16 @@ mod tests {
 
     #[test]
     fn rejects_malformed_upstreams() {
-        for bad in ["no-port", "host:", ":8080", "host:0", "host:notaport"] {
+        for bad in [
+            "no-port", "host:", ":8080", "host:0", "host:notaport",
+            "http://ci.example:80", "ftp://ci.example:21", "https://user@ci.example:443",
+            "https://ci.example:443/api", "https://ci.example:443/?q=1",
+            "https://ci.example:443/#fragment", "https://:443",
+            "https://ci.example:0", "https://ci.example/a/..",
+            "https://ci.example/%2e/", "https://ci.example\\",
+            " https://ci.example", "https://ci.example\n",
+            "https://127.0.0.1:443", "https://[::1]:443",
+        ] {
             let s = static_spec(&[bad]);
             assert_eq!(
                 s.validate(),
@@ -7136,6 +7793,21 @@ mod tests {
             })
         }
 
+        #[test]
+        fn browser_login_requires_cookie_and_safe_issuer_transport() {
+            for endpoint in ["http://issuer.example/login", "https://user:pass@issuer.example/login", "https://issuer.example/login#fragment", "https://issuer.example/login?token=x", "file:///login"] {
+                let mut block = heyo_block();
+                block["cookie"] = serde_json::json!("heyo_login");
+                block["login_endpoint"] = serde_json::json!(endpoint);
+                assert!(matches!(with_jwt(r#""jwt""#, block).validate(), Err(SpecError::BadJwtLoginEndpoint)), "{endpoint}");
+            }
+            let mut block = heyo_block();
+            block["login_endpoint"] = serde_json::json!("https://stage.heyo.computer/api/auth/login");
+            assert!(matches!(with_jwt(r#""jwt""#, block.clone()).validate(), Err(SpecError::BadJwtLoginEndpoint)));
+            block["cookie"] = serde_json::json!("heyo_login");
+            with_jwt(r#""jwt""#, block).validate().unwrap();
+        }
+
         /// The shape a Heyo auth API gate is actually written in.
         #[test]
         fn the_heyo_auth_api_gate_is_a_valid_spec() {
@@ -7182,6 +7854,34 @@ mod tests {
                 with_jwt(r#""google""#, heyo_block()).validate().unwrap_err(),
                 SpecError::JwtPolicyWithoutProvider,
             );
+        }
+
+        /// Hosted sign-in: a `login_url` needs a cookie to carry the token back,
+        /// must be https (loopback http aside), and is otherwise accepted.
+        #[test]
+        fn a_hosted_login_url_needs_a_cookie_and_https() {
+            // login_url without a cookie loops forever, so it is refused.
+            let mut no_cookie = heyo_block();
+            no_cookie["login_url"] = serde_json::json!("https://auth.example.com/login");
+            assert_eq!(
+                with_jwt(r#""jwt""#, no_cookie).validate().unwrap_err(),
+                SpecError::LoginUrlWithoutCookie,
+            );
+
+            // Plaintext to another host is a redirect an attacker can intercept.
+            let mut plaintext = heyo_block();
+            plaintext["cookie"] = serde_json::json!("heyo_access_token");
+            plaintext["login_url"] = serde_json::json!("http://auth.example.com/login");
+            assert!(matches!(
+                with_jwt(r#""jwt""#, plaintext).validate().unwrap_err(),
+                SpecError::BadLoginUrl(_),
+            ));
+
+            // https with a cookie is the shape that works.
+            let mut ok = heyo_block();
+            ok["cookie"] = serde_json::json!("heyo_access_token");
+            ok["login_url"] = serde_json::json!("https://auth.example.com/login");
+            assert_eq!(with_jwt(r#""jwt""#, ok).validate(), Ok(()));
         }
 
         /// `algorithms` has no default, because the only available default would
@@ -7489,7 +8189,9 @@ mod tests {
             // printing both of them buries the one line that matters under a
             // screenful nobody reads. Name what moved instead, and leave the
             // diff to git — which is where the reviewer is going to read it.
-            if current != rendered {
+            if serde_json::from_str::<serde_json::Value>(&current).expect("recorded schema is JSON")
+                != serde_json::from_str::<serde_json::Value>(&rendered).expect("generated schema is JSON")
+            {
                 let (old, new) = (parse_defs(&current), parse_defs(&rendered));
                 let added: Vec<_> = new.iter().filter(|k| !old.contains(*k)).collect();
                 let removed: Vec<_> = old.iter().filter(|k| !new.contains(*k)).collect();

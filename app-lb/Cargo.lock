@@ -190,11 +190,13 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tar",
+ "tempfile",
  "tokio",
  "tower-service",
  "tracing",
  "tracing-subscriber",
  "u-siem",
+ "url",
 ]
 
 [[package]]

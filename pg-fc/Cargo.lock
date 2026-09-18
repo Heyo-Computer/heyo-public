@@ -2566,6 +2566,8 @@ dependencies = [
  "hex",
  "heyo-sdk",
  "hmac",
+ "hyper",
+ "hyper-util",
  "libc",
  "maud",
  "reqwest 0.12.28",

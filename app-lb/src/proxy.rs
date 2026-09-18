@@ -90,9 +90,14 @@ pub struct LbProxy {
     /// The per-namespace event feed, for the deployments that `expose` it on
     /// their own routes, and for the cold-start-timeout issue hook.
     feed: Arc<crate::feed::Feed>,
+    /// The declared auth providers, resolved live for a gate that inherits one
+    /// with `auth.provider_ref`. Read only on the gated path; a deployment
+    /// without a reference never touches it.
+    auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
 }
 
 impl LbProxy {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry: Arc<Registry>,
         metrics: Arc<Metrics>,
@@ -102,6 +107,7 @@ impl LbProxy {
         security: Option<SecuritySink>,
         guard: Arc<Guard>,
         feed: Arc<crate::feed::Feed>,
+        auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
     ) -> Self {
         Self {
             registry,
@@ -112,6 +118,39 @@ impl LbProxy {
             security,
             guard,
             feed,
+            auth_providers,
+        }
+    }
+
+    /// Resolve a gate that may inherit its identity from a namespace provider.
+    ///
+    /// A gate with no `provider_ref` is returned untouched. One with a reference
+    /// is merged with the named provider in `namespace` — identity from the
+    /// provider, the route-scoped fields from the gate — into a plain,
+    /// self-contained [`AuthGate`] the rest of the pipeline treats exactly like
+    /// an inline one, including [`policy_fingerprint`], so an edit to the
+    /// provider re-signs the sessions issued under the old policy.
+    ///
+    /// A reference that names no provider in the namespace is an `Err`, and the
+    /// caller refuses the request: a gate that cannot be built must fail closed,
+    /// never fall open to serving the deployment with no gate at all.
+    ///
+    /// [`AuthGate`]: crate::config::AuthGate
+    /// [`policy_fingerprint`]: crate::config::AuthGate::policy_fingerprint
+    fn resolve_gate(
+        &self,
+        gate: crate::config::AuthGate,
+        namespace: &str,
+    ) -> std::result::Result<crate::config::AuthGate, String> {
+        let Some(name) = gate.provider_ref.as_deref() else {
+            return Ok(gate);
+        };
+        match self.auth_providers.get(namespace, name) {
+            Some(provider) => Ok(provider.resolve(&gate)),
+            None => Err(format!(
+                "this deployment's sign-in gate inherits the auth provider {name:?}, \
+                 which is not declared in its namespace\n"
+            )),
         }
     }
 
@@ -223,6 +262,10 @@ async fn resolve_peer(peer: &str) -> Option<SocketAddr> {
     tokio::net::lookup_host(peer).await.ok()?.next()
 }
 
+fn http_peer(backend: &VmBackend, address: SocketAddr) -> HttpPeer {
+    HttpPeer::new(address, backend.tls, backend.sni.clone())
+}
+
 /// The key authorization to serve for `path`, if it names an outstanding
 /// HTTP-01 challenge.
 ///
@@ -278,6 +321,13 @@ async fn write_plain(session: &mut Session, code: u16, message: &str) -> Result<
         .await
 }
 
+fn maintenance_response(deployment: &Deployment) -> Option<(u16, &'static str)> {
+    deployment
+        .spec
+        .maintenance
+        .then_some((503, "deployment is under maintenance\n"))
+}
+
 /// The newest events an exposed or admin-served feed returns. Half the ring:
 /// a reader wants "recent", and the full ring is the debugging view.
 pub const FEED_PAGE: usize = 100;
@@ -311,6 +361,8 @@ async fn write_gate_response(session: &mut Session, r: crate::auth::Response) ->
     // a spent authorization code, and a stored 403 would outlive the allow-list
     // change that fixes it.
     header.insert_header(http::header::CACHE_CONTROL, "no-store")?;
+    header.insert_header("X-Frame-Options", "DENY")?;
+    header.insert_header("Referrer-Policy", "same-origin")?;
     for cookie in &r.cookies {
         // Appended, not inserted: a callback sets the session cookie *and*
         // clears the flow cookie, and one `Set-Cookie` cannot carry both.
@@ -598,6 +650,17 @@ impl ProxyHttp for LbProxy {
             return Ok(true); // response already written; stop proxying
         };
 
+        // Maintenance is a deployment data-plane fence, not an admin outage.
+        // Keep the route present and answer 503 so retrying clients wait while
+        // operators continue to use the separate admin listener (including
+        // exec). Do this before auth and backend selection: maintenance must
+        // neither turn into a terminal 401/403 nor wake a scaled-to-zero VM.
+        if let Some((status, message)) = maintenance_response(&deployment) {
+            ctx.deployment = Some(deployment);
+            write_plain(session, status, message).await?;
+            return Ok(true);
+        }
+
         ctx.route_prefix = matched_strip_prefix(&deployment, host.as_deref(), &path);
 
         // The sign-in gate, for the deployments that declare one. It runs after
@@ -605,6 +668,25 @@ impl ProxyHttp for LbProxy {
         // anything touches a backend — including the cold-start wait, so an
         // unauthenticated request never boots a VM.
         if let Some(gate) = deployment.spec.auth.clone() {
+            // Inherit the identity half from a namespace provider if this gate
+            // names one. Resolution is live — read on every request, so an edit
+            // to the provider reaches here at once — and fails *closed*: a gate
+            // whose provider no longer resolves refuses the request rather than
+            // serving the deployment ungated.
+            let gate = match self.resolve_gate(gate, &deployment.spec.namespace) {
+                Ok(g) => g,
+                Err(msg) => {
+                    tracing::warn!(
+                        deployment = %deployment.spec.id,
+                        namespace = %deployment.spec.namespace,
+                        "auth gate references an unresolvable provider; refusing the request",
+                    );
+                    write_plain(session, 500, &msg).await?;
+                    ctx.deployment = Some(deployment);
+                    return Ok(true);
+                }
+            };
+
             // A gate needs a hostname to build its callback URL against; a
             // request routed purely by path prefix with no Host header cannot
             // complete a sign-in, and saying so beats redirecting to a URL the
@@ -621,14 +703,45 @@ impl ProxyHttp for LbProxy {
             };
 
             let secure = is_secure_request(session);
+            // Consume credentials only on the gate-owned login endpoint, never
+            // on an application request. Bound the body before buffering it.
+            let login_post = path == gate.login_path()
+                && session.req_header().method == http::Method::POST
+                && gate.jwt_policy().is_some_and(|p| p.login_endpoint.is_some());
+            let mut login_body = Vec::new();
+            if login_post {
+                while let Some(chunk) = session.read_request_body().await? {
+                    if login_body.len() + chunk.len() > 8192 {
+                        write_plain(session, 413, "sign-in request is too large\n").await?;
+                        ctx.deployment = Some(deployment);
+                        return Ok(true);
+                    }
+                    login_body.extend_from_slice(&chunk);
+                }
+            }
+            // Origin checks and logout redirects need the browser's authority,
+            // including a non-default port; routing intentionally strips it.
+            let auth_host = if gate.jwt_policy().is_some_and(|p| p.login_endpoint.is_some()) {
+                session.req_header().uri.authority().map(|a| a.as_str())
+                    .or_else(|| session.req_header().headers.get(http::header::HOST).and_then(|v| v.to_str().ok()))
+                    .unwrap_or(host)
+            } else {
+                host
+            };
             let info = request_info(
                 session,
-                host,
+                auth_host,
                 &path,
                 secure,
                 self.auth.fronts_admin_api(&deployment.spec),
             );
-            match self.auth.decide(&gate, &deployment.spec.id, &deployment.spec.namespace, &info).await {
+            let decision = if login_post {
+                let request_origin = session.req_header().headers.get("origin").and_then(|v| v.to_str().ok());
+                Decision::Answered(self.auth.heyo_login_submit(&gate, &deployment.spec.id, &info, request_origin, &login_body).await)
+            } else {
+                self.auth.decide(&gate, &deployment.spec.id, &deployment.spec.namespace, &info).await
+            };
+            match decision {
                 Decision::Allow(identity) => ctx.identity = *identity,
                 Decision::Answered(response) => {
                     write_gate_response(session, response).await?;
@@ -749,7 +862,7 @@ impl ProxyHttp for LbProxy {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let deployment = ctx
+        let mut deployment = ctx
             .deployment
             .clone()
             .ok_or_else(|| Error::explain(ErrorType::InternalError, "no deployment in ctx"))?;
@@ -778,13 +891,28 @@ impl ProxyHttp for LbProxy {
         // unhealthy and skipped, so a bad static upstream fails over to a good one
         // (and the autoscaler's health re-probe restores it once it resolves).
         let addr = loop {
+            let observed = deployment.clone();
+            let changed = observed.ready_signal.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(current) = self.registry.get(&deployment.spec.id) {
+                if !Arc::ptr_eq(&current, &deployment) {
+                    drop(changed);
+                    deployment = current;
+                    ctx.deployment = Some(deployment.clone());
+                    continue;
+                }
+            }
             let backend = match deployment.select(&ctx.failed) {
                 Some(b) => b,
                 None => {
                     // Nothing ready. If the deployment can still grow, hold the
                     // request while a VM boots rather than failing the caller.
                     // (A static deployment never grows, so this returns at once.)
-                    match wait_for_capacity(&deployment, &ctx.failed, &self.metrics, &self.feed).await {
+                    match tokio::select! {
+                        result = wait_for_capacity(&deployment, &ctx.failed, &self.metrics, &self.feed) => result,
+                        _ = &mut changed => continue,
+                    } {
                         Some(b) => b,
                         None => {
                             return Err(Error::explain(
@@ -805,7 +933,7 @@ impl ProxyHttp for LbProxy {
             }
             ctx.backend = Some(backend.clone());
 
-            match resolve_peer(&backend.peer).await {
+            match resolve_peer(&backend.address).await {
                 Some(addr) => break addr,
                 None => {
                     tracing::warn!(
@@ -820,9 +948,11 @@ impl ProxyHttp for LbProxy {
             }
         };
 
-        // Plaintext, in both modes: a managed VM's guest IP is on a host-local
-        // tap network, and static proxy_pass upstreams are plaintext by design.
-        Ok(Box::new(HttpPeer::new(addr, false, String::new())))
+        let backend = ctx
+            .backend
+            .as_ref()
+            .expect("selected backend remains in context");
+        Ok(Box::new(http_peer(backend, addr)))
     }
 
     async fn response_filter(
@@ -1109,6 +1239,16 @@ mod tests {
     }
 
     #[test]
+    fn https_backend_builds_a_tls_peer_with_url_hostname_as_sni() {
+        let backend = VmBackend::for_upstream("https://ci.eu1.heyo.work:443".into());
+        let peer = http_peer(&backend, "127.0.0.1:443".parse().unwrap());
+        assert!(peer.is_tls());
+        assert_eq!(peer.sni, "ci.eu1.heyo.work");
+        assert!(peer.options.verify_cert);
+        assert!(peer.options.verify_hostname);
+    }
+
+    #[test]
     fn ipv6_literal_host_survives_port_stripping() {
         assert_eq!(
             request_host(&header(Some("[::1]:8080"), "/")).as_deref(),
@@ -1187,6 +1327,7 @@ mod tests {
                 ttl_seconds: 3600,
             }),
             scaling,
+            maintenance: false,
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
@@ -1218,6 +1359,19 @@ mod tests {
         // decrement a slot it no longer owns.
         ctx.release();
         assert_eq!(b.in_flight(), 0);
+    }
+
+    #[test]
+    fn maintenance_fence_is_retryable_and_does_not_remove_the_deployment() {
+        let d = deployment(ScalingPolicy::default());
+        assert_eq!(maintenance_response(&d), None);
+        let mut spec = d.spec.clone();
+        spec.maintenance = true;
+        let fenced = Deployment::new(spec);
+        assert_eq!(
+            maintenance_response(&fenced),
+            Some((503, "deployment is under maintenance\n")),
+        );
     }
 
     #[tokio::test]

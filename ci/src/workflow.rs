@@ -299,6 +299,11 @@ pub struct Job {
     /// online host in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uses: Option<String>,
+    /// Native runner labels. Every label must be advertised by one runner.
+    /// Mutually exclusive with `uses:` and `vm:` placement.
+    #[serde(rename = "runs-on", default, skip_serializing_if = "Vec::is_empty")]
+    pub runs_on: Vec<String>,
+    #[serde(default)]
     pub vm: VmSpec,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub needs: Vec<String>,
@@ -325,6 +330,17 @@ pub struct Job {
 
 impl Job {
     pub fn target(&self) -> Result<Target, WorkflowError> {
+        if !self.runs_on.is_empty() {
+            if self.uses.is_some() {
+                return Err(WorkflowError::NativePlacement("`runs-on` and `uses` are mutually exclusive".into()));
+            }
+            if self.vm != VmSpec::default() {
+                return Err(WorkflowError::NativePlacement("native `runs-on` jobs cannot have a `vm` block".into()));
+            }
+            if self.runs_on.iter().any(|label| label.trim().is_empty()) {
+                return Err(WorkflowError::NativePlacement("`runs-on` labels cannot be empty".into()));
+            }
+        }
         match &self.uses {
             Some(u) => Target::parse(u),
             None => Ok(Target::any()),
@@ -440,8 +456,8 @@ impl SubmitFilter {
 pub struct Workflow {
     pub path: String,
     pub name: Option<String>,
-    /// Trigger names from `on:`. Only `submit` is honoured today; anything else
-    /// parses and is reported as unsupported rather than silently ignored.
+    /// `submit` starts validation; `release` is coordinator-only and waits for
+    /// the complete frozen submission's validation evidence.
     pub on: Vec<String>,
     /// The filters written under `on: submit:`. Default — no filters, build
     /// everything — when `on:` is absent or names `submit` without a block.
@@ -499,7 +515,15 @@ impl Workflow {
 
         let (on, on_submit) = match header.on {
             None => (vec!["submit".to_string()], SubmitFilter::default()),
-            Some(v) => (trigger_names(&v), submit_filter(path, &v)?),
+            Some(v) => {
+                if v.as_mapping().and_then(|m| m.get("release")).is_some_and(|v| !v.is_null()) {
+                    return Err(WorkflowError::Yaml {
+                        path: path.to_string(),
+                        detail: "release trigger does not accept filters; it coordinates all selected validations".into(),
+                    });
+                }
+                (trigger_names(&v), submit_filter(path, &v)?)
+            }
         };
         on_submit.validate(path)?;
 
@@ -701,6 +725,7 @@ pub fn is_job_id(s: &str) -> bool {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum WorkflowError {
+    NativePlacement(String),
     Yaml {
         path: String,
         detail: String,
@@ -765,6 +790,7 @@ pub enum WorkflowError {
 impl fmt::Display for WorkflowError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NativePlacement(detail) => write!(f, "invalid native runner placement: {detail}"),
             Self::Yaml { path, detail } => write!(f, "{path} is not valid workflow YAML: {detail}"),
             Self::NoJobs(path) => write!(f, "{path} declares no jobs"),
             Self::DuplicateJob(path) => write!(f, "{path} declares the same job id twice"),
@@ -977,6 +1003,7 @@ jobs:
     fn this_repositorys_own_workflows_parse_and_plan() {
         let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.ci/workflows"));
         let mut checked = 0;
+        let mut releases = 0;
         for entry in std::fs::read_dir(dir)
             .expect(".ci/workflows exists")
             .flatten()
@@ -988,18 +1015,21 @@ jobs:
             let text = std::fs::read_to_string(&path).expect("readable");
             let wf = Workflow::parse(&path.display().to_string(), &text)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            assert!(
-                wf.on.iter().any(|t| t == "submit"),
-                "{} does not trigger on `submit`, so a submit would silently \
-                 skip it and report that nothing matched",
-                path.display()
-            );
-            crate::plan::Plan::build(&wf).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let plan = crate::plan::Plan::build(&wf).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            if wf.on.iter().any(|t| t == "release") {
+                assert_eq!(wf.on, ["release"]);
+                crate::submission::validate_release_plan(&plan).unwrap();
+                releases += 1;
+            } else {
+                assert!(wf.on.iter().any(|t| t == "submit"), "{} has no submission trigger", path.display());
+                crate::submission::validate_validation_plan(&plan).unwrap();
+            }
             checked += 1;
         }
         // Without this the test passes by finding nothing, which is exactly what
         // happens if the directory is ever renamed.
         assert!(checked > 0, "no workflow files found in {}", dir.display());
+        assert_eq!(releases, 1, "exactly one coordinator must own publication");
     }
 
     #[test]
@@ -1612,17 +1642,85 @@ mod repo_workflow {
 
         let plan =
             crate::plan::Plan::build(&wf).unwrap_or_else(|e| panic!("{path} does not plan: {e}"));
-        assert!(!plan.jobs.is_empty());
+        assert_eq!(plan.jobs.len(), 1);
+        crate::submission::validate_validation_plan(&plan).unwrap();
+        let validate = plan.jobs.iter().find(|j| j.base_id == "release").unwrap();
+        assert!(!validate.target.local, "CI builds must not pin the controller host");
+        assert!(wf.on_submit.paths.iter().any(|p| p == "app-lb/src/host_bundle.rs"),
+            "CI must rebuild when its shared archive validator changes");
+        assert!(validate.condition.as_deref().unwrap().contains("'app-lb/src/host_bundle.rs'"),
+            "the job filter must not skip a shared archive validator change");
+        assert!(validate.steps.iter().any(|s| s.run.as_deref().is_some_and(|s|
+            s == "cargo test --release --locked -- --test-threads=1")));
 
         // Every `uses:` step in it must name an action that exists, or the
         // build fails at the step rather than at parse time.
         for job in &plan.jobs {
             for step in &job.steps {
                 if let Some(action) = &step.uses {
-                    assert_eq!(
-                        action, "ci/upload-artifact",
+                    assert!(
+                        matches!(action.as_str(), "ci/upload-artifact"),
                         "{path} uses {action:?}, which is not a built-in action"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn regional_release_orders_regions_and_selects_exact_validation_artifacts() {
+        let text = include_str!("../../.ci/workflows/regional-release.yml");
+        let wf = Workflow::parse("regional-release.yml", text).unwrap();
+        assert_eq!(wf.on, ["release"]);
+        let plan = crate::plan::Plan::build(&wf).unwrap();
+        crate::submission::validate_release_plan(&plan).unwrap();
+        assert_eq!(plan.jobs.iter().map(|j| j.base_id.as_str()).collect::<Vec<_>>(),
+            ["merge", "us3", "eu1", "controller"]);
+        for (i, predecessor) in [(1, "merge"), (2, "us3"), (3, "eu1")] {
+            assert_eq!(plan.jobs[i].needs, [predecessor]);
+            assert!(plan.jobs[i].condition.is_none(), "do not skip a dependency stage");
+        }
+        for (i, region, deployment) in [(1, "us3", "orchestrator-us3-next"), (2, "eu1", "orchestrator-eu1")] {
+            let steps = &plan.jobs[i].steps;
+            assert_eq!(steps[0].uses.as_deref(), Some("ci/rollout-host-app-lb"));
+            assert_eq!(steps[0].with["target"], format!("app-lb-{region}"));
+            assert_eq!(steps[1].uses.as_deref(), Some("ci/rollout-service"));
+            assert_eq!(steps[1].with["deployment"], deployment);
+            assert_eq!(steps[1].with["url"], format!("https://admin.{region}.heyo.work"));
+            assert_eq!(steps[1].with["mount-path"], "/opt/orchestrator-release",
+                "reuse the registered private release mount instead of adding an unauthenticated mount");
+        }
+        assert_eq!(plan.jobs[3].steps.last().unwrap().uses.as_deref(), Some("ci/deploy-controller"));
+
+        // Exercise asymmetric changes: a shared parser affects CI and app-lb,
+        // while a service-only edit must not silently demand an absent bundle.
+        for (path, expected) in [
+            ("app-lb/src/main.rs", vec!["app-lb"]),
+            ("app-lb/src/host_bundle.rs", vec!["app-lb", "ci"]),
+            ("ci/src/main.rs", vec!["ci"]),
+            ("orchestrator/src/main.rs", vec!["orchestrator-linux"]),
+            ("heyosecret-client/src/lib.rs", vec!["orchestrator-linux"]),
+            (".ci/image/ci/Dockerfile", vec!["ci", "orchestrator-linux"]),
+            (".ci/image/apps/Dockerfile", vec!["app-lb"]),
+            (".ci/workflows/regional-release.yml", vec!["app-lb", "ci", "orchestrator-linux"]),
+            ("README.md", vec![]),
+        ] {
+            let changes = crate::paths::Changes::known(vec![path.into()]);
+            let mut ctx = crate::expr::Context::new();
+            ctx.set("ci", serde_json::json!({"changes_known":true,"changed_files":[path]}));
+            for step in plan.jobs.iter().skip(1).flat_map(|j| &j.steps) {
+                let validation_path = &step.with["workflow"];
+                let yaml = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(validation_path)).unwrap();
+                let validation = Workflow::parse(validation_path, &yaml).unwrap();
+                let build = crate::plan::Plan::build(&validation).unwrap();
+                crate::submission::validate_validation_plan(&build).unwrap();
+                let selected = ctx.eval_condition(step.condition.as_deref().unwrap()).unwrap();
+                assert_eq!(selected, expected.contains(&step.with["artifact"].as_str()), "{path}: {validation_path}");
+                assert_eq!(selected, validation.on_submit.admits("feature", &changes).is_ok(), "{path}: {validation_path}");
+                if selected {
+                    assert!(build.jobs.iter().all(|j| j.condition.as_deref().is_none_or(|c| ctx.eval_condition(c).unwrap())));
+                    assert!(build.jobs.iter().flat_map(|j| &j.steps).any(|s|
+                        s.uses.as_deref() == Some("ci/upload-artifact") && s.with.get("name") == step.with.get("artifact")));
                 }
             }
         }
