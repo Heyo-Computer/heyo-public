@@ -5,6 +5,9 @@ on:
     paths:
       - 'orchestrator/**'
       - 'heyosecret-client/**'
+      - 'app-lb/src/artifact.rs'
+      - 'app-lb/src/mounts.rs'
+      - 'app-lb/src/unpack.rs'
       - '.ci/workflows/orchestrator.yml'
       - '.ci/image/ci/**'
       - '.ci/workflows/regional-release.yml'
