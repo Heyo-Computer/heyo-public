@@ -47,6 +47,7 @@ git submit --dry-run    # show what would be sent
 git submit              # submit HEAD
 git submit --dirty      # include uncommitted tracked changes
 git submit --archive    # send a tree-only tarball instead of a bundle
+git submit --bundle     # a bundle even where .ci/submit.gitattributes asks for a tarball
 git submit --only apps  # run one workflow file, skip the rest
 ```
 
@@ -91,6 +92,27 @@ the old tree-only tarball for the repository where that is the wrong trade.
 
 Two practical requirements: a bundle needs `git` on the orchestrator **and** in
 the guest image; a tarball needs neither. Each absence is reported by name.
+
+A repository for which the bundle is the wrong trade says so by committing
+**`.ci/submit.gitattributes`** at its root: an `export-ignore` allowlist that
+trims the tarball to what its workflows read. The file is the opt-in. With it,
+plain `git submit` sends the trimmed tarball from every clone with no alias to
+set up, and `--bundle` sends a bundle for one submit. (An `alias.submit` could
+not do this: git runs a `git-submit` on `PATH` ahead of any alias of that
+name.) It is its own file, applied as `core.attributesFile`, rather than
+`.gitattributes`, so other tools that `git archive` the repository still see
+the whole tree. The private `heyo` monorepo is the case it exists for: its
+history bundles to 338 MB, its build images have no git, and its allowlist
+brings the tarball to 2.4 MB.
+
+**Anything over 50 MiB is refused before upload**, with the size and the fix.
+Without the check, a payload too big for the server does not fail. It uploads,
+a third bigger as base64, until curl's `--max-time` (`CI_SUBMIT_TIMEOUT`,
+300 s) ends it with *"0 bytes received"*, and the server never gets to say why.
+`CI_SUBMIT_MAX_BYTES` or `git config ci.maxSubmitBytes` moves the limit
+(`200m`; `0` for none). It is the client's guess; the server's
+`CI_MAX_SOURCE_BYTES` still has the last word. A curl timeout after the
+connection was made now says so, instead of "could not reach".
 
 Three shapes of `git bundle` do not work, and the client is built around them:
 it refuses a bare sha (*"Refusing to create empty bundle"*), so `--ref <sha>` and

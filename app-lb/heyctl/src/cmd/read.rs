@@ -3,8 +3,8 @@
 use super::{Ctx, Resource, now_secs, parse_ref};
 use crate::output::{self, OutputFormat, Table};
 use crate::types::{
-    CertStatus, DeploymentStatus, DiskInfo, DiskInventory, JobRecord, MetricsResponse,
-    NamespaceEntry, SecretSummary, WorkflowList, WorkflowView,
+    AuthProviderView, CertStatus, DeploymentStatus, DiskInfo, DiskInventory, JobRecord,
+    MetricsResponse, NamespaceEntry, SecretSummary, WorkflowList, WorkflowView,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -22,8 +22,10 @@ pub struct GetArgs {
     #[arg(long, short = 'd', value_name = "NAME")]
     pub deployment: Option<String>,
 
-    /// Only show deployments in this namespace. Applied by app-lb, not here, so
-    /// the listing is narrowed before it is sent.
+    /// Only show deployments, secrets or auth providers in this namespace.
+    /// Applied by app-lb, not here, so the listing is narrowed before it is
+    /// sent — and for the walled kinds it is the only way to name one, since a
+    /// secret in `team-a` and a secret in `default` may share an id.
     #[arg(long, short = 'n', value_name = "NAMESPACE")]
     pub namespace: Option<String>,
 
@@ -53,11 +55,12 @@ fn get_once(ctx: &Ctx, kind: Resource, names: &[String], args: &GetArgs) -> Resu
         Resource::Deployment => get_deployments(ctx, names, args.namespace.as_deref()),
         Resource::Vm => get_vms(ctx, names, args.deployment.as_deref()),
         Resource::Cert => get_certs(ctx),
-        Resource::Secret => get_secrets(ctx, names),
+        Resource::Secret => get_secrets(ctx, names, args.namespace.as_deref()),
         Resource::Workflow => get_workflows(ctx, names),
         Resource::Job => get_jobs(ctx, names, args.deployment.as_deref()),
         Resource::Disk => get_disks(ctx, names, args.deployment.as_deref()),
         Resource::Namespace => get_namespaces(ctx),
+        Resource::AuthProvider => get_auth_providers(ctx, names, args.namespace.as_deref()),
         Resource::All => {
             get_deployments(ctx, &[], args.namespace.as_deref())?;
             println!();
@@ -555,16 +558,16 @@ fn get_workflows(ctx: &Ctx, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn get_secrets(ctx: &Ctx, names: &[String]) -> Result<()> {
+fn get_secrets(ctx: &Ctx, names: &[String], namespace: Option<&str>) -> Result<()> {
     let raw = if names.is_empty() {
-        ctx.client.raw().secrets()?
+        ctx.client.raw().secrets_in(namespace)?
     } else {
         let mut out = Vec::new();
         for name in names {
             out.push(
                 ctx.client
                     .raw()
-                    .secret(name)
+                    .secret_in(namespace, name)
                     .with_context(|| format!("getting secret {name:?}"))?,
             );
         }
@@ -621,6 +624,80 @@ fn get_secrets(ctx: &Ctx, names: &[String]) -> Result<()> {
         });
         if ctx.out.is_wide() {
             row.push(output::opt_str(s.description.as_deref()));
+        }
+        table.row(row);
+    }
+    table.print();
+    Ok(())
+}
+
+/// `get auth-providers [-n NAMESPACE] [NAME...]` — the declared identity
+/// objects a gate can inherit with `auth.provider_ref`.
+///
+/// Names are resolved inside one namespace, because that is the only place a
+/// provider is unique: `-n` when it is not `default`.
+fn get_auth_providers(ctx: &Ctx, names: &[String], namespace: Option<&str>) -> Result<()> {
+    let ns = namespace.unwrap_or(crate::DEFAULT_NAMESPACE);
+    let raw = if names.is_empty() {
+        ctx.client.raw().auth_providers(namespace)?
+    } else {
+        let mut out = Vec::new();
+        for name in names {
+            out.push(
+                ctx.client
+                    .raw()
+                    .auth_provider(ns, name)
+                    .with_context(|| format!("getting auth provider {name:?} in namespace {ns:?}"))?,
+            );
+        }
+        Value::Array(out)
+    };
+
+    let providers: Vec<AuthProviderView> = match &raw {
+        Value::Array(items) => items
+            .iter()
+            .map(|v| serde_json::from_value(v.clone()))
+            .collect::<Result<_, _>>()
+            .context("parsing the auth provider list")?,
+        other => vec![serde_json::from_value(other.clone()).context("parsing the auth provider")?],
+    };
+
+    if ctx.out.is_machine() {
+        let refs: Vec<String> = providers
+            .iter()
+            .map(|p| format!("auth-provider/{}/{}", p.namespace, p.name))
+            .collect();
+        return output::emit(&raw, ctx.out, &refs);
+    }
+
+    if providers.is_empty() {
+        println!(
+            "No auth providers declared{}. (`heyctl create auth-provider heyo --preset heyo \
+             --secret heyo-auth/jwt_secret` declares one; deployments inherit it with \
+             `heyctl set auth <deployment> --provider-ref heyo`.)",
+            match namespace {
+                Some(ns) => format!(" in namespace {ns}"),
+                None => String::new(),
+            }
+        );
+        return Ok(());
+    }
+
+    let mut table = if ctx.out.is_wide() {
+        Table::new(["NAME", "NAMESPACE", "PROVIDER", "TRUST", "ADMITS", "DESCRIPTION"])
+    } else {
+        Table::new(["NAME", "NAMESPACE", "PROVIDER", "TRUST", "ADMITS"])
+    };
+    for p in &providers {
+        let mut row = vec![
+            p.name.clone(),
+            p.namespace.clone(),
+            p.providers().join("+"),
+            p.trust_summary(),
+            p.admits(),
+        ];
+        if ctx.out.is_wide() {
+            row.push(output::opt_str(p.description.as_deref()));
         }
         table.row(row);
     }
@@ -833,15 +910,23 @@ fn describe_job(j: &JobRecord) -> Result<()> {
 
 #[derive(Args, Debug)]
 pub struct DescribeArgs {
-    /// The deployment to describe, e.g. `web` or `deployment/web`.
+    /// What to describe: `web`, `deployment/web`, or `auth-provider heyo`.
     #[arg(value_name = "RESOURCE", required = true)]
     pub args: Vec<String>,
+
+    /// The namespace an auth provider lives in. Ignored for a deployment,
+    /// whose namespace is part of the object.
+    #[arg(long, short = 'n', value_name = "NAMESPACE")]
+    pub namespace: Option<String>,
 }
 
 pub fn describe(ctx: &Ctx, args: &DescribeArgs) -> Result<()> {
     let (kind, names) = parse_ref(&args.args, Some(Resource::Deployment))?;
+    if kind == Resource::AuthProvider {
+        return describe_auth_providers(ctx, &names, args.namespace.as_deref());
+    }
     if kind != Resource::Deployment {
-        bail!("describe only works on deployments");
+        bail!("describe works on deployments and auth providers");
     }
     if names.is_empty() {
         bail!("describe needs a name, e.g. `heyctl describe deployment web`");
@@ -873,6 +958,118 @@ pub fn describe(ctx: &Ctx, args: &DescribeArgs) -> Result<()> {
         describe_one(&d, metrics.as_ref());
     }
     Ok(())
+}
+
+/// `describe auth-provider <NAME> [-n NAMESPACE]` — everything an inheriting
+/// gate will be given, plus what a deployment still has to supply itself.
+fn describe_auth_providers(ctx: &Ctx, names: &[String], namespace: Option<&str>) -> Result<()> {
+    if names.is_empty() {
+        bail!(
+            "describe needs a name, e.g. `heyctl describe auth-provider heyo` \
+             (add -n <namespace> when it is not `default`)"
+        );
+    }
+    let ns = namespace.unwrap_or(crate::DEFAULT_NAMESPACE);
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        let raw = ctx
+            .client
+            .raw()
+            .auth_provider(ns, name)
+            .with_context(|| format!("getting auth provider {name:?} in namespace {ns:?}"))?;
+        if ctx.out.is_machine() {
+            output::emit(&raw, ctx.out, &[format!("auth-provider/{ns}/{name}")])?;
+            continue;
+        }
+        let p: AuthProviderView = serde_json::from_value(raw)?;
+        describe_provider(&p);
+    }
+    Ok(())
+}
+
+fn describe_provider(p: &AuthProviderView) {
+    output::top_field("Name", &p.name);
+    output::top_field("Namespace", &p.namespace);
+    if let Some(d) = &p.description {
+        output::top_field("Description", d);
+    }
+    if p.created_at > 0 {
+        output::top_field("Declared", output::timestamp(p.created_at));
+    }
+
+    output::section("Identity");
+    output::field("Provider", p.providers().join(" or "));
+    if let Some(client_id) = &p.client_id {
+        output::field("Client id", client_id);
+    }
+    if let Some(secret) = &p.client_secret {
+        output::field("Client secret", format!("secret {}", secret.render_in(&p.namespace)));
+    }
+    if p.providers().iter().any(|q| q == "google") {
+        output::field("Who may enter", p.admits());
+    }
+    if let Some(jwt) = &p.jwt {
+        output::field("JWT issuer", &jwt.issuer);
+        output::field("JWT audience", jwt.audience.as_deref().unwrap_or("(not checked)"));
+        // Spelled out rather than summarised: which key verifies a token is the
+        // whole of what this object is trusted for.
+        output::field(
+            "JWT key",
+            match (&jwt.secret, &jwt.public_key, &jwt.jwks_url) {
+                (Some(r), _, _) => format!("shared secret {}", r.render_in(&p.namespace)),
+                (_, Some(_), _) => "an inline public key".to_string(),
+                (_, _, Some(url)) => format!("the key set at {url}"),
+                _ => "<none>".to_string(),
+            },
+        );
+        output::field("JWT algorithms", jwt.algorithms.join(", "));
+        output::field("JWT admits", jwt.require_summary());
+        output::field(
+            "JWT subject claim",
+            format!("{} -> x-auth-request-user", jwt.subject_claim),
+        );
+        if let Some(cookie) = &jwt.cookie {
+            output::field("JWT cookie", format!("{cookie} (when no Authorization header)"));
+        }
+        match (&jwt.login_url, &jwt.cookie) {
+            (Some(url), Some(cookie)) => {
+                output::field(
+                    "Browser sign-in",
+                    format!(
+                        "{url}?{}=<the url they asked for> — that page sets {cookie}",
+                        jwt.login_redirect_param.as_deref().unwrap_or("redirect_uri")
+                    ),
+                );
+            }
+            // Worth saying, because it is the difference between a person seeing
+            // a sign-in page and a person seeing a 401 they cannot act on.
+            (None, _) => output::field(
+                "Browser sign-in",
+                "none — a token-less browser gets 401. Set --login-url and --cookie \
+                 to send it somewhere",
+            ),
+            _ => {}
+        }
+    }
+    if let Some(domain) = &p.cookie_domain {
+        output::field("Session realm", format!("{domain} (shared across the namespace's gates)"));
+    }
+
+    output::section("Inheriting it");
+    output::field(
+        "In a spec",
+        format!("auth: {{ provider_ref: {} }}", p.name),
+    );
+    output::field(
+        "With heyctl",
+        format!("heyctl set auth <deployment> --provider-ref {}", p.name),
+    );
+    output::field(
+        "The gate still owns",
+        "public_paths, base_path, cookie_name, session_ttl_secs, forward_identity",
+    );
 }
 
 fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
@@ -1193,20 +1390,41 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
 
     if let Some(auth) = &d.spec.auth {
         output::section("Sign-in gate");
-        // Joined rather than listed, because they are alternatives: any one of
-        // them admits a request.
-        output::field("Provider", auth.providers().join(" or "));
-        // Absent on a token-only gate, where neither describes anything.
-        if let Some(client_id) = &auth.client_id {
-            output::field("Client id", client_id);
+        // An inheriting gate carries no identity of its own, so everything below
+        // would print as absent. Say where it comes from instead, and name the
+        // command that shows it.
+        if let Some(provider_ref) = &auth.provider_ref {
+            output::field(
+                "Identity from",
+                format!(
+                    "auth provider {provider_ref} in namespace {} \
+                     (`heyctl describe auth-provider {provider_ref} -n {}`)",
+                    d.spec.namespace(),
+                    d.spec.namespace(),
+                ),
+            );
         }
-        if let Some(secret) = &auth.client_secret {
-            output::field("Client secret", format!("secret {}", secret.render()));
-        }
-        // Only meaningful for Google, which is the only provider these two
-        // describe — a JWT gate's allow-list is `jwt.require`, printed below.
-        if auth.providers().iter().any(|p| p == "google") {
-            output::field("Who may enter", auth.allow_summary());
+        // Every field from here to the JWT block is the *identity* half, which
+        // an inheriting gate does not have: printing it would describe this
+        // empty gate rather than the provider it borrows, and `providers()`
+        // reads an absent list as Google, so "who may enter: <nobody>" is what
+        // that looks like. The line above says where to look instead.
+        if auth.provider_ref.is_none() {
+            // Joined rather than listed, because they are alternatives: any one
+            // of them admits a request.
+            output::field("Provider", auth.providers().join(" or "));
+            // Absent on a token-only gate, where neither describes anything.
+            if let Some(client_id) = &auth.client_id {
+                output::field("Client id", client_id);
+            }
+            if let Some(secret) = &auth.client_secret {
+                output::field("Client secret", format!("secret {}", secret.render()));
+            }
+            // Only meaningful for Google, which is the only provider these two
+            // describe — a JWT gate's allow-list is `jwt.require`, printed below.
+            if auth.providers().iter().any(|p| p == "google") {
+                output::field("Who may enter", auth.allow_summary());
+            }
         }
         if let Some(jwt) = &auth.jwt {
             output::field("JWT issuer", &jwt.issuer);

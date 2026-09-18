@@ -2263,13 +2263,21 @@ fn auth_provider_users(state: &AdminState, ns: &str, name: &str) -> Vec<String> 
     users
 }
 
-/// The body of `POST /auth-providers`: an [`AuthProviderSpec`] plus two
+/// The body of `POST /auth-providers`: an [`AuthProviderSpec`] plus three
 /// request-only conveniences that never reach the store.
 ///
-/// `preset` expands a known template — currently only `"heyo"`, which builds the
-/// JWT policy for the Heyo auth API from `secret` alone — so "the Heyo app works
-/// out of the box once the secret is provided" is one POST rather than a dozen
-/// fields nobody should have to know.
+/// `preset` expands a known template, so "gate this on Heyo sign-in" is one
+/// POST rather than a dozen fields nobody should have to know:
+///
+/// | preset | verifies | needs |
+/// | --- | --- | --- |
+/// | `heyo-jwks` | gate tokens, `RS256`, against the published key set | nothing, or `jwks_url` |
+/// | `heyo` | access tokens, `HS256` | `secret` |
+///
+/// Prefer `heyo-jwks`. `heyo` needs the auth service's *signing* key, so the
+/// fleet that holds it can mint identities as well as check them — acceptable
+/// where we run everything, and not something to put behind a wall somebody
+/// else administers.
 #[derive(Deserialize)]
 struct CreateProviderBody {
     #[serde(flatten)]
@@ -2277,9 +2285,14 @@ struct CreateProviderBody {
     /// Expand a provider template before validation. Request-only.
     #[serde(default)]
     preset: Option<String>,
-    /// The signing secret a preset needs. Request-only.
+    /// The signing secret the `heyo` preset needs. Request-only.
     #[serde(default)]
     secret: Option<crate::secrets::SecretRef>,
+    /// Where the issuer publishes its key set, for `heyo-jwks`. Request-only,
+    /// and optional: with federated auth configured app-lb already knows the
+    /// auth service's address and derives it.
+    #[serde(default)]
+    jwks_url: Option<String>,
 }
 
 /// `GET /auth-providers[?namespace=]` — the providers this caller may see.
@@ -2323,12 +2336,39 @@ async fn create_auth_provider(
     // path or in the state file.
     if let Some(preset) = body.preset.as_deref() {
         match preset {
+            "heyo-jwks" => {
+                // Either the caller named the key set, or app-lb derives it from
+                // the auth service it already federates to — which is the whole
+                // provisioning story: declaring a customer's provider takes a
+                // namespace and a name, and nothing else.
+                let jwks_url = match body.jwks_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                    Some(url) => url.to_string(),
+                    None => {
+                        let Some(base) = state.federated.as_ref().map(|f| f.base_url().to_string())
+                        else {
+                            return err(
+                                StatusCode::BAD_REQUEST,
+                                "the \"heyo-jwks\" preset needs `jwks_url`, because this app-lb \
+                                 has no auth service configured to derive it from (set \
+                                 APP_LB_AUTH_URL, or send \
+                                 {\"jwks_url\": \"https://auth.example.com/.well-known/jwks.json\"})",
+                            )
+                            .into_response();
+                        };
+                        format!("{}/.well-known/jwks.json", base.trim_end_matches('/'))
+                    }
+                };
+                spec.provider = crate::config::Providers::one(crate::config::AuthProvider::Jwt);
+                spec.jwt = Some(crate::config::JwtSpec::heyo_jwks(jwks_url));
+            }
             "heyo" => {
                 let Some(secret) = body.secret else {
                     return err(
                         StatusCode::BAD_REQUEST,
                         "the \"heyo\" preset needs a `secret` reference to the JWT signing key, \
-                         e.g. {\"secret\": \"heyo-auth\", \"key\": \"jwt_secret\"}",
+                         e.g. {\"secret\": \"heyo-auth\", \"key\": \"jwt_secret\"} — or use the \
+                         \"heyo-jwks\" preset, which verifies against the auth service's \
+                         published key set and needs no secret at all",
                     )
                     .into_response();
                 };
@@ -2344,6 +2384,11 @@ async fn create_auth_provider(
             }
         }
     }
+
+    // Bind the secret references to this provider's own namespace before
+    // anything validates or stores them — the wall a deployment gets from
+    // `DeploymentSpec::normalize`, which no other path was giving a provider.
+    spec.normalize();
 
     let ns = spec.namespace.clone();
     if let Err(refused) = may_use_auth_providers(caller.as_deref(), &ns, true) {

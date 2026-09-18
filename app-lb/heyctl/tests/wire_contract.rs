@@ -16,8 +16,8 @@
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
 use heyctl::types::{
-    DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse, UpstreamTrafficStatus,
-    WorkflowList, WorkflowView,
+    AuthProviderView, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse,
+    UpstreamTrafficStatus, WorkflowList, WorkflowView,
 };
 use std::path::PathBuf;
 
@@ -373,4 +373,50 @@ fn a_jwt_gate_survives_the_wire() {
     assert!(summary.contains("role=user|admin"), "{summary}");
     assert!(summary.contains("accountId=acct_7f3c"), "{summary}");
     assert!(jwt.key_summary().contains("heyo-auth"), "{}", jwt.key_summary());
+}
+
+/// The auth provider object, in both shapes app-lb serialises it in.
+#[test]
+fn auth_provider_view_understands_every_field() {
+    let heyo: AuthProviderView =
+        serde_json::from_str(&fixture("auth-provider-heyo")).expect("fixture parses");
+    assert!(
+        heyo.extra.is_empty(),
+        "heyctl does not understand these fields app-lb sends: {:?}\n\
+         Add them to AuthProviderView in src/types.rs.",
+        heyo.extra.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(heyo.name, "heyo");
+    assert_eq!(heyo.namespace, "team-a");
+    assert_eq!(heyo.providers(), vec!["jwt".to_string()]);
+    let jwt = heyo.jwt.as_ref().expect("a jwt provider carries its policy");
+    assert_eq!(jwt.issuer, "auth-service");
+    assert_eq!(jwt.subject_claim, "userId", "the Heyo auth API's subject is not `sub`");
+    assert_eq!(heyo.admits(), "role=user|admin");
+    assert_eq!(heyo.trust_summary(), "auth-service");
+
+    let google: AuthProviderView =
+        serde_json::from_str(&fixture("auth-provider-google")).expect("fixture parses");
+    assert!(
+        google.extra.is_empty(),
+        "unknown fields on the google provider: {:?}",
+        google.extra.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(google.providers(), vec!["google".to_string()]);
+    assert!(google.client_secret.is_some(), "a SecretRef must survive as a reference");
+    assert_eq!(google.admits(), "@example.com");
+    assert_eq!(google.cookie_domain.as_deref(), Some(".example.com"));
+}
+
+/// A gate that inherits its identity carries `provider_ref` and nothing else —
+/// which only reads correctly if this crate knows the field exists.
+#[test]
+fn an_inherited_gate_names_the_provider_it_came_from() {
+    // This fixture is a bare spec, not the status envelope a listing returns.
+    let spec: DeploymentSpec =
+        serde_json::from_str(&fixture("deployment-inherited-gate")).expect("fixture parses");
+    let gate = spec.auth.as_ref().expect("the fixture has a gate");
+    assert_eq!(gate.provider_ref.as_deref(), Some("corp-google"));
+    assert_eq!(spec.namespace(), "team-a", "the provider is looked up in this namespace");
+    assert!(gate.client_id.is_none(), "an inheriting gate carries no identity of its own");
 }

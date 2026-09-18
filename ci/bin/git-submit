@@ -19,6 +19,13 @@
 # a partial slice is refused at clone time. For a repository with long history
 # and no need for `.git`, `--archive` sends one tree instead.
 #
+# A repository makes that its default by committing `.ci/submit.gitattributes`:
+# an `export-ignore` allowlist that trims the tarball to what its workflows
+# read. The file is the opt-in, so every clone gets it with no alias to set up,
+# and `--bundle` overrides it for one submit. It is its own file, applied as
+# `core.attributesFile`, rather than `.gitattributes`, so other tools that run
+# `git archive` on the repository still see the whole tree.
+#
 # ## Two credentials, and you want the first one
 #
 # A **repository token** (`ci.token`) is minted per repository from the CI app's
@@ -32,12 +39,15 @@
 # one exists. A server with CI_REQUIRE_REPO_TOKEN set refuses it.
 #
 # Configuration, in order of precedence:
-#   CI_ENDPOINT       / git config ci.endpoint   the server's base URL
-#   CI_TOKEN          / git config ci.token      a repository submit token
-#   CI_WEBHOOK_SECRET / git config ci.secret     the shared HMAC secret
+#   CI_ENDPOINT         / git config ci.endpoint         the server's base URL
+#   CI_TOKEN            / git config ci.token            a repository submit token
+#   CI_WEBHOOK_SECRET   / git config ci.secret           the shared HMAC secret
+#   CI_SUBMIT_MAX_BYTES / git config ci.maxSubmitBytes   refuse bigger payloads
+#                                                        before upload (50m; 0 = off)
+#   CI_SUBMIT_TIMEOUT                                    seconds for the upload (300)
 set -euo pipefail
 
-GIT_SUBMIT_VERSION="0.5.0"
+GIT_SUBMIT_VERSION="0.6.0"
 
 # `git-submit` invoked as `git submit`, `git-ci` invoked as `git ci`. Only used
 # in messages, but a script that tells you to run a command that does not exist
@@ -49,17 +59,22 @@ die() { printf '%s: %s\n' "$cmd" "$*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-Usage: $cmd [--dirty] [--ref <rev>] [--only <workflow>] [--workflow <id>] [--dry-run] [--submit-empty]
+Usage: $cmd [--dirty] [--ref <rev>] [--only <workflow>] [--workflow <id>] [--archive | --bundle] [--dry-run] [--submit-empty]
 
-Submits a tarball of the tree to the CI orchestrator and prints the runs it
-started.
+Submits a commit to the CI orchestrator and prints the runs it started. What
+travels is a git bundle of the branch, or a tarball of the tree when the
+repository has a .ci/submit.gitattributes or --archive asks for one.
 
 Options:
   --dirty          include uncommitted tracked changes
   --submit-empty   submit even when the tree is identical to the default
                    branch — a run that rebuilds what main already is
   --archive        send a tree-only tarball instead of a git bundle (no .git in
-                   the guest, but a payload that does not carry history)
+                   the guest, but a payload that does not carry history). The
+                   default when the repository has .ci/submit.gitattributes,
+                   whose export-ignore rules then trim the tarball
+  --bundle         send a git bundle even where .ci/submit.gitattributes makes
+                   the tarball the default
   --ref <rev>      submit some other commit (default HEAD)
   --only <workflow>
                    run only this workflow file, skipping every other one the
@@ -80,6 +95,10 @@ Options:
 Setup, from the /repos page of your CI:
   git config ci.endpoint https://ci.example.com
   git config ci.token    <the repository token it minted>
+
+Payloads over 50 MiB are refused before anything is uploaded. Change that with
+CI_SUBMIT_MAX_BYTES or git config ci.maxSubmitBytes (200m, or 0 for no limit).
+CI_SUBMIT_TIMEOUT (seconds, default 300) bounds the upload itself.
 EOF
 }
 
@@ -88,7 +107,7 @@ EOF
 rev="HEAD"
 dirty=0
 dry_run=0
-archive=0
+format_flag=""
 submit_empty=0
 workflow=""
 only=()
@@ -96,7 +115,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dirty)    dirty=1; shift ;;
     --submit-empty) submit_empty=1; shift ;;
-    --archive)  archive=1; shift ;;
+    --archive|--bundle)
+      [ -n "$format_flag" ] && [ "$format_flag" != "$1" ] \
+        && die "--archive and --bundle ask for opposite things; pass one"
+      format_flag="$1"; shift ;;
     --dry-run)  dry_run=1; shift ;;
     --ref)      rev="${2:?--ref needs a revision}"; shift 2 ;;
     --workflow) workflow="${2:?--workflow needs an id}"; shift 2 ;;
@@ -155,7 +177,8 @@ sha="$(git rev-parse --verify "$rev^{commit}" 2>/dev/null)" \
 branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
 [ "$branch" = "HEAD" ] && branch="detached"
 repo_url="$(git config --get remote.origin.url || echo "")"
-repo_name="$(basename "$(git rev-parse --show-toplevel)")"
+toplevel="$(git rev-parse --show-toplevel)"
+repo_name="$(basename "$toplevel")"
 default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
 before="$(git rev-parse --verify "${rev}^" 2>/dev/null || echo "")"
 pusher_name="$(git config --get user.name || echo "")"
@@ -217,13 +240,42 @@ if [ "$submit_empty" -eq 0 ]; then
   fi
 fi
 
+# The repository's own say in what travels. `.ci/submit.gitattributes` is the
+# export-ignore allowlist for the tarball, and its existence is the opt-in: a
+# repository whose history is too heavy to bundle, or whose build images have
+# no git, gets --archive in every clone instead of relying on each person to set
+# up an alias — and `alias.submit` could not do it anyway, because git runs this
+# script ahead of any alias with its name. Read from the worktree, like the
+# `core.attributesFile` it becomes.
+submit_attributes="$toplevel/.ci/submit.gitattributes"
+[ -f "$submit_attributes" ] || submit_attributes=""
+case "$format_flag" in
+  --archive) archive=1; format_reason="asked for with --archive" ;;
+  --bundle)  archive=0; format_reason="asked for with --bundle" ;;
+  *)
+    if [ -n "$submit_attributes" ]; then
+      archive=1; format_reason="the default here; --bundle overrides"
+    else
+      archive=0; format_reason="the default; --archive sends a tarball"
+    fi ;;
+esac
+
 if [ "$archive" -eq 1 ]; then
   format="tar.gz"
   payload_file="$tarball"
-  git archive --format=tar.gz -o "$tarball" "$send_sha"
+  what="tarball"
+  trim=""
+  attributes=()
+  if [ -n "$submit_attributes" ]; then
+    attributes=(-c "core.attributesFile=$submit_attributes")
+    trim=", trimmed by .ci/submit.gitattributes"
+  fi
+  git ${attributes[@]+"${attributes[@]}"} archive --format=tar.gz -o "$tarball" "$send_sha"
 else
   format="git-bundle"
   payload_file="$bundle"
+  what="git bundle"
+  trim=""
   # `git bundle create` refuses a bare sha — "Refusing to create empty bundle" —
   # so the commit needs a ref. Rather than write one into the user's repository
   # and hope to clean it up, a throwaway bare repo borrows their object store
@@ -245,13 +297,51 @@ fi
 
 size="$(wc -c < "$payload_file" | tr -d ' ')"
 
+# Bytes for a person: 2383620 is a number, 2.3 MiB is an answer.
+human() {
+  awk -v b="$1" 'BEGIN {
+    if (b >= 1048576) printf "%.1f MiB", b / 1048576
+    else if (b >= 1024) printf "%.1f KiB", b / 1024
+    else printf "%d bytes", b
+  }'
+}
+
+# --- size -------------------------------------------------------------------
+#
+# Checked before a byte leaves. A payload the server will not take does not
+# fail, it uploads — a third bigger as base64 — until curl's --max-time ends it
+# with "0 bytes received", and the server never got to say why. One it will
+# take is still copied into every build VM in small exec chunks, so size is
+# checkout time too. Past 50 MiB it is nearly always history nobody meant to
+# send: a bundle carries every blob the branch ever held, deleted ones included.
+# This is the client's guess; the server's CI_MAX_SOURCE_BYTES has the last word.
+limit_raw="${CI_SUBMIT_MAX_BYTES:-$(git config --get ci.maxSubmitBytes || true)}"
+# git's own integer parser, so 50m, 200M and 1g mean what they say.
+limit="$(git -c "ci.submitlimit=${limit_raw:-50m}" config --type=int --get ci.submitlimit 2>/dev/null)" \
+  || die "CI_SUBMIT_MAX_BYTES / ci.maxSubmitBytes must be a byte count such as 52428800, 50m or 0, not '$limit_raw'"
+refusal=""
+if [ "$limit" -gt 0 ] && [ "$size" -gt "$limit" ]; then
+  if [ "$archive" -eq 1 ]; then
+    fix="Trim it with export-ignore rules in .ci/submit.gitattributes (build output
+    and vendored binaries are the usual weight), or raise the limit."
+  else
+    fix="A bundle carries the branch's whole history, deleted files included. Send
+    the tree with --archive, commit a .ci/submit.gitattributes to make that this
+    repository's default, or raise the limit."
+  fi
+  refusal="the $what is $(human "$size"), over the $(human "$limit") submit limit, so nothing was sent.
+    $fix
+    CI_SUBMIT_MAX_BYTES or git config ci.maxSubmitBytes sets the limit (200m; 0 for none)."
+fi
+
 if [ "$dry_run" -eq 1 ]; then
   printf 'would submit to %s\n' "$submit_url"
   printf '  repository %s (%s)\n' "$repo_name" "${repo_url:-no remote}"
   printf '  ref        refs/heads/%s\n' "$branch"
   printf '  commit     %s\n' "$sha"
-  printf '  source     %s, %s bytes%s\n' "$format" "$size" \
+  printf '  source     %s, %s bytes (%s)%s\n' "$format" "$size" "$(human "$size")" \
     "$([ "$dirty" -eq 1 ] && echo ' (including uncommitted changes)')"
+  printf '  format     %s%s — %s\n' "$what" "$trim" "$format_reason"
   printf '  credential %s\n' "$([ -n "$token" ] && echo 'repository token (ci.token)' || echo 'shared secret (ci.secret)')"
   [ -n "$workflow" ] && printf '  workflow   %s\n' "$workflow"
   [ "${#only[@]}" -gt 0 ] && printf '  only       %s\n' "${only[*]}"
@@ -260,11 +350,21 @@ if [ "$dry_run" -eq 1 ]; then
     git bundle list-heads "$bundle" | sed 's/^/    /'
   fi
   printf '  files:\n'
-  git ls-tree -r --name-only "$send_sha" | head -20 | sed 's/^/    /'
+  # awk rather than `head`: head exits after 20 lines, ls-tree then dies of
+  # SIGPIPE, and under pipefail that ended every dry run with status 141.
+  git ls-tree -r --name-only "$send_sha" | awk 'NR <= 20 { print "    " $0 }'
+  [ -z "$refusal" ] || die "$refusal"
   exit 0
 fi
 
+[ -z "$refusal" ] || die "$refusal"
+
 # --- payload ----------------------------------------------------------------
+
+# Said before the slow part, not after it: base64, the JSON and the upload are
+# the three steps that scale with size, and a submit that sits silent for
+# minutes reads as a hang whatever it is really doing.
+printf '%s: sending %s (%s%s) to %s\n' "$cmd" "$(human "$size")" "$what" "$trim" "$submit_url" >&2
 
 payload="$work/payload.json"
 content="$work/content.b64"
@@ -336,13 +436,32 @@ else
 fi
 
 response="$work/response.json"
-code="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' \
-  --max-time "${CI_SUBMIT_TIMEOUT:-300}" \
+timeout="${CI_SUBMIT_TIMEOUT:-300}"
+# Two fields: the status, and when the TCP connection was made — 0 if it never
+# was, which is what tells a timeout on a dead host from one mid-upload.
+result="$(curl --silent --show-error --output "$response" \
+  --write-out '%{http_code} %{time_connect}' \
+  --max-time "$timeout" \
   -X POST "$submit_url" \
   -H 'content-type: application/json' \
   -H "x-heyo-git-ci-version: $GIT_SUBMIT_VERSION" \
   --config "$auth_config" \
-  --data-binary "@$payload")" || die "could not reach $submit_url"
+  --data-binary "@$payload")" || {
+  rc=$?
+  case "${result#* }" in
+    ""|0|0.000000) connected=0 ;;
+    *)             connected=1 ;;
+  esac
+  # curl has said what happened; this says what it means. Exit 28 is its own
+  # --max-time, and after a connection that is not "could not reach": the
+  # server was there, and an upload still in progress ends exactly like this.
+  [ "$rc" -eq 28 ] && [ "$connected" -eq 1 ] \
+    && die "no answer from $submit_url within ${timeout}s, although it connected.
+    A $(human "$size") $what that is still uploading ends exactly like this. Raise
+    CI_SUBMIT_TIMEOUT for a slow link, or send less."
+  die "could not reach $submit_url (curl exit $rc)"
+}
+code="${result%% *}"
 
 if [ "$code" -ge 400 ]; then
   if command -v jq >/dev/null 2>&1 && jq -e . "$response" >/dev/null 2>&1; then

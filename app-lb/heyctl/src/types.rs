@@ -123,6 +123,11 @@ impl VmStatus {
 #[serde(default)]
 pub struct DeploymentSpec {
     pub id: String,
+    /// The namespace wall this deployment sits behind. Omitted on the wire when
+    /// it is `default` — a single-tenant app-lb's specs look exactly as they did
+    /// before namespaces — so read it through
+    /// [`namespace()`](DeploymentSpec::namespace) rather than directly.
+    pub namespace: String,
     /// The heyo account this deployment's VMs are metered to, and the user
     /// who registered it. Set by the managed service; absent on a
     /// self-hosted app-lb.
@@ -139,6 +144,18 @@ pub struct DeploymentSpec {
     pub update: Option<UpdateSpec>,
     pub auth: Option<AuthGate>,
     pub site: Option<SiteSpec>,
+}
+
+impl DeploymentSpec {
+    /// The namespace this deployment is in, filling in the default the server
+    /// omits.
+    pub fn namespace(&self) -> &str {
+        if self.namespace.is_empty() {
+            crate::DEFAULT_NAMESPACE
+        } else {
+            &self.namespace
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -441,11 +458,25 @@ pub struct SecretRef {
     pub secret: String,
     pub key: String,
     pub username: Option<String>,
+    /// The namespace the reference resolves in. Stamped by app-lb from the
+    /// owning object's namespace, so it is never the client's choice — but it
+    /// is worth rendering when it is *not* the namespace being looked at, which
+    /// would otherwise read as a secret that does not exist.
+    pub namespace: Option<String>,
 }
 
 impl SecretRef {
     pub fn render(&self) -> String {
         format!("{}/{}", self.secret, self.key)
+    }
+
+    /// The same thing, said from inside `ns`: qualified only when the reference
+    /// resolves somewhere else.
+    pub fn render_in(&self, ns: &str) -> String {
+        match self.namespace.as_deref() {
+            Some(other) if other != ns => format!("{}/{} in namespace {other}", self.secret, self.key),
+            _ => self.render(),
+        }
     }
 }
 
@@ -525,6 +556,11 @@ pub struct AuthGate {
     pub forward_identity: bool,
     /// How a JWT is verified, when `jwt` is among the providers.
     pub jwt: Option<JwtSpec>,
+    /// The namespace auth provider this gate inherits its identity from, if it
+    /// inherits one. Mutually exclusive with every identity field above — the
+    /// server refuses a gate that sets both — so a gate with this set looks
+    /// empty until the provider is fetched.
+    pub provider_ref: Option<String>,
 }
 
 /// How a gate verifies a JWT somebody else issued, and which ones it admits.
@@ -548,6 +584,12 @@ pub struct JwtSpec {
     pub name_claim: String,
     pub leeway_secs: Option<u64>,
     pub cookie: Option<String>,
+    /// Where a token-less *browser* is sent to acquire one. Requires `cookie`:
+    /// a navigation can only carry a credential in one.
+    pub login_url: Option<String>,
+    /// The query parameter that sign-in page reads the return URL from.
+    /// `redirect_uri` when unset.
+    pub login_redirect_param: Option<String>,
 }
 
 impl JwtSpec {
@@ -642,6 +684,90 @@ impl AuthGate {
             "https://{host}{}/callback",
             self.base_path.trim_end_matches('/')
         )
+    }
+}
+
+// -- GET /auth-providers, GET /auth-providers/:namespace/:name -------------
+
+/// A declared auth provider: the identity half of a gate, named and owned by a
+/// namespace.
+///
+/// The same fields an [`AuthGate`] carries for identity — who may enter and how
+/// they are verified — with none of the route-scoped ones. A deployment
+/// inherits it with `auth.provider_ref`, and app-lb resolves it on every gated
+/// request, so editing this object reaches every deployment that names it.
+///
+/// Secrets appear as references, never values, which is what makes the object
+/// safe to print.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct AuthProviderView {
+    pub name: String,
+    pub namespace: String,
+    pub description: Option<String>,
+    pub created_at: u64,
+    /// One provider or several, spelled as the server spells it — a `Value` for
+    /// the reason [`AuthGate::provider`] is one.
+    pub provider: Value,
+    pub client_id: Option<String>,
+    pub client_secret: Option<SecretRef>,
+    pub allowed_domains: Vec<String>,
+    pub allowed_emails: Vec<String>,
+    pub jwt: Option<JwtSpec>,
+    pub cookie_domain: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl AuthProviderView {
+    /// The providers this object admits, however the server spelled them.
+    /// Shares [`AuthGate::providers`]'s rule, including that an empty value
+    /// means Google.
+    pub fn providers(&self) -> Vec<String> {
+        match &self.provider {
+            Value::String(s) if !s.is_empty() => vec![s.clone()],
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => vec!["google".to_string()],
+        }
+    }
+
+    /// Who this provider lets in, in one column: the Google allow-list, the
+    /// JWT `require` map, or — for `app-token` — a statement that the token's
+    /// own scope decides.
+    pub fn admits(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.allowed_domains.is_empty() || !self.allowed_emails.is_empty() {
+            if self.allowed_domains.iter().any(|d| d == "*") {
+                parts.push("any Google account".into());
+            } else {
+                parts.extend(self.allowed_domains.iter().map(|d| format!("@{d}")));
+            }
+            parts.extend(self.allowed_emails.iter().cloned());
+        }
+        if let Some(jwt) = &self.jwt {
+            parts.push(jwt.require_summary());
+        }
+        if parts.is_empty() && self.providers().iter().any(|p| p == "app-token") {
+            parts.push("whatever the app-token is scoped to".into());
+        }
+        if parts.is_empty() {
+            "<nobody>".into()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    /// Where the trust comes from, for the listing's one column: the issuer for
+    /// a JWT provider, the OAuth client for Google.
+    pub fn trust_summary(&self) -> String {
+        match (&self.jwt, &self.client_id) {
+            (Some(jwt), _) => jwt.issuer.clone(),
+            (None, Some(id)) => id.clone(),
+            (None, None) => "—".into(),
+        }
     }
 }
 
