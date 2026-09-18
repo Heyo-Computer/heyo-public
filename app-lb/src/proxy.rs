@@ -862,7 +862,7 @@ impl ProxyHttp for LbProxy {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let deployment = ctx
+        let mut deployment = ctx
             .deployment
             .clone()
             .ok_or_else(|| Error::explain(ErrorType::InternalError, "no deployment in ctx"))?;
@@ -891,13 +891,28 @@ impl ProxyHttp for LbProxy {
         // unhealthy and skipped, so a bad static upstream fails over to a good one
         // (and the autoscaler's health re-probe restores it once it resolves).
         let addr = loop {
+            let observed = deployment.clone();
+            let changed = observed.ready_signal.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(current) = self.registry.get(&deployment.spec.id) {
+                if !Arc::ptr_eq(&current, &deployment) {
+                    drop(changed);
+                    deployment = current;
+                    ctx.deployment = Some(deployment.clone());
+                    continue;
+                }
+            }
             let backend = match deployment.select(&ctx.failed) {
                 Some(b) => b,
                 None => {
                     // Nothing ready. If the deployment can still grow, hold the
                     // request while a VM boots rather than failing the caller.
                     // (A static deployment never grows, so this returns at once.)
-                    match wait_for_capacity(&deployment, &ctx.failed, &self.metrics, &self.feed).await {
+                    match tokio::select! {
+                        result = wait_for_capacity(&deployment, &ctx.failed, &self.metrics, &self.feed) => result,
+                        _ = &mut changed => continue,
+                    } {
                         Some(b) => b,
                         None => {
                             return Err(Error::explain(

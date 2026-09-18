@@ -85,6 +85,16 @@ pub async fn monitoring(
         // Same 24h window as the charts, so the create rate above and the
         // create latency below describe exactly the same set of creates.
         vm_create: crate::events::timing_stats(crate::events::Timing::VmCreate, 24),
+        // Same window again, so a restore rate above and its latency below
+        // describe the same restores.
+        restore_latency: views::RestoreLatency {
+            s3_image: crate::events::timing_stats(crate::events::Timing::RestoreS3Image, 24),
+            s3_dump: crate::events::timing_stats(crate::events::Timing::RestoreS3Dump, 24),
+            local_image: crate::events::timing_stats(crate::events::Timing::RestoreLocalImage, 24),
+            local_dump: crate::events::timing_stats(crate::events::Timing::RestoreLocalDump, 24),
+            s3_download: crate::events::timing_stats(crate::events::Timing::RestoreS3Download, 24),
+            image_adopt: crate::events::timing_stats(crate::events::Timing::RestoreImageAdopt, 24),
+        },
     };
     Ok(views::monitoring_page(
         &st,

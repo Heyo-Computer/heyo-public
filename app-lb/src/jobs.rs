@@ -809,6 +809,9 @@ impl Jobs {
         let intent_fingerprint = fingerprint(&(digest.clone(), force, &config_fingerprint));
 
         let mut running = self.running.lock().expect("job slot mutex poisoned");
+        if self.registry.get(deployment_id).is_some_and(|d| crate::rollout::reserved(&d)) {
+            return Err(StartError::AlreadyRunning(deployment_id.into()));
+        }
         let mut history = self.history.lock().expect("job history mutex poisoned");
         if let Some(existing) = history.iter().find(|r| {
             r.deployment == deployment_id
@@ -941,6 +944,37 @@ impl Jobs {
             .is_some_and(|vm| vm.mounts.iter().any(|m| self.cfg.mounts.resolve(m).is_none()))
     }
 
+    pub fn with_rollout_slot<T>(&self, id: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let running = self.running.lock().expect("job slot mutex poisoned");
+        if running.contains(id) { return Err("legacy deployment job is running".into()); }
+        f()
+    }
+
+    /// Materialize privately: never install a spec or recycle its serving pool.
+    /// Force verification rather than trusting catalog name/size reuse.
+    pub async fn prepare_candidate(&self, spec: &crate::config::DeploymentSpec, generation: &str) -> Result<crate::config::DeploymentSpec, String> {
+        let puller = self.puller.for_candidate()?;
+        let mut prepared = spec.clone();
+        let mut artifact = spec.artifact.clone().ok_or("pinned rootfs artifact required")?;
+        artifact.image_name = Some(format!("rollout-{}", generation));
+        let key = self.store_key(artifact.auth.as_ref())?;
+        artifact.artifact_ref = puller.pinned_rootfs(&artifact, key.as_deref()).await?;
+        let mut log = |_: String| {};
+        let pulled = puller.pull(&spec.id, &artifact, key.as_deref(), true, &mut log).await?;
+        if pulled.digest != artifact.artifact_ref { return Err("rootfs blob differs from pinned manifest".into()); }
+        let vm = prepared.vm.as_mut().ok_or("managed VM required")?;
+        vm.image = Some(pulled.image);
+        vm.image_download_url = None;
+        vm.image_sha256 = None;
+        vm.image_size_bytes = None;
+        for mount in &spec.vm_spec().mounts {
+            let key = self.store_key(mount.auth.as_ref())?;
+            let pulled = puller.pull_mount(mount, &self.cfg.mounts, key.as_deref(), true, &mut log).await?;
+            if Some(&pulled.digest) != mount.digest.as_ref() { return Err("mount digest differs from requested artifact".into()); }
+        }
+        Ok(prepared)
+    }
+
     /// Run a static deployment's update commands on this host.
     pub fn start_update(
         self: &Arc<Self>,
@@ -975,6 +1009,7 @@ impl Jobs {
         let Some(deployment) = self.registry.get(deployment_id) else {
             return Err(StartError::NoDeployment(deployment_id.to_string()));
         };
+        if crate::rollout::reserved(&deployment) { return Err(StartError::AlreadyRunning(deployment_id.into())); }
         let backend = deployment.spec.backend();
         if !kind.applies_to(backend) {
             return Err(StartError::WrongKind {
@@ -1004,6 +1039,9 @@ impl Jobs {
     {
         {
             let mut running = self.running.lock().expect("job slot mutex poisoned");
+            if self.registry.get(deployment_id).is_some_and(|d| crate::rollout::reserved(&d)) {
+                return Err(StartError::AlreadyRunning(deployment_id.into()));
+            }
             if !running.insert(deployment_id.to_string()) {
                 return Err(StartError::AlreadyRunning(deployment_id.to_string()));
             }
@@ -1403,6 +1441,10 @@ impl Jobs {
                  the image {image:?} was built but nothing is using it"
             ));
         };
+        if crate::rollout::reserved(&old) { return Err("candidate rollout reserves this deployment".into()); }
+        if self.autoscaler.workspaces().recovery_active(deployment_id) {
+            return Err("workspace recovery reserves this deployment".into());
+        }
         {
             let history = self.history.lock().expect("job history mutex poisoned");
             if let Some(record) = history.iter().find(|r| r.id == job_id && r.operation_id.is_some()) {
@@ -1726,6 +1768,10 @@ impl Jobs {
                  the trees are on this host but nothing is using them"
             ));
         };
+        if crate::rollout::reserved(&old) { return Err("candidate rollout reserves this deployment".into()); }
+        if self.autoscaler.workspaces().recovery_active(deployment_id) {
+            return Err("workspace recovery reserves this deployment".into());
+        }
         let mut spec = old.spec.clone();
         let Some(vm) = spec.vm.as_mut() else {
             return Err(format!(

@@ -44,8 +44,10 @@
 //!   check at read time and this is a write to the host.
 //! * **Devices, fifos and sockets.** Nothing a web server serves.
 //!
-//! Permissions are not taken from the archive either. Files land under app-lb's
-//! umask, so a bundle cannot ship something setuid or group-writable.
+//! Write and special permission bits are not taken from the archive. Files land
+//! as `0644`, with only the archive's executable bits preserved, so a bundle
+//! cannot ship something setuid or group-writable while release entry points
+//! and binaries remain runnable after they are materialized into a VM mount.
 
 use flate2::read::GzDecoder;
 use std::io::Read;
@@ -422,6 +424,17 @@ fn extract(archive: &Path, dest: &Path, strip: usize) -> Result<Unpacked, String
             .map_err(|e| format!("could not write {}: {e}", relative.display()))?;
         let bytes = std::io::copy(&mut entry, &mut file)
             .map_err(|e| format!("could not write {}: {e}", relative.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let executable = entry
+                .header()
+                .mode()
+                .map_err(|e| format!("could not read permissions for {}: {e}", relative.display()))?
+                & 0o111;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644 | executable))
+                .map_err(|e| format!("could not set permissions on {}: {e}", relative.display()))?;
+        }
         out.files += 1;
         out.bytes += bytes;
     }
@@ -538,6 +551,17 @@ mod tests {
         builder.into_inner().unwrap()
     }
 
+    fn executable(name: &str, content: &[u8], mode: u32) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(mode);
+        header.set_cksum();
+        builder.append_data(&mut header, name, content).unwrap();
+        builder.into_inner().unwrap()
+    }
+
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         e.write_all(bytes).unwrap();
@@ -614,6 +638,21 @@ mod tests {
         assert_eq!(out.files, 1);
         staged.commit().unwrap();
         assert_eq!(std::fs::read_to_string(f.root.join("index.html")).unwrap(), "gz");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_bits_survive_without_accepting_archive_write_or_special_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = fixture(&executable("start.sh", b"#!/bin/sh\n", 0o7755));
+        let (staged, _) = stage(&f.root, &f.archive, 0).unwrap();
+        staged.commit().unwrap();
+
+        assert_eq!(
+            std::fs::metadata(f.root.join("start.sh")).unwrap().permissions().mode() & 0o7777,
+            0o755,
+        );
     }
 
     /// `tar czf dist.tgz dist` is what people actually run, and it wraps

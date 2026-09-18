@@ -779,6 +779,14 @@ pub async fn ensure_vm(
              restore {restore_took:?}, slots {bootstrap_took:?}",
         );
 
+        // Time to a serving Postgres, per restore source — the same span the
+        // line above breaks into phases, and the same bound `VmCreate` uses:
+        // successful bring-ups only, admission wait excluded. A bring-up with
+        // nothing to restore is already covered by `VmCreate`.
+        if let Some(source) = restore {
+            crate::events::record_timing(restore_timing(source), bringup_started.elapsed());
+        }
+
         Ok(Arc::new(SchemaEntry::new(
             sandbox,
             target,
@@ -1940,8 +1948,14 @@ async fn restore_from_s3(
         match s3.head_object(&http, &key, ARCHIVE_HEAD_TIMEOUT).await {
             Ok(None) => bail!(
                 "schema {schema} is marked archived but s3://{}/{key} does not exist — \
-                 there is no archive to restore",
-                s3.bucket
+                 there is no archive to restore{}",
+                s3.bucket,
+                s3.fallback_prefix()
+                    .map(|p| format!(
+                        " (the legacy prefix {p} is read only when this host's prefix is \
+                         known to hold nothing for the schema)"
+                    ))
+                    .unwrap_or_default()
             ),
             Ok(Some(id)) if id.content_length < MIN_ARCHIVE_BYTES => bail!(
                 "schema {schema}: the archive at s3://{}/{key} is only {} bytes — it was \
@@ -2456,7 +2470,7 @@ async fn power_cycle(
 /// Never fails — every failure mode becomes descriptive text.
 async fn boot_evidence(cfg: &Config, sandbox: &Sandbox) -> String {
     let cmd = "v=$(cat /workspace/pgdata/PG_VERSION 2>/dev/null || echo '?'); \
-               s=$(postgres --version 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo '?'); \
+               s=$(ls /usr/lib/postgresql 2>/dev/null | sort -n | tail -1); [ -n \"$s\" ] || s='?'; \
                echo \"pgdata=v$v server=v$s pg-procs=$(pgrep -c postgres 2>/dev/null || echo 0)\"; \
                tail -n 4 /workspace/pg-startup.log 2>/dev/null; \
                tail -n 3 \"$(ls -t /workspace/pgdata/log/*.log 2>/dev/null | head -1)\" 2>/dev/null \
@@ -2679,6 +2693,21 @@ pub(crate) async fn resolve_sandbox(
     create_vm(cfg, name, keepalive, disk_gb)
         .await
         .map(|sb| (sb, Provenance::Created))
+}
+
+/// Which total a restore of this source records. Kept apart rather than
+/// summed into one "restore" figure: a dump reloads through Postgres while an
+/// image swaps a disk under a booted VM, and the S3 pair pays a download the
+/// local pair does not — one percentile over all four would describe no
+/// restore anyone actually waited for.
+fn restore_timing(source: &RestoreSource) -> crate::events::Timing {
+    use crate::events::Timing;
+    match source {
+        RestoreSource::S3(_) => Timing::RestoreS3Dump,
+        RestoreSource::S3Image(_) => Timing::RestoreS3Image,
+        RestoreSource::Local { .. } => Timing::RestoreLocalDump,
+        RestoreSource::LocalImage(_) => Timing::RestoreLocalImage,
+    }
 }
 
 /// A booted, ready VM for an image restore to use as its *vehicle*: the caller
@@ -4338,6 +4367,34 @@ const REPL_MARKER: &str = "/workspace/heyvm-replication";
 /// grants and every replication status view are per-database objects, so they
 /// need their own connection. Built fresh per call rather than pooled: these
 /// are operator-paced actions and a monitor tick, not a hot path.
+/// Whether `schema`'s database holds any user relation — the SQL answer to
+/// the question [`crate::imgarchive::cluster_contents_of`] answers offline,
+/// used where a running Postgres is in hand (the dump archive path).
+///
+/// `None` when the question couldn't be answered at all: an unreachable
+/// database is never a reason to call a workbook empty.
+pub(crate) async fn has_user_relations(
+    cfg: &Config,
+    target: &SocketAddr,
+    schema: &str,
+) -> Option<bool> {
+    let ask = async {
+        let client = db_client(cfg, target, schema).await.ok()?;
+        let row = client
+            .query_one(
+                "SELECT count(*) FROM pg_class c                  JOIN pg_namespace n ON n.oid = c.relnamespace                  WHERE c.relkind IN ('r', 'p', 'm', 'f')                  AND n.nspname NOT IN ('pg_catalog', 'information_schema')",
+                &[],
+            )
+            .await
+            .ok()?;
+        let relations: i64 = row.get(0);
+        Some(relations > 0)
+    };
+    tokio::time::timeout(Duration::from_secs(30), ask)
+        .await
+        .ok()?
+}
+
 pub(crate) async fn db_client(
     cfg: &Config,
     target: &SocketAddr,

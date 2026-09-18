@@ -223,6 +223,8 @@ pub struct Registry {
     /// Every deployment uses a deterministic temporary filename. Serialize
     /// writes so concurrent background and admin persistence cannot clobber it.
     persist_lock: std::sync::Mutex<()>,
+    #[cfg(test)]
+    pub(crate) fail_after_rename: std::sync::atomic::AtomicBool,
     /// Whether the last [`load`](Registry::load) left a file on disk that it
     /// could not turn into a deployment. Gates
     /// [`sweep_orphan_state`](Registry::sweep_orphan_state), which must not
@@ -238,6 +240,8 @@ impl Registry {
             persist_path: persist_path.into(),
             change_lock: tokio::sync::Mutex::new(()),
             persist_lock: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             load_skipped: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -294,6 +298,12 @@ impl Registry {
         if let Some(state) = previous_state {
             deployment.set_state(state);
         }
+        if let Some(previous) = &previous {
+            deployment.mutate_state(|s| {
+                s.rollouts = previous.state().rollouts.clone();
+                s.rollout_revision = crate::rollout::revision();
+            });
+        }
         if deployment.spec.is_static()
             && let Some(previous) = previous.filter(|previous| previous.spec.is_static())
         {
@@ -348,6 +358,7 @@ impl Registry {
         // deployment had suspended — they are absent from the daemon's fleet
         // list, so nothing else remembers them.
         new.set_state((*old.state()).clone());
+        new.mutate_state(|s| s.rollout_revision = crate::rollout::revision());
         new.set_backends((*old.backends()).clone());
         new.set_pending((*old.pending()).clone());
         self.install(Some(new.clone()), &new.spec.id.clone());
@@ -372,6 +383,10 @@ impl Registry {
     /// two `store`s are ordered deployments-then-routes so a request that
     /// resolves an id always finds it — the reverse order has a window where the
     /// index names a deployment the map does not yet hold.
+    pub(crate) fn publish(&self, deployment: Arc<Deployment>) {
+        self.install(Some(deployment.clone()), &deployment.spec.id);
+    }
+
     fn install(&self, deployment: Option<Arc<Deployment>>, id: &str) {
         let current = self.deployments.load();
         let previous = current.get(id).cloned();
@@ -469,6 +484,10 @@ impl Registry {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, &path)?;
+        #[cfg(test)]
+        if self.fail_after_rename.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected failure after rename"));
+        }
         // The rename is not durable until the directory entry is synced. A
         // successful drain must not disappear after a host crash and silently
         // reopen traffic on restart.

@@ -204,3 +204,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # field *names* in app-obs: a rename would reshape every security log stored.
 u-siem = "=0.7.0"
 schemars = "1.2.2"
+
+[dev-dependencies]
+tempfile = "3"

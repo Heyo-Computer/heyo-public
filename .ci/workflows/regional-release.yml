@@ -1,0 +1,94 @@
+# Activate only after both hosts expose the correlated rollout APIs and the
+# controller supports these actions. Validation-only submissions do not run this
+# coordinator. Tokens and host aliases are provisioned by the operator, never
+# taken from a build artifact. NATS is an independent service and is not updated.
+name: regional-release
+on: release
+
+jobs:
+  merge:
+    vm: &release_vm
+      driver: firecracker
+      build:
+        dockerfile: .ci/image/ci/Dockerfile
+        context: .ci/image/ci
+        size_mb: 6144
+      size_class: small
+      disk_size_gb: 10
+      ttl_seconds: 7200
+    steps:
+      - uses: ci/merge-release
+        with:
+          manifests: '[]'
+          token: ${{ secrets.GIT_AUTH_TOKEN }}
+
+  us3:
+    needs: [merge]
+    vm: *release_vm
+    timeout-minutes: 60
+    steps:
+      - name: Verify us3 host app-lb replacement
+        if: ${{ changed('app-lb/**', '.ci/workflows/app-lb.yml', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
+        uses: ci/rollout-host-app-lb
+        timeout-minutes: 20
+        with:
+          target: app-lb-us3
+          token: ${{ secrets.APP_LB_US3_TOKEN }}
+          workflow: .ci/workflows/app-lb.yml
+          artifact: app-lb
+      - name: Verify us3 orchestrator candidate and predecessor drain
+        if: ${{ changed('orchestrator/**', 'heyosecret-client/**', 'app-lb/src/artifact.rs', 'app-lb/src/mounts.rs', 'app-lb/src/unpack.rs', '.ci/workflows/orchestrator.yml', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
+        uses: ci/rollout-service
+        timeout-minutes: 30
+        with:
+          url: https://admin.us3.heyo.work
+          token: ${{ secrets.APP_LB_US3_TOKEN }}
+          deployment: orchestrator-us3-next
+          namespace: default
+          # Reuse the registered release mount and its private-store credential.
+          mount-path: /opt/orchestrator-release
+          revision-env: HEYO_ORCHESTRATOR_DEPLOYMENT_GIT_SHA
+          workflow: .ci/workflows/orchestrator.yml
+          artifact: orchestrator-linux
+
+  eu1:
+    needs: [us3]
+    vm: *release_vm
+    timeout-minutes: 60
+    steps:
+      - name: Verify eu1 host app-lb replacement
+        if: ${{ changed('app-lb/**', '.ci/workflows/app-lb.yml', '.ci/image/apps/**', '.ci/workflows/regional-release.yml') }}
+        uses: ci/rollout-host-app-lb
+        timeout-minutes: 20
+        with:
+          target: app-lb-eu1
+          token: ${{ secrets.APP_LB_EU1_TOKEN }}
+          workflow: .ci/workflows/app-lb.yml
+          artifact: app-lb
+      - name: Verify eu1 orchestrator candidate and predecessor drain
+        if: ${{ changed('orchestrator/**', 'heyosecret-client/**', 'app-lb/src/artifact.rs', 'app-lb/src/mounts.rs', 'app-lb/src/unpack.rs', '.ci/workflows/orchestrator.yml', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
+        uses: ci/rollout-service
+        timeout-minutes: 30
+        with:
+          url: https://admin.eu1.heyo.work
+          token: ${{ secrets.APP_LB_EU1_TOKEN }}
+          deployment: orchestrator-eu1
+          namespace: default
+          # Reuse the registered release mount and its private-store credential.
+          mount-path: /opt/orchestrator-release
+          revision-env: HEYO_ORCHESTRATOR_DEPLOYMENT_GIT_SHA
+          workflow: .ci/workflows/orchestrator.yml
+          artifact: orchestrator-linux
+
+  controller:
+    needs: [eu1]
+    vm: *release_vm
+    timeout-minutes: 30
+    steps:
+      - name: Replace CI only after both regional stages succeed
+        if: ${{ changed('ci/**', 'app-lb/src/host_bundle.rs', '.ci/workflows/ci.yml', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
+        uses: ci/deploy-controller
+        timeout-minutes: 25
+        with:
+          workflow: .ci/workflows/ci.yml
+          artifact: ci

@@ -2610,7 +2610,7 @@ impl Dispatcher {
             .ok_or_else(|| DispatchError::StepFailed(format!("{action} requires with.{key}")));
 
         if matches!(action, "ci/merge-release" | "ci/publish-service-archive" |
-            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance" | "ci/rollout-service") {
+            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance" | "ci/rollout-service" | "ci/rollout-host-app-lb") {
             crate::submission::authorize_publication(&self.store, &msg.run_id).await
                 .map_err(DispatchError::StepFailed)?;
         }
@@ -2753,6 +2753,11 @@ impl Dispatcher {
                     &required("deployment")?, &required("namespace")?, &required("manifest")?, &required("store")?,
                     step_timeout(step, plan), masker).await
                     .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
+            }
+            "ci/rollout-host-app-lb" => {
+                crate::host_app_lb::deploy(self, msg, sid, &required("target")?, &required("token")?,
+                    &required("workflow")?, &required("artifact")?, step_timeout(step, plan), masker).await
+                    .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
             }
             "ci/rollout-service" => {
                 let mount_path = required("mount-path")?;

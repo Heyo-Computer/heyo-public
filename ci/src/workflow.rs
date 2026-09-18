@@ -1003,6 +1003,7 @@ jobs:
     fn this_repositorys_own_workflows_parse_and_plan() {
         let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.ci/workflows"));
         let mut checked = 0;
+        let mut releases = 0;
         for entry in std::fs::read_dir(dir)
             .expect(".ci/workflows exists")
             .flatten()
@@ -1014,18 +1015,21 @@ jobs:
             let text = std::fs::read_to_string(&path).expect("readable");
             let wf = Workflow::parse(&path.display().to_string(), &text)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            assert!(
-                wf.on.iter().any(|t| t == "submit"),
-                "{} does not trigger on `submit`, so a submit would silently \
-                 skip it and report that nothing matched",
-                path.display()
-            );
-            crate::plan::Plan::build(&wf).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let plan = crate::plan::Plan::build(&wf).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            if wf.on.iter().any(|t| t == "release") {
+                assert_eq!(wf.on, ["release"]);
+                crate::submission::validate_release_plan(&plan).unwrap();
+                releases += 1;
+            } else {
+                assert!(wf.on.iter().any(|t| t == "submit"), "{} has no submission trigger", path.display());
+                crate::submission::validate_validation_plan(&plan).unwrap();
+            }
             checked += 1;
         }
         // Without this the test passes by finding nothing, which is exactly what
         // happens if the directory is ever renamed.
         assert!(checked > 0, "no workflow files found in {}", dir.display());
+        assert_eq!(releases, 1, "exactly one coordinator must own publication");
     }
 
     #[test]
@@ -1638,13 +1642,14 @@ mod repo_workflow {
 
         let plan =
             crate::plan::Plan::build(&wf).unwrap_or_else(|e| panic!("{path} does not plan: {e}"));
-        assert_eq!(plan.jobs.len(), 3);
-        let merge = plan.jobs.iter().find(|j| j.base_id == "merge").unwrap();
-        assert_eq!(merge.needs, ["release"]);
-        let deploy = plan.jobs.iter().find(|j| j.base_id == "deploy").unwrap();
-        assert_eq!(deploy.needs, ["merge"]);
+        assert_eq!(plan.jobs.len(), 1);
+        crate::submission::validate_validation_plan(&plan).unwrap();
         let validate = plan.jobs.iter().find(|j| j.base_id == "release").unwrap();
         assert!(!validate.target.local, "CI builds must not pin the controller host");
+        assert!(wf.on_submit.paths.iter().any(|p| p == "app-lb/src/host_bundle.rs"),
+            "CI must rebuild when its shared archive validator changes");
+        assert!(validate.condition.as_deref().unwrap().contains("'app-lb/src/host_bundle.rs'"),
+            "the job filter must not skip a shared archive validator change");
         assert!(validate.steps.iter().any(|s| s.run.as_deref().is_some_and(|s|
             s == "cargo test --release --locked -- --test-threads=1")));
 
@@ -1654,7 +1659,7 @@ mod repo_workflow {
             for step in &job.steps {
                 if let Some(action) = &step.uses {
                     assert!(
-                        matches!(action.as_str(), "ci/upload-artifact" | "ci/merge-release" | "ci/deploy-controller"),
+                        matches!(action.as_str(), "ci/upload-artifact"),
                         "{path} uses {action:?}, which is not a built-in action"
                     );
                 }
@@ -1662,42 +1667,64 @@ mod repo_workflow {
         }
     }
 
-    #[cfg(unix)]
     #[test]
-    fn ci_release_scope_and_deployment_gate_execute_fail_closed() {
-        use std::os::unix::fs::PermissionsExt;
-        let text = include_str!("../../.ci/workflows/ci.yml");
-        let wf = Workflow::parse("ci.yml", text).unwrap();
+    fn regional_release_orders_regions_and_selects_exact_validation_artifacts() {
+        let text = include_str!("../../.ci/workflows/regional-release.yml");
+        let wf = Workflow::parse("regional-release.yml", text).unwrap();
+        assert_eq!(wf.on, ["release"]);
         let plan = crate::plan::Plan::build(&wf).unwrap();
-        let merge = plan.jobs.iter().find(|j| j.base_id == "merge").unwrap();
-        let scope = merge.steps[0].run.as_ref().unwrap();
-        let deploy = plan.jobs.iter().find(|j| j.base_id == "deploy").unwrap();
-        let gate = deploy.steps[0].run.as_ref().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let git = tmp.path().join("git");
-        std::fs::write(&git, "#!/bin/sh\ncase \"$1\" in\nmerge-base) exit 0;;\ndiff) printf '%s\\0' \"$TEST_PATH\";;\n*) exit 2;;\nesac\n").unwrap();
-        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
-        for (path, expected) in [("ci/src/main.rs", Some("true")), ("ci/README.md", Some("false")),
-            (".ci/workflows/ci.yml", Some("false")), (".ci/image/ci/Dockerfile", Some("true")),
-            ("app-lb/src/main.rs", None)] {
-            let output_file = tmp.path().join("outputs");
-            std::fs::write(&output_file, "").unwrap();
-            let out = std::process::Command::new("sh").arg("-c").arg(scope)
-                .env("PATH", format!("{}:{}", tmp.path().display(), std::env::var("PATH").unwrap()))
-                .env("RELEASE_BASE", "base").env("SOURCE_SHA", "head")
-                .env("TEST_PATH", path).env("CI_OUTPUT", &output_file).output().unwrap();
-            assert_eq!(out.status.success(), expected.is_some(), "{}", String::from_utf8_lossy(&out.stderr));
-            if let Some(expected) = expected {
-                assert_eq!(std::fs::read_to_string(output_file).unwrap(), format!("deploy_required={expected}\n"));
+        crate::submission::validate_release_plan(&plan).unwrap();
+        assert_eq!(plan.jobs.iter().map(|j| j.base_id.as_str()).collect::<Vec<_>>(),
+            ["merge", "us3", "eu1", "controller"]);
+        for (i, predecessor) in [(1, "merge"), (2, "us3"), (3, "eu1")] {
+            assert_eq!(plan.jobs[i].needs, [predecessor]);
+            assert!(plan.jobs[i].condition.is_none(), "do not skip a dependency stage");
+        }
+        for (i, region, deployment) in [(1, "us3", "orchestrator-us3-next"), (2, "eu1", "orchestrator-eu1")] {
+            let steps = &plan.jobs[i].steps;
+            assert_eq!(steps[0].uses.as_deref(), Some("ci/rollout-host-app-lb"));
+            assert_eq!(steps[0].with["target"], format!("app-lb-{region}"));
+            assert_eq!(steps[1].uses.as_deref(), Some("ci/rollout-service"));
+            assert_eq!(steps[1].with["deployment"], deployment);
+            assert_eq!(steps[1].with["url"], format!("https://admin.{region}.heyo.work"));
+            assert_eq!(steps[1].with["mount-path"], "/opt/orchestrator-release",
+                "reuse the registered private release mount instead of adding an unauthenticated mount");
+        }
+        assert_eq!(plan.jobs[3].steps.last().unwrap().uses.as_deref(), Some("ci/deploy-controller"));
+
+        // Exercise asymmetric changes: a shared parser affects CI and app-lb,
+        // release-mount extraction affects app-lb and its mounted service, while
+        // a service-only edit must not silently demand an absent bundle.
+        for (path, expected) in [
+            ("app-lb/src/main.rs", vec!["app-lb"]),
+            ("app-lb/src/host_bundle.rs", vec!["app-lb", "ci"]),
+            ("app-lb/src/unpack.rs", vec!["app-lb", "orchestrator-linux"]),
+            ("ci/src/main.rs", vec!["ci"]),
+            ("orchestrator/src/main.rs", vec!["orchestrator-linux"]),
+            ("heyosecret-client/src/lib.rs", vec!["orchestrator-linux"]),
+            (".ci/image/ci/Dockerfile", vec!["ci", "orchestrator-linux"]),
+            (".ci/image/apps/Dockerfile", vec!["app-lb"]),
+            (".ci/workflows/regional-release.yml", vec!["app-lb", "ci", "orchestrator-linux"]),
+            ("README.md", vec![]),
+        ] {
+            let changes = crate::paths::Changes::known(vec![path.into()]);
+            let mut ctx = crate::expr::Context::new();
+            ctx.set("ci", serde_json::json!({"changes_known":true,"changed_files":[path]}));
+            for step in plan.jobs.iter().skip(1).flat_map(|j| &j.steps) {
+                let validation_path = &step.with["workflow"];
+                let yaml = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(validation_path)).unwrap();
+                let validation = Workflow::parse(validation_path, &yaml).unwrap();
+                let build = crate::plan::Plan::build(&validation).unwrap();
+                crate::submission::validate_validation_plan(&build).unwrap();
+                let selected = ctx.eval_condition(step.condition.as_deref().unwrap()).unwrap();
+                assert_eq!(selected, expected.contains(&step.with["artifact"].as_str()), "{path}: {validation_path}");
+                assert_eq!(selected, validation.on_submit.admits("feature", &changes).is_ok(), "{path}: {validation_path}");
+                if selected {
+                    assert!(build.jobs.iter().all(|j| j.condition.as_deref().is_none_or(|c| ctx.eval_condition(c).unwrap())));
+                    assert!(build.jobs.iter().flat_map(|j| &j.steps).any(|s|
+                        s.uses.as_deref() == Some("ci/upload-artifact") && s.with.get("name") == step.with.get("artifact")));
+                }
             }
         }
-        for (value, success) in [("false", true), ("true", true), ("", false)] {
-            let out = std::process::Command::new("sh").arg("-c").arg(gate)
-                .env("DEPLOY_REQUIRED", value).output().unwrap();
-            assert_eq!(out.status.success(), success);
-        }
-        let rollout = &deploy.steps[1];
-        assert_eq!(rollout.uses.as_deref(), Some("ci/deploy-controller"));
-        assert_eq!(rollout.condition.as_deref(), Some("${{ needs.merge.outputs.deploy_required == 'true' }}"));
     }
 }

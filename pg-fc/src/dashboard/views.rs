@@ -306,6 +306,22 @@ pub struct ActivitySeries {
     /// nothing was created in it — which is not the same as "creates are
     /// instant", so the page says which it is.
     pub vm_create: Option<crate::events::TimingStats>,
+    /// Time to a serving Postgres per restore source, and the two phases an
+    /// image restore splits into, over the same window. Each is `None` when
+    /// that source saw no restore in it.
+    pub restore_latency: RestoreLatency,
+}
+
+/// The restore side of the latency picture: one total per source, plus the
+/// download/adopt split that says which half of an image restore to tune.
+#[derive(Default)]
+pub struct RestoreLatency {
+    pub s3_image: Option<crate::events::TimingStats>,
+    pub s3_dump: Option<crate::events::TimingStats>,
+    pub local_image: Option<crate::events::TimingStats>,
+    pub local_dump: Option<crate::events::TimingStats>,
+    pub s3_download: Option<crate::events::TimingStats>,
+    pub image_adopt: Option<crate::events::TimingStats>,
 }
 
 /// The monitoring view: whole-host CPU/memory/disk saturation plus pooler-fleet
@@ -494,6 +510,9 @@ pub fn monitoring_page(
 
             h3.sub-head { "restores from local dumps" }
             (hourly_bar_chart(&activity.restores_local, "restore"))
+
+            h3.sub-head { "restore latency" }
+            (restore_latency_table(&activity.restore_latency))
 
             h3.sub-head { "VMs created" }
             (hourly_bar_chart(&activity.vms_created, "VM"))
@@ -1327,6 +1346,110 @@ fn timing_stats_block(stats: Option<&crate::events::TimingStats>) -> Markup {
             "nearest-rank, so each figure is a create that actually happened."
         }
     }
+}
+
+/// Time to a serving Postgres for each restore source, side by side.
+///
+/// A table rather than four stat blocks because the question an operator
+/// brings here is comparative — is the bucket the problem, or the host? —
+/// and that is a column read, not four paragraphs. Sources that saw no
+/// restore in the window are listed with a dash rather than dropped: "no S3
+/// image restore happened in 24h" is an answer, and a row that vanishes
+/// reads as a missing feature.
+///
+/// The percentile columns carry the same caveat the create block does: at
+/// nearest rank, a p99 needs 100 samples to be distinguishable from the
+/// maximum, so thin windows are marked rather than quietly printed.
+fn restore_latency_table(l: &RestoreLatency) -> Markup {
+    let rows: [(&str, Option<&crate::events::TimingStats>); 4] = [
+        ("S3 disk image", l.s3_image.as_ref()),
+        ("S3 dump", l.s3_dump.as_ref()),
+        ("local image (compacted)", l.local_image.as_ref()),
+        ("local dump (frozen)", l.local_dump.as_ref()),
+    ];
+    // Nearest-rank needs this many samples before the percentile stops being
+    // the maximum in disguise.
+    let thin = |p: u32| (100 / (100 - p)) as usize;
+    let cell = |s: &crate::events::TimingStats, ms: u32, p: u32| -> Markup {
+        html! {
+            (human_ms(ms as u128))
+            @if s.count < thin(p) { span.stat-sub { " (thin)" } }
+        }
+    };
+    html! {
+        table.restores {
+            thead {
+                tr {
+                    th { "source" }
+                    th { "p50" }
+                    th { "p95" }
+                    th { "p99" }
+                    th { "slowest" }
+                    th { "restores" }
+                }
+            }
+            tbody {
+                @for (label, stats) in rows {
+                    tr {
+                        td { (label) }
+                        @match stats {
+                            Some(s) => {
+                                td { (cell(s, s.p50_ms, 50)) }
+                                td { (cell(s, s.p95_ms, 95)) }
+                                td { (cell(s, s.p99_ms, 99)) }
+                                td { (human_ms(s.max_ms as u128)) }
+                                td { (s.count) }
+                            }
+                            None => {
+                                td { "—" } td { "—" } td { "—" } td { "—" } td { "0" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        p.note {
+            "Time from the bring-up starting to a Postgres serving the client, per source — "
+            "the wait for an admission slot is excluded (it measures how many other clients "
+            "arrived at once), and only restores that finished are counted. Read the two "
+            "image rows against each other: the gap between them is what fetching from the "
+            "bucket costs, since everything after the download is identical work. "
+            (image_phase_note(l))
+            " Percentiles are nearest-rank, so every figure is a restore that actually "
+            "happened; \"thin\" marks a window with too few samples to tell that "
+            "percentile from the slowest one."
+        }
+    }
+}
+
+/// The download/adopt split for image restores, as a sentence — it describes
+/// phases of the image rows above rather than restores of its own, so it
+/// belongs in the note and not as two more table rows.
+fn image_phase_note(l: &RestoreLatency) -> Markup {
+    let phase = |what: &str, s: Option<&crate::events::TimingStats>| -> Option<String> {
+        let s = s?;
+        Some(format!(
+            "{what} p50 {}, p95 {} over {} sample{}",
+            human_ms(s.p50_ms as u128),
+            human_ms(s.p95_ms as u128),
+            s.count,
+            if s.count == 1 { "" } else { "s" }
+        ))
+    };
+    let parts: Vec<String> = [
+        phase("S3 download", l.s3_download.as_ref()),
+        phase(
+            "decompress + repair + disk swap + boot",
+            l.image_adopt.as_ref(),
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if parts.is_empty() {
+        return html! {};
+    }
+    html! { "Inside an image restore: " (parts.join("; ")) "." }
 }
 
 fn stat(label: &str, value: &str, sub: Option<&str>) -> Markup {
@@ -2280,6 +2403,55 @@ mod tests {
         }
     }
 
+    /// The restore table is read as a comparison, so a source with no
+    /// restores in the window has to stay on the page as a dash — a row that
+    /// disappears reads as a feature that is missing, and the operator is
+    /// here precisely to find out which sources are being used.
+    #[test]
+    fn restore_latency_table_keeps_idle_sources_and_marks_thin_windows() {
+        let stats = |count: usize, p50: u32, max: u32| TimingStats {
+            count,
+            p50_ms: p50,
+            p95_ms: max,
+            p99_ms: max,
+            max_ms: max,
+        };
+        let html = restore_latency_table(&RestoreLatency {
+            s3_image: Some(stats(3, 9_000, 30_000)),
+            local_image: Some(stats(200, 900, 4_000)),
+            s3_download: Some(stats(3, 6_000, 20_000)),
+            ..Default::default()
+        })
+        .into_string();
+
+        assert!(html.contains("S3 disk image"), "{html}");
+        assert!(html.contains("local image (compacted)"), "{html}");
+        // Both dump sources were idle: still listed, with dashes.
+        assert!(
+            html.contains("S3 dump"),
+            "an idle source must stay on the page: {html}"
+        );
+        assert!(html.contains("local dump (frozen)"), "{html}");
+        assert!(
+            html.contains("—"),
+            "an idle source reports a dash, not 0ms: {html}"
+        );
+        // 3 samples cannot support a p95, and the table says so; 200 can.
+        assert!(html.contains("(thin)"), "a thin window must be marked: {html}");
+        // The download phase belongs to the note, not to the rows.
+        assert!(html.contains("S3 download p50"), "{html}");
+
+        // Nothing measured at all: the phase sentence is simply absent, and
+        // no percentile is invented anywhere.
+        let quiet = restore_latency_table(&RestoreLatency::default()).into_string();
+        assert!(!quiet.contains("S3 download p50"), "{quiet}");
+        assert!(!quiet.contains("(thin)"), "{quiet}");
+        assert!(
+            quiet.contains("S3 disk image"),
+            "every source stays listed: {quiet}"
+        );
+    }
+
     /// An offloaded schema's sandbox is deleted by the offload, so its row
     /// carries a dead id: a `start` form there posts to a sandbox the daemon
     /// 404s ("Sandbox not found: sb-… (calling /sandbox/sb-…/start)"). Offer
@@ -2495,6 +2667,8 @@ h1 { font-size:1.3rem; }
 .lvl-err { background:var(--err-bg); color:var(--err-fg); border-color:var(--err-border); }
 .lvl-info { background:var(--code-bg); color:var(--dim); border-color:var(--border); }
 table.events td { vertical-align:top; }
+table.restores td:not(:first-child), table.restores th:not(:first-child) {
+  text-align:right; font-variant-numeric:tabular-nums; }
 table.events td.dim { white-space:nowrap; }
 td.ev-msg { word-break:break-word; }
 .chart-caption { margin:.2rem .2rem .5rem; font-size:.8rem; }

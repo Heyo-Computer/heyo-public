@@ -33,7 +33,14 @@ export interface ScalingPolicy {
   boot_timeout_secs?: number;
 }
 
+export interface ExpectedHeader {
+  name: string;
+  value: string;
+}
+
 export interface HealthCheck {
+  /** Require 2xx and one exact response header; rollout requires x-heyo-revision. */
+  expected_header?: ExpectedHeader;
   /** `null` means a bare TCP connect rather than an HTTP probe. */
   path?: string | null;
   port?: number;
@@ -433,6 +440,8 @@ export interface VmStatus {
 }
 
 export interface DeploymentStatus {
+  /** Opaque persisted token for conditional service rollout; absent on older servers. */
+  rollout_revision?: string;
   spec: DeploymentSpec;
   kind: DeploymentKind;
   desired_replicas: number;

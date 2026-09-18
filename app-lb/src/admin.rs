@@ -150,6 +150,7 @@ fn html_escape(s: &str) -> String {
 
 #[derive(Clone)]
 struct AdminState {
+    rollouts: Arc<crate::rollout::Rollouts>,
     registry: Arc<Registry>,
     autoscaler: Arc<Autoscaler>,
     metrics: Arc<Metrics>,
@@ -318,6 +319,7 @@ impl AdminApi {
         Self {
             addr,
             state: AdminState {
+                rollouts: Arc::new(crate::rollout::Rollouts::new(registry.clone(), autoscaler.clone(), jobs.clone())),
                 registry,
                 autoscaler,
                 metrics,
@@ -968,6 +970,7 @@ struct VmStatus {
 
 #[derive(Serialize)]
 struct DeploymentStatus {
+    rollout_revision: String,
     spec: DeploymentSpec,
     /// `"vm"` (managed pool) or `"static"` (fixed proxy_pass upstreams).
     kind: &'static str,
@@ -1071,6 +1074,7 @@ fn pull_mounts_if_needed(state: &AdminState, spec: &DeploymentSpec) {
 fn status_of(state: &AdminState, d: &Arc<crate::deployment::Deployment>) -> DeploymentStatus {
     let backends = d.backends();
     DeploymentStatus {
+        rollout_revision: d.state().rollout_revision.clone(),
         workspace: state.autoscaler.workspaces().status(d),
         spec: d.spec.clone(),
         kind: deployment_kind(d),
@@ -2264,13 +2268,21 @@ fn auth_provider_users(state: &AdminState, ns: &str, name: &str) -> Vec<String> 
     users
 }
 
-/// The body of `POST /auth-providers`: an [`AuthProviderSpec`] plus two
+/// The body of `POST /auth-providers`: an [`AuthProviderSpec`] plus three
 /// request-only conveniences that never reach the store.
 ///
-/// `preset` expands a known template — currently only `"heyo"`, which builds the
-/// JWT policy for the Heyo auth API from `secret` alone — so "the Heyo app works
-/// out of the box once the secret is provided" is one POST rather than a dozen
-/// fields nobody should have to know.
+/// `preset` expands a known template, so "gate this on Heyo sign-in" is one
+/// POST rather than a dozen fields nobody should have to know:
+///
+/// | preset | verifies | needs |
+/// | --- | --- | --- |
+/// | `heyo-jwks` | gate tokens, `RS256`, against the published key set | nothing, or `jwks_url` |
+/// | `heyo` | access tokens, `HS256` | `secret` |
+///
+/// Prefer `heyo-jwks`. `heyo` needs the auth service's *signing* key, so the
+/// fleet that holds it can mint identities as well as check them — acceptable
+/// where we run everything, and not something to put behind a wall somebody
+/// else administers.
 #[derive(Deserialize)]
 struct CreateProviderBody {
     #[serde(flatten)]
@@ -2278,9 +2290,14 @@ struct CreateProviderBody {
     /// Expand a provider template before validation. Request-only.
     #[serde(default)]
     preset: Option<String>,
-    /// The signing secret a preset needs. Request-only.
+    /// The signing secret the `heyo` preset needs. Request-only.
     #[serde(default)]
     secret: Option<crate::secrets::SecretRef>,
+    /// Where the issuer publishes its key set, for `heyo-jwks`. Request-only,
+    /// and optional: with federated auth configured app-lb already knows the
+    /// auth service's address and derives it.
+    #[serde(default)]
+    jwks_url: Option<String>,
 }
 
 /// `GET /auth-providers[?namespace=]` — the providers this caller may see.
@@ -2324,12 +2341,39 @@ async fn create_auth_provider(
     // path or in the state file.
     if let Some(preset) = body.preset.as_deref() {
         match preset {
+            "heyo-jwks" => {
+                // Either the caller named the key set, or app-lb derives it from
+                // the auth service it already federates to — which is the whole
+                // provisioning story: declaring a customer's provider takes a
+                // namespace and a name, and nothing else.
+                let jwks_url = match body.jwks_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                    Some(url) => url.to_string(),
+                    None => {
+                        let Some(base) = state.federated.as_ref().map(|f| f.base_url().to_string())
+                        else {
+                            return err(
+                                StatusCode::BAD_REQUEST,
+                                "the \"heyo-jwks\" preset needs `jwks_url`, because this app-lb \
+                                 has no auth service configured to derive it from (set \
+                                 APP_LB_AUTH_URL, or send \
+                                 {\"jwks_url\": \"https://auth.example.com/.well-known/jwks.json\"})",
+                            )
+                            .into_response();
+                        };
+                        format!("{}/.well-known/jwks.json", base.trim_end_matches('/'))
+                    }
+                };
+                spec.provider = crate::config::Providers::one(crate::config::AuthProvider::Jwt);
+                spec.jwt = Some(crate::config::JwtSpec::heyo_jwks(jwks_url));
+            }
             "heyo" => {
                 let Some(secret) = body.secret else {
                     return err(
                         StatusCode::BAD_REQUEST,
                         "the \"heyo\" preset needs a `secret` reference to the JWT signing key, \
-                         e.g. {\"secret\": \"heyo-auth\", \"key\": \"jwt_secret\"}",
+                         e.g. {\"secret\": \"heyo-auth\", \"key\": \"jwt_secret\"} — or use the \
+                         \"heyo-jwks\" preset, which verifies against the auth service's \
+                         published key set and needs no secret at all",
                     )
                     .into_response();
                 };
@@ -2345,6 +2389,11 @@ async fn create_auth_provider(
             }
         }
     }
+
+    // Bind the secret references to this provider's own namespace before
+    // anything validates or stores them — the wall a deployment gets from
+    // `DeploymentSpec::normalize`, which no other path was giving a provider.
+    spec.normalize();
 
     let ns = spec.namespace.clone();
     if let Err(refused) = may_use_auth_providers(caller.as_deref(), &ns, true) {
@@ -2559,6 +2608,7 @@ async fn patch_disk(
     let Some(store) = state.disks.as_ref() else {
         return disks_off();
     };
+    let _retention = state.autoscaler.workspaces().lifecycle_guard().await;
     if let Err(e) = store.set_policy(&id, body.retain, body.note) {
         return disk_error(e);
     }
@@ -3180,6 +3230,12 @@ async fn register(
     // from booting until teardown's final old-state capture has published.
     let change = state.registry.change_guard().await;
     let old = state.registry.get(&id);
+    if old.as_ref().is_some_and(|d| crate::rollout::reserved(d)) {
+        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
+    if state.autoscaler.workspaces().recovery_active(&id) {
+        return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
+    }
     let replaced = old.is_some();
     let workspace_replacement = match &old {
         Some(old) => match state.autoscaler.fence_workspace_replacement(old).await {
@@ -3282,9 +3338,15 @@ async fn update(
     let Some(old) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
+    if crate::rollout::reserved(&old) {
+        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
     // Compare while holding the same writer guard that covers fencing, the
     // registry swap, persistence and teardown scheduling. A stale request must
     // leave all of those untouched.
+    if state.autoscaler.workspaces().recovery_active(&id) {
+        return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
+    }
     if let Err(status) = check_etag_precondition(expected_etag.as_deref(), &old.spec) {
         let message = if status == StatusCode::PRECONDITION_FAILED {
             "If-Match does not match the current deployment spec"
@@ -3366,9 +3428,15 @@ async fn scale(
     let Some(old) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
+    if crate::rollout::reserved(&old) {
+        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
 
     // Only a managed deployment is autoscaled; for the others the scaling policy
     // is inert, so a scale request is a mistake rather than a no-op.
+    if state.autoscaler.workspaces().recovery_active(&id) {
+        return err(StatusCode::CONFLICT, "workspace recovery reserves this deployment").into_response();
+    }
     if !old.spec.is_managed() {
         let fix = if old.spec.is_site() {
             "a site serves files off disk and has nothing to scale"
@@ -3451,6 +3519,15 @@ async fn list(
 }
 
 async fn get_one(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
+    let _change = state.registry.change_guard().await;
+    if let Some(d) = state.registry.get(&id) {
+        if d.state().rollout_revision.is_empty() { d.mutate_state(|s| s.rollout_revision = crate::rollout::revision()); }
+    }
+    if state.registry.get(&id).is_some() && !state.registry.get(&id).is_some_and(|d| crate::rollout::reserved(&d)) {
+        if state.registry.persist_one(&id).is_err() {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "could not persist rollout revision").into_response();
+        }
+    }
     match state.registry.get(&id) {
         Some(d) => match deployment_etag(&d.spec) {
             Ok(etag) => ([(header::ETAG, etag)], Json(status_of(&state, &d))).into_response(),
@@ -3724,6 +3801,12 @@ async fn uncordon_upstream(
 
 async fn deregister(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
     let change = state.registry.change_guard().await;
+    if state.registry.get(&id).is_some_and(|d| crate::rollout::reserved(&d) || !d.state().rollouts.is_empty()) {
+        return err(StatusCode::CONFLICT, "rollout generations must be explicitly reconciled before deregistration").into_response();
+    }
+    if state.autoscaler.workspaces().has_recovery(&id) {
+        return err(StatusCode::CONFLICT, "workspace recovery history and retained source must be preserved").into_response();
+    }
     let Some(d) = state.registry.remove(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
@@ -3770,9 +3853,13 @@ async fn evict_vm(
     Path((id, sandbox_id)): Path<(String, String)>,
     Query(params): Query<EvictParams>,
 ) -> impl IntoResponse {
+    let _change = state.registry.change_guard().await;
     let Some(d) = state.registry.get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
     };
+    if crate::rollout::reserved(&d) {
+        return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
+    }
 
     // Eviction recycles a VM and lets the autoscaler boot a replacement, which
     // only means something for a managed deployment. A static one's upstreams are
@@ -4246,8 +4333,8 @@ async fn pump_shell(
     let _ = tx.send(Message::Close(None)).await;
 }
 
-async fn healthz() -> &'static str {
-    "ok\n"
+async fn healthz() -> impl IntoResponse {
+    ([("x-heyo-revision", env!("APP_LB_BUILD_REVISION"))], "ok\n")
 }
 
 /// Issued certificates: `GET /certs`.
@@ -4804,12 +4891,59 @@ async fn start_update(
     State(state): State<AdminState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if std::env::var_os("APP_LB_HOST_UPDATE_CONFIG").is_some() {
+        match crate::host_update::configured() {
+            Ok((_, config)) if config.deployment != id => {}
+            _ => return err(StatusCode::CONFLICT, "mapped host requires correlated /update/rollouts, not legacy commands").into_response(),
+        }
+    }
     match state.jobs.start_update(&id) {
         Ok(record) => {
             tracing::info!(deployment = %id, job = %record.id, "host update started");
             (StatusCode::ACCEPTED, Json(record)).into_response()
         }
         Err(e) => job_start_error(e),
+    }
+}
+
+fn host_update_mapping(state: &AdminState, caller: &Caller, id: &str) -> Result<(std::path::PathBuf, crate::host_update::Config), Response> {
+    let (path, config) = crate::host_update::configured().map_err(|e| err(StatusCode::CONFLICT, e).into_response())?;
+    let d = state.registry.get(id).ok_or_else(|| err(StatusCode::NOT_FOUND, "deployment not found").into_response())?;
+    if config.deployment != id || config.namespace != d.spec.namespace || !recovery_authorized(caller, &d.spec) {
+        return Err(forbidden("authenticated mapped namespace admin required"));
+    }
+    Ok((path, config))
+}
+
+async fn host_update_snapshot(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>, Path(id): Path<String>) -> Response {
+    let (_, config) = match host_update_mapping(&state, &caller, &id) { Ok(c) => c, Err(e) => return e };
+    match crate::host_update::snapshot(&config).await {
+        Ok(value) => Json(value).into_response(), Err(e) => err(StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+async fn start_host_rollout(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>, Path(id): Path<String>, Json(request): Json<crate::host_update::Request>) -> Response {
+    let (path, config) = match host_update_mapping(&state, &caller, &id) { Ok(c) => c, Err(e) => return e };
+    match crate::host_update::start(&path, &config, request).await {
+        Ok(value) => (StatusCode::ACCEPTED, Json(value)).into_response(), Err(e) => err(StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+async fn get_host_rollout(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>, Path((id, operation)): Path<(String,String)>) -> Response {
+    let (_, config) = match host_update_mapping(&state, &caller, &id) { Ok(c) => c, Err(e) => return e };
+    match crate::host_update::get(&config, &operation).await {
+        Ok(value) => Json(value).into_response(),
+        Err(e) if e == "operation not found" => err(StatusCode::NOT_FOUND, e).into_response(),
+        Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
+async fn get_host_bootstrap(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>, Path((id, operation)): Path<(String,String)>) -> Response {
+    let (path, config) = match host_update_mapping(&state, &caller, &id) { Ok(c) => c, Err(e) => return e };
+    match crate::host_update::bootstrap::get(&config, &path, &operation).await {
+        Ok(value) => Json(value).into_response(),
+        Err(e) if e == "operation not found" => err(StatusCode::NOT_FOUND, e).into_response(),
+        Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
     }
 }
 
@@ -4840,6 +4974,57 @@ async fn get_job(
             format!("no job {job_id:?} — it may have aged out of the job history"),
         )
         .into_response(),
+    }
+}
+
+async fn start_rollout(State(state): State<AdminState>, Path(id): Path<String>, Json(mut request): Json<crate::rollout::Request>) -> Response {
+    if request.spec.id != id { return err(StatusCode::BAD_REQUEST, "spec.id must match deployment").into_response(); }
+    request.spec.normalize();
+    if let Err(refused) = check_provider_ref(&state, &request.spec) { return refused; }
+    let _lifecycle = state.autoscaler.rollout_guard().await;
+    let _change = state.registry.change_guard().await;
+    let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    match state.jobs.with_rollout_slot(&id, || state.rollouts.admit(&d, request)) {
+        Ok(o) => (StatusCode::ACCEPTED, Json(o.view())).into_response(),
+        Err(e) => err(StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+async fn get_rollout(State(state): State<AdminState>, Path((id, operation)): Path<(String, String)>) -> Response {
+    let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    match d.state().rollouts.iter().find(|o| o.operation_id == operation) {
+        Some(o) => Json(o.view()).into_response(),
+        None => err(StatusCode::NOT_FOUND, "rollout not found").into_response(),
+    }
+}
+
+fn recovery_authorized(caller: &Caller, spec: &DeploymentSpec) -> bool {
+    !matches!(caller, Caller::Ungated)
+        && caller.satisfies_in(crate::tokens::AdminScope::Admin, Some(&spec.namespace))
+        && caller.may_touch(&spec.id, Some(&spec.namespace))
+}
+
+async fn recover_workspace(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path(id): Path<String>, Json(request): Json<crate::workspace::RecoveryRequest>) -> Response {
+    let _writer = state.registry.change_guard().await;
+    let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    if !recovery_authorized(&caller, &d.spec) { return forbidden("authenticated namespace admin required"); }
+    let _creates = state.autoscaler.workspace_recovery_guard().await;
+    let ws = state.autoscaler.workspaces();
+    let _lifecycle = ws.lifecycle_guard().await;
+    match ws.admit_recovery(&d, request).await {
+        Ok(operation) => (StatusCode::ACCEPTED, Json(operation)).into_response(),
+        Err(message) => err(StatusCode::CONFLICT, message).into_response(),
+    }
+}
+
+async fn get_workspace_recovery(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path((id, operation_id)): Path<(String, String)>) -> Response {
+    let Some(d) = state.registry.get(&id) else { return err(StatusCode::NOT_FOUND, "deployment not found").into_response(); };
+    if !recovery_authorized(&caller, &d.spec) { return forbidden("authenticated namespace admin required"); }
+    match state.autoscaler.workspaces().recovery(&id, &operation_id) {
+        Some(operation) if operation.namespace == d.spec.namespace => Json(operation).into_response(),
+        _ => err(StatusCode::NOT_FOUND, "recovery not found in this namespace").into_response(),
     }
 }
 
@@ -4890,6 +5075,8 @@ fn router(state: AdminState) -> Router {
     // `admin_auth` is on; otherwise it stays open, as before.
     let crud = Router::new()
         .route("/deployments", post(register).get(list))
+        .route("/deployments/:id/rollouts", post(start_rollout))
+        .route("/deployments/:id/rollouts/:operation", get(get_rollout))
         .route("/deployments/:id", get(get_one).put(update).delete(deregister))
         .route("/deployments/:id/scaling", patch(scale))
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
@@ -4945,6 +5132,9 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/pull", post(start_pull))
         .route("/deployments/:id/mounts/pull", post(start_mount_pull))
         .route("/deployments/:id/update", post(start_update))
+        .route("/deployments/:id/update/rollouts", get(host_update_snapshot).post(start_host_rollout))
+        .route("/deployments/:id/update/rollouts/:operation", get(get_host_rollout))
+        .route("/deployments/:id/update/bootstrap/:operation", get(get_host_bootstrap))
         .route("/deployments/:id/jobs", get(deployment_jobs))
         .route("/jobs", get(list_jobs))
         .route("/jobs/:job_id", get(get_job))
@@ -5006,8 +5196,15 @@ fn router(state: AdminState) -> Router {
             require_any_credential,
         ));
 
+    // Unlike legacy CRUD, explicit data recovery is never available ungated.
+    let recovery = Router::new()
+        .route("/deployments/:id/workspace/recoveries", post(recover_workspace))
+        .route("/deployments/:id/workspace/recoveries/:operation_id", get(get_workspace_recovery))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
+
     Router::new()
         .route("/healthz", get(healthz))
+        .merge(recovery)
         .merge(view)
         .merge(whoami)
         .merge(crud)
@@ -5026,6 +5223,15 @@ impl BackgroundService for AdminApi {
             }
         };
         tracing::info!(addr = %self.addr, "admin API listening");
+        let rollouts = self.state.rollouts.clone();
+        let mut rollout_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop { tokio::select! {
+                _ = tick.tick() => rollouts.tick().await,
+                _ = rollout_shutdown.changed() => break,
+            } }
+        });
 
         // `into_make_service_with_connect_info` rather than the bare router:
         // without it there is no `ConnectInfo` extension anywhere in the admin
@@ -5304,6 +5510,15 @@ async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn healthz_reports_compiled_revision() {
+        let response = healthz().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-heyo-revision"], env!("APP_LB_BUILD_REVISION"));
+        let body = axum::body::to_bytes(response.into_body(), 32).await.unwrap();
+        assert_eq!(body.as_ref(), b"ok\n");
+    }
 
     mod deployment_etags {
         use super::*;
@@ -6438,6 +6653,20 @@ mod tests {
             // lets a confined caller through to be measured there.
             assert!(matches!(at("/secrets", "/secrets"), Verdict::Allow(_)));
             assert!(matches!(at("/secrets/:id", "/secrets/github"), Verdict::Allow(_)));
+        }
+
+        #[test]
+        fn workspace_recovery_requires_explicit_namespace_admin_even_when_ungated() {
+            let spec: DeploymentSpec = serde_json::from_value(serde_json::json!({"id":"svc","namespace":"team-a","routes":[]})).unwrap();
+            assert!(!recovery_authorized(&Caller::Ungated, &spec));
+            assert!(recovery_authorized(&Caller::Operator, &spec));
+            let t = store();
+            for (namespace, tier, allowed) in [("team-a", AdminScope::Admin, true), ("team-b", AdminScope::Admin, false), ("team-a", AdminScope::View, false)] {
+                let token = mint_in_namespace(&t, tier, namespace);
+                let caller = Caller::Token(t.verify(&token, NOW).unwrap());
+                assert_eq!(recovery_authorized(&caller, &spec), allowed);
+            }
+            assert_eq!(deployment_of("/deployments/:id/workspace/recoveries", "/deployments/svc/workspace/recoveries"), Some("svc"));
         }
 
         /// The handler-side wall: a confined caller reaches its own

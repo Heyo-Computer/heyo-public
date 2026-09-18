@@ -610,7 +610,7 @@ impl Default for LxcConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ScalingPolicy {
     /// Replicas kept running even with no traffic. Defaults to 0, which lets
     /// the pool scale to zero and makes the next request pay a cold start.
@@ -686,12 +686,23 @@ fn default_health_timeout_secs() -> u64 {
     2
 }
 
+/// A response identity assertion, in addition to HTTP success.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ExpectedHeader {
+    pub name: String,
+    pub value: String,
+}
+
 /// How a freshly-booted VM is proven ready before it joins the pool.
 ///
 /// This exists because the SDK's readiness signal is not trustworthy on its own
 /// (see `vm::wait_until_running`), so we always probe the guest ourselves.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct HealthCheck {
+    /// With an identity assertion, require a 2xx response and exactly one
+    /// matching header. An old baked-in listener must not verify a new release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_header: Option<ExpectedHeader>,
     /// `None` means a bare TCP connect is enough.
     #[serde(default = "default_health_path")]
     pub path: Option<String>,
@@ -707,6 +718,7 @@ pub struct HealthCheck {
 impl Default for HealthCheck {
     fn default() -> Self {
         Self {
+            expected_header: None,
             path: default_health_path(),
             port: None,
             timeout_secs: default_health_timeout_secs(),
@@ -2423,6 +2435,51 @@ impl JwtSpec {
         }
     }
 
+    /// The JWT policy for the Heyo auth API's **gate tokens**, given where its
+    /// key set is published — the "works out of the box" case behind the
+    /// `heyo-jwks` provider preset, and the one to prefer.
+    ///
+    /// The difference from [`heyo`](Self::heyo) is the whole point of it: that
+    /// one verifies an `HS256` token with the auth service's *signing* secret,
+    /// so the fleet holding it can also mint any identity that service can
+    /// issue. This one verifies an `RS256` signature against a published public
+    /// key, so it holds nothing secret at all — which is what makes it safe to
+    /// declare in a namespace somebody else administers, or on an app-lb
+    /// somebody else runs.
+    ///
+    /// The audience is `heyo-gate` rather than `heyo-app`: a gate token is
+    /// minted for this purpose (by the hosted sign-in page, or
+    /// `POST /api/auth/gate-token`), and keeping the populations apart means a
+    /// platform token cannot be replayed at a gate and a gate token cannot be
+    /// replayed at the API.
+    pub fn heyo_jwks(jwks_url: String) -> Self {
+        JwtSpec {
+            secret: None,
+            public_key: None,
+            jwks_url: Some(jwks_url),
+            algorithms: vec!["RS256".to_string()],
+            issuer: "auth-service".to_string(),
+            audience: Some("heyo-gate".to_string()),
+            require: BTreeMap::from([(
+                "role".to_string(),
+                serde_json::json!(["user", "admin"]),
+            )]),
+            subject_claim: "userId".to_string(),
+            email_claim: DEFAULT_EMAIL_CLAIM.to_string(),
+            name_claim: DEFAULT_NAME_CLAIM.to_string(),
+            leeway_secs: None,
+            cookie: None,
+            // The browser path for a gate token is the issuer's own hosted
+            // sign-in (`login_url`), which sets the cookie itself. app-lb
+            // posting an email and password to `/api/auth/login` would get an
+            // *access* token back — `aud: heyo-app` — which this policy is
+            // built to refuse.
+            login_endpoint: None,
+            login_url: None,
+            login_redirect_param: None,
+        }
+    }
+
     /// The query parameter the hosted sign-in reads the return URL from. See
     /// [`login_url`](Self::login_url); `redirect_uri` unless overridden.
     pub fn login_redirect_param(&self) -> &str {
@@ -3164,7 +3221,7 @@ impl AuthGate {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct DeploymentSpec {
     /// Unique name for this deployment, and its handle in every other call.
     /// Registering an id that already exists REPLACES that deployment.
@@ -4265,8 +4322,10 @@ impl std::fmt::Display for SpecError {
             ),
             Self::UnknownAuthPreset(p) => write!(
                 f,
-                "auth provider preset {p:?} is not one app-lb knows. The only preset is \
-                 \"heyo\", which builds the JWT policy for the Heyo auth API from a `secret`"
+                "auth provider preset {p:?} is not one app-lb knows. The presets are \
+                 \"heyo-jwks\", which verifies the Heyo auth API's gate tokens against its \
+                 published key set and needs no secret, or \"heyo\", which verifies its \
+                 HS256 access tokens from a `secret`"
             ),
             Self::EmptyRepo => write!(f, "build.repo must not be empty"),
             Self::UnsupportedRepoUrl(r) => write!(
@@ -5074,6 +5133,30 @@ impl AuthProviderSpec {
             &self.allowed_emails,
             &self.jwt,
         )
+    }
+
+    /// Bind every secret reference this provider holds to its own namespace.
+    ///
+    /// The counterpart of [`DeploymentSpec::normalize`], run on every path an
+    /// object enters by (create, and the state directory on load), and for the
+    /// same reason: a reference that names no namespace resolves in `default`
+    /// ([`crate::secrets::SecretStore::resolve`]), so without this the obvious
+    /// body — the secret id and key, nothing else — either failed to find a
+    /// secret that plainly exists or, in a fleet that keeps one in `default`
+    /// under the same id, verified against another namespace's key. Whatever
+    /// the client wrote is overwritten, which is the point: naming another
+    /// namespace's secret is not an error to report, it is a thing a provider
+    /// cannot express.
+    pub fn normalize(&mut self) {
+        let ns = self.namespace.clone();
+        if let Some(r) = self.client_secret.as_mut() {
+            r.scope_to(&ns);
+        }
+        if let Some(jwt) = self.jwt.as_mut()
+            && let Some(r) = jwt.secret.as_mut()
+        {
+            r.scope_to(&ns);
+        }
     }
 
     /// The effective gate when `gate` inherits this provider: the identity comes
@@ -6503,6 +6586,85 @@ mod tests {
             ..google_provider()
         };
         assert_eq!(provider.validate(), Ok(()), "the preset must validate on its own");
+    }
+
+    /// The wall: whatever namespace a body wrote on a provider's secret
+    /// references, they resolve behind the provider's own.
+    #[test]
+    fn normalize_binds_a_providers_secret_refs_to_its_namespace() {
+        let elsewhere = |name: &str| crate::secrets::SecretRef {
+            namespace: Some("someone-else".into()),
+            secret: name.into(),
+            key: "k".into(),
+            username: None,
+        };
+        let mut p = AuthProviderSpec {
+            namespace: "team-a".into(),
+            client_secret: Some(elsewhere("google-oauth")),
+            jwt: None,
+            ..google_provider()
+        };
+        p.normalize();
+        assert_eq!(p.client_secret.as_ref().unwrap().namespace(), "team-a");
+
+        // And the JWT key, which is the one that verifies identities.
+        let mut p = AuthProviderSpec {
+            namespace: "team-a".into(),
+            provider: Providers::one(AuthProvider::Jwt),
+            client_id: None,
+            client_secret: None,
+            allowed_domains: vec![],
+            // The shape the `heyo` preset builds: a reference with no namespace,
+            // which before this resolved in `default`.
+            jwt: Some(JwtSpec::heyo(crate::secrets::SecretRef {
+                namespace: None,
+                secret: "heyo-auth".into(),
+                key: "jwt_secret".into(),
+                username: None,
+            })),
+            ..google_provider()
+        };
+        p.normalize();
+        assert_eq!(
+            p.jwt.as_ref().unwrap().secret.as_ref().unwrap().namespace(),
+            "team-a",
+            "an unqualified reference must not resolve in `default`",
+        );
+        assert_eq!(p.validate(), Ok(()));
+    }
+
+    /// The preset that needs nothing secret — the one to reach for when the
+    /// namespace, or the app-lb, belongs to somebody else.
+    #[test]
+    fn the_heyo_jwks_preset_verifies_against_a_key_set_and_holds_no_secret() {
+        let jwt = JwtSpec::heyo_jwks("https://auth.example.com/.well-known/jwks.json".into());
+        assert_eq!(jwt.algorithms, vec!["RS256".to_string()]);
+        assert_eq!(jwt.issuer, "auth-service");
+        assert_eq!(
+            jwt.audience.as_deref(),
+            Some("heyo-gate"),
+            "a gate token's audience, so a platform token cannot be replayed here",
+        );
+        assert_eq!(jwt.subject_claim, "userId");
+        assert!(jwt.secret.is_none(), "nothing secret may be part of this policy");
+        assert!(jwt.public_key.is_none());
+
+        let provider = AuthProviderSpec {
+            provider: Providers::one(AuthProvider::Jwt),
+            client_id: None,
+            client_secret: None,
+            allowed_domains: vec![],
+            jwt: Some(jwt),
+            ..google_provider()
+        };
+        assert_eq!(provider.validate(), Ok(()));
+
+        // And normalizing it touches nothing, because there is no reference to
+        // bind to a namespace — the property that makes it safe behind a wall
+        // somebody else administers.
+        let mut normalized = provider.clone();
+        normalized.normalize();
+        assert_eq!(normalized, provider);
     }
 
     #[test]

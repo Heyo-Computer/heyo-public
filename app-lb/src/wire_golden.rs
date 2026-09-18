@@ -147,6 +147,7 @@ fn vm_spec() -> DeploymentSpec {
             idle_action: crate::config::IdleAction::Retain,
         },
         health: crate::config::HealthCheck {
+            expected_header: Some(crate::config::ExpectedHeader { name: "x-heyo-revision".into(), value: "0123456789abcdef0123456789abcdef01234567".into() }),
             path: Some("/healthz".into()),
             port: Some(8080),
             timeout_secs: 2,
@@ -485,6 +486,7 @@ fn deployment_status_is_stable() {
         golden(
             name,
             &DeploymentStatus {
+                rollout_revision: "persisted-opaque-revision".into(),
                 spec,
                 kind,
                 desired_replicas: if managed { 1 } else { 0 },

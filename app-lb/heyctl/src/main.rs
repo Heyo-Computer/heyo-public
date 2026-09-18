@@ -71,14 +71,17 @@ enum Command {
         cmd: cmd::auth::ConfigCmd,
     },
 
-    /// List deployments, VMs, certificates, secrets, jobs or disks.
+    /// List deployments, VMs, certificates, secrets, auth providers, jobs or
+    /// disks.
     #[command(visible_alias = "list")]
     Get(cmd::read::GetArgs),
 
-    /// Show everything about a deployment: spec, pool, backends and traffic.
+    /// Show everything about a deployment — spec, pool, backends and traffic —
+    /// or about an auth provider.
     Describe(cmd::read::DescribeArgs),
 
-    /// Register a new deployment, or store a secret.
+    /// Register a deployment, store a secret, or declare a namespace or auth
+    /// provider.
     Create {
         #[command(subcommand)]
         cmd: CreateCmd,
@@ -206,6 +209,16 @@ enum CreateCmd {
     /// for. Fleet-scoped admin only.
     #[command(visible_alias = "ns")]
     Namespace(cmd::write::CreateNamespaceArgs),
+
+    /// Declare an auth provider: who may enter and how they are verified,
+    /// named once and inherited by any deployment in the namespace.
+    ///
+    /// The identity half of a sign-in gate on its own. Deployments inherit it
+    /// with `heyctl set auth <deployment> --provider-ref <name>`, and app-lb
+    /// resolves it on every gated request — so editing the provider reaches
+    /// every deployment that names it, and rotating a key is one command.
+    #[command(visible_aliases = ["provider", "idp"])]
+    AuthProvider(Box<cmd::write::CreateAuthProviderArgs>),
 }
 
 #[derive(Subcommand, Debug)]
@@ -240,8 +253,10 @@ enum SetCmd {
     /// host and the commands to run in it. `heyctl update` runs them.
     Update(cmd::write::SetUpdateArgs),
 
-    /// Put a deployment behind Google sign-in, or change who may enter. Applies
-    /// to either kind of deployment; the application behind it is unchanged.
+    /// Put a deployment behind a sign-in gate, or change who may enter: Google
+    /// inline with --client-id, or a namespace auth provider with
+    /// --provider-ref. Applies to either kind of deployment; the application
+    /// behind it is unchanged.
     Auth(cmd::write::SetAuthArgs),
 
     /// Rotate keys of a stored secret (`KEY=VALUE`, or `KEY-`). Keys you don't
@@ -310,6 +325,9 @@ fn run(cli: &Cli) -> Result<()> {
             CreateCmd::Secret(args) => cmd::write::create_secret(&Ctx::new(g)?, args),
             CreateCmd::Workflow(args) => cmd::write::create_workflow(&Ctx::new(g)?, args),
             CreateCmd::Namespace(args) => cmd::write::create_namespace(&Ctx::new(g)?, args),
+            CreateCmd::AuthProvider(args) => {
+                cmd::write::create_auth_provider(&Ctx::new(g)?, args)
+            }
         },
         Command::Build(args) => cmd::write::build(&Ctx::new(g)?, args),
         Command::Pull(args) => cmd::write::pull(&Ctx::new(g)?, args),
@@ -386,6 +404,64 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["heyctl", "scale", "web", "--replicas", "2"]).is_ok());
+    }
+
+    /// The three identity shapes are alternatives, and one of them is required:
+    /// a provider with no identity at all would be a name and nothing else.
+    #[test]
+    fn creating_an_auth_provider_needs_exactly_one_identity_shape() {
+        assert!(
+            Cli::try_parse_from(["heyctl", "create", "auth-provider", "heyo"]).is_err(),
+            "no identity given"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "heyctl", "create", "auth-provider", "heyo",
+                "--preset", "heyo", "--issuer", "auth-service",
+            ])
+            .is_err(),
+            "a preset and a hand-written issuer are two answers to one question"
+        );
+        // The preset form: an issuer app-lb knows, from a stored key.
+        assert!(
+            Cli::try_parse_from([
+                "heyctl", "create", "auth-provider", "heyo", "-n", "team-a",
+                "--preset", "heyo", "--secret", "heyo-auth/jwt_secret",
+            ])
+            .is_ok()
+        );
+        // The bring-your-own form: any issuer, verified against its key set.
+        assert!(
+            Cli::try_parse_from([
+                "heyctl", "create", "provider", "okta",
+                "--issuer", "https://example.okta.com",
+                "--jwks-url", "https://example.okta.com/oauth2/v1/keys",
+                "--alg", "RS256",
+                "--require", "groups=engineering,ops",
+            ])
+            .is_ok()
+        );
+    }
+
+    /// Inheriting an identity and writing one inline are mutually exclusive —
+    /// app-lb refuses a gate that carries both, so clap refuses it first.
+    #[test]
+    fn a_gate_either_inherits_an_identity_or_writes_one() {
+        assert!(
+            Cli::try_parse_from([
+                "heyctl", "set", "auth", "web", "--provider-ref", "heyo",
+                "--client-id", "1234.apps.googleusercontent.com",
+            ])
+            .is_err()
+        );
+        // Route-scoped flags still belong to the deployment.
+        assert!(
+            Cli::try_parse_from([
+                "heyctl", "set", "auth", "web", "--provider-ref", "heyo",
+                "--public-path", "/healthz",
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

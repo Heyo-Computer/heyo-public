@@ -41,6 +41,7 @@ on:
       # it rebuilds both, which is the one change that genuinely must.
       - '.ci/workflows/app-lb.yml'
       - '.ci/image/apps/**'
+      - '.ci/workflows/regional-release.yml'
 
 jobs:
   release:
@@ -184,6 +185,7 @@ jobs:
         # the exec channel, not the serial console that carries the marker
         # protocol.
         run: |
+          export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
           cargo fetch --locked
           df -P / "$CARGO_TARGET_DIR"
           cargo test --locked --bin app-lb || exit $?
@@ -265,7 +267,8 @@ jobs:
           branch    ${{ ci.branch }}
           run       ${{ ci.run_id }}
           EOF
-          ( cd dist && sha256sum app-lb heyctl > SHA256SUMS )
+          printf '%s\n' '${{ ci.sha }}' > dist/REVISION
+          ( cd dist && sha256sum app-lb heyctl REVISION > SHA256SUMS )
           ls -la dist
           cat dist/BUILD-INFO
 

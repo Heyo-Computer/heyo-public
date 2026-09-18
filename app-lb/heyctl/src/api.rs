@@ -45,6 +45,24 @@ const EXEC_MARGIN_SECS: u64 = 15;
 /// Deployment and secret ids are constrained server-side, but a *token* id, a
 /// job id or a sandbox id all arrive from elsewhere, and a stray `/` or `?`
 /// would silently address a different route.
+/// `/secrets/<id>` with the query the item routes take: the namespace the id is
+/// looked up in, and `force` where a delete accepts one.
+fn secret_path(namespace: Option<&str>, id: &str, force: Option<bool>) -> String {
+    let mut path = format!("/secrets/{}", seg(id));
+    let mut query: Vec<String> = Vec::new();
+    if let Some(ns) = namespace {
+        query.push(format!("namespace={}", seg(ns)));
+    }
+    if let Some(force) = force {
+        query.push(format!("force={}", if force { "true" } else { "false" }));
+    }
+    if !query.is_empty() {
+        path.push('?');
+        path.push_str(&query.join("&"));
+    }
+    path
+}
+
 fn seg(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -442,13 +460,30 @@ impl Client {
     }
 
     pub async fn secrets(&self) -> Result<Vec<SecretSummary>> {
-        self.read(Request::new(Method::Get, "/secrets"), "secret", "")
-            .await
+        self.secrets_in(None).await
+    }
+
+    /// The secrets of one namespace, or of every namespace this credential
+    /// reaches.
+    ///
+    /// A namespace is a wall, not a filter: a deployment in `team-a` resolves
+    /// `team-a`'s secrets and cannot name another namespace's, so a secret
+    /// stored in the wrong one is invisible rather than merely misfiled.
+    pub async fn secrets_in(&self, namespace: Option<&str>) -> Result<Vec<SecretSummary>> {
+        let path = match namespace {
+            Some(ns) => format!("/secrets?namespace={}", seg(ns)),
+            None => "/secrets".to_string(),
+        };
+        self.read(Request::new(Method::Get, path), "secret", "").await
     }
 
     pub async fn secret(&self, id: &str) -> Result<SecretSummary> {
+        self.secret_in(None, id).await
+    }
+
+    pub async fn secret_in(&self, namespace: Option<&str>, id: &str) -> Result<SecretSummary> {
         self.read(
-            Request::new(Method::Get, format!("/secrets/{}", seg(id))),
+            Request::new(Method::Get, secret_path(namespace, id, None)),
             "secret",
             id,
         )
@@ -456,7 +491,11 @@ impl Client {
     }
 
     pub async fn secret_exists(&self, id: &str) -> Result<bool> {
-        match self.secret(id).await {
+        self.secret_exists_in(None, id).await
+    }
+
+    pub async fn secret_exists_in(&self, namespace: Option<&str>, id: &str) -> Result<bool> {
+        match self.secret_in(namespace, id).await {
             Ok(_) => Ok(true),
             Err(Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(e),
@@ -478,8 +517,17 @@ impl Client {
     /// Change individual keys. A `null` value deletes that key; absent keys are
     /// left alone.
     pub async fn patch_secret(&self, id: &str, patch: &Value) -> Result<SecretSummary> {
+        self.patch_secret_in(None, id, patch).await
+    }
+
+    pub async fn patch_secret_in(
+        &self,
+        namespace: Option<&str>,
+        id: &str,
+        patch: &Value,
+    ) -> Result<SecretSummary> {
         self.read(
-            Request::new(Method::Patch, format!("/secrets/{}", seg(id))).json(patch.clone()),
+            Request::new(Method::Patch, secret_path(namespace, id, None)).json(patch.clone()),
             "secret",
             id,
         )
@@ -489,17 +537,91 @@ impl Client {
     /// Delete a secret. Refused with [`Error::Conflict`] if a deployment still
     /// references it, unless `force`.
     pub async fn delete_secret(&self, id: &str, force: bool) -> Result<()> {
+        self.delete_secret_in(None, id, force).await
+    }
+
+    pub async fn delete_secret_in(
+        &self,
+        namespace: Option<&str>,
+        id: &str,
+        force: bool,
+    ) -> Result<()> {
+        self.unit(
+            Request::new(Method::Delete, secret_path(namespace, id, Some(force))),
+            "secret",
+            id,
+        )
+        .await
+    }
+
+    // -- auth providers ------------------------------------------------------
+
+    /// The declared auth providers this credential can see, or those of one
+    /// namespace.
+    ///
+    /// The listing narrows itself server-side — a namespace-confined token gets
+    /// its own namespace's providers rather than a refusal — so calling this
+    /// without a namespace is the right way to ask "what identity is declared
+    /// anywhere I can reach".
+    pub async fn auth_providers(&self, namespace: Option<&str>) -> Result<Vec<AuthProviderView>> {
+        let path = match namespace {
+            Some(ns) => format!("/auth-providers?namespace={}", seg(ns)),
+            None => "/auth-providers".to_string(),
+        };
+        self.read(Request::new(Method::Get, path), "auth provider", "")
+            .await
+    }
+
+    /// One provider, by the pair that identifies it. A provider is unique
+    /// within its namespace, not across the fleet, so both halves are required.
+    pub async fn auth_provider(&self, namespace: &str, name: &str) -> Result<AuthProviderView> {
+        self.read(
+            Request::new(
+                Method::Get,
+                format!("/auth-providers/{}/{}", seg(namespace), seg(name)),
+            ),
+            "auth provider",
+            name,
+        )
+        .await
+    }
+
+    pub async fn auth_provider_exists(&self, namespace: &str, name: &str) -> Result<bool> {
+        match self.auth_provider(namespace, name).await {
+            Ok(_) => Ok(true),
+            Err(Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Declare or replace a provider. Upserts, keeping the original
+    /// `created_at`, so applying the same object twice is not an error.
+    ///
+    /// Takes a `Value` for the reason [`Client::create_namespace`] does, and one
+    /// more: the body may carry `preset` and `secret`, which are request-only
+    /// conveniences the server expands and never stores, so there is no stored
+    /// type that could round-trip it.
+    pub async fn create_auth_provider(&self, spec: &Value) -> Result<AuthProviderView> {
+        let name = spec.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+        self.read(
+            Request::new(Method::Post, "/auth-providers").json(spec.clone()),
+            "auth provider",
+            &name,
+        )
+        .await
+    }
+
+    /// Undeclare a provider. Refused with [`Error::Conflict`] while a
+    /// deployment's gate still inherits it — resolution fails closed, so
+    /// removing one out from under a live gate would take it offline.
+    pub async fn delete_auth_provider(&self, namespace: &str, name: &str) -> Result<()> {
         self.unit(
             Request::new(
                 Method::Delete,
-                format!(
-                    "/secrets/{}?force={}",
-                    seg(id),
-                    if force { "true" } else { "false" }
-                ),
+                format!("/auth-providers/{}/{}", seg(namespace), seg(name)),
             ),
-            "secret",
-            id,
+            "auth provider",
+            name,
         )
         .await
     }
@@ -883,6 +1005,51 @@ impl Raw<'_> {
             .await
     }
 
+    /// The secrets of one namespace as app-lb sent them.
+    pub async fn secrets_in(&self, namespace: Option<&str>) -> Result<Value> {
+        let path = match namespace {
+            Some(ns) => format!("/secrets?namespace={}", seg(ns)),
+            None => "/secrets".to_string(),
+        };
+        self.0.read(Request::new(Method::Get, path), "secret", "").await
+    }
+
+    /// One secret as app-lb sent it, looked up in `namespace`.
+    pub async fn secret_in(&self, namespace: Option<&str>, id: &str) -> Result<Value> {
+        self.0
+            .read(
+                Request::new(Method::Get, secret_path(namespace, id, None)),
+                "secret",
+                id,
+            )
+            .await
+    }
+
+    /// The auth providers as app-lb sent them, fleet-wide or for one namespace.
+    pub async fn auth_providers(&self, namespace: Option<&str>) -> Result<Value> {
+        let path = match namespace {
+            Some(ns) => format!("/auth-providers?namespace={}", seg(ns)),
+            None => "/auth-providers".to_string(),
+        };
+        self.0
+            .read(Request::new(Method::Get, path), "auth provider", "")
+            .await
+    }
+
+    /// One auth provider as app-lb sent it.
+    pub async fn auth_provider(&self, namespace: &str, name: &str) -> Result<Value> {
+        self.0
+            .read(
+                Request::new(
+                    Method::Get,
+                    format!("/auth-providers/{}/{}", seg(namespace), seg(name)),
+                ),
+                "auth provider",
+                name,
+            )
+            .await
+    }
+
     /// A namespace's feed events as app-lb sent them.
     pub async fn feed_events(&self, namespace: &str) -> Result<Value> {
         self.0
@@ -956,6 +1123,22 @@ impl Raw<'_> {
                 Request::new(Method::Post, "/secrets").json(spec.clone()),
                 "secret",
                 &id,
+            )
+            .await
+    }
+
+    /// Patch a secret in `namespace`. See [`Client::patch_secret_in`].
+    pub async fn patch_secret_in(
+        &self,
+        namespace: Option<&str>,
+        id: &str,
+        patch: &Value,
+    ) -> Result<Value> {
+        self.0
+            .read(
+                Request::new(Method::Patch, secret_path(namespace, id, None)).json(patch.clone()),
+                "secret",
+                id,
             )
             .await
     }

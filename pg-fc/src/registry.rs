@@ -1611,15 +1611,27 @@ impl SchemaRegistry {
                     // actually holds data decides the restore strategy (a HEAD
                     // or two on the cold path; transport trouble defaults to
                     // the dump path, exactly the pre-image behavior).
-                    Some(a) => Some(
-                        match crate::imgarchive::pick_restore(&a.s3, schema).await {
-                            crate::imgarchive::RestoreKind::Dump => RestoreSource::S3(a.s3.clone()),
+                    //
+                    // The config that comes back is addressed at the prefix
+                    // holding the archive — the legacy one when this host's
+                    // own prefix is known to hold nothing for the schema.
+                    Some(a) => Some({
+                        let (kind, s3) = crate::imgarchive::pick_restore(&a.s3, schema).await;
+                        if s3.prefix != a.s3.prefix {
+                            info!(
+                                "schema {schema}: nothing under s3://{}/{}; restoring from the \
+                                 legacy prefix {}",
+                                a.s3.bucket, a.s3.prefix, s3.prefix
+                            );
+                        }
+                        match kind {
+                            crate::imgarchive::RestoreKind::Dump => RestoreSource::S3(s3),
                             crate::imgarchive::RestoreKind::Image => {
                                 info!("schema {schema}: restoring from its disk-image archive");
-                                RestoreSource::S3Image(a.s3.clone())
+                                RestoreSource::S3Image(s3)
                             }
-                        },
-                    ),
+                        }
+                    }),
                     None => bail!(
                         "schema {schema} is archived to S3, but the eviction tier is not \
                          configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_*) — \
@@ -1698,6 +1710,10 @@ impl SchemaRegistry {
                         _ => None,
                     };
                     if let Some(file) = thawed_file {
+                        // The emptiness marker describes the image, not the
+                        // schema: it goes with it.
+                        let _ =
+                            tokio::fs::remove_file(crate::imgarchive::empty_marker(&file)).await;
                         match tokio::fs::remove_file(&file).await {
                             Ok(()) => {
                                 info!("schema {schema}: thawed; removed {}", file.display());
@@ -2340,8 +2356,13 @@ impl SchemaRegistry {
         }
         if let Some(a) = &self.cfg.archive {
             tiers.push(format!(
-                "S3 >= {:?} (s3://{}/{})",
-                a.archive_after, a.s3.bucket, a.s3.prefix
+                "S3 >= {:?} (s3://{}/{}{})",
+                a.archive_after,
+                a.s3.bucket,
+                a.s3.prefix,
+                a.s3.fallback_prefix()
+                    .map(|p| format!("; restores fall back to {p}"))
+                    .unwrap_or_default()
             ));
         }
         if tiers.is_empty() {
@@ -3582,6 +3603,24 @@ impl SchemaRegistry {
                 crate::events::journal_info("archive", format!("schema {schema} → archived (S3)"));
                 crate::events::record(crate::events::Event::OffloadDone);
             }
+            // Not a failure: the schema has nothing worth uploading, and the
+            // pooler can rebuild an empty database for free. Backed off all
+            // the same, so sweeps stop re-asking a question whose answer only
+            // changes when a client writes to it.
+            Err(e)
+                if e.downcast_ref::<crate::imgarchive::EmptyCluster>()
+                    .is_some() =>
+            {
+                let (_, delay) = self.offload_backoff.record_failure(schema, Instant::now());
+                crate::events::journal_info(
+                    "archive",
+                    format!(
+                        "schema {schema} kept local — its database holds no user data \
+                         (sweeps skip it for {})",
+                        fmt_backoff(delay)
+                    ),
+                );
+            }
             // Losing the claim race to another worker / the dashboard is
             // benign — no backoff, no error journal.
             Err(e) if e.downcast_ref::<AlreadyOffloading>().is_some() => {
@@ -3698,6 +3737,20 @@ impl SchemaRegistry {
         // sees it), it burns RAM, and it pins its disk open against reclaim.
         // A whole sweep of failures leaks a fleet of them at once. Stop, not
         // kill: the data on its disk is still the only copy.
+        // The same refusal the image paths make offline, asked of the running
+        // Postgres this path already has: a dump of a database with no user
+        // relations restores as an empty workbook, and uploading it replaces
+        // whatever the schema's key holds. Unreachable (None) is not empty.
+        if vm::has_user_relations(&self.cfg, &entry.target, schema).await == Some(false) {
+            checkpoint_and_stop(&entry, schema).await;
+            return Err(crate::imgarchive::empty_cluster(format!(
+                "schema {schema}: refusing to dump it to S3 — its database has no user \
+                 relations, and the upload would replace whatever s3://{}/{} holds",
+                archive.s3.bucket,
+                archive.s3.object_key(schema),
+            )));
+        }
+
         let dumps = self
             .dumps
             .as_deref()
@@ -3754,6 +3807,19 @@ impl SchemaRegistry {
         );
 
         let path = dumps.dump_path(schema);
+        // Set by `freeze_schema`, which had a live Postgres to ask.
+        if tokio::fs::metadata(crate::imgarchive::empty_marker(&path))
+            .await
+            .is_ok()
+        {
+            return Err(crate::imgarchive::empty_cluster(format!(
+                "schema {schema}: refusing to promote {} to S3 — it dumps a database with no \
+                 user relations, and the upload would replace whatever s3://{}/{} holds",
+                path.display(),
+                archive.s3.bucket,
+                archive.s3.object_key(schema),
+            )));
+        }
         let meta = std::fs::metadata(&path)
             .with_context(|| format!("reading local dump {}", path.display()))?;
         let len = meta.len();
@@ -4345,6 +4411,13 @@ impl SchemaRegistry {
             self.store.set_disk_gb(schema, device_gb(dev));
         }
 
+        // Asked here, where a running Postgres can answer it, and recorded
+        // beside the dump: the promotion to S3 has only the dump file, and
+        // "how many relations does this dump hold" is not a question a dump
+        // file answers cheaply. Freezing an empty database locally is fine —
+        // uploading it is what must not happen.
+        let empty = vm::has_user_relations(&self.cfg, &entry.target, schema).await == Some(false);
+
         // Same leak guard as archive_schema_inner: a failed dump must not
         // leave the VM it booted running and unowned.
         let bytes = match vm::dump_to_local(
@@ -4364,6 +4437,19 @@ impl SchemaRegistry {
                     .with_context(|| format!("dumping schema {schema} to the local dump store"));
             }
         };
+
+        let marker = crate::imgarchive::empty_marker(&dumps.dump_path(schema));
+        if empty {
+            info!(
+                "schema {schema}: froze an empty database — keeping it local; it will not be \
+                 promoted to S3"
+            );
+            if let Err(e) = tokio::fs::write(&marker, b"").await {
+                warn!("schema {schema}: writing {} failed: {e}", marker.display());
+            }
+        } else {
+            let _ = tokio::fs::remove_file(&marker).await;
+        }
 
         self.store.set_tier(schema, Tier::Frozen).await;
         let accomplished = format!("frozen to a {bytes}-byte local dump");

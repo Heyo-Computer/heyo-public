@@ -119,19 +119,23 @@ retain the managed CI workspace, external database and broker configuration.
 
 ## Submitting a build
 
-For this repository's `ci` workflow, submission includes merge after the
-non-ignored CI test suite and artifact validation. The merge uses `ci/merge-release`
-with the registered HeyoSecret `GIT_AUTH_TOKEN`, no version bump or tags, and
-refuses changes outside the CI component and its workflow/image. The captured
-trunk must still match at publication; a moved trunk requires revalidation.
+This repository's `ci` workflow only validates and produces an artifact.
+`git submit --only ci` never merges or deploys. Once the installed platform meets
+the prerequisites described under [coordinated submissions](#one-submission-across-validation-workflows-and-deployment),
+an unrestricted submission also selects `.ci/workflows/regional-release.yml`.
+That workflow owns the single merge after all selected validations pass, then
+deploys sequentially to us3, eu1, and finally the CI controller. The merge uses
+the registered HeyoSecret `GIT_AUTH_TOKEN`, with no version bump or tags. The
+captured trunk must still match at publication; a moved trunk requires revalidation.
 
 CI runtime changes also require `ci/deploy-controller`. It records a durable
 rollout, closes new submissions (HTTP 503), and lets existing jobs finish before
 replacing the controller. The requesting job finishes first; the **run remains
 running** until the replacement resumes reconciliation and its public health
 endpoint identifies the expected revision and executable SHA256. Documentation
-and workflow-only changes need no runtime deploy. Other workflows retain their
-own release policy; this does not make all workflows merge or deploy automatically.
+and workflow-only changes need no controller replacement unless the release
+workflow explicitly selects one. A passing validation run is not deployment
+completion; inspect the coordinated release run.
 
 Self-deployment is opt-in and currently supports **one Firecracker controller
 with a persistent workspace**, not active-active controllers or regional DB
@@ -161,12 +165,10 @@ through the existing drained deployment path, then enable the configured workflo
 An older controller cannot deploy its own first implementation of this action.
 Missing capabilities or configuration fail the deployment rather than claim success.
 
-To retry deployment after the candidate has already merged, submit that revision
-with `git submit --only ci --submit-empty`. CI revalidates and republishes the
-candidate, then requests deployment even though its diff against trunk is empty.
-This explicit retry can replace the controller even if that revision is already
-running. New documentation-only changes still skip deployment; mixed unmerged
-changes still fail the CI-only merge scope guard.
+`git submit --only ci --submit-empty` also remains validation-only: it cannot
+retry controller replacement. Use the coordinated release policy for deployment;
+do not treat an individual validation rerun or a successful artifact upload as
+authorization to publish or as evidence that a replacement occurred.
 
 The durable rollout waits for jobs, claimed/building VMs, live native leases and
 other unresolved deployments. A historical running native job does not block
@@ -1331,6 +1333,26 @@ actions. `--only`, explicit workflow selections, and individual reruns are
 validation-only and cannot publish or deploy. The submit client computes changed
 paths across the full trunk-to-feature diff, including earlier feature commits.
 
+This repository's `.ci/workflows/regional-release.yml` sequences public app-lb
+and Orchestrator updates as `merge → us3 → eu1 → controller`. The three build
+workflows are validation-only; a coordinator change selects all three so every
+referenced artifact is built from the same submission. Component-only changes
+select only their matching deployments, including CI when the shared host-bundle
+parser changes. Private Auth/Cloud/heyvm deployment remains a separate repository
+workflow. NATS is not part of CI's artifact or replacement.
+
+Before activating coordinated submissions, both regional app-lb hosts must have
+the verified native bootstrap and correlated rollout APIs installed, the CI
+controller must support the rollout actions, and service rootfs artifacts must
+be pinned. Provision repository-scoped `CI_HOST_APP_LB_TARGETS` entries named
+`app-lb-us3` and `app-lb-eu1` with each host's exact deployment/namespace/public
+health mapping. The registered workflow resolves `GIT_AUTH_TOKEN`,
+`APP_LB_US3_TOKEN`, and `APP_LB_EU1_TOKEN` through its HeyoSecret-backed secrets;
+no values belong in YAML. The existing controller-deployment mapping owns the
+final CI replacement. Until these prerequisites are verified, use only
+validation-only submissions such as `git submit --only ci`; a pushed workflow
+or passing build does not establish regional deployment readiness.
+
 For artifact reuse, `ci/download-artifact` accepts `with.workflow` naming the exact
 validation workflow path. CI resolves it only within this submission's frozen,
 successful membership, never from an arbitrary run ID or a latest-artifact tag.
@@ -1479,6 +1501,156 @@ Archive APIs lack idempotency keys: a retry can leave an extra uploaded archive,
 but failed/uncertain finalization never authorizes a deployment. Publication,
 release and deployment state write NATS outbox events transactionally. These
 actions do not change app-lb, namespaces, existing VM pages, or Retail.
+
+### Host app-lb executable rollout
+
+`ci/rollout-host-app-lb` is a release-only action with `target`, secret `token`,
+`workflow` (frozen validation workflow path), and `artifact` (bundle name).
+Job/step `continue-on-error` is rejected for this action.
+It does not accept paths, service names, commands, revisions, or digests from
+the workflow. The operator supplies `CI_HOST_APP_LB_TARGETS` as JSON. When
+that environment variable is absent, the action reads the same JSON from
+the fixed HeyoSecret path `ci-controller/host-app-lb-targets`, using the
+controller's existing HeyoSecret configuration. This operator-owned path is
+outside workflow secret prefixes; job variables cannot select or override it.
+Missing or invalid configuration refuses the rollout. Explicit environment
+configuration takes precedence, including invalid values (no fallback).
+
+Example mapping:
+
+```json
+{
+  "eu1": {
+    "repository": "https://github.com/Heyo-Computer/heyo-public.git",
+    "url": "https://admin.eu1.heyo.work",
+    "deployment": "app-lb-host-controller",
+    "namespace": "default",
+    "health_url": "https://admin.eu1.heyo.work/healthz"
+  }
+}
+```
+
+This example does not enable a target or release workflow. The host requires
+the matching operator-owned [host update mapping](../app-lb/README.md#correlated-host-executable-rollout)
+and bootstrapped correlated API/helper support. API and health URLs require
+HTTPS; redirects are never followed. Host and CI must agree on the configured
+artifact store and public health URL. The validated blob must be public for
+the helper's credential-free pinned download.
+
+The action uses successful frozen artifact membership at the exact confirmed
+merged SHA, verifies the bounded bundle and derives its executable digest from
+`dist/app-lb`, `dist/REVISION`, and `dist/SHA256SUMS`. It stores the immutable
+request, original executable/configuration hashes and deadline in Postgres
+before POST. Secrets and live host configuration are not persisted.
+
+Every reconciliation first GETs the same operation ID. Admission and systemd
+launch success do not complete a job: CI requires exact operation identity,
+verified replacement completion and a separate public 2xx health response with
+the exact immutable `x-heyo-revision`. Cancellation/deadline fences late success
+and prevents further admission, but does not roll back already accepted work.
+An uncertain helper launch/switch remains blocked for operator reconciliation,
+never retried as a different operation or through legacy commands.
+
+This action does not provide regional ordering by itself. Parent release jobs
+must use sequential `needs` edges and must not tolerate rollout failure. No
+repository workflows are enabled by this primitive.
+
+#### Preparing the initial native bootstrap manifest
+
+`ci --prepare-host-bootstrap plan.json inspection.json app-lb.tar.gz manifest.json`
+is an offline operator command. It does not load CI service configuration or
+connect to Postgres, NATS, or a host. It prepares a private, atomically published
+manifest without overwriting an existing file, and prints only its path,
+canonical SHA256 and `prepared` status. Preparation is **not deployment or
+release authorization**.
+
+The plan contains `operation_id`, the expected 40-hex build `revision`, the exact
+native host `config`, `mapping_path`, and `files`. Each file has `path`, numeric
+`mode`, and exactly one of `after_base64`, `preserve: true`, or
+`supervisor_environment: true`. Omit inactive keys. Do not supply `before_sha256`:
+the command derives it from the native `inspect` response. The ordered file list
+must match both `config.config_files` and the inspection, including the mapping
+file. That mapping requires explicit non-secret `after_base64` bytes that decode
+to the same `config`. Literal modes are 384 (0600) or 420 (0644); preservation
+and the native Supervisor edit require the inspected existing mode.
+
+Use `preserve` or the native Supervisor edit for secret-bearing files; never
+copy their contents into `after_base64`, inspection output, or logs. The command
+retains hashes and typed edits without reading the original host file contents.
+It verifies the supplied bundle's revision and executable checksum, derives the
+artifact/helper/executable digests, and emits compact recursively sorted native
+manifest JSON. JSON inputs/output are bounded to 4 MiB and 32 config files;
+the shared host-bundle parser enforces archive limits.
+
+Obtain the bundle from trusted CI evidence and the inspection from an authorized
+native host inspection; this offline command cannot authenticate their source
+or establish that the inspection is still current. Native admission must still
+check root ownership, paths, current source generation, all file hashes and
+loaded service identity. Delivery/reconciliation is a separate bootstrap step:
+this command does not send or retry legacy update POSTs. After replacement, use
+the authenticated bootstrap-operation GET for completion, not the mapped legacy
+update endpoint, which is deliberately disabled.
+
+`ci --check-host-bootstrap TARGET manifest.json INTENT_SHA256` performs that
+completion check once, without loading the CI database or broker. `TARGET` must
+exist in operator-owned `CI_HOST_APP_LB_TARGETS`; supply its namespace-admin
+credential through `CI_HOST_APP_LB_TOKEN` from the managed secret configuration,
+not a command argument. Existing operator Basic credentials are also supported
+through `CI_HOST_APP_LB_USER` and `CI_HOST_APP_LB_PASSWORD` when no bearer token
+is supplied; no new token or access-control change is required. These credentials
+are sent only to the mapped admin endpoint, never public health or artifacts.
+The manifest bytes must match the previously recorded
+hash and the target's deployment, namespace and public health URL.
+
+The command checks the authenticated native receipt's operation, intent, source,
+target, journal and helper-unit identities, completed status, and verified
+readiness; it then independently requests public health without credentials and
+requires one exact revision header. Both requests forbid redirects and have
+timeouts; the receipt is capped at 64 KiB. Only verified completion exits zero.
+Missing/old endpoints, busy helpers, mismatched receipts and unavailable health
+exit nonzero without sending any POST, changing IDs, or retrying installation.
+It can be rerun for the same manifest/intent. The native GET can persist success
+and release its fence; this is an authenticated reconciliation action, not an
+unauthenticated status probe. Initial launch delivery remains separate.
+
+`ci --deliver-host-bootstrap TARGET inspect plan.json app-lb.tar.gz inspect-delivery.json`
+registers an operation-specific static launcher and invokes the pinned native
+inspection. Save its JSON output as the inspection input above. Poll with the
+**same command and journal** if the job is still running. Then prepare the
+manifest and invoke
+`ci --deliver-host-bootstrap TARGET admit manifest.json app-lb.tar.gz admit-delivery.json`.
+This uses the same managed target/token configuration as completion checking.
+Only use public artifacts tied to successful trusted CI evidence.
+
+This is an explicitly authorized bootstrap operation, not an ordinary release
+fallback. One designated coordinator owns each operation and its journals; no
+other writer may alter its launchers. Each phase gets a new, never-reused static
+deployment ID with an exact `.invalid` hostname, maintenance 503, and an
+unresolvable upstream. It creates no VM and changes no existing service route.
+The fixed transport requires root and Python 3, downloads without credentials or
+redirects, verifies the exact archive/executable, writes only root-owned staging
+files, and invokes native `inspect` or `admit`. It never installs a service or
+restarts a process itself. Preserve/native edits keep existing secrets on-host;
+never put secret literal bytes in these logged launcher recipes.
+
+The caller fsyncs its immutable recipe before registration and `delivery_armed`
+before its single update POST. Matching existing recipes are not rewritten;
+conflicts fail closed. An armed phase is GET-only on every later invocation,
+even if a crash happened before sending or the response was lost. Keep the
+journals and launchers; do not generate a new journal/ID to retry uncertainty.
+A crashed coordinator also leaves a local lock directory for explicit operator
+reconciliation. A successful legacy job is only transport evidence: use
+`--check-host-bootstrap` to attest the actual replacement and release its fence.
+
+For an explicitly reconciled failure **before launch**, the delivery CLI accepts
+`ci --deliver-host-bootstrap TARGET replan NEW_MANIFEST BUNDLE NEW_DELIVERY_JOURNAL EXPECTED_OLD_INTENT_SHA256`.
+The native replan capability must be present in the pinned bundle. It requires
+the same operation/source/config/files and checks the old exact intent,
+`reconciliation_required/preserving` phase, unchanged originals, intact backups,
+and absence of a launched helper. Only helper/target artifact identity changes.
+It archives the old record under the same state directory and preserves its
+backups. This is not permission to retry an ambiguous launch or switch, change
+the source assertions, or choose a fresh state directory to bypass a fence.
 
 ### Service deployments
 

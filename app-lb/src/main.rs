@@ -27,6 +27,8 @@ mod federated;
 mod feed;
 mod guard;
 mod health;
+mod host_bundle;
+mod host_update;
 mod incus;
 mod jobs;
 mod jwt;
@@ -36,6 +38,7 @@ mod namespaces;
 mod obs;
 mod proxy;
 mod registry;
+mod rollout;
 mod runtime;
 mod secrets;
 mod siem;
@@ -283,6 +286,7 @@ fn init_tracing(events: Option<obs::LogSink>) {
 }
 
 fn main() {
+    if let Some(code) = host_update::helper_main() { std::process::exit(code); }
     // Before the subscriber, because shipping app-lb's own events means adding a
     // layer to it, and a subscriber can only be built once. Reads the environment
     // and allocates a channel — no threads, nothing that a later fork would lose.
@@ -805,7 +809,8 @@ fn main() {
     let autoscaler = autoscaler_svc.task();
 
     let disks = {
-        let store = Arc::new(disks::DiskStore::new(disk_cfg, vms.clone(), registry.clone()));
+        let store = Arc::new(disks::DiskStore::new(disk_cfg, vms.clone(), registry.clone()).with_workspaces(workspaces.clone()));
+        workspaces.attach_disk_store(&store);
         match store.load() {
             Ok(0) => {}
             Ok(n) => tracing::info!(count = n, "loaded disk retention policies"),

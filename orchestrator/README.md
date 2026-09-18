@@ -4,6 +4,12 @@ Heyo's control plane for sandboxes, services, and agent-driven workflows.
 
 The orchestrator owns the source of truth for what should be running where. Other services hand it work — CICD asks it to spin up a sandbox to run a job, Cloud asks it to deploy a service — and the orchestrator plans, persists, and reconciles those requests against a backend (mvm-ctrl) that actually moves VMs. It also drives the agentic workflows used to compile parent jobs (discovery / planning / review / patch) against pluggable LLM providers.
 
+`/health` returns `x-heyo-revision` from **build-time** `HEYO_BUILD_GIT_SHA`
+(`unknown` for unstamped builds). Runtime deployment environment variables remain
+diagnostic metadata, not proof of which binary answered. The public CI workflow
+stamps the validated Git SHA and packages a relocatable `start.sh` with migrations
+for a read-only release mount. These artifacts alone do not activate regional CD.
+
 ## How it fits with CICD and HeyoSecret
 
 ```

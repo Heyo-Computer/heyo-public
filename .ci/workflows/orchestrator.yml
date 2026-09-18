@@ -5,8 +5,12 @@ on:
     paths:
       - 'orchestrator/**'
       - 'heyosecret-client/**'
+      - 'app-lb/src/artifact.rs'
+      - 'app-lb/src/mounts.rs'
+      - 'app-lb/src/unpack.rs'
       - '.ci/workflows/orchestrator.yml'
       - '.ci/image/ci/**'
+      - '.ci/workflows/regional-release.yml'
 
 jobs:
   release:
@@ -39,6 +43,7 @@ jobs:
         timeout-minutes: 75
         run: |
           set -eu
+          export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
           cargo test --locked
           ORCHESTRATOR_TEST_DATABASE_URL=postgres://postgres:disposable-test-password@127.0.0.1/postgres cargo test --locked --bin orchestrator concurrent_step_claim_creates_one_running_attempt_postgres -- --ignored
           cargo build --release --locked --bin orchestrator
@@ -46,6 +51,14 @@ jobs:
           cp "$CARGO_TARGET_DIR/release/orchestrator" /workspace/dist/orchestrator
           strip /workspace/dist/orchestrator
           cp -R migrations /workspace/dist/migrations
+          cat > /workspace/dist/start.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          CDPATH= cd -- "$(dirname -- "$0")"
+          export ORCHESTRATOR_MIGRATIONS_DIR="${ORCHESTRATOR_MIGRATIONS_DIR:-$PWD/migrations}"
+          exec ./orchestrator
+          SH
+          chmod +x /workspace/dist/start.sh
           printf '%s\n' '${{ ci.sha }}' > /workspace/dist/REVISION
           (cd /workspace/dist && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 

@@ -40,6 +40,352 @@ unroutable, so the driver is rejected at registration.
   otherwise uses `http://127.0.0.1:34099`
 - `cmake` — a hard build dependency of `pingora-core`, via `flate2`'s `zlib-ng` backend
 
+## Conditional candidate-first service rollout
+
+For existing **stateless Firecracker services**, use `POST /deployments/:id/rollouts`
+instead of destructive PUT/pull/mount replacement. First GET `/deployments/:id`:
+its `rollout_revision` is an opaque persisted CAS token, distinct from the spec ETag.
+Send `{ "operation_id": "release-123", "expected_revision": "<GET token>", "spec": <complete desired spec> }`.
+IDs are 1–128 ASCII letters, digits, hyphens or underscores. Exact replay returns the
+same operation, including terminal operations; conflicting payloads/revisions return 409.
+GET `/deployments/:id/rollouts/:operation_id` reports `operation_id`, `deployment`,
+`source_revision`, `target_spec_sha256`, `status`, `phase`, `readiness_verified`,
+`previous_stopped`, and `error`. Status is `running`, `succeeded`, `failed`, or
+`reconciliation_required`. Admission is not rollout success.
+
+`target_spec_sha256` hashes compact JSON of the **requested normalized spec**, with
+all object keys recursively sorted and array order preserved. A spec copied from
+GET is already normalized (including secret-reference namespaces). Rootfs import
+uses an operation-specific image alias in a separately recorded prepared spec;
+that materialization does not change the requested-spec hash.
+
+The desired spec must contain `artifact: { "store": "https://…", "ref": "<64 lowercase hex SHA256>" }`.
+The ref identifies a rootfs blob or the canonical artifacts manifest containing
+`rootfs.ext4`. Optional existing fields are `auth: { "secret": "id", "key": "token" }`,
+`grow_gb`, `image_name`, and `strip_components`. Candidate preparation verifies
+manifest and blob content and does not trust the catalog's name/size reuse check.
+The current daemon catalog has no digest, so a preinstalled image alias without
+pinned artifact metadata is **not sufficient**, even if the image name is unchanged.
+Every code mount must be read-only with `ref` and `digest` set to the same blob SHA256.
+Startup, environment and those mounts are applied together to the candidate.
+
+Routes, namespace, owner, request authentication and maintenance mode must remain
+unchanged. Workspace/archive-seeded VMs, writable mounts, non-Firecracker runtimes,
+Cloud ingress and extra exposed ports are rejected. An HTTP health path and a
+stable old serving pool (no pending/draining replicas) are required. Legacy writes
+and jobs are reserved out while the operation runs or requires reconciliation.
+The desired health check must include `expected_header: { "name": "x-heyo-revision", "value": "<exact lowercase Git SHA>" }`.
+Readiness requires 2xx and exactly one matching response header, using a bounded
+16 KiB parser that accepts fragmented headers. The service must emit an immutable
+build-stamped identity, **not echo a deployment environment variable**: an old
+baked-in listener must not pass when the new startup command fails. Missing/wrong
+identity, redirects and even otherwise healthy 404 responses cannot pass a rollout.
+Legacy health checks without `expected_header` retain their existing semantics.
+
+app-lb's own admin `/healthz` also returns `x-heyo-revision`, compiled from
+`HEYO_BUILD_GIT_SHA` (a full lowercase Git SHA; `unknown` for unstamped local
+builds). Runtime environment variables cannot change this header. CI stamps
+the validated source and includes a checksummed `REVISION` in the release bundle,
+so a host-controller rollout can verify the intended build through the public
+admin endpoint instead of accepting an old process's generic `ok` response.
+
+The deployment's existing fsync/rename record stores the operation, unique allocation
+intents, active generation, and exact retiring VM IDs. Candidates stay unrouted until
+healthy. Cutover persists first, then fences admission on old backends and publishes
+the candidate pool. Acquired requests drain until zero or `drain_timeout_secs`; only
+then are recorded previous replicas stopped, **not destroyed**. Their records/disks
+remain claimed, and old retained VMs cannot resume into the new generation.
+Retirement relies on the daemon's stop acknowledgment: install a daemon that
+propagates termination errors and preserves live handles on failure before
+enabling rollouts. Older daemons that swallow stop errors cannot establish
+`previous_stopped` reliably. Normal ephemeral rootfs cleanup performed by the
+daemon on successful stop is unchanged; app-lb never purges the retained sandbox.
+
+Restart reconciles attempted creates by exact recorded name, never by issuing another
+create. Unknown allocations or ambiguous persistence retain both generations for
+operator reconciliation. A failed candidate leaves the source serving; failed candidate
+allocations are retained, not purged. Post-cutover stop/readiness failure is bounded by
+the drain deadline plus five minutes and never reports `previous_stopped`. The record
+requires one owning app-lb process, as the existing registry does; it is not a shared
+multi-process database. Retained history requires explicit operator reconciliation
+before deregistration. This endpoint does not migrate external ingress or coordinate
+regions; the caller must wait for both success flags before rolling the next region.
+
+## Correlated host executable rollout
+
+### One-time native bootstrap over the existing managed command transport
+
+An installed predecessor without the correlated helper uses a **separately
+staged, validated new app-lb binary**, not a shell installer. No bootstrap is
+enabled by a repository workflow alone. A root operator supplies a private
+manifest through the existing management channel. The CI caller durably records
+the intended submission/artifact and manifest hash before requesting its fixed
+managed launcher. Successful legacy job/oneshot exit is **not** deployment success.
+
+The new binary exposes these commands (one redacted JSON object on stdout):
+
+```text
+app-lb --bootstrap-host-update inspect /absolute/desired-config.json
+app-lb --bootstrap-host-update admit /absolute/manifest.json INTENT_SHA256
+app-lb --bootstrap-host-update replan /absolute/manifest.json NEW_INTENT_SHA256 EXPECTED_OLD_INTENT_SHA256
+app-lb --bootstrap-host-update status /absolute/state/bootstrap.json INTENT_SHA256
+app-lb --bootstrap-host-update apply /absolute/state/bootstrap.json INTENT_SHA256
+```
+
+`inspect` and `status` are read-only. `inspect` returns `source` and `files`
+(path, SHA256 or null for absence, and mode). `status` returns `not_found` for
+an absent journal; it never launches or attests a process. `apply` is internal
+to the independently launched systemd oneshot. `admit` returns `protocol:
+host-app-lb-bootstrap-v1`, `operation_id`, `intent_sha256`, `journal_path`,
+`unit_name`, deployment/namespace, status, phase, source/target identities,
+`readiness_verified` and error. Outputs never include config file contents.
+
+The strict manifest schema is:
+
+```text
+{
+  operation_id, helper_sha256,
+  source: {disk_sha256, running_sha256,
+           generation: {boot_id, pid, start_time}},
+  config: <complete AFTER host Config shown below>,
+  mapping_path: <absolute APP_LB_HOST_UPDATE_CONFIG path>,
+  files: [{path, before_sha256: <SHA256 or null>, after_base64, mode}],
+  target: {artifact_sha256, binary_sha256, revision}
+}
+```
+
+`INTENT_SHA256` hashes UTF-8 compact JSON with recursively sorted object keys,
+unchanged array order and no extra whitespace. Include every required field,
+including null `before_sha256`; omit inactive file-action keys. `helper_sha256`
+must equal `target.binary_sha256` and the
+executing new helper's digest; it is **not** the predecessor digest. The exact
+pinned bundle supplies `dist/app-lb`, `dist/REVISION`, and `dist/SHA256SUMS`
+under the same 256 MiB/no-links/no-traversal archive rules as normal rollout.
+The predecessor's disk and running digests must agree. Boot ID/PID/kernel
+start-time bind the observed predecessor generation, not an alias or service
+name alone. A predecessor already configured for normal host updates is refused.
+
+`files` exactly enumerates `config.config_files` in order. Each file has `path`,
+`before_sha256`, `mode`, and **exactly one** of:
+
+- `after_base64`: explicit new bytes. Required for the non-secret mapping file,
+  whose decoded Config must equal `config`. Also suitable for a new systemd
+  environment drop-in. Modes are decimal 384 (0600) or 420 (0644).
+- `preserve:true`: assert and back up existing bytes locally without rewriting
+  the original. Requires its inspected non-null SHA and unchanged mode.
+- `supervisor_environment:true`: derive an edit locally from the preserved
+  original, append only `APP_LB_HOST_UPDATE_CONFIG` in the mapped program's
+  environment, and preserve all other bytes/settings. Requires non-null SHA
+  and unchanged mode. No existing secrets appear in the manifest or output.
+
+The native Supervisor edit requires one effective, ungrouped `[program:name]`
+definition. Its environment may continue on indented lines, including leading
+commas and intervening blank/comment lines. Whitespace-prefixed `;` and `#`
+inline comments follow Supervisor's ConfigParser rules (before quote parsing).
+The edit appends before the final physical value line's comment, preserving
+existing bytes and spacing. Other multiline settings, duplicate
+sections/environment keys, missing separators, ambiguous quotes, pre-existing mapping
+assignment, and colon delimiters are rejected. Mapping path characters are
+restricted to ASCII letters/digits and `/_.-` to avoid interpolation/quoting
+ambiguity. Other environment values and CRLF/LF endings remain untouched.
+Use `preserve:true` for all other effective unit/include/env files. Never export
+those files into CI job logs. Derivation is bound by the BEFORE hash, typed edit,
+mapped process/path and authorized helper digest.
+
+Unknown fields are rejected. Manifest and desired-config reads are bounded at
+4 MiB, decoded/derived AFTER bytes total at 4 MiB, each BEFORE config file at
+4 MiB, and file count at 32. Manifest must be owner-only. All paths and ancestors
+must be root-owned, not group/world writable, with no symlinks or hardlinked
+files. Stage under an operator-owned `/var/lib` or `/opt` tree, **not `/tmp`**.
+Config targets must not overlap the executable or updater state directory.
+
+Admission first durably fences `state_dir/bootstrap.json`, preserves original
+executable/config bytes, modes and explicit absence, then launches exactly once
+as `app-lb-bootstrap-<intent hash>`. Same-ID replay only reads the journal.
+Different intent conflicts; a terminal unit is never recycled. File writes use
+fsync and same-directory atomic rename. Systemd runs bounded `daemon-reload`
+then the exact unit restart. Supervisor runs from `/`, requires one ungrouped
+program, requires `reread` to report only that program changed, then issues
+`update <program>` (not restart-only, `all`, or `supervisor.service`). No VM,
+disk, workspace or unrelated program is touched. Original bytes are retained
+indefinitely; no rollback, automatic relaunch, cancellation/unpin or partial
+install resume is provided.
+
+`replan` is the sole explicit exception to the different-intent conflict. It
+requires the exact old intent in `reconciliation_required` / `preserving`, the
+same operation, Config/state directory, source, mapping path and file actions.
+Only helper/target identities may change. It verifies unchanged predecessor
+generation/executable/config bytes and modes, intact backups and staged helper,
+no unresolved normal operation, and successful `systemctl show` probes returning
+exact `LoadState=not-found` values for both helper units. Errors or existing
+terminal units are not absence. Executor exclusion covers inspection through
+staging; the ledger CAS archives the old journal at
+`state_dir/bootstrap/replans/<old-intent>.json` and atomically replaces the
+active intent before further effects. Original backups and helpers remain pinned;
+the new helper uses `state_dir/bootstrap/helpers/<new-intent>`. Output includes
+`supersedes`. Exact replays only return state, including after interruption or a
+lost launch reply. Running preservation, launch/install and uncertain phases
+cannot be replanned. Never bypass a fence by changing state directories or IDs.
+
+Only authenticated namespace-admin GET
+`/deployments/:id/update/bootstrap/:operation_id` in the installed replacement
+can persist success and release the normal-rollout fence. It verifies this exact
+new mapped process, disk/running/compiled identities, effective mapping env,
+all AFTER files/modes, preserved originals and public 2xx health with **one exact**
+`x-heyo-revision` header. Native status cannot replace this attestation. Lost
+launch replies, interrupted config/binary commits, and failed restarts stay
+fenced; GET can reconcile only a fully verified replacement. Operators must
+retain journals/backups and must not concurrently alter files or supervision.
+This requires root, local durable filesystems, one controller owner and one
+fixed operator-owned mapping/state directory per executable, executable helper
+storage, systemd-run, and the same default Supervisor instance from `/`.
+Multi-file changes are not one filesystem transaction: interruption may leave
+partial configuration installed and require explicit operator reconciliation.
+The mapped legacy `/update` POST remains blocked once configuration is active;
+use authenticated bootstrap GET after replacement, not another legacy job.
+Native status remains available through a separately authorized read-only root
+management transport. A busy helper makes GET retryable, never successful.
+
+### Subsequent unchanged-configuration updates
+
+This is a separate operation from VM/service rollout. It replaces **only the
+running host app-lb executable**, retaining its predecessor indefinitely. It
+does not install bundled units/configuration/heyctl, recreate VMs, purge disks,
+or change workspace state. Bootstrap this API/helper once through the existing
+managed platform update process before enabling CI callers. Unstamped builds
+(`x-heyo-revision: unknown`) cannot complete a correlated rollout.
+
+Disabled by default. `APP_LB_HOST_UPDATE_CONFIG` must name an absolute,
+operator-owned JSON file, inaccessible to workflow writes, for example:
+
+```json
+{
+  "deployment": "app-lb-host-controller",
+  "namespace": "default",
+  "executable": "/usr/local/bin/app-lb-eu1",
+  "process": {"kind": "systemd", "unit": "app-lb-eu1.service"},
+  "state_dir": "/var/lib/heyo-eu1/app-lb/host-updates",
+  "artifact_store": "https://artifacts.eu1.heyo.work",
+  "health_url": "https://admin.eu1.heyo.work/healthz",
+  "config_files": ["/etc/systemd/system/app-lb-eu1.service", "/etc/heyo/app-lb-eu1.env"]
+}
+```
+
+These are example values, not defaults or a provisioning command. A Supervisor
+installation instead uses `"process":{"kind":"supervisor","program":"app-lb"}`.
+It restarts **only that program**, never `supervisor.service`. `config_files`
+must explicitly enumerate all effective startup/unit/include/environment files;
+their contents are hashed, never sent to CI. Do not list mutable deployment or
+workspace state. Mapping/config changes and source binary drift invalidate the
+conditional request. Supervisor requires its already-loaded configuration to
+match these files; operators must not concurrently change/reload supervision.
+The controller and independent helper must resolve the same default
+`supervisorctl` configuration/socket; every supervisor command explicitly runs
+from `/` in both processes. Non-default client layouts are unsupported, and
+the reserved multi-program target `all` and option-like targets are rejected.
+
+Supported hosts are Linux with local durable storage, one controller owning the
+mapped executable, and permission to run `/usr/bin/systemd-run` and the mapped
+`/usr/bin/systemctl` or `/usr/bin/supervisorctl` operation. Mapping, executable
+directory, and state directory must be trusted root-owned locations. Pre-create
+the state directory durably, on a filesystem that allows helper execution.
+Symlink executables and arbitrary shell commands
+are unsupported. No privilege changes or units are provisioned by this feature.
+The supervisor-reported PID must be this app-lb process, not a wrapper/parent.
+
+Authenticated namespace admins use GET `/deployments/:id/update/rollouts` for
+`protocol:host-app-lb-v1`, `binary_sha256`, `config_sha256`, and mapped public
+health/artifact URLs. POST the same path with:
+
+```json
+{
+  "operation_id": "ci-host-stable-id",
+  "expected_binary_sha256": "<GET source SHA256>",
+  "expected_config_sha256": "<GET configuration SHA256>",
+  "artifact_sha256": "<validated public bundle SHA256>",
+  "binary_sha256": "<derived dist/app-lb SHA256>",
+  "revision": "<exact validated 40-character Git SHA>"
+}
+```
+
+GET `/deployments/:id/update/rollouts/:operation_id` returns the exact `request`,
+deployment/namespace, status, phase, error and `readiness_verified`. IDs are
+1–128 ASCII letters/digits/hyphens/underscores. Different replay payloads
+conflict. The mapped deployment cannot use legacy uncorrelated `/update`.
+
+Admission persists before staging or launch. Downloads use the configured
+HTTPS public blob store, never redirects or workflow-selected URLs. Both CI
+and app-lb verify the archive digest, unique regular `dist/app-lb`, exact
+`dist/REVISION`, and `dist/SHA256SUMS`; links, special files, traversal,
+duplicate identity entries, and expansion beyond 256 MiB are rejected.
+Only the verified executable is written; tar paths are never extracted.
+
+The operation retains `.previous` and `.candidate` bytes, syncs files and
+directories, then launches a stable-name independent systemd helper using the
+previous executable. The helper checks source process/configuration again,
+records switch intent, atomically renames a same-directory executable, syncs,
+and restarts only the mapped process. Completion requires a new process start
+identity, exact running/on-disk executable hash, immutable compiled revision,
+unchanged mapped configuration, and public 2xx health with that exact header.
+Command success or generic health is never sufficient.
+
+Interrupted staging/launch with no definitive helper evidence remains fenced;
+replay **does not launch again**. A surviving helper can finish across HTTP
+process restart; GET reconciles the replacement. Ambiguous switch/restart or
+failure never triggers rollback, unit recycling, or VM deletion. CI cancellation
+stops waiting, not accepted remote work. Inspect the recorded operation and
+its stable helper unit before operator reconciliation; do not remove its ledger
+to manufacture a retry. There is intentionally no force/unlock shortcut.
+
+## Recover a retained workspace lineage
+
+`POST /deployments/:id/workspace/recoveries` explicitly selects a stopped retained
+VM as the source of a new workspace snapshot. It is not a VM restart or a data
+merge. The operator must first decide that replacing the current snapshot with
+this source is appropriate; the API verifies filesystem capture, not application
+integrity (for example, JetStream message checks).
+
+```json
+{
+  "operation_id": "recover-retained-source-1",
+  "source_sandbox_id": "sb-exact-retained-id",
+  "expected_snapshot": "<current 64-character lowercase SHA256>",
+  "confirm_replace": true
+}
+```
+
+Admission requires authenticated namespace-admin authority even when ordinary
+CRUD is ungated. The deployment must have exactly one unresolved replacement
+capture, an empty serving/pending/resumable pool, and no queued captures. The
+source must have a unique durable seed record with a mount index, matching
+remembered workspace namespace/path/store, and an exact stopped daemon record.
+Unknown, running, foreign, or missing sources and stale snapshots fail closed.
+The source need not have been seeded from the current snapshot: this explicit
+operation is the only exception, and it does not rewrite its seed history.
+
+GET `/deployments/:id/workspace/recoveries/:operation_id` returns the original
+`request`, deployment/namespace, `status`, resulting `snapshot`, and `error`.
+Status is `running` or `succeeded`; failures remain running with an error and
+the creation fence intact. IDs are 1–128 ASCII letters/digits/hyphens/underscores.
+Exact replay returns the same operation, including after restart/completion;
+reuse with another payload conflicts. There is no unsafe cancel/unpin shortcut.
+
+Recovery first persists intent and a permanent source pin, then captures and
+verifies the stopped source. Snapshot files and the workspace record are synced
+before atomically releasing the replacement fence. Restart retries read-only
+capture if needed; uncertain writes never report success or permit placement.
+The selected VM is never stopped, resumed, deleted, or added to the resumable
+pool by recovery. Its pin survives completion and defeats even forced disk purge.
+PUT/register/scaling and image/mount replacement commits are blocked while
+recovery runs; deletion of a deployment with recovery history is refused.
+One owning app-lb process is required for this local state directory.
+
+Separately, `PATCH /disks/:id {"retain":true}` now also protects workspace
+predecessors from post-capture replacement deletion, not just disk expiry.
+Such predecessors remain stopped after replacement capture; ordinary unpinned
+retirement and same-pool idle suspension retain their existing behavior. These
+app-lb protections cannot prevent an out-of-band daemon/operator deletion.
+
 ## Run
 
 ```sh
@@ -2426,6 +2772,36 @@ A refused token is logged and sent to [security monitoring](#security-monitoring
 as `gate-jwt` with the reason — expired, wrong issuer, bad signature. The caller
 gets a bare `401`: which of those it was is exactly the feedback somebody probing
 a gate is looking for.
+
+### Declaring an identity once: auth providers
+
+Written inline, a gate's identity is copied into every spec that needs it, so
+rotating a client secret or tightening an allow-list means editing each one. An
+**auth provider** is that identity half on its own, named and owned by a
+namespace:
+
+```sh
+heyctl create auth-provider heyo -n team-a --preset heyo-jwks
+heyctl set auth reports --provider-ref heyo --public-path /healthz
+```
+
+The deployment keeps only its route-scoped fields; `provider_ref` supplies the
+rest. Resolution is live — app-lb reads the provider on every gated request — so
+an edit reaches every deployment that names it at once, and re-signs the sessions
+issued under the old policy rather than leaving a removed user signed in. A
+reference that does not resolve **fails closed**: the request is refused, never
+served ungated.
+
+That provider holds nothing secret — it verifies the Heyo auth API's gate tokens
+against the key set that service publishes — so it is safe to declare in a
+namespace somebody else administers, which a shared-secret provider is not
+(`--preset heyo` is the `HS256` form, and that key mints as well as verifies).
+
+Neither preset is a coupling to one issuer: `--issuer` with `--jwks-url`,
+`--public-key-file` or `--secret` describes any issuer at all, and `--login-url`
++ `--cookie` point a token-less browser at that issuer's own sign-in page. Full treatment, including the sign-in page contract
+and what a customer running their own issuer needs:
+**[AUTH_PROVIDERS.md](AUTH_PROVIDERS.md)**.
 
 ### Tokens in a URL
 
