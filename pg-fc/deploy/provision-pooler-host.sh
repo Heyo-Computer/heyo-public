@@ -52,7 +52,11 @@ API_PORT="${API_PORT:-34099}"
 DASHBOARD_LISTEN="${DASHBOARD_LISTEN:-127.0.0.1:34199}"
 POOL_LISTEN="${POOL_LISTEN:-0.0.0.0:6432}"
 POOL_IMAGE="${POOL_IMAGE:-pg}"
-DOCKERFILE="${DOCKERFILE:-Dockerfile}"            # Dockerfile.pg18 for PG 18
+# PG 18 is the fleet major. The bare ./Dockerfile defaults to PG_MAJOR=16, and
+# a host built from it serves 16 while its peers serve 18 — every archive one
+# writes then fails to restore on the other (they share S3 keys per schema).
+# Override only to build a whole new fleet on a different major.
+DOCKERFILE="${DOCKERFILE:-Dockerfile.pg18}"
 
 STATE_DIR="${POOL_HOME}/.heyo/pg-vm-pool"
 TLS_DIR="${STATE_DIR}/tls"

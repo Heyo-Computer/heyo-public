@@ -230,7 +230,8 @@ Config via env (all optional):
 | `PG_VM_POOL_OFFLOAD_LOAD_MAX` | `0.75` | normalized host load (1-min loadavg / cores; on Linux this includes tasks blocked on disk I/O) at or above which the pacer stops adding jobs beyond the first — aggressive with headroom, single file without |
 | `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` | `300` | how long queued client bring-ups **or a running reclaim pass** may hold the pacer off before it dispatches anyway — single-file, no-boot kinds only. Bounds the sawtooth on a host whose bring-up queue is never empty and whose reaper keeps re-triggering reclaim; `0` yields indefinitely — see "Offload pacer" |
 | `PG_VM_POOL_S3_BUCKET` | unset | S3 bucket for dumps (required when eviction is on) |
-| `PG_VM_POOL_S3_PREFIX` | `pg-vm-pool/` | key prefix; the object per schema is `{prefix}{schema}.dump` |
+| `PG_VM_POOL_S3_PREFIX` | `pg-vm-pool/` | key prefix; the objects per schema are `{prefix}{schema}.dump` and `{prefix}{schema}.img.zst`. Joined as plain text, so end it with `/`. Every upload and delete uses it. Give each host its own (e.g. `pg-vm-pool/<host>/`) so hosts sharing a bucket can't overwrite each other's archives |
+| `PG_VM_POOL_S3_LEGACY_PREFIX` | `pg-vm-pool/` when `PG_VM_POOL_S3_PREFIX` differs, else unset | read-only fallback for restores: consulted only when both of a schema's keys under `PG_VM_POOL_S3_PREFIX` are known absent (a failed HEAD or a torn object keeps the restore on the write prefix), so changing the prefix on a host with existing archives doesn't strand them. Nothing is ever written or deleted under it. Set it empty to disable the fallback |
 | `PG_VM_POOL_S3_REGION` | `us-east-1` | region for SigV4 signing |
 | `PG_VM_POOL_S3_ENDPOINT` | unset (AWS) | custom endpoint for an S3-compatible store (MinIO/R2); path-style addressing |
 | `PG_VM_POOL_S3_ACCESS_KEY_ID` / `PG_VM_POOL_S3_SECRET_ACCESS_KEY` | unset | S3 credentials (fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) |
@@ -590,6 +591,18 @@ pooler and the S3 secret key never leaves it. This requires the guest VMs to
 have outbound network egress to the S3 endpoint. Each schema maps to one object,
 `s3://{bucket}/{prefix}{schema}.dump`; a single `PUT` caps at 5 GB, which is
 ample for one-workbook databases.
+
+**Empty databases are never uploaded.** A schema's key is stable and shared, so
+an upload replaces whatever is already at it — and a cluster with no user
+relations is worth nothing in a bucket: restoring one leaves a client exactly
+where a fresh create would. Every path that writes to S3 refuses such a cluster
+first. The image paths read the stopped disk's `base/` directory offline (a
+database is copied from `template1` and only grows, so a user database no
+larger than template1 has no relations of its own); the dump paths ask the
+running Postgres. Compaction and local freezing still run — the bytes stay on
+the host, the registry row keeps its tier, and the pooler journals
+`kept local — its database holds no user data`. An unreadable disk or an
+unreachable database is never treated as empty.
 
 **Disk-pressure eviction (emergency tier):** the threshold-driven pacer can't
 help when load outruns it — a filesystem that hits `No space left on device`
@@ -1690,6 +1703,39 @@ extra column on the event lines so the event format is unchanged: roll back to
 an older binary and it still reads its charts, simply ignoring the timing
 files. The same numbers are also in the pooler log, one line per create
 (`created VM pg-<schema> in …`).
+
+#### Restore latency (time to a serving Postgres)
+
+Under the two restore charts the monitoring page reports, over the same
+trailing 24 hours, how long a restore took to reach a Postgres serving the
+client — one row per source, because the four have nothing in common to
+average:
+
+| source | what it does |
+| --- | --- |
+| S3 disk image | download `{prefix}{schema}.img.zst`, decompress, swap the disk under a vehicle VM, boot on it |
+| S3 dump | bring a VM up, `CREATE DATABASE`, then the guest's `curl \| pg_restore` |
+| local image (compacted) | the S3 image path minus the download |
+| local dump (frozen) | the S3 dump path minus the download |
+
+Read the two image rows against each other: everything after the download is
+identical work, so the gap between them is what fetching from the bucket costs.
+The note under the table splits an image restore further, into the download and
+everything after it (decompress, `e2fsck`, disk swap, boot) — which is the
+reading that separates "the bucket is slow" from "this host is busy", and points
+at what to tune: the bucket's throughput on one side, or the run-dir filesystem
+(the decompress and the in-place copy are disk-bound) and the warm-spare pool
+that supplies the vehicle on the other.
+
+Bounded exactly as the create figures are: the admission wait is excluded (it
+measures how many other clients arrived at once, not what this restore costs),
+only restores that finished are counted, and percentiles are nearest-rank, so
+every figure is a restore someone actually waited through. A source with no
+restores in the window shows dashes rather than zeros, and a window too thin to
+support a percentile marks it rather than printing the maximum three times.
+Samples share the `timings-*.tsv` partitions with the create figures, so they
+survive a restart the same way; the download phase is recorded even when the
+restore that follows it fails, since the bytes still moved.
 
 #### Webhook alerts
 

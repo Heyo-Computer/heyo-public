@@ -1001,6 +1001,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_PRESSURE_CHECK_SECS",
     "PG_VM_POOL_S3_BUCKET",
     "PG_VM_POOL_S3_PREFIX",
+    "PG_VM_POOL_S3_LEGACY_PREFIX",
     "PG_VM_POOL_S3_REGION",
     "PG_VM_POOL_S3_ENDPOINT",
     "PG_VM_POOL_S3_ACCESS_KEY_ID",
@@ -1509,7 +1510,11 @@ impl ArchiveConfig {
         };
         let region = nonempty("PG_VM_POOL_S3_REGION").unwrap_or_else(|| "us-east-1".to_string());
         let prefix = std::env::var("PG_VM_POOL_S3_PREFIX")
-            .unwrap_or_else(|_| "pg-vm-pool/".to_string());
+            .unwrap_or_else(|_| crate::s3::DEFAULT_PREFIX.to_string());
+        let legacy_prefix = crate::s3::legacy_prefix_for(
+            &prefix,
+            std::env::var("PG_VM_POOL_S3_LEGACY_PREFIX").ok(),
+        );
         let endpoint = nonempty("PG_VM_POOL_S3_ENDPOINT");
 
         Ok(Some(Self {
@@ -1519,6 +1524,7 @@ impl ArchiveConfig {
             s3: crate::s3::S3Config {
                 bucket,
                 prefix,
+                legacy_prefix,
                 region,
                 // Filled in on the first HEAD if S3 says the bucket lives
                 // somewhere other than `region`.
