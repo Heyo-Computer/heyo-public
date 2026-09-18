@@ -289,12 +289,24 @@ impl Client {
         run!(self, self.inner.secrets())
     }
 
+    pub fn secrets_in(&self, namespace: Option<&str>) -> Result<Vec<SecretSummary>> {
+        run!(self, self.inner.secrets_in(namespace))
+    }
+
     pub fn secret(&self, id: &str) -> Result<SecretSummary> {
         run!(self, self.inner.secret(id))
     }
 
+    pub fn secret_in(&self, namespace: Option<&str>, id: &str) -> Result<SecretSummary> {
+        run!(self, self.inner.secret_in(namespace, id))
+    }
+
     pub fn secret_exists(&self, id: &str) -> Result<bool> {
         run!(self, self.inner.secret_exists(id))
+    }
+
+    pub fn secret_exists_in(&self, namespace: Option<&str>, id: &str) -> Result<bool> {
+        run!(self, self.inner.secret_exists_in(namespace, id))
     }
 
     pub fn put_secret(&self, spec: &Value) -> Result<SecretSummary> {
@@ -305,8 +317,43 @@ impl Client {
         run!(self, self.inner.patch_secret(id, patch))
     }
 
+    pub fn patch_secret_in(
+        &self,
+        namespace: Option<&str>,
+        id: &str,
+        patch: &Value,
+    ) -> Result<SecretSummary> {
+        run!(self, self.inner.patch_secret_in(namespace, id, patch))
+    }
+
     pub fn delete_secret(&self, id: &str, force: bool) -> Result<()> {
         run!(self, self.inner.delete_secret(id, force))
+    }
+
+    pub fn delete_secret_in(&self, namespace: Option<&str>, id: &str, force: bool) -> Result<()> {
+        run!(self, self.inner.delete_secret_in(namespace, id, force))
+    }
+
+    // -- auth providers ------------------------------------------------------
+
+    pub fn auth_providers(&self, namespace: Option<&str>) -> Result<Vec<AuthProviderView>> {
+        run!(self, self.inner.auth_providers(namespace))
+    }
+
+    pub fn auth_provider(&self, namespace: &str, name: &str) -> Result<AuthProviderView> {
+        run!(self, self.inner.auth_provider(namespace, name))
+    }
+
+    pub fn auth_provider_exists(&self, namespace: &str, name: &str) -> Result<bool> {
+        run!(self, self.inner.auth_provider_exists(namespace, name))
+    }
+
+    pub fn create_auth_provider(&self, spec: &Value) -> Result<AuthProviderView> {
+        run!(self, self.inner.create_auth_provider(spec))
+    }
+
+    pub fn delete_auth_provider(&self, namespace: &str, name: &str) -> Result<()> {
+        run!(self, self.inner.delete_auth_provider(namespace, name))
     }
 
     // -- app-tokens ---------------------------------------------------------
@@ -643,8 +690,36 @@ impl Raw<'_> {
         block_on(&self.client.rt, self.client.inner.raw().patch_secret(id, patch))?
     }
 
+    pub fn patch_secret_in(
+        &self,
+        namespace: Option<&str>,
+        id: &str,
+        patch: &Value,
+    ) -> Result<Value> {
+        block_on(
+            &self.client.rt,
+            self.client.inner.raw().patch_secret_in(namespace, id, patch),
+        )?
+    }
+
     pub fn feed_events(&self, namespace: &str) -> Result<Value> {
         block_on(&self.client.rt, self.client.inner.raw().feed_events(namespace))?
+    }
+
+    pub fn secrets_in(&self, namespace: Option<&str>) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().secrets_in(namespace))?
+    }
+
+    pub fn secret_in(&self, namespace: Option<&str>, id: &str) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().secret_in(namespace, id))?
+    }
+
+    pub fn auth_providers(&self, namespace: Option<&str>) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().auth_providers(namespace))?
+    }
+
+    pub fn auth_provider(&self, namespace: &str, name: &str) -> Result<Value> {
+        block_on(&self.client.rt, self.client.inner.raw().auth_provider(namespace, name))?
     }
 
     pub fn mint_token(&self, req: &NewToken) -> Result<Value> {

@@ -138,6 +138,13 @@ impl AuthProviderStore {
             match std::fs::read(&path)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<AuthProviderSpec>(&b).ok())
+                .map(|mut spec| {
+                    // The same stamp the create path applies, so an object
+                    // written before it existed resolves its secrets behind its
+                    // own wall rather than in `default`.
+                    spec.normalize();
+                    spec
+                })
             {
                 Some(spec) if spec.validate().is_ok() => {
                     loaded.insert((spec.namespace.clone(), spec.name.clone()), Arc::new(spec));

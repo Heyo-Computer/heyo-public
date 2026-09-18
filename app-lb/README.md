@@ -2773,6 +2773,36 @@ as `gate-jwt` with the reason — expired, wrong issuer, bad signature. The call
 gets a bare `401`: which of those it was is exactly the feedback somebody probing
 a gate is looking for.
 
+### Declaring an identity once: auth providers
+
+Written inline, a gate's identity is copied into every spec that needs it, so
+rotating a client secret or tightening an allow-list means editing each one. An
+**auth provider** is that identity half on its own, named and owned by a
+namespace:
+
+```sh
+heyctl create auth-provider heyo -n team-a --preset heyo-jwks
+heyctl set auth reports --provider-ref heyo --public-path /healthz
+```
+
+The deployment keeps only its route-scoped fields; `provider_ref` supplies the
+rest. Resolution is live — app-lb reads the provider on every gated request — so
+an edit reaches every deployment that names it at once, and re-signs the sessions
+issued under the old policy rather than leaving a removed user signed in. A
+reference that does not resolve **fails closed**: the request is refused, never
+served ungated.
+
+That provider holds nothing secret — it verifies the Heyo auth API's gate tokens
+against the key set that service publishes — so it is safe to declare in a
+namespace somebody else administers, which a shared-secret provider is not
+(`--preset heyo` is the `HS256` form, and that key mints as well as verifies).
+
+Neither preset is a coupling to one issuer: `--issuer` with `--jwks-url`,
+`--public-key-file` or `--secret` describes any issuer at all, and `--login-url`
++ `--cookie` point a token-less browser at that issuer's own sign-in page. Full treatment, including the sign-in page contract
+and what a customer running their own issuer needs:
+**[AUTH_PROVIDERS.md](AUTH_PROVIDERS.md)**.
+
 ### Tokens in a URL
 
 The shell WebSocket — and only the shell WebSocket — also accepts

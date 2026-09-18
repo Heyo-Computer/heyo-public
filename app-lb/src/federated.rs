@@ -152,6 +152,14 @@ struct NamespaceGrantWire {
 }
 
 impl FederatedAuth {
+    /// The auth service this fleet federates to. Read by the admin API to
+    /// derive that service's key set URL for the `heyo-jwks` provider preset —
+    /// the one place app-lb needs to name the auth service for something other
+    /// than resolving a bearer.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn new(base_url: String, ttl_secs: u64, timeout_secs: u64) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
