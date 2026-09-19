@@ -26,6 +26,7 @@ mod expr;
 mod host_app_lb;
 mod host_bootstrap;
 mod host_bootstrap_delivery;
+mod host_heyvm_bootstrap;
 mod host_maintenance;
 #[path = "../../ui/ui.rs"]
 mod heyo_ui;
