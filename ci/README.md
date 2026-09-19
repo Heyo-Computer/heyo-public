@@ -1412,6 +1412,11 @@ The operator must configure `CI_HOST_MAINTENANCE_TARGETS` as a JSON object:
   "artifact_user_id":"archive-owner","target":"stage-eu1-host-heyvm","region":"eu1"}}
 ```
 
+When the environment variable is absent, the controller reads the same JSON
+from the fixed HeyoSecret path `ci-controller/host-maintenance-targets`. An
+explicit environment value takes precedence. Repository workflow secrets cannot
+replace this operator-owned mapping.
+
 Runner `hd` IDs and Cloud `backendServerId` are **different namespaces**. The
 mapping explicitly attests their association and the archive database/storage
 association: Orchestrator's `CLOUD_INTERNAL_URL` must use the **same Cloud archive

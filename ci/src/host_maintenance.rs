@@ -109,11 +109,23 @@ pub async fn owns_job(store: &Store, job: &str) -> Result<bool> {
         .bind(job).fetch_one(store.pool()).await?)
 }
 
+async fn trusted_target(d: &Dispatcher, alias: &str) -> Result<Target> {
+    let managed;
+    let raw = match d.config.host_maintenance_targets.as_deref() {
+        Some(raw) => raw,
+        None => {
+            managed = d.secrets.host_maintenance_targets().await?;
+            managed.as_str()
+        }
+    };
+    mapping(Some(raw), alias)
+}
+
 pub async fn request(d: &Dispatcher, msg: &JobMessage, plan: &JobPlan, step: &str,
     alias: &str, cloud_url: &str, archive: &str, secret: &str, timeout: Duration) -> Result<String> {
     validate_plan(plan)?;
     crate::submission::authorize_publication(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?;
-    let target = mapping(d.config.host_maintenance_targets.as_deref(), alias)?;
+    let target = trusted_target(d, alias).await?;
     ensure!(endpoint(cloud_url)? == endpoint(&target.cloud_url)?, "workflow Cloud URL differs from trusted mapping");
     ensure!(d.runners.snapshot().locate(&target.runner_hd_id).is_some(), "mapped runner is not served by this controller");
     let run = d.store.get_run(&msg.run_id).await?.ok_or_else(|| anyhow::anyhow!("missing run"))?;
@@ -308,7 +320,7 @@ pub fn spawn(d: Arc<Dispatcher>) {
                 let id: String = row.get("id"); let run: String = row.get("run_id");
                 let result: Result<()> = async {
                     let request: Request = serde_json::from_value(row.get("request"))?;
-                    let target = mapping(d.config.host_maintenance_targets.as_deref(), &request.alias).ok();
+                    let target = trusted_target(&d, &request.alias).await.ok();
                     // Local cancellation/deadline/configuration checks do not
                     // depend on either the runner or credential store working.
                     poll(&d.store, &id, "", target.as_ref()).await?;

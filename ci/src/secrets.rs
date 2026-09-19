@@ -232,6 +232,16 @@ impl Secrets {
         }).await
     }
 
+    /// Private host-daemon mappings are operator configuration, never workflow
+    /// secrets. Keeping the fixed path here prevents a repository from
+    /// authorizing itself to replace a runner's daemon.
+    pub async fn host_maintenance_targets(&self) -> Result<String, SecretsError> {
+        self.read(&SecretMetadata {
+            path: "ci-controller/host-maintenance-targets".into(),
+            tags: Vec::new(),
+        }).await
+    }
+
     async fn read(&self, meta: &SecretMetadata) -> Result<String, SecretsError> {
         let (Some(base), Some(token)) = (&self.base_url, &self.token) else {
             return Ok(String::new());
@@ -457,23 +467,29 @@ mod tests {
     async fn host_targets_only_read_operator_path() {
         let base = stub_heyosecret(vec![
             ("ci-controller/host-app-lb-targets", vec![], "operator mapping"),
+            ("ci-controller/host-maintenance-targets", vec![], "maintenance mapping"),
             ("ci/heyo-public/default/CI_HOST_APP_LB_TARGETS", vec![], "workflow spoof"),
+            ("ci/heyo-public/default/CI_HOST_MAINTENANCE_TARGETS", vec![], "maintenance spoof"),
         ]).await;
         let secrets = Secrets {
             http: reqwest::Client::new(), base_url: Some(base), token: Some("test".into()),
         };
         assert_eq!(secrets.host_app_lb_targets().await.unwrap(), "operator mapping");
+        assert_eq!(secrets.host_maintenance_targets().await.unwrap(), "maintenance mapping");
         let workflow = secrets.resolve("ci/heyo-public/default").await.unwrap();
-        assert_eq!(workflow.secrets.len(), 1);
+        assert_eq!(workflow.secrets.len(), 2);
         assert_eq!(workflow.secrets["CI_HOST_APP_LB_TARGETS"], "workflow spoof");
+        assert_eq!(workflow.secrets["CI_HOST_MAINTENANCE_TARGETS"], "maintenance spoof");
 
         let base = stub_heyosecret(vec![
             ("ci/heyo-public/default/CI_HOST_APP_LB_TARGETS", vec![], "workflow spoof"),
+            ("ci/heyo-public/default/CI_HOST_MAINTENANCE_TARGETS", vec![], "maintenance spoof"),
         ]).await;
         let secrets = Secrets {
             http: reqwest::Client::new(), base_url: Some(base), token: Some("test".into()),
         };
         assert!(secrets.host_app_lb_targets().await.is_err());
+        assert!(secrets.host_maintenance_targets().await.is_err());
     }
 
     async fn stub_heyosecret(
