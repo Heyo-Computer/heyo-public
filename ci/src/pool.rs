@@ -303,6 +303,9 @@ impl Pool {
     ///
     /// Scoped to `runners` for the reason every sweep here is: instances own
     /// disjoint hosts, and one must not clear another's in-flight work.
+    /// Host maintenance fences new claims, but must not fence this reclamation:
+    /// the maintenance coordinator waits for stale builds to disappear before
+    /// it can touch the host.
     pub async fn sweep_stale_builds(
         &self,
         runners: &[String],
@@ -315,8 +318,6 @@ impl Pool {
             "DELETE FROM ci_vm_pool
               WHERE status = 'building'
                 AND runner_hd_id = ANY($1)
-                AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase<>'passed')
-                AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase<>'passed')
                 AND leased_by IS DISTINCT FROM $2
                 AND (leased_until IS NULL OR leased_until < now())",
         )
@@ -768,6 +769,9 @@ impl Pool {
     ///
     /// Still scoped to `runners`: a VM on a host this instance does not serve
     /// belongs to whichever instance does, however stale its lease looks.
+    /// An active host operation protects only its own coordinator VM. Protecting
+    /// every VM on the target runner would deadlock that operation's drain on an
+    /// expired lease left by an earlier controller.
     pub async fn release_orphans(
         &self,
         runners: &[String],
@@ -782,8 +786,8 @@ impl Pool {
               WHERE p.status = 'claimed'
                 AND p.runner_hd_id = ANY($1)
                 AND NOT EXISTS (SELECT 1 FROM ci_vm_cleanup c WHERE c.sandbox_id=p.sandbox_id)
-                AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase<>'passed' AND (h.runner_hd_id=p.runner_hd_id OR s.job_id=p.claimed_by_job))
-                AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase<>'passed' AND (h.runner_hd_id=p.runner_hd_id OR s.job_id=p.claimed_by_job))
+                AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase<>'passed' AND s.job_id=p.claimed_by_job)
+                AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase<>'passed' AND s.job_id=p.claimed_by_job)
                 AND p.leased_by IS DISTINCT FROM $2
                 AND (
                      p.leased_until < now()
@@ -1326,6 +1330,104 @@ mod tests {
                 .await
                 .unwrap(),
             Some(sb(&runner, "live"))
+        );
+    }
+
+    /// A host bootstrap fences new work and then waits for all old work to
+    /// drain. Expired state from a dead controller therefore has to remain
+    /// reclaimable while the fence is active, while the bootstrap's own VM
+    /// remains exclusively owned by its coordinator.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_bootstrap_fence_allows_unrelated_expired_pool_state_to_drain() {
+        let (pool, store) = test_pool().await;
+        let runner = runner_id();
+        let ours = std::slice::from_ref(&runner);
+        let run_id = crate::vm::new_id();
+        let wf = crate::workflow::Workflow::parse(
+            "wf.yml",
+            "name: t\njobs:\n  bootstrap:\n    vm: { driver: firecracker }\n    steps: [{ run: \"true\" }]\n",
+        )
+        .expect("workflow");
+        let plan = crate::plan::Plan::build(&wf).expect("plan");
+        store
+            .create_run(&run_id, &crate::store::RunRequest::default(), &plan)
+            .await
+            .unwrap();
+        let job = crate::store::job_id(&run_id, "bootstrap");
+        let coordinator = sb(&runner, "coordinator");
+        store
+            .start_job(&job, &runner, &coordinator, "fp-bootstrap", 1)
+            .await
+            .unwrap();
+        pool.register(
+            &coordinator,
+            &runner,
+            "fp-bootstrap",
+            "wf",
+            None,
+            &job,
+            lapsed("ci-previous-life"),
+        )
+        .await
+        .unwrap();
+
+        let step = format!("{job}.0");
+        let operation = format!("bootstrap-{run_id}");
+        store
+            .create_step(&step, &job, 0, "bootstrap", None)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) VALUES($1,$2,$3,$4,'host','test','running','draining','test','main')")
+            .bind(&operation).bind(&step).bind(&run_id).bind(&job)
+            .execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_host_heyvm_bootstrap(id,runner_hd_id,request,launcher_recipe,deadline,launcher_deployment_id,phase) VALUES($1,$2,'{}','{}',now()+interval '1 hour','launcher','draining')")
+            .bind(&operation).bind(&runner).execute(store.pool()).await.unwrap();
+
+        pool.register(
+            &sb(&runner, "orphan"),
+            &runner,
+            "fp-old",
+            "wf",
+            None,
+            "job-from-dead-controller",
+            lapsed("ci-dead-controller"),
+        )
+        .await
+        .unwrap();
+        pool.begin_build(
+            "job-abandoned-build",
+            &runner,
+            "fp-build",
+            "wf",
+            None,
+            lapsed("ci-dead-controller"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(pool.release_orphans(ours, INSTANCE).await.unwrap(), 1);
+        assert_eq!(pool.sweep_stale_builds(ours, INSTANCE).await.unwrap(), 1);
+        assert_eq!(
+            pool.get(&coordinator).await.unwrap().unwrap().status,
+            "claimed",
+            "the bootstrap coordinator keeps its own VM until explicit release"
+        );
+        assert_eq!(
+            pool.get(&sb(&runner, "orphan"))
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "idle",
+            "an unrelated expired claim no longer blocks the host drain"
+        );
+        assert!(
+            pool.get(&Pool::building_id("job-abandoned-build"))
+                .await
+                .unwrap()
+                .is_none(),
+            "an abandoned build placeholder no longer blocks the host drain"
         );
     }
 
