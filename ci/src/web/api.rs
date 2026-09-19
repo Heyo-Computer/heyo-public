@@ -83,6 +83,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/runs/{run_id}", get(run_status))
         .route("/api/runs/{run_id}/rerun-failed", post(rerun_failed))
+        .route("/api/runs/{run_id}/bootstrap/{operation_id}/recover", post(recover_bootstrap))
         .route("/api/runs/{run_id}/logs", get(run_logs))
         .route("/api/runs/{run_id}/events", get(run_events))
         .route("/api/runs/{run_id}/deployments", get(run_deployments))
@@ -122,6 +123,32 @@ async fn rerun_failed(
             tracing::error!(run = %run_id, "could not rerun failed jobs: {e}");
             error(StatusCode::INTERNAL_SERVER_ERROR, "could not rerun failed jobs")
         }
+    }
+}
+
+async fn recover_bootstrap(
+    State(state): State<AppState>,
+    Path((run_id, operation_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if bearer(&headers).is_none() {
+        return error(StatusCode::UNAUTHORIZED, "a repository submit bearer token is required");
+    }
+    let reader = match authenticate(&state, &headers, "").await {
+        Ok(reader) => reader,
+        Err(response) => return response,
+    };
+    if let Err(response) = readable_run(&state, &reader, &run_id).await {
+        return response;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(90),
+        crate::host_heyvm_bootstrap_coordinator::recover(&state.dispatcher, &run_id, &operation_id)).await {
+        Ok(Ok(result)) => axum::Json(result).into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(run=%run_id, operation=%operation_id, error=%e, "bootstrap recovery refused; fence retained");
+            error(StatusCode::CONFLICT, "bootstrap recovery verification failed; fence retained; inspect controller logs")
+        }
+        Err(_) => error(StatusCode::GATEWAY_TIMEOUT, "bootstrap recovery timed out; inspect recovery events before retrying"),
     }
 }
 

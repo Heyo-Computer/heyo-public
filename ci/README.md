@@ -1562,6 +1562,23 @@ with `target: eu1`, verify its deployment event reaches `passed`, then use norma
 `ci/host-heyvm-maintenance` for subsequent upgrades. Do not rerun bootstrap to
 repair a retained fence; reconcile the persisted operation and launcher job.
 
+For a failed attempt whose installer succeeded, explicitly invoke
+`POST /api/runs/{run_id}/bootstrap/{operation_id}/recover` with that repository's
+submit bearer token. This is a production scheduling-state change, not a status
+query. It requires the original successful launcher receipt and unchanged trusted
+target mapping, then launches a fresh **read-only** app-lb verification job to check
+the host journal, active executable, config, drop-in, permissions, environment,
+and health identity. It never downloads or reinstalls the binary or restarts the
+service. Missing history, drift, or conflicting operations retain the fence.
+
+Successful recovery atomically releases this operation's fence and emits
+`ci.host.bootstrap.recovered.v1` in the run's `/events` API. The original failed
+run, job, step, and deployment history remain failed; the recovery response and
+audit event are the evidence of recovery. Repeating a completed recovery returns
+`already_passed` without running another verification job. A request interrupted
+before commit retains the fence; inspect events before retrying. Verification
+launcher records are retained for audit, not automatically deleted.
+
 ### Host app-lb executable rollout
 
 `ci/rollout-host-app-lb` is a release-only action with `target`, secret `token`,

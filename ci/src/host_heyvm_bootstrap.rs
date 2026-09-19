@@ -25,13 +25,21 @@ pub(crate) struct Artifact {
 fn digest(value: &[u8]) -> String { hex::encode(Sha256::digest(value)) }
 
 pub(crate) fn recipe(mapping_json: &str, target_alias: &str, artifact: &Artifact) -> Result<String> {
+    command(mapping_json, target_alias, artifact, false)
+}
+
+pub(crate) fn verification_recipe(mapping_json: &str, target_alias: &str, artifact: &Artifact) -> Result<String> {
+    command(mapping_json, target_alias, artifact, true)
+}
+
+fn command(mapping_json: &str, target_alias: &str, artifact: &Artifact, verify_only: bool) -> Result<String> {
     ensure!(artifact.artifact_size > 0 && artifact.artifact_size <= MAX_ARTIFACT, "artifact size is outside bound");
     ensure!(artifact.artifact_url.starts_with("https://"), "artifact URL requires HTTPS");
     ensure!([&artifact.artifact_sha256, &artifact.inner_archive_sha256, &artifact.heyvm_sha256]
         .iter().all(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())), "invalid artifact digest");
     ensure!(!mapping_json.is_empty() && mapping_json.len() <= 64 * 1024 && !target_alias.is_empty() && target_alias.len() <= 128,
         "mapping or alias exceeds launcher bound");
-    let envelope = serde_json::json!({"mapping_json":mapping_json,"target_alias":target_alias,"request":artifact});
+    let envelope = serde_json::json!({"mapping_json":mapping_json,"target_alias":target_alias,"request":artifact,"verify_only":verify_only});
     let input = STANDARD.encode(serde_json::to_vec(&envelope)?);
     let script = STANDARD.encode(INSTALLER);
     let command = format!("python3 -c \"import base64;exec(base64.b64decode('{}'))\" '{}'", script, input);

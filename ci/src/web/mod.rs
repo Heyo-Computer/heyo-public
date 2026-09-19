@@ -1669,8 +1669,12 @@ mod tests {
     /// The pages read run history, so there is no honest way to exercise them
     /// without a store; a mock would test the mock.
     async fn test_router() -> Router {
-        let url = std::env::var("CI_TEST_DATABASE_URL").expect("CI_TEST_DATABASE_URL");
         let config = test_config();
+        test_router_with_config(config).await
+    }
+
+    async fn test_router_with_config(config: Arc<Config>) -> Router {
+        let url = std::env::var("CI_TEST_DATABASE_URL").expect("CI_TEST_DATABASE_URL");
         let dir = std::env::temp_dir().join(format!("ci-web-logs-{}", crate::vm::new_id()));
         let store = Store::connect(&url, dir, std::time::Duration::from_secs(30))
             .await
@@ -1698,6 +1702,104 @@ mod tests {
             objects: Arc::new(crate::objects::Workflows::new(&config)),
         });
         router(config, runners, store, dispatcher)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_NATS_URL"]
+    async fn bootstrap_recovery_is_scoped_read_only_and_preserves_failure() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use serde_json::{Value, json};
+        use sqlx::Row;
+        use std::sync::Mutex;
+        let root=tempfile::tempdir().unwrap();
+        let remote=Arc::new(Mutex::new(json!({"spec":null,"receipt":null,"posts":0,"bad_live":true})));
+        let fake=Router::new()
+            .route("/v1/secrets",get(|| async {Json(json!({"secrets":[{"path":"ci/recovery/default/ADMIN","tags":[]}]}))}))
+            .route("/v1/secrets/read",post(|| async {Json(json!({"valueBase64":STANDARD.encode("scoped-token")}))}))
+            .route("/deployments",post(|State(r):State<Arc<Mutex<Value>>>,Json(spec):Json<Value>| async move {
+                let cmd=spec["update"]["commands"][0].as_str().unwrap();
+                let encoded=cmd.rsplit_once(" '").unwrap().1.trim_end_matches('\'');
+                let envelope:Value=serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+                assert_eq!(envelope["verify_only"],true);
+                let mut r=r.lock().unwrap(); r["spec"]=spec.clone(); r["posts"]=json!(r["posts"].as_u64().unwrap()+1); Json(spec)
+            }))
+            .route("/deployments/{id}",get(|State(r):State<Arc<Mutex<Value>>>| async move {Json(r.lock().unwrap()["spec"].clone())}))
+            .route("/deployments/{id}/update",post(|Path(id):Path<String>| async move {
+                assert!(id.starts_with("heyvm-verify-")); Json(json!({"id":"verify-job"}))
+            }))
+            .route("/deployments/{id}/jobs",get(|State(r):State<Arc<Mutex<Value>>>,Path(id):Path<String>| async move {
+                let r=r.lock().unwrap(); let mut receipt=r["receipt"].clone();
+                if id!="original"&&r["bad_live"]==true {receipt["heyvm_sha256"]=json!("wrong");}
+                Json(json!([{"id":if id=="original" {"original-job"} else {"verify-job"},"deployment":id,"kind":"update","status":"succeeded",
+                    "log":[format!("HEYO_HEYVM_BOOTSTRAP_RESULT={}",STANDARD.encode(serde_json::to_vec(&receipt).unwrap()))]}]))
+            })).with_state(remote.clone());
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {axum::serve(listener,fake).await.unwrap()});
+        let runner=crate::vm::new_id(); let operation=crate::vm::new_id(); let run=crate::vm::new_id();
+        let target=json!({"repository":"https://github.com/Heyo-Computer/heyo.git","app_lb_admin_url":base,"app_lb_deployment":"host","app_lb_namespace":"default",
+            "runner_hd_id":runner,"backend_server_id":"backend","executable":"/usr/bin/heyvm","unit":"heyvm.service","state_dir":"/var/lib/heyvm-update",
+            "config_json_path":"/etc/heyvm.json","systemd_drop_in_path":"/etc/systemd/system/heyvm.service.d/update.conf","local_health_url":"http://127.0.0.1:3000/health","target_alias":"eu1","region":"eu1"});
+        let mut config=Arc::try_unwrap(test_config()).unwrap();
+        config.host_heyvm_bootstrap_targets=Some(json!({"eu1":target}).to_string());
+        config.heyosecret_url=Some(base); config.heyosecret_token=Some("test".into());
+        let app=test_router_with_config(Arc::new(config)).await;
+        let store=Store::connect(&std::env::var("CI_TEST_DATABASE_URL").unwrap(),root.path().into(),std::time::Duration::from_secs(30)).await.unwrap();
+        let repo=store.register_repo("https://github.com/Heyo-Computer/heyo.git","recovery",None,None,None).await.unwrap();
+        let other=store.register_repo(&format!("https://example.test/{run}.git"),"other",None,None,None).await.unwrap();
+        let (_,token)=store.create_repo_token(&repo.id,"recovery",None).await.unwrap();
+        let (_,wrong)=store.create_repo_token(&other.id,"other",None).await.unwrap();
+        let plan=crate::plan::Plan::build(&crate::workflow::Workflow::parse("recovery.yml","jobs:\n  bootstrap:\n    steps: [{run: 'true'}]\n").unwrap()).unwrap();
+        store.create_run(&run,&crate::store::RunRequest {workflow_id:"recovery".into(),repo_id:Some(repo.id),repo_url:"https://github.com/Heyo-Computer/heyo.git".into(),sha:"a".repeat(40),..Default::default()},&plan).await.unwrap();
+        let job=store.jobs_of(&run).await.unwrap().remove(0); let step=crate::store::step_id(&job.id,0);
+        store.create_step(&step,&job.id,0,"bootstrap",None).await.unwrap();
+        store.set_job_status(&job.id,crate::store::JobStatus::Failure,Some("original timeout")).await.unwrap();
+        store.set_run_status(&run,crate::store::RunStatus::Failure,Some("original timeout")).await.unwrap();
+        let receipt=json!({"protocol":"host-heyvm-bootstrap-v1","operation_id":operation,"request_sha256":"d".repeat(64),"target_alias":"eu1","status":"succeeded",
+            "heyvm_sha256":"c".repeat(64),"config_sha256":"e".repeat(64),"systemd_drop_in_sha256":"f".repeat(64),"backend_server_id":"backend","region":"eu1"});
+        remote.lock().unwrap()["receipt"]=receipt;
+        let req=json!({"alias":"eu1","target":target,"token_secret":"ADMIN","request_sha256":"d".repeat(64),"config_sha256":"e".repeat(64),"systemd_drop_in_sha256":"f".repeat(64),
+            "artifact":{"operation_id":operation,"artifact_url":"https://artifact.test/blob","artifact_sha256":"a".repeat(64),"artifact_size":42,"inner_path":"heyvm.tar.gz","inner_archive_sha256":"b".repeat(64),"heyvm_sha256":"c".repeat(64)}});
+        sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) VALUES($1,$2,$3,$4,'backend','hash','failed','failed','sha','main')")
+            .bind(&operation).bind(&step).bind(&run).bind(&job.id).execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_host_heyvm_bootstrap(id,runner_hd_id,request,launcher_recipe,deadline,phase,delivery_armed,launcher_deployment_id,launcher_job_id) VALUES($1,$2,$3,'{}',now()-interval '1 hour','failed',true,'original','original-job')")
+            .bind(&operation).bind(&runner).bind(req).execute(store.pool()).await.unwrap();
+        let path=format!("/api/runs/{run}/bootstrap/{operation}/recover");
+        for (credential,status) in [(None,StatusCode::UNAUTHORIZED),(Some(wrong.as_str()),StatusCode::NOT_FOUND),(Some(token.as_str()),StatusCode::CONFLICT)] {
+            let mut request=Request::builder().method("POST").uri(&path);
+            if let Some(token)=credential {request=request.header("Authorization",format!("Bearer {token}"));}
+            let response=app.clone().oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(),status);
+            assert!(crate::host_maintenance::cordoned(&store,&runner).await.unwrap());
+        }
+        assert_eq!(remote.lock().unwrap()["posts"],1);
+        remote.lock().unwrap()["bad_live"]=json!(false);
+        // A concurrent owner or superseding release must not be bypassed by recovery.
+        let mut owner=store.pool().begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,222))").bind(&runner).execute(&mut *owner).await.unwrap();
+        let response=app.clone().oneshot(Request::builder().method("POST").uri(&path).header("Authorization",format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::CONFLICT);
+        owner.rollback().await.unwrap();
+        for phase in ["superseded","polling"] {
+            sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase=$2 WHERE id=$1").bind(&operation).bind(phase).execute(store.pool()).await.unwrap();
+            let response=app.clone().oneshot(Request::builder().method("POST").uri(&path).header("Authorization",format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::CONFLICT);
+        }
+        sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase='failed' WHERE id=$1").bind(&operation).execute(store.pool()).await.unwrap();
+        assert_eq!(remote.lock().unwrap()["posts"],1);
+        for expected in ["recovered","already_passed"] {
+            let response=app.clone().oneshot(Request::builder().method("POST").uri(&path).header("Authorization",format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::OK);
+            let result:Value=serde_json::from_slice(&to_bytes(response.into_body(),1024*1024).await.unwrap()).unwrap(); assert_eq!(result["status"],expected);
+        }
+        assert_eq!(remote.lock().unwrap()["posts"],2);
+        assert!(!crate::host_maintenance::cordoned(&store,&runner).await.unwrap());
+        assert_eq!(store.get_run(&run).await.unwrap().unwrap().status,"failure");
+        assert_eq!(store.get_job(&job.id).await.unwrap().unwrap().error.as_deref(),Some("original timeout"));
+        let row=sqlx::query("SELECT status,phase FROM ci_service_deployment WHERE id=$1").bind(&operation).fetch_one(store.pool()).await.unwrap();
+        assert_eq!(row.get::<String,_>("status"),"failed"); assert_eq!(row.get::<String,_>("phase"),"failed");
+        assert!(store.run_events(&run,None,100).await.unwrap().iter().any(|e|e.event_type=="ci.host.bootstrap.recovered.v1"));
+        server.abort();
     }
 
     /// The token half of the submit credential, without a database: what does

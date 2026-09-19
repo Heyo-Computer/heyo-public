@@ -217,6 +217,67 @@ pub(crate) async fn release(d:&Dispatcher,id:&str)->Result<()> {
 
 pub async fn owns_job(store:&Store,job:&str)->Result<bool>{Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_service_deployment d JOIN ci_host_heyvm_bootstrap h ON h.id=d.id WHERE d.job_id=$1)").bind(job).fetch_one(store.pool()).await?)}
 
+/// Explicit receipt-only recovery. Never redeliver the original installer or rewrite run history.
+pub async fn recover(d:&Dispatcher,run_id:&str,id:&str)->Result<Value> {
+    let run=d.store.get_run(run_id).await?.ok_or_else(||anyhow::anyhow!("missing run"))?;
+    ensure!(crate::repos::same_repo(REPOSITORY,&run.repo_url),"only the private Heyo repository may recover hosts");
+    let mut tx=d.store.pool().begin().await?;
+    let runner:String=sqlx::query_scalar("SELECT h.runner_hd_id FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment s ON s.id=h.id WHERE h.id=$1 AND s.run_id=$2")
+        .bind(id).bind(run_id).fetch_one(&mut *tx).await?;
+    let locked:bool=sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1,222))").bind(&runner).fetch_one(&mut *tx).await?;
+    ensure!(locked,"host recovery or maintenance is already in progress");
+    let row=sqlx::query("SELECT h.*,s.job_id FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment s ON s.id=h.id WHERE h.id=$1 AND s.run_id=$2 FOR UPDATE OF h")
+        .bind(id).bind(run_id).fetch_one(&mut *tx).await?;
+    let phase:String=row.get("phase");
+    if phase=="passed" { return Ok(json!({"operation_id":id,"status":"already_passed"})); }
+    ensure!(phase=="failed"&&row.get::<bool,_>("delivery_armed"),"only failed, delivered bootstrap operations can be recovered");
+    let other:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND id<>$2 AND phase NOT IN ('passed','superseded'))")
+        .bind(&runner).bind(id).fetch_one(&mut *tx).await?;
+    ensure!(!other,"another operation owns the host fence");
+    let req:Request=serde_json::from_value(row.get("request"))?;
+    ensure!(req.artifact.operation_id==id&&req.target.runner_hd_id==runner,"stored operation identity differs");
+    ensure!(trusted(d,&req.alias).await?==req.target,"bootstrap target configuration drifted");
+    let job=d.store.get_job(&row.get::<String,_>("job_id")).await?.ok_or_else(||anyhow::anyhow!("missing bootstrap job"))?;
+    ensure!(job.status=="failure"&&run.status=="failure","original run and job must remain failed");
+    let plan:JobPlan=serde_json::from_value(job.plan)?;
+    let prefix=crate::secrets::Secrets::prefix(&run.workflow_id,plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default"));
+    let resolved=d.secrets.resolve(&prefix).await?;
+    let token=resolved.secrets.get(&req.token_secret).filter(|s|!s.is_empty()).ok_or_else(||anyhow::anyhow!("bootstrap token unavailable"))?;
+    let http=client()?; let base=req.target.app_lb_admin_url.trim_end_matches('/');
+    let launcher:String=row.get("launcher_deployment_id");
+    let original_job:String=row.try_get("launcher_job_id")?;
+    let original=receipt(&launcher_job(&http,base,token,&launcher,&original_job).await?,&req,&launcher)?;
+
+    // A fresh, isolated launcher runs only read-only verification. Retrying this request
+    // may repeat verification, but can never repeat installation or service restart.
+    let verifier=format!("heyvm-verify-{}",uuid::Uuid::new_v4().simple());
+    let mapping=serde_json::to_string(&BTreeMap::from([(req.alias.clone(),req.target.clone())]))?;
+    let command=crate::host_heyvm_bootstrap::verification_recipe(&mapping,&req.alias,&req.artifact)?;
+    let mut spec=launcher_spec(&verifier,&req.target.app_lb_namespace,command);
+    spec["update"]["timeout_secs"]=json!(30);
+    body(http.post(format!("{base}/deployments")).bearer_auth(token).json(&spec).send().await?).await?;
+    let actual=body(http.get(format!("{base}/deployments/{verifier}")).bearer_auth(token).send().await?).await?;
+    ensure!(same_spec(&actual,&spec),"verification launcher differs");
+    let started=body(http.post(format!("{base}/deployments/{verifier}/update")).bearer_auth(token).send().await?).await?;
+    let verify_job=started["id"].as_str().ok_or_else(||anyhow::anyhow!("verification job ID missing"))?;
+    let live=tokio::time::timeout(Duration::from_secs(45),async {
+        loop {
+            let job=launcher_job(&http,base,token,&verifier,verify_job).await?;
+            if matches!(job["status"].as_str(),Some("queued"|"running")) {tokio::time::sleep(Duration::from_secs(1)).await;continue}
+            return receipt(&job,&req,&verifier);
+        }
+    }).await??;
+    ensure!(live==original,"live verification differs from original receipt");
+    ensure!(trusted(d,&req.alias).await?==req.target,"bootstrap target configuration drifted during recovery");
+    let result=json!({"operation_id":id,"status":"recovered","receipt":live,"original_job_id":original_job,
+        "verification_deployment":verifier,"verification_job_id":verify_job,"recovered_at":chrono::Utc::now()});
+    sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase='passed',result=$2,updated_at=now() WHERE id=$1").bind(id).bind(&result).execute(&mut *tx).await?;
+    let note=format!("Bootstrap {id} recovered by explicit receipt and live-state verification; host fence released. Original failed run preserved. Verification job: {verify_job}");
+    Store::add_event(&mut tx,run_id,Some(&job.id),None,None,"ci.host.bootstrap.recovered.v1","recovered",Some(&note)).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
 pub fn spawn(d:Arc<Dispatcher>){tokio::spawn(async move{let mut tick=tokio::time::interval(Duration::from_secs(3));loop{tick.tick().await;let rows=sqlx::query("SELECT h.id,h.request,d.run_id,d.job_id FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment d ON d.id=h.id WHERE h.phase NOT IN ('passed','failed','superseded') ORDER BY h.created_at LIMIT 32").fetch_all(d.store.pool()).await;let Ok(rows)=rows else{continue};for row in rows{let id:String=row.get("id");let run:String=row.get("run_id");let result:Result<()>=async{let req:Request=serde_json::from_value(row.get("request"))?;release(&d,&id).await?;let target=trusted(&d,&req.alias).await.ok();reconcile(&d,&id,"",target.as_ref()).await?;let job=d.store.get_job(&row.get::<String,_>("job_id")).await?.ok_or_else(||anyhow::anyhow!("missing bootstrap job"))?;let plan:JobPlan=serde_json::from_value(job.plan)?;let rr=d.store.get_run(&run).await?.ok_or_else(||anyhow::anyhow!("missing bootstrap run"))?;let prefix=crate::secrets::Secrets::prefix(&rr.workflow_id,plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default"));let resolved=d.secrets.resolve(&prefix).await?;let token=resolved.secrets.get(&req.token_secret).filter(|s|!s.is_empty()).ok_or_else(||anyhow::anyhow!("bootstrap token unavailable"))?;reconcile(&d,&id,token,target.as_ref()).await}.await;if let Err(error)=result{tracing::warn!(operation=%id,error=%error,"host heyvm bootstrap blocked; fence retained");}let _=d.advance_run(&run).await;}}});}
 
 #[cfg(test)]

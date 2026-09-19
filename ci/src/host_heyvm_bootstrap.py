@@ -281,11 +281,42 @@ def install(target, req, binary, host=None):
             journal.update(status="rollback_failed", result=result); save_journal(journal_path, journal); return result
 
 
+def verify_existing(target, req, host=None):
+    """Read-only recovery: never download, install, restart, or rewrite the journal."""
+    host = host or Host()
+    journal_path = pathlib.Path(target["state_dir"]) / (req["operation_id"] + ".json")
+    old = json.loads(journal_path.read_bytes())
+    operation_hash = sha(json.dumps(req, sort_keys=True, separators=(",", ":")).encode())
+    if old.get("status") != "succeeded" or old.get("request_sha256") != operation_hash:
+        raise ValueError("no matching successful bootstrap journal")
+    config, drop = exact_files(target)
+    expected = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
+                "target_alias": target["target_alias"], "status": "succeeded", "heyvm_sha256": req["heyvm_sha256"],
+                "config_sha256": sha(config), "systemd_drop_in_sha256": sha(drop),
+                "backend_server_id": target["backend_server_id"], "region": target["region"]}
+    if old.get("result") != expected: raise ValueError("saved receipt differs")
+    now = service(host, target)
+    if now["disk_sha256"] != req["heyvm_sha256"] or now["running_sha256"] != req["heyvm_sha256"] or host.proc_exe(now["pid"]) != os.path.realpath(target["executable"]):
+        raise ValueError("current executable differs")
+    if pathlib.Path(target["config_json_path"]).read_bytes() != config or pathlib.Path(target["systemd_drop_in_path"]).read_bytes() != drop:
+        raise ValueError("current bootstrap files differ")
+    if not exact_regular(target["executable"], 0o755) or not exact_regular(target["config_json_path"], 0o600) or not exact_regular(target["systemd_drop_in_path"], 0o644):
+        raise ValueError("current ownership or mode differs")
+    if not host.environment_has(now["pid"], target["config_json_path"]): raise ValueError("current environment differs")
+    health = host.health(target["local_health_url"])
+    if health.get("backendId", health.get("backend_id")) != target["backend_server_id"] or health.get("backendRegion", health.get("backend_region")) != target["region"] or health.get("status") not in ("ok", "healthy", "running"):
+        raise ValueError("current health identity differs")
+    if service(host, target) != now: raise ValueError("service changed during verification")
+    return expected
+
+
 def main():
     envelope = json.loads(base64.b64decode(sys.argv[1], validate=True))
+    verify_only = envelope.pop("verify_only", False)
+    if not isinstance(verify_only, bool): raise ValueError("invalid verification mode")
     closed(envelope, {"mapping_json", "target_alias", "request"}, "envelope")
     target = mapping(envelope["mapping_json"], envelope["target_alias"]); req = request(envelope["request"])
-    result = install(target, req, executable(download(req), req))
+    result = verify_existing(target, req) if verify_only else install(target, req, executable(download(req), req))
     print("HEYO_HEYVM_BOOTSTRAP_RESULT=" + base64.b64encode(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()).decode(), flush=True)
 
 

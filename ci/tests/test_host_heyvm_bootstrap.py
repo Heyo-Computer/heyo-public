@@ -149,6 +149,32 @@ class Tests(unittest.TestCase):
             host=FakeHost(target,old,new); host.current=b"different"
             with self.assertRaises(ValueError): b.install(target,self.req(new),new,host)
 
+    def test_recovery_verifies_live_state_without_mutations(self):
+        from unittest.mock import patch
+        for drift in (None, "running", "config", "drop", "journal", "health", "environment", "mode"):
+            temp,target,host,result,old,new=self.run_install()
+            try:
+                if drift == "running": host.current=old
+                if drift in ("config", "drop"):
+                    pathlib.Path(target["config_json_path" if drift == "config" else "systemd_drop_in_path"]).write_bytes(b"drift")
+                if drift == "journal":
+                    p=pathlib.Path(target["state_dir"])/"op-1.json"; saved=json.loads(p.read_bytes()); saved["request_sha256"]="0"*64; p.write_text(json.dumps(saved))
+                if drift == "health": host.health=lambda _: {"status":"healthy","backendId":"wrong","backendRegion":"eu1"}
+                if drift == "environment": host.fail="environment"
+                if drift == "mode": pathlib.Path(target["executable"]).chmod(0o777)
+                files={p:p.read_bytes() for p in pathlib.Path(temp.name).rglob("*") if p.is_file()}
+                host.calls.clear()
+                with patch.object(b,"exact_regular",side_effect=lambda path,mode: stat.S_IMODE(pathlib.Path(path).stat().st_mode)==mode), \
+                     patch.object(b,"atomic",side_effect=AssertionError("verification wrote a file")), \
+                     patch.object(b,"download",side_effect=AssertionError("verification downloaded an artifact")):
+                    if drift:
+                        with self.assertRaises(ValueError): b.verify_existing(target,self.req(new),host)
+                    else:
+                        self.assertEqual(b.verify_existing(target,self.req(new),host),result)
+                self.assertTrue(all(call[:2] == ("systemctl","show") for call in host.calls))
+                self.assertEqual({p:p.read_bytes() for p in files},files)
+            finally: temp.cleanup()
+
     def test_all_mutation_boundaries_roll_back_and_rollback_failure_is_retained(self):
         for failure in ("daemon-reload","restart","health","environment"):
             temp,target,_host,result,old,_new=self.run_install(failure)
