@@ -27,6 +27,7 @@ struct Request { alias: String, target: Target, token_secret: String, artifact: 
 
 fn sha(bytes: &[u8]) -> String { hex::encode(Sha256::digest(bytes)) }
 fn canonical(value:&Value)->Value { match value { Value::Object(m)=>Value::Object(m.iter().map(|(k,v)|(k.clone(),canonical(v))).collect::<BTreeMap<_,_>>().into_iter().collect()), Value::Array(a)=>Value::Array(a.iter().map(canonical).collect()), v=>v.clone() } }
+fn terminal_phase(phase:&str)->bool { matches!(phase,"passed"|"failed"|"superseded") }
 
 pub fn validate_plan(plan: &JobPlan) -> Result<()> {
     for (i, step) in plan.steps.iter().enumerate().filter(|(_,s)| s.uses.as_deref()==Some(ACTION)) {
@@ -152,7 +153,7 @@ async fn finish(store:&Store,id:&str,passed:bool,note:&str,result:Option<&Value>
     let job_status:String=sqlx::query_scalar("SELECT status FROM ci_job WHERE id=$1 FOR UPDATE").bind(&job).fetch_one(&mut *tx).await?;
     let operation=sqlx::query("SELECT phase,deadline FROM ci_host_heyvm_bootstrap WHERE id=$1 FOR UPDATE").bind(id).fetch_one(&mut *tx).await?;
     let phase:String=operation.get("phase");let deadline:chrono::DateTime<chrono::Utc>=operation.get("deadline");
-    if matches!(phase.as_str(),"passed"|"failed"){return Ok(())}
+    if terminal_phase(&phase){return Ok(())}
     let eligible=run_status=="running"&&job_status=="running"&&deadline>chrono::Utc::now()&&phase=="polling";
     let passed=passed&&eligible;
     let status=if passed{"success"}else{"failure"}; let phase=if passed{"passed"}else{"failed"};
@@ -164,7 +165,7 @@ async fn finish(store:&Store,id:&str,passed:bool,note:&str,result:Option<&Value>
 }
 
 async fn reconcile(d:&Dispatcher,id:&str,token:&str,configured:Option<&Target>)->Result<()> {
-    let row=sqlx::query("SELECT h.*,d.run_id,d.job_id FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment d ON d.id=h.id WHERE h.id=$1 AND h.phase NOT IN ('passed','failed')").bind(id).fetch_optional(d.store.pool()).await?;let Some(row)=row else{return Ok(())};
+    let row=sqlx::query("SELECT h.*,d.run_id,d.job_id FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment d ON d.id=h.id WHERE h.id=$1 AND h.phase NOT IN ('passed','failed','superseded')").bind(id).fetch_optional(d.store.pool()).await?;let Some(row)=row else{return Ok(())};
     let req:Request=serde_json::from_value(row.get("request"))?;let phase:String=row.get("phase");let deadline:chrono::DateTime<chrono::Utc>=row.get("deadline");
     let run:String=row.get("run_id");let job:String=row.get("job_id");
     let lifecycle=sqlx::query("SELECT j.status AS job_status,r.status AS run_status FROM ci_job j JOIN ci_run r ON r.id=j.run_id WHERE j.id=$1").bind(&job).fetch_one(d.store.pool()).await?;
@@ -204,11 +205,19 @@ pub(crate) async fn release(d:&Dispatcher,id:&str)->Result<()> {
 
 pub async fn owns_job(store:&Store,job:&str)->Result<bool>{Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_service_deployment d JOIN ci_host_heyvm_bootstrap h ON h.id=d.id WHERE d.job_id=$1)").bind(job).fetch_one(store.pool()).await?)}
 
-pub fn spawn(d:Arc<Dispatcher>){tokio::spawn(async move{let mut tick=tokio::time::interval(Duration::from_secs(3));loop{tick.tick().await;let rows=sqlx::query("SELECT h.id,h.request,d.run_id,d.job_id FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment d ON d.id=h.id WHERE h.phase NOT IN ('passed','failed') ORDER BY h.created_at LIMIT 32").fetch_all(d.store.pool()).await;let Ok(rows)=rows else{continue};for row in rows{let id:String=row.get("id");let run:String=row.get("run_id");let result:Result<()>=async{let req:Request=serde_json::from_value(row.get("request"))?;release(&d,&id).await?;let target=trusted(&d,&req.alias).await.ok();reconcile(&d,&id,"",target.as_ref()).await?;let job=d.store.get_job(&row.get::<String,_>("job_id")).await?.ok_or_else(||anyhow::anyhow!("missing bootstrap job"))?;let plan:JobPlan=serde_json::from_value(job.plan)?;let rr=d.store.get_run(&run).await?.ok_or_else(||anyhow::anyhow!("missing bootstrap run"))?;let prefix=crate::secrets::Secrets::prefix(&rr.workflow_id,plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default"));let resolved=d.secrets.resolve(&prefix).await?;let token=resolved.secrets.get(&req.token_secret).filter(|s|!s.is_empty()).ok_or_else(||anyhow::anyhow!("bootstrap token unavailable"))?;reconcile(&d,&id,token,target.as_ref()).await}.await;if result.is_err(){tracing::warn!(operation=%id,"host heyvm bootstrap blocked; fence retained");}let _=d.advance_run(&run).await;}}});}
+pub fn spawn(d:Arc<Dispatcher>){tokio::spawn(async move{let mut tick=tokio::time::interval(Duration::from_secs(3));loop{tick.tick().await;let rows=sqlx::query("SELECT h.id,h.request,d.run_id,d.job_id FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment d ON d.id=h.id WHERE h.phase NOT IN ('passed','failed','superseded') ORDER BY h.created_at LIMIT 32").fetch_all(d.store.pool()).await;let Ok(rows)=rows else{continue};for row in rows{let id:String=row.get("id");let run:String=row.get("run_id");let result:Result<()>=async{let req:Request=serde_json::from_value(row.get("request"))?;release(&d,&id).await?;let target=trusted(&d,&req.alias).await.ok();reconcile(&d,&id,"",target.as_ref()).await?;let job=d.store.get_job(&row.get::<String,_>("job_id")).await?.ok_or_else(||anyhow::anyhow!("missing bootstrap job"))?;let plan:JobPlan=serde_json::from_value(job.plan)?;let rr=d.store.get_run(&run).await?.ok_or_else(||anyhow::anyhow!("missing bootstrap run"))?;let prefix=crate::secrets::Secrets::prefix(&rr.workflow_id,plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default"));let resolved=d.secrets.resolve(&prefix).await?;let token=resolved.secrets.get(&req.token_secret).filter(|s|!s.is_empty()).ok_or_else(||anyhow::anyhow!("bootstrap token unavailable"))?;reconcile(&d,&id,token,target.as_ref()).await}.await;if let Err(error)=result{tracing::warn!(operation=%id,error=%error,"host heyvm bootstrap blocked; fence retained");}let _=d.advance_run(&run).await;}}});}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn superseded_bootstrap_is_terminal() {
+        assert!(terminal_phase("passed"));
+        assert!(terminal_phase("failed"));
+        assert!(terminal_phase("superseded"));
+        assert!(!terminal_phase("draining"));
+    }
 
     #[test]
     fn plan_and_receipt_are_closed() {
