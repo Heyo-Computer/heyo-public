@@ -110,6 +110,9 @@ pub async fn request(d:&Dispatcher,msg:&JobMessage,plan:&JobPlan,step:&str,alias
     if let Some(old)=sqlx::query_scalar::<_,Value>("SELECT request FROM ci_host_heyvm_bootstrap WHERE id=$1").bind(&id).fetch_optional(&mut *tx).await? { ensure!(old==value,"bootstrap request changed on replay"); return Ok(format!("[ci] bootstrap {id} already persisted\n")); }
     let maintenance_fenced:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed')").bind(&target.runner_hd_id).fetch_one(&mut *tx).await?;
     ensure!(!maintenance_fenced,"runner has unresolved host maintenance");
+    let active_bootstrap:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase NOT IN ('passed','failed','superseded'))").bind(&target.runner_hd_id).fetch_one(&mut *tx).await?;
+    ensure!(!active_bootstrap,"runner has an active host heyvm bootstrap");
+    sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase='superseded',updated_at=now() WHERE runner_hd_id=$1 AND phase='failed'").bind(&target.runner_hd_id).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) VALUES($1,$2,$3,$4,$5,$6,'running','draining',$7,$8)")
         .bind(&id).bind(step).bind(&msg.run_id).bind(&msg.job_id).bind(&target.backend_server_id).bind(sha(&serde_json::to_vec(&value)?)).bind(&run.sha).bind(&release.prepared.git_ref).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO ci_host_heyvm_bootstrap(id,runner_hd_id,request,launcher_recipe,deadline,launcher_deployment_id,phase) VALUES($1,$2,$3,$4,now()+make_interval(secs=>$5),$6,'releasing')")

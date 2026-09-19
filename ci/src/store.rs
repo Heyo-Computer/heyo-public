@@ -1340,7 +1340,7 @@ impl Store {
         // this running job and must drain it before submitting.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 222))")
             .bind(runner_hd_id).execute(&mut *tx).await.map_err(StoreError::sql)?;
-        let cordoned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase<>'passed')")
+        let cordoned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase NOT IN ('passed','superseded'))")
             .bind(runner_hd_id).fetch_one(&mut *tx).await.map_err(StoreError::sql)?;
         if cordoned { return Ok(false); }
         let row = sqlx::query(
