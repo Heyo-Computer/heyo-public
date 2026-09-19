@@ -3,6 +3,7 @@
 use anyhow::{Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 const INSTALLER: &str = include_str!("host_heyvm_bootstrap.py");
@@ -20,6 +21,7 @@ pub(crate) struct Artifact {
     pub heyvm_sha256: String,
 }
 
+#[cfg(test)]
 fn digest(value: &[u8]) -> String { hex::encode(Sha256::digest(value)) }
 
 pub(crate) fn recipe(mapping_json: &str, target_alias: &str, artifact: &Artifact) -> Result<String> {

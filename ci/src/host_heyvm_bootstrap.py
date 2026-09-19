@@ -152,9 +152,9 @@ def service(host, target):
     values = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     if values.get("LoadState") != "loaded" or values.get("ActiveState") != "active" or values.get("KillMode") != "process": raise ValueError("unsafe service state")
     pid = int(values.get("MainPID", "0")); command = values.get("ExecStart", "")
-    # systemctl's structured display starts with { path ; ... } or the path itself.
-    paths = re.findall(r"(?:^|[ {;])(/[^ ;}]+)", command)
-    if pid <= 1 or not paths or os.path.realpath(paths[0]) != os.path.realpath(target["executable"]): raise ValueError("service executable differs")
+    # systemctl show serializes ExecCommand with an authoritative path= field.
+    paths = re.findall(r"(?:^|[ {;])path=([^ ;}]+)", command)
+    if pid <= 1 or len(paths) != 1 or paths[0] != target["executable"]: raise ValueError("service executable differs")
     return {"boot_id": host.boot_id(), "pid": pid, "starttime": host.starttime(pid), "disk_sha256": sha(pathlib.Path(target["executable"]).read_bytes()), "running_sha256": host.proc_digest(pid)}
 
 

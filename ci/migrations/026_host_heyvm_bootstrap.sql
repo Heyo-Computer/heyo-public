@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS ci_host_heyvm_bootstrap (
     request JSONB NOT NULL,
     launcher_recipe JSONB NOT NULL,
     deadline TIMESTAMPTZ NOT NULL,
-    phase TEXT NOT NULL DEFAULT 'draining' CHECK (phase IN ('draining','registering','delivery_ready','armed','polling','failed','passed')),
+    phase TEXT NOT NULL DEFAULT 'releasing' CHECK (phase IN ('releasing','draining','registering','delivery_ready','armed','polling','failed','passed')),
     delivery_armed BOOLEAN NOT NULL DEFAULT false,
     launcher_deployment_id TEXT NOT NULL,
     launcher_job_id TEXT,

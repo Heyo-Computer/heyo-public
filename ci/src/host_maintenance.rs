@@ -154,6 +154,13 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, plan: &JobPlan, step: &st
         ensure!(existing == value, "maintenance payload changed on replay");
         return Ok(format!("[ci] maintenance {id} already recorded\n"));
     }
+    let bootstrap_fenced: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase<>'passed')",
+    )
+    .bind(&request.target.runner_hd_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    ensure!(!bootstrap_fenced, "runner has an unresolved native heyvm bootstrap");
     let inserted = sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) SELECT $1,$2,$3,$4,$5,$6,'running','releasing',$7,$8 WHERE EXISTS(SELECT 1 FROM ci_job WHERE id=$4 AND status='running')")
         .bind(&id).bind(step).bind(&msg.run_id).bind(&msg.job_id).bind(&request.target.backend_server_id)
         .bind(hash).bind(&sha).bind(&release.prepared.git_ref).execute(&mut *tx).await?.rows_affected();

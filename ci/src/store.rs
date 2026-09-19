@@ -1350,6 +1350,7 @@ impl Store {
               WHERE id = $1
                 AND status NOT IN ('success','failure','skipped','cancelled')
                 AND NOT EXISTS (SELECT 1 FROM ci_service_deployment s JOIN ci_host_maintenance h ON h.id=s.id WHERE s.job_id=ci_job.id)
+                AND NOT EXISTS (SELECT 1 FROM ci_service_deployment s JOIN ci_host_heyvm_bootstrap h ON h.id=s.id WHERE s.job_id=ci_job.id)
               RETURNING run_id, job_key",
         )
         .bind(job_id)

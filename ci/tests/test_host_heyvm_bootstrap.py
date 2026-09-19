@@ -46,7 +46,7 @@ class FakeHost(b.Host):
             if self.rollback_fail and disk == self.old: self.current=self.new
             else: self.current=disk
             self.pid += 1; self.start=str(int(self.start)+1)
-        return "LoadState=loaded\nActiveState=active\nKillMode=process\nMainPID=%s\nExecStart={ %s ; }\n" % (self.pid,self.target["executable"])
+        return "LoadState=loaded\nActiveState=active\nKillMode=process\nMainPID=%s\nExecStart={ path=%s ; argv[]=/misleading/heyvm --serve ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n" % (self.pid,self.target["executable"])
     def boot_id(self): return "boot"
     def starttime(self, _pid): return self.start
     def proc_exe(self, _pid): return self.target["executable"]
@@ -85,6 +85,14 @@ class Tests(unittest.TestCase):
         for payload,status in [(b"xx",200),(b"x",302),(b"y",200)]:
             with self.assertRaises(ValueError): b.download(req,Opener(payload,status))
         self.assertIsNone(b.NoRedirect().redirect_request(None,None,None,None,None,None))
+
+    def test_service_uses_authoritative_systemd_path_not_argv(self):
+        with tempfile.TemporaryDirectory() as td:
+            target=self.target(pathlib.Path(td)); exe=pathlib.Path(target["executable"]); exe.parent.mkdir(); exe.write_bytes(b"old")
+            host=FakeHost(target,b"old",b"new")
+            self.assertEqual(b.service(host,target)["pid"],10)
+            host.command=lambda _argv: "LoadState=loaded\nActiveState=active\nKillMode=process\nMainPID=10\nExecStart={ path=/wrong/heyvm ; argv[]=%s ; }\n" % target["executable"]
+            with self.assertRaises(ValueError): b.service(host,target)
 
     def test_archives_reject_traversal_links_ambiguity_and_hashes(self):
         binary=b"\x7fELFpayload"; inner=tar([("heyvm",binary,"file")]); outer=tar([("validation/heyvm.tar.gz",inner,"file")],False)
