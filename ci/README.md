@@ -1551,6 +1551,12 @@ job. Cancellation, timeout, mapping drift, missing identity, ambiguous launcher
 history, failure, or rollback retain the target fence. Only an exact authenticated
 success receipt uncordons it.
 
+The coordinator polls `/deployments/{launcher}/jobs` and selects the persisted
+job ID, preserving namespace-scoped access. It does not require fleet-wide
+`/jobs/{id}` access. Missing or duplicate job IDs and mismatched deployment or
+job-kind identities retain the fence; the selected job still requires the exact
+success receipt before uncordoning.
+
 The initial eu1 installation is explicitly a **one-time** use: run one release job
 with `target: eu1`, verify its deployment event reaches `passed`, then use normal
 `ci/host-heyvm-maintenance` for subsequent upgrades. Do not rerun bootstrap to

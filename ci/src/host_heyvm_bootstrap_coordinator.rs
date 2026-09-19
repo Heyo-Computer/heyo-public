@@ -134,6 +134,17 @@ fn same_spec(actual:&Value,want:&Value)->bool{
             || value.is_null()||value==&json!([]))
 }
 
+async fn launcher_job(http:&reqwest::Client,base:&str,token:&str,launcher:&str,job_id:&str)->Result<Value>{
+    // The global /jobs/{id} route requires fleet access; bootstrap tokens are confined.
+    let response=body(http.get(format!("{base}/deployments/{launcher}/jobs")).bearer_auth(token).send().await?).await?;
+    let jobs=response.as_array().ok_or_else(||anyhow::anyhow!("launcher job list is invalid"))?;
+    let mut matches=jobs.iter().filter(|job|job["id"].as_str()==Some(job_id));
+    let job=matches.next().ok_or_else(||anyhow::anyhow!("launcher job missing; target remains fenced"))?;
+    ensure!(matches.next().is_none(),"launcher job ambiguity; target remains fenced");
+    ensure!(job["deployment"]==launcher && matches!(job["kind"].as_str(),Some("update"|"host-update")),"launcher job identity differs");
+    Ok(job.clone())
+}
+
 fn receipt(job:&Value,req:&Request,launcher:&str)->Result<Value>{
     ensure!(job["deployment"]==launcher && matches!(job["kind"].as_str(),Some("update"|"host-update")),"launcher job identity differs");
     ensure!(job["status"]=="succeeded","launcher did not succeed");
@@ -186,7 +197,7 @@ async fn reconcile(d:&Dispatcher,id:&str,token:&str,configured:Option<&Target>)-
     if phase=="armed" && job_id.is_none(){let jobs=body(http.get(format!("{base}/deployments/{launcher}/jobs")).bearer_auth(token).send().await?).await?;let matches:Vec<_>=jobs.as_array().into_iter().flatten().filter(|j|matches!(j["kind"].as_str(),Some("update"|"host-update"))).collect();
         if matches.len()==1 {job_id=matches[0]["id"].as_str().map(str::to_string);} else if matches.is_empty(){return Ok(())} else {bail!("launcher job ambiguity; target remains fenced")}
         if let Some(j)=&job_id{sqlx::query("UPDATE ci_host_heyvm_bootstrap SET launcher_job_id=$2,phase='polling',updated_at=now() WHERE id=$1 AND phase='armed' AND launcher_job_id IS NULL").bind(id).bind(j).execute(d.store.pool()).await?;}return Ok(())}
-    let Some(job_id)=job_id else{return Ok(())};let jobv=body(http.get(format!("{base}/jobs/{job_id}")).bearer_auth(token).send().await?).await?;
+    let Some(job_id)=job_id else{return Ok(())};let jobv=launcher_job(&http,base,token,&launcher,&job_id).await?;
     match jobv["status"].as_str(){Some("queued"|"running")=>{},Some("succeeded")=>match receipt(&jobv,&req,&launcher){Ok(r)=>finish(&d.store,id,true,"Exact native heyvm bootstrap receipt verified; target uncordoned.",Some(&r)).await?,Err(_)=>finish(&d.store,id,false,"Launcher receipt was missing, ambiguous, mismatched, or reported rollback; target remains fenced.",None).await?},_=>finish(&d.store,id,false,"Launcher/bootstrap failed or rolled back; target remains fenced.",None).await?};
     let _=run;Ok(())
 }
@@ -211,6 +222,37 @@ pub fn spawn(d:Arc<Dispatcher>){tokio::spawn(async move{let mut tick=tokio::time
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn polling_uses_scoped_route_and_exact_job_identity() {
+        use axum::{Json, Router, extract::State, http::{HeaderMap, StatusCode}, routing::get};
+        let wanted=json!({"id":"job-target","deployment":"launcher","kind":"update","status":"succeeded","log":["receipt retained"]});
+        let other=json!({"id":"job-other","deployment":"launcher","kind":"update","status":"failed"});
+        let records=Arc::new(tokio::sync::RwLock::new(json!([other,wanted])));
+        let app=Router::new().route("/deployments/launcher/jobs",get(
+            |State(records):State<Arc<tokio::sync::RwLock<Value>>>,headers:HeaderMap| async move {
+                assert_eq!(headers["authorization"],"Bearer scoped-test-token");
+                Json(records.read().await.clone())
+            }
+        )).fallback(|| async { StatusCode::FORBIDDEN }).with_state(records.clone());
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move { axum::serve(listener,app).await.unwrap(); });
+        let http=client().unwrap();
+        let got=launcher_job(&http,&base,"scoped-test-token","launcher","job-target").await.unwrap();
+        assert_eq!(got,wanted);
+        assert!(launcher_job(&http,&base,"scoped-test-token","launcher","missing").await.is_err());
+        for invalid in [
+            json!([wanted,wanted]),
+            json!([{"id":"job-target","deployment":"another-launcher","kind":"update","status":"succeeded"}]),
+            json!([{"id":"job-target","deployment":"launcher","kind":"deploy","status":"succeeded"}]),
+            json!({"jobs":[wanted]}),
+        ] {
+            *records.write().await=invalid;
+            assert!(launcher_job(&http,&base,"scoped-test-token","launcher","job-target").await.is_err());
+        }
+        server.abort();
+    }
 
     #[test]
     fn superseded_bootstrap_is_terminal() {
