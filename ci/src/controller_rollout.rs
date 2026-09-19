@@ -109,6 +109,16 @@ fn client() -> Result<reqwest::Client, String> {
         .redirect(reqwest::redirect::Policy::none()).build().map_err(|e| e.to_string())
 }
 
+fn success_message(request: &Request) -> String {
+    format!(
+        "Deployed CI controller `{}` at {} from revision {}; verified the exact executable through {}/healthz; submissions reopened.",
+        request.deployment,
+        request.public_url.trim_end_matches('/'),
+        request.sha,
+        request.public_url.trim_end_matches('/'),
+    )
+}
+
 fn target(d: &Dispatcher) -> Result<(&str, &str, &str), String> {
     let id = d.config.controller_deployment.as_deref().ok_or("CI_CONTROLLER_DEPLOYMENT is not configured")?;
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
@@ -298,7 +308,7 @@ async fn reconcile(d: &Dispatcher) -> Result<(), String> {
         || headers.get("x-ci-binary-sha256").and_then(|h| h.to_str().ok()) != Some(request.binary_sha256.as_str()) {
         return Err("public health does not identify the exact replacement binary".into());
     }
-    finish(d, &id, &run, true, "Exact replacement binary verified through public health; submissions reopened.").await
+    finish(d, &id, &run, true, &success_message(&request)).await
 }
 
 pub fn spawn(d: Arc<Dispatcher>) {
@@ -358,6 +368,18 @@ mod tests {
         assert!(artifact_identity(&package("different\n", &sums, false), "source").is_err());
         assert!(artifact_identity(&package("source\n", "bad  ci\n", false), "source").is_err());
         assert!(artifact_identity(&package("source\n", &sums, true), "source").is_err());
+    }
+
+    #[test]
+    fn completed_deployment_message_identifies_what_and_where() {
+        let request = Request {
+            deployment: "ci-eu1".into(), base_url: "https://admin.eu1.example".into(),
+            public_url: "https://ci.eu1.example/".into(), artifact: "a".repeat(64),
+            sha: "8f3dc6d".into(), binary_sha256: "b".repeat(64), previous_vm: "old".into(),
+            previous_etag: "before".into(), desired_etag: "after".into(),
+        };
+        assert_eq!(success_message(&request),
+            "Deployed CI controller `ci-eu1` at https://ci.eu1.example from revision 8f3dc6d; verified the exact executable through https://ci.eu1.example/healthz; submissions reopened.");
     }
 
     fn spec() -> Value {
