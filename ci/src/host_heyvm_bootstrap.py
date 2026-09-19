@@ -154,14 +154,27 @@ def service(host, target):
     pid = int(values.get("MainPID", "0")); command = values.get("ExecStart", "")
     # systemctl show serializes ExecCommand with an authoritative path= field.
     paths = re.findall(r"(?:^|[ {;])path=([^ ;}]+)", command)
-    if pid <= 1 or len(paths) != 1 or paths[0] != target["executable"]: raise ValueError("service executable differs")
+    # The legacy eu1 service starts a stable symlink. Before the one-time
+    # bootstrap /proc resolves that symlink to its versioned release; after the
+    # atomic replacement both names are the stable path. Require both identities
+    # rather than incorrectly requiring their string representations to match.
+    if pid <= 1 or len(paths) != 1 or paths[0] != target["executable"] or host.proc_exe(pid) != os.path.realpath(target["executable"]):
+        raise ValueError("service executable differs")
     return {"boot_id": host.boot_id(), "pid": pid, "starttime": host.starttime(pid), "disk_sha256": sha(pathlib.Path(target["executable"]).read_bytes()), "running_sha256": host.proc_digest(pid)}
 
 
-def secure_file(path, limit):
+def secure_file(path, limit, allow_symlink=False):
     p = pathlib.Path(path)
     if not p.exists() and not p.is_symlink(): return {"present": False}
     s = p.lstat()
+    if allow_symlink and stat.S_ISLNK(s.st_mode):
+        link = os.readlink(path)
+        safe_path(link)
+        resolved = p.resolve(strict=True)
+        info = resolved.stat()
+        if not stat.S_ISREG(info.st_mode) or s.st_uid != 0 or info.st_uid != 0 or info.st_nlink != 1 or info.st_size > limit:
+            raise ValueError("unsafe predecessor symlink")
+        return {"present": True, "link_target": link}
     if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_nlink != 1 or s.st_size > limit: raise ValueError("unsafe predecessor file")
     return {"present": True, "mode": stat.S_IMODE(s.st_mode), "bytes": base64.b64encode(p.read_bytes()).decode()}
 
@@ -183,6 +196,15 @@ def atomic(path, data, mode):
         if os.path.exists(name): os.unlink(name)
 
 
+def atomic_symlink(path, target):
+    p = pathlib.Path(path); p.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    fd, name = tempfile.mkstemp(prefix=".heyvm-update-", dir=p.parent); os.close(fd); os.unlink(name)
+    try:
+        os.symlink(target, name); os.replace(name, p); fsync_dir(p.parent)
+    finally:
+        if os.path.lexists(name): os.unlink(name)
+
+
 def save_journal(path, value): atomic(path, json.dumps(value, sort_keys=True, separators=(",", ":")).encode(), 0o600)
 
 
@@ -202,12 +224,13 @@ def exact_files(target):
 def restore(host, target, journal):
     for key, path in (("executable", target["executable"]), ("config", target["config_json_path"]), ("drop_in", target["systemd_drop_in_path"])):
         old = journal["predecessors"][key]
-        if old["present"]: atomic(path, base64.b64decode(old["bytes"], validate=True), old["mode"])
+        if old.get("link_target") is not None: atomic_symlink(path, old["link_target"])
+        elif old["present"]: atomic(path, base64.b64decode(old["bytes"], validate=True), old["mode"])
         elif pathlib.Path(path).exists() or pathlib.Path(path).is_symlink(): pathlib.Path(path).unlink(); fsync_dir(pathlib.Path(path).parent)
     host.command(["systemctl", "daemon-reload"]); host.command(["systemctl", "restart", target["unit"]])
     now = service(host, target)
     before = journal["service"]
-    if now["disk_sha256"] != before["disk_sha256"] or now["running_sha256"] != before["running_sha256"] or host.proc_exe(now["pid"]) != target["executable"]:
+    if now["disk_sha256"] != before["disk_sha256"] or now["running_sha256"] != before["running_sha256"] or host.proc_exe(now["pid"]) != os.path.realpath(target["executable"]):
         raise ValueError("rollback verification failed")
 
 
@@ -222,7 +245,7 @@ def install(target, req, binary, host=None):
     before = service(host, target)
     if before["disk_sha256"] != before["running_sha256"]: raise ValueError("predecessor executable drift")
     journal = {"version": 1, "operation_id": req["operation_id"], "request_sha256": operation_hash, "status": "prepared", "service": before,
-               "predecessors": {"executable": secure_file(target["executable"], MAX_HEYVM), "config": secure_file(target["config_json_path"], MAX_SMALL_BACKUP),
+               "predecessors": {"executable": secure_file(target["executable"], MAX_HEYVM, allow_symlink=True), "config": secure_file(target["config_json_path"], MAX_SMALL_BACKUP),
                                 "drop_in": secure_file(target["systemd_drop_in_path"], MAX_SMALL_BACKUP)}}
     pathlib.Path(target["state_dir"]).mkdir(parents=True, exist_ok=True, mode=0o700)
     save_journal(journal_path, journal)  # durable before the first mutation
@@ -232,7 +255,7 @@ def install(target, req, binary, host=None):
         host.command(["systemctl", "daemon-reload"]); host.command(["systemctl", "restart", target["unit"]])
         now = service(host, target)
         if now["boot_id"] != before["boot_id"] or now["pid"] == before["pid"] or now["starttime"] == before["starttime"]: raise ValueError("service generation did not change")
-        if now["disk_sha256"] != req["heyvm_sha256"] or now["running_sha256"] != req["heyvm_sha256"] or host.proc_exe(now["pid"]) != target["executable"]: raise ValueError("new executable verification failed")
+        if now["disk_sha256"] != req["heyvm_sha256"] or now["running_sha256"] != req["heyvm_sha256"] or host.proc_exe(now["pid"]) != os.path.realpath(target["executable"]): raise ValueError("new executable verification failed")
         if pathlib.Path(target["config_json_path"]).read_bytes() != config or pathlib.Path(target["systemd_drop_in_path"]).read_bytes() != drop: raise ValueError("installed file verification failed")
         if not exact_regular(target["executable"], 0o755) or not exact_regular(target["config_json_path"], 0o600) or not exact_regular(target["systemd_drop_in_path"], 0o644): raise ValueError("installed ownership or mode verification failed")
         if not host.environment_has(now["pid"], target["config_json_path"]): raise ValueError("service environment verification failed")

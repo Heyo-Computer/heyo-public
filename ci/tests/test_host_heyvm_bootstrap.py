@@ -49,7 +49,7 @@ class FakeHost(b.Host):
         return "LoadState=loaded\nActiveState=active\nKillMode=process\nMainPID=%s\nExecStart={ path=%s ; argv[]=/misleading/heyvm --serve ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n" % (self.pid,self.target["executable"])
     def boot_id(self): return "boot"
     def starttime(self, _pid): return self.start
-    def proc_exe(self, _pid): return self.target["executable"]
+    def proc_exe(self, _pid): return os.path.realpath(self.target["executable"])
     def proc_digest(self, _pid): return b.sha(self.current)
     def environment_has(self, _pid, _expected):
         if self.fail == "environment": self.fail=None; return False
@@ -94,6 +94,20 @@ class Tests(unittest.TestCase):
             host.command=lambda _argv: "LoadState=loaded\nActiveState=active\nKillMode=process\nMainPID=10\nExecStart={ path=/wrong/heyvm ; argv[]=%s ; }\n" % target["executable"]
             with self.assertRaises(ValueError): b.service(host,target)
 
+    def test_legacy_launcher_symlink_is_verified_and_restored_exactly(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=pathlib.Path(td); target=self.target(root); old=b"\x7fELFold"; new=b"\x7fELFnew"
+            release=root/"releases/old/heyvm"; release.parent.mkdir(parents=True); release.write_bytes(old); release.chmod(0o755)
+            exe=pathlib.Path(target["executable"]); exe.parent.mkdir(); exe.symlink_to(release)
+            host=FakeHost(target,old,new)
+            host.proc_exe=lambda _pid: os.path.realpath(target["executable"])
+            self.assertEqual(b.service(host,target)["disk_sha256"],b.sha(old))
+            exe.unlink(); exe.write_bytes(new); exe.chmod(0o755); host.current=new
+            journal={"service":{"disk_sha256":b.sha(old),"running_sha256":b.sha(old)},"predecessors":{
+              "executable":{"present":True,"link_target":str(release)},"config":{"present":False},"drop_in":{"present":False}}}
+            b.restore(host,target,journal)
+            self.assertTrue(exe.is_symlink()); self.assertEqual(os.readlink(exe),str(release)); self.assertEqual(exe.read_bytes(),old)
+
     def test_archives_reject_traversal_links_ambiguity_and_hashes(self):
         binary=b"\x7fELFpayload"; inner=tar([("heyvm",binary,"file")]); outer=tar([("validation/heyvm.tar.gz",inner,"file")],False)
         req=self.req(binary); req.update(artifact_size=len(outer),artifact_sha256=b.sha(outer),inner_archive_sha256=b.sha(inner))
@@ -110,7 +124,7 @@ class Tests(unittest.TestCase):
         temp=tempfile.TemporaryDirectory(); root=pathlib.Path(temp.name); target=self.target(root)
         old=b"\x7fELFold"; new=b"\x7fELFnew"; exe=pathlib.Path(target["executable"]); exe.parent.mkdir(); exe.write_bytes(old); exe.chmod(0o755)
         original=b.secure_file
-        def test_secure(path,limit):
+        def test_secure(path,limit,**_options):
             p=pathlib.Path(path)
             if not p.exists(): return {"present":False}
             return {"present":True,"mode":stat.S_IMODE(p.stat().st_mode),"bytes":__import__('base64').b64encode(p.read_bytes()).decode()}
@@ -146,7 +160,7 @@ class Tests(unittest.TestCase):
             temp=tempfile.TemporaryDirectory(); root=pathlib.Path(temp.name); target=self.target(root); old=b"\x7fELFold"; new=b"\x7fELFnew"
             p=pathlib.Path(target["executable"]); p.parent.mkdir(); p.write_bytes(old); host=FakeHost(target,old,new)
             original_secure,original_atomic,original_regular=b.secure_file,b.atomic,b.exact_regular; count=[0]
-            b.secure_file=lambda path,limit: ({"present":True,"mode":0o644,"bytes":__import__('base64').b64encode(pathlib.Path(path).read_bytes()).decode()} if pathlib.Path(path).exists() else {"present":False})
+            b.secure_file=lambda path,limit,**_options: ({"present":True,"mode":0o644,"bytes":__import__('base64').b64encode(pathlib.Path(path).read_bytes()).decode()} if pathlib.Path(path).exists() else {"present":False})
             b.exact_regular=lambda path,mode: stat.S_IMODE(pathlib.Path(path).stat().st_mode) == mode
             def failing(path,data,mode):
                 count[0]+=1
