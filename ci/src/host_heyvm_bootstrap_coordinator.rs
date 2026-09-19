@@ -124,6 +124,7 @@ pub async fn request(d:&Dispatcher,msg:&JobMessage,plan:&JobPlan,step:&str,alias
 
 fn client()->Result<reqwest::Client>{Ok(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(20)).build()?)}
 async fn body(mut r:reqwest::Response)->Result<Value>{ensure!(r.status().is_success(),"launcher returned {}",r.status());let mut b=Vec::new();while let Some(c)=r.chunk().await?{ensure!(b.len()+c.len()<=8*1024*1024,"launcher response exceeds bound");b.extend_from_slice(&c);}Ok(serde_json::from_slice(&b)?)}
+fn registration_probe_requires_create(status:reqwest::StatusCode)->bool { matches!(status,reqwest::StatusCode::NOT_FOUND|reqwest::StatusCode::FORBIDDEN) }
 fn same_spec(actual:&Value,want:&Value)->bool{
     let actual=actual.get("spec").unwrap_or(actual);
     let (Some(fields),Some(expected))=(actual.as_object(),want.as_object()) else{return false};
@@ -175,7 +176,7 @@ async fn reconcile(d:&Dispatcher,id:&str,token:&str,configured:Option<&Target>)-
     if phase=="draining" { let blocked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_job WHERE runner_hd_id=$1 AND status='running') OR EXISTS(SELECT 1 FROM ci_host_work WHERE runner_hd_id=$1) OR EXISTS(SELECT 1 FROM ci_vm_pool WHERE runner_hd_id=$1 AND status IN ('claimed','building','draining'))").bind(&req.target.runner_hd_id).fetch_one(d.store.pool()).await?;if blocked{return Ok(())}
         sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase='registering',updated_at=now() WHERE id=$1 AND phase='draining'").bind(id).execute(d.store.pool()).await?;return Ok(()) }
     if token.trim().is_empty(){return Ok(())}let base=req.target.app_lb_admin_url.trim_end_matches('/');let launcher:String=row.get("launcher_deployment_id");let spec:Value=row.get("launcher_recipe");let http=client()?;
-    if phase=="registering" {let r=http.get(format!("{base}/deployments/{launcher}")).bearer_auth(token).send().await?;if r.status()==reqwest::StatusCode::NOT_FOUND{body(http.post(format!("{base}/deployments")).bearer_auth(token).json(&spec).send().await?).await?;}else{ensure!(same_spec(&body(r).await?,&spec),"launcher recipe conflict");}
+    if phase=="registering" {let r=http.get(format!("{base}/deployments/{launcher}")).bearer_auth(token).send().await?;if registration_probe_requires_create(r.status()){body(http.post(format!("{base}/deployments")).bearer_auth(token).json(&spec).send().await?).await?;}else{ensure!(same_spec(&body(r).await?,&spec),"launcher recipe conflict");}
         let exact=body(http.get(format!("{base}/deployments/{launcher}")).bearer_auth(token).send().await?).await?;ensure!(same_spec(&exact,&spec),"registered launcher differs");
         let changed=sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase='delivery_ready',updated_at=now() WHERE id=$1 AND phase='registering'").bind(id).execute(d.store.pool()).await?.rows_affected();ensure!(changed<=1,"invalid phase transition");return Ok(())}
     let mut job_id:Option<String>=row.try_get("launcher_job_id")?;
@@ -217,6 +218,14 @@ mod tests {
         assert!(terminal_phase("failed"));
         assert!(terminal_phase("superseded"));
         assert!(!terminal_phase("draining"));
+    }
+
+    #[test]
+    fn namespace_private_missing_probe_attempts_confined_create() {
+        assert!(registration_probe_requires_create(reqwest::StatusCode::NOT_FOUND));
+        assert!(registration_probe_requires_create(reqwest::StatusCode::FORBIDDEN));
+        assert!(!registration_probe_requires_create(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(!registration_probe_requires_create(reqwest::StatusCode::OK));
     }
 
     #[test]
