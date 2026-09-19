@@ -923,7 +923,15 @@ disk budget: its data disk, two declared rootfs copies, and 5 GiB host headroom.
 Free space is read again after every deletion, and checked again before a cold
 VM creation. Claimed, building, and already-draining VMs are never victims;
 only CI pool rows on that host qualify. A failed deletion stays tracked as
-draining and stops that cleanup attempt. If no idle caches remain and space is
+draining and stops that cleanup attempt. An explicit, persisted eviction intent
+makes the lease-loop sweep retry it after failures or controller restarts, even
+if its fingerprint is still wanted. Deletion holds a database row lock across
+the bounded daemon call and requires a follow-up not-found response before
+forgetting the pool row. Resize operations also use `draining`, but carry no
+eviction intent and are never selected for deletion. Pre-existing ambiguous
+draining rows are not automatically adopted as eviction requests.
+
+If no idle caches remain and space is
 still insufficient, the host cannot admit a new VM. This is admission headroom,
 not a disk reservation against concurrent allocations or unknown build scratch.
 

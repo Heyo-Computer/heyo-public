@@ -373,7 +373,7 @@ impl Pool {
             "UPDATE ci_vm_pool
                 SET status='idle', claimed_by_job=NULL, last_used_at=now(),
                     leased_by=NULL, leased_until=NULL
-              WHERE sandbox_id = $1",
+              WHERE sandbox_id = $1 AND NOT eviction_requested",
         )
         .bind(sandbox_id)
         .execute(&self.db)
@@ -579,10 +579,10 @@ impl Pool {
         }
         let row = sqlx::query(
             "UPDATE ci_vm_pool
-                SET status = 'draining'
+                SET status = 'draining', eviction_requested = TRUE
               WHERE sandbox_id = $1
                 AND runner_hd_id = ANY($2)
-                AND status NOT IN ('claimed','building')
+                AND (status = 'idle' OR (status = 'draining' AND eviction_requested))
              RETURNING *",
         )
         .bind(sandbox_id)
@@ -608,7 +608,7 @@ impl Pool {
         }
         let rows = sqlx::query(
             "UPDATE ci_vm_pool
-                SET status = 'draining'
+                SET status = 'draining', eviction_requested = TRUE
               WHERE sandbox_id IN (
                     SELECT p.sandbox_id FROM ci_vm_pool p
                       JOIN ci_job j ON j.id = p.last_job
@@ -631,7 +631,7 @@ impl Pool {
     /// Locking and marking it draining atomically excludes concurrent claims.
     pub async fn take_oldest_idle(&self, runner: &str) -> Result<Option<PooledVm>, PoolError> {
         let row = sqlx::query(
-            "UPDATE ci_vm_pool SET status = 'draining'
+            "UPDATE ci_vm_pool SET status = 'draining', eviction_requested = TRUE
               WHERE sandbox_id = (
                     SELECT sandbox_id FROM ci_vm_pool
                      WHERE status = 'idle' AND runner_hd_id = $1
@@ -671,15 +671,15 @@ impl Pool {
         }
         let rows = sqlx::query(
             "UPDATE ci_vm_pool
-                SET status = 'draining'
+                SET status = 'draining', eviction_requested = TRUE
               WHERE sandbox_id IN (
                     SELECT sandbox_id FROM ci_vm_pool
-                     WHERE status = 'idle'
-                       AND runner_hd_id = ANY($1)
+                     WHERE runner_hd_id = ANY($1)
                        AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase<>'passed')
                        AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase NOT IN ('passed','superseded'))
-                       AND (NOT (fingerprint = ANY($2))
-                            OR last_used_at < now() - make_interval(secs => $3))
+                       AND ((status = 'draining' AND eviction_requested)
+                            OR (status = 'idle' AND (NOT (fingerprint = ANY($2))
+                                OR last_used_at < now() - make_interval(secs => $3))))
                      FOR UPDATE SKIP LOCKED
               )
              RETURNING *",
@@ -1720,6 +1720,46 @@ mod tests {
         assert_eq!(pool.get(&sb(&runner, "claimed")).await.unwrap().unwrap().status, "claimed");
         assert_eq!(pool.get(&sb(&other, "foreign")).await.unwrap().unwrap().status, "idle");
         assert_eq!(pool.get(&building).await.unwrap().unwrap().status, "building");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn eviction_intent_survives_restart_without_deleting_resizes() {
+        let (pool, _store) = test_pool().await;
+        let runner = runner_id();
+        let foreign = runner_id();
+        for (host, name) in [(&runner, "evict"), (&runner, "resize"),
+            (&runner, "legacy-draining"), (&runner, "fresh"), (&foreign, "evict")] {
+            let id = sb(host, name);
+            pool.register(&id, host, "live", "wf", None, "job", held()).await.unwrap();
+            pool.release(&id).await.unwrap();
+            if name == "evict" {
+                pool.take_one_for_sweep(&id, std::slice::from_ref(host)).await.unwrap().unwrap();
+            } else if name != "fresh" {
+                pool.take_idle(&id, std::slice::from_ref(host)).await.unwrap().unwrap();
+            }
+        }
+        // An unrelated release must not cancel the durable deletion request.
+        let target = sb(&runner, "evict");
+        pool.release(&target).await.unwrap();
+        assert_eq!(pool.get(&target).await.unwrap().unwrap().status, "draining");
+        assert!(pool.take_one_for_sweep(&sb(&runner, "resize"), &[runner.clone()])
+            .await.unwrap().is_none());
+
+        // New process, no in-memory cleanup list. Even a recently used image
+        // must be retried once eviction was explicitly requested.
+        let restarted = Pool::new(pool.db.clone());
+        let taken = restarted.take_for_sweep(&[runner.clone()], &["live".into()], 86400)
+            .await.unwrap();
+        assert_eq!(taken.iter().map(|v| &v.sandbox_id).collect::<Vec<_>>(), vec![&target]);
+        let mut in_flight = pool.db.begin().await.unwrap();
+        sqlx::query("SELECT sandbox_id FROM ci_vm_pool WHERE sandbox_id=$1 FOR UPDATE")
+            .bind(&target).fetch_one(&mut *in_flight).await.unwrap();
+        assert!(restarted.take_for_sweep(&[runner.clone()], &["live".into()], 86400)
+            .await.unwrap().is_empty());
+        in_flight.rollback().await.unwrap();
+        assert_eq!(restarted.take_for_sweep(&[runner], &["live".into()], 86400)
+            .await.unwrap().len(), 1);
     }
 
     /// Sweeping marks VMs `draining` so a concurrent claim cannot take one that
