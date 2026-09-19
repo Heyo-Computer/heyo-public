@@ -1524,6 +1524,38 @@ but failed/uncertain finalization never authorizes a deployment. Publication,
 release and deployment state write NATS outbox events transactionally. These
 actions do not change app-lb, namespaces, existing VM pages, or Retail.
 
+### One-time native heyvm host bootstrap
+
+`ci/bootstrap-host-heyvm` is a release-only, final-step action used to install the
+managed host heyvm service before normal host maintenance is available. It accepts
+only `target`, a direct `${{ secrets.NAME }}` app-lb namespace-admin `token`, and
+the frozen validation `workflow` and `artifact` names. The coordinator must run in
+a CI-owned VM on a runner other than the target. The artifact must have been
+uploaded as a public artifact to CI's configured HTTP artifact sink and contain
+exactly one `*heyvm.tar.gz` with exactly one ELF `heyvm`.
+
+Set `CI_HOST_HEYVM_BOOTSTRAP_TARGETS`, or preferably store the same JSON at the
+operator-only HeyoSecret path `ci-controller/host-heyvm-bootstrap-targets` (the
+environment variable wins):
+
+```json
+{"eu1":{"repository":"https://github.com/Heyo-Computer/heyo.git","app_lb_admin_url":"https://eu1.heyo.computer/app-lb-admin","app_lb_deployment":"app-lb-eu1","app_lb_namespace":"default","runner_hd_id":"target-runner-id","backend_server_id":"eu1-backend-id","executable":"/usr/local/bin/heyvm","unit":"heyvm.service","state_dir":"/var/lib/heyvm-host-update","config_json_path":"/etc/heyvm-host-update.json","systemd_drop_in_path":"/etc/systemd/system/heyvm.service.d/host-update.conf","local_health_url":"http://127.0.0.1:4455/health","target_alias":"eu1","region":"eu1"}}
+```
+
+Prerequisites are app-lb's authenticated admin launcher and job-history APIs, a
+namespace-admin token in the workflow secret named by `token`, the target runner
+registered with this controller, and a confirmed merged release whose exact
+successful frozen validation produced the artifact. Delivery is durably armed
+before its single launcher POST; restart recovery only adopts exactly one update
+job. Cancellation, timeout, mapping drift, missing identity, ambiguous launcher
+history, failure, or rollback retain the target fence. Only an exact authenticated
+success receipt uncordons it.
+
+The initial eu1 installation is explicitly a **one-time** use: run one release job
+with `target: eu1`, verify its deployment event reaches `passed`, then use normal
+`ci/host-heyvm-maintenance` for subsequent upgrades. Do not rerun bootstrap to
+repair a retained fence; reconcile the persisted operation and launcher job.
+
 ### Host app-lb executable rollout
 
 `ci/rollout-host-app-lb` is a release-only action with `target`, secret `token`,

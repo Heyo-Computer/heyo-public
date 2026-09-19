@@ -239,15 +239,22 @@ def install(target, req, binary, host=None):
         health = host.health(target["local_health_url"])
         if health.get("backendId", health.get("backend_id")) != target["backend_server_id"] or health.get("backendRegion", health.get("backend_region")) != target["region"] or health.get("status") not in ("ok", "healthy", "running"):
             raise ValueError("health identity or API status differs")
-        result = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "status": "succeeded", "heyvm_sha256": req["heyvm_sha256"]}
+        result = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
+                  "target_alias": target["target_alias"], "status": "succeeded", "heyvm_sha256": req["heyvm_sha256"],
+                  "config_sha256": sha(config), "systemd_drop_in_sha256": sha(drop),
+                  "backend_server_id": target["backend_server_id"], "region": target["region"]}
         journal.update(status="succeeded", result=result); save_journal(journal_path, journal); return result
     except Exception:
         try:
             restore(host, target, journal)
-            result = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "status": "rolled_back"}
+            result = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
+                      "target_alias": target["target_alias"], "status": "rolled_back",
+                      "backend_server_id": target["backend_server_id"], "region": target["region"]}
             journal.update(status="rolled_back", result=result); save_journal(journal_path, journal); return result
         except Exception:
-            result = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "status": "rollback_failed"}
+            result = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
+                      "target_alias": target["target_alias"], "status": "rollback_failed",
+                      "backend_server_id": target["backend_server_id"], "region": target["region"]}
             journal.update(status="rollback_failed", result=result); save_journal(journal_path, journal); return result
 
 
@@ -256,12 +263,12 @@ def main():
     closed(envelope, {"mapping_json", "target_alias", "request"}, "envelope")
     target = mapping(envelope["mapping_json"], envelope["target_alias"]); req = request(envelope["request"])
     result = install(target, req, executable(download(req), req))
-    print("HEYO_BOOTSTRAP_RESULT=" + base64.b64encode(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()).decode(), flush=True)
+    print("HEYO_HEYVM_BOOTSTRAP_RESULT=" + base64.b64encode(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()).decode(), flush=True)
 
 
 if __name__ == "__main__":
     try: main()
     except Exception:
         result = {"protocol": "host-heyvm-bootstrap-v1", "status": "refused"}
-        print("HEYO_BOOTSTRAP_RESULT=" + base64.b64encode(json.dumps(result, separators=(",", ":")).encode()).decode(), flush=True)
+        print("HEYO_HEYVM_BOOTSTRAP_RESULT=" + base64.b64encode(json.dumps(result, separators=(",", ":")).encode()).decode(), flush=True)
         sys.exit(1)

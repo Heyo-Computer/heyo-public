@@ -27,6 +27,7 @@ mod host_app_lb;
 mod host_bootstrap;
 mod host_bootstrap_delivery;
 mod host_heyvm_bootstrap;
+mod host_heyvm_bootstrap_coordinator;
 mod host_maintenance;
 #[path = "../../ui/ui.rs"]
 mod heyo_ui;
@@ -325,6 +326,7 @@ async fn main() {
     dispatcher.clone().spawn_consumers();
     controller_rollout::spawn(dispatcher.clone());
     host_maintenance::spawn(dispatcher.clone());
+    host_heyvm_bootstrap_coordinator::spawn(dispatcher.clone());
     vm_cleanup::spawn(dispatcher.clone());
 
     // Bind before announcing readiness. A listener that cannot bind is a hard

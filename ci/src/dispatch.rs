@@ -1172,6 +1172,8 @@ impl Dispatcher {
             .map_err(|e| DispatchError::BadPlan(e.to_string()))?;
 
         if crate::host_maintenance::owns_job(&self.store, &msg.job_id).await
+            .map_err(|e| DispatchError::StepFailed(e.to_string()))?
+            || crate::host_heyvm_bootstrap_coordinator::owns_job(&self.store, &msg.job_id).await
             .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Ok(JobStatus::Running); }
         let (runner, existing_vm) = self.pick_runner(&plan).await?;
 
@@ -1309,6 +1311,8 @@ impl Dispatcher {
         // Do not stop or repool here: another reconciler may already have done
         // so and that VM might now belong to a different job.
         if crate::host_maintenance::owns_job(&self.store, &msg.job_id).await
+            .map_err(|e| DispatchError::StepFailed(e.to_string()))?
+            || crate::host_heyvm_bootstrap_coordinator::owns_job(&self.store, &msg.job_id).await
             .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Ok(JobStatus::Running); }
         // Before the release, always: a VM with `reuse: false` is destroyed on
         // the next line, and the console of the boot that just failed is exactly
@@ -2610,7 +2614,7 @@ impl Dispatcher {
             .ok_or_else(|| DispatchError::StepFailed(format!("{action} requires with.{key}")));
 
         if matches!(action, "ci/merge-release" | "ci/publish-service-archive" |
-            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance" | "ci/rollout-service" | "ci/rollout-host-app-lb") {
+            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance" | "ci/bootstrap-host-heyvm" | "ci/rollout-service" | "ci/rollout-host-app-lb") {
             crate::submission::authorize_publication(&self.store, &msg.run_id).await
                 .map_err(DispatchError::StepFailed)?;
         }
@@ -2787,6 +2791,12 @@ impl Dispatcher {
                 crate::host_maintenance::request(self, msg, plan, sid, &required("runner")?, &required("url")?,
                     &required("archive-id")?, &secret, step_timeout(step, plan)).await
                     .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
+            }
+            "ci/bootstrap-host-heyvm" => {
+                required("token")?;
+                crate::host_heyvm_bootstrap_coordinator::request(self,msg,plan,sid,&required("target")?,
+                    step.with.get("token").map(String::as_str).unwrap_or(""),&required("workflow")?,&required("artifact")?,step_timeout(step,plan)).await
+                    .map(|note|(note,json!({}))).map_err(|e|DispatchError::StepFailed(e.to_string()))
             }
             "ci/upload-artifact" => {
                 let name = with("name").ok_or_else(|| {

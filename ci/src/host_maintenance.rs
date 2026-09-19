@@ -100,7 +100,7 @@ pub fn executable_digest(bytes: &[u8]) -> Result<String> {
 }
 
 pub async fn cordoned(store: &Store, runner: &str) -> Result<bool> {
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed')")
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase<>'passed')")
         .bind(runner).fetch_one(store.pool()).await?)
 }
 

@@ -316,6 +316,7 @@ impl Pool {
               WHERE status = 'building'
                 AND runner_hd_id = ANY($1)
                 AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase<>'passed')
+                AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase<>'passed')
                 AND leased_by IS DISTINCT FROM $2
                 AND (leased_until IS NULL OR leased_until < now())",
         )
@@ -675,6 +676,7 @@ impl Pool {
                      WHERE status = 'idle'
                        AND runner_hd_id = ANY($1)
                        AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase<>'passed')
+                       AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase<>'passed')
                        AND (NOT (fingerprint = ANY($2))
                             OR last_used_at < now() - make_interval(secs => $3))
                      FOR UPDATE SKIP LOCKED
@@ -781,6 +783,7 @@ impl Pool {
                 AND p.runner_hd_id = ANY($1)
                 AND NOT EXISTS (SELECT 1 FROM ci_vm_cleanup c WHERE c.sandbox_id=p.sandbox_id)
                 AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase<>'passed' AND (h.runner_hd_id=p.runner_hd_id OR s.job_id=p.claimed_by_job))
+                AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase<>'passed' AND (h.runner_hd_id=p.runner_hd_id OR s.job_id=p.claimed_by_job))
                 AND p.leased_by IS DISTINCT FROM $2
                 AND (
                      p.leased_until < now()
