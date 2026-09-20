@@ -106,6 +106,12 @@ const SPARE_MAX_CULLS_PER_PASS: usize = 2;
 /// restarted and dropped every spare).
 const TAKE_MAX_ATTEMPTS: usize = 3;
 
+/// How many spares one pass chills (stops and moves to the vehicle shelf) at
+/// a time. A stop is cheap for the pooler but takes the daemon a couple of
+/// seconds per VM (it SIGKILLs Firecracker and waits for the process), and a
+/// pass must not sit on a wide fan of them while the warm shelf is short.
+const SPARE_CHILL_CONCURRENCY: usize = 2;
+
 /// How long a stranded-spare restart waits on a reclaim permit before giving
 /// up for this pass. [`SparePool::replenish`] does not return until every build
 /// in its batch has, and passes are serialized in one supervisor loop, so a
@@ -119,6 +125,8 @@ const SPARE_PERMIT_WAIT: Duration = Duration::from_secs(15);
 
 pub struct SparePool {
     target: usize,
+    /// How many spares to keep chilled — see [`Self::chilled`].
+    chilled_target: usize,
     /// Sandbox ids claimed by this process (bound to a schema, or mid-claim).
     /// In-memory only: after a restart the registry's id bindings provide the
     /// same exclusion for successful claims. A claim whose bring-up *failed*
@@ -133,8 +141,36 @@ pub struct SparePool {
     /// out of band) survives at most until the next one, and `take` confirms
     /// each id before handing it over anyway.
     ///
-    /// Lock order where both are held: `claimed` first, then `ready`.
+    /// Lock order where both are held: `claimed` first, then `ready`, then
+    /// `chilled`.
     ready: StdMutex<VecDeque<String>>,
+    /// Spares this pool verified healthy and then deliberately **stopped**,
+    /// held as image-restore vehicles.
+    ///
+    /// An image restore does not want a running VM. It overwrites its
+    /// vehicle's data disk with the archived filesystem and boots on that, so
+    /// every bit of the boot and `initdb` a warm spare paid for is thrown
+    /// away — and handing it a running spare means stopping that VM first
+    /// (~2.1s for the daemon to SIGKILL Firecracker and ack) and then waiting
+    /// for the disk fd to be released before the swap can start. Measured on a
+    /// production host, that stop-and-wait was ~4.8s of a ~6.9s thaw, against
+    /// ~2.8s of actual work (decompress + one boot).
+    ///
+    /// So the pool keeps a few spares already in the state a restore wants.
+    /// They are chilled by the replenisher, off any client's critical path,
+    /// and only ever from spares whose Postgres answered while they were
+    /// running — a vehicle that was never verified would also have no
+    /// readable `PG_VERSION` for [`crate::imgarchive`]'s major-compatibility
+    /// gate to check the archive against.
+    ///
+    /// Stopped VMs hold no RAM, so this shelf does not compete with `ready`
+    /// for memory; it costs one thin data disk per vehicle.
+    ///
+    /// Ids here are untouchable by the replenish plan — a chilled spare is
+    /// stopped, unbound and unclaimed, which is exactly the shape
+    /// [`plan_replenish`] would otherwise restart as deficit or delete as
+    /// surplus.
+    chilled: StdMutex<VecDeque<String>>,
     /// Spares whose Postgres has been unreachable since the given instant.
     /// Kept out of inventory, and deleted once past [`SPARE_SICK_GRACE`] so
     /// the pool rebuilds them rather than reporting itself full of VMs no
@@ -148,11 +184,13 @@ pub struct SparePool {
 }
 
 impl SparePool {
-    pub fn new(target: usize) -> Self {
+    pub fn new(target: usize, chilled_target: usize) -> Self {
         Self {
             target: target.min(MAX_SPARES),
+            chilled_target: chilled_target.min(MAX_SPARES),
             claimed: StdMutex::new(HashSet::new()),
             ready: StdMutex::new(VecDeque::new()),
+            chilled: StdMutex::new(VecDeque::new()),
             sick_since: StdMutex::new(HashMap::new()),
             poke: Arc::new(Notify::new()),
         }
@@ -177,6 +215,90 @@ impl SparePool {
     /// means the next cold connect pays a full create + boot + initdb.
     pub fn depth(&self) -> (usize, usize) {
         (self.ready.lock().unwrap().len(), self.target)
+    }
+
+    /// `(chilled, target)`: stopped vehicles on the shelf vs the configured
+    /// count. Zero chilled means the next image restore falls back to stopping
+    /// a running spare — correct, but ~4.8s slower.
+    pub fn chilled_depth(&self) -> (usize, usize) {
+        (self.chilled.lock().unwrap().len(), self.chilled_target)
+    }
+
+    /// Ids on the chilled shelf — the exemption set the replenish plan needs.
+    /// A chilled spare is stopped, unbound and unclaimed, which is precisely
+    /// what [`plan_replenish`] restarts as deficit or deletes as surplus, so
+    /// without this the pool would spend every pass undoing its own vehicles.
+    fn chilled_ids(&self) -> HashSet<String> {
+        self.chilled.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Claim one **stopped** spare as an image-restore vehicle, excluding
+    /// `bound` ids. `None` when the chilled shelf is empty, which sends the
+    /// caller to the running-spare fallback.
+    ///
+    /// Cheap for the same reason [`Self::take`] is: it pops the shelf the
+    /// replenisher published and spends one by-id `get` confirming the sandbox
+    /// is still there and still stopped. A vehicle that has drifted back to
+    /// running is not handed over — taking it would reintroduce exactly the
+    /// stop this shelf exists to avoid — it is unclaimed and left for the next
+    /// pass to re-plan.
+    pub async fn take_chilled(&self, bound: &HashSet<String>) -> Option<Sandbox> {
+        for _ in 0..TAKE_MAX_ATTEMPTS {
+            // Pop-and-claim in one critical section, as `take` does: the id is
+            // off the shelf and in `claimed` before any await.
+            let popped = {
+                let mut claimed = self.claimed.lock().unwrap();
+                let mut chilled = self.chilled.lock().unwrap();
+                loop {
+                    match chilled.pop_front() {
+                        Some(id) if !bound.contains(&id) && claimed.insert(id.clone()) => {
+                            break Some(id);
+                        }
+                        Some(_) => continue,
+                        None => break None,
+                    }
+                }
+            };
+            let Some(id) = popped else { break };
+            let sb = match Sandbox::connect(id.clone(), vm::local_opts()) {
+                Ok(sb) => sb,
+                Err(e) => {
+                    warn!("connecting to claimed chilled vehicle {id} failed: {e:#}");
+                    self.unclaim(&id);
+                    continue;
+                }
+            };
+            match sb.get().await {
+                Ok(info) if info.status == SandboxStatus::Stopped => {
+                    crate::inventory::insert(&info.name, &info.id);
+                    crate::events::record(crate::events::Event::SpareClaimed);
+                    self.poke.notify_one();
+                    return Some(sb);
+                }
+                Ok(info) => {
+                    warn!(
+                        "warm-spares: chilled vehicle {id} is {:?}, not stopped — skipping it",
+                        info.status
+                    );
+                    self.unclaim(&id);
+                }
+                Err(HeyoError::NotFound(_)) => {
+                    info!("warm-spares: chilled vehicle {id} no longer exists — skipping it");
+                    self.unclaim(&id);
+                }
+                // Unlike `take`, a flaking daemon is not a reason to use it
+                // anyway: the whole value of this shelf is that the vehicle is
+                // already stopped, and `swap_and_boot` skips its stop on that
+                // promise. Unconfirmed, the fallback path is the safe answer.
+                Err(e) => {
+                    warn!("warm-spares: confirming chilled vehicle {id} failed ({e:#}); \
+                           falling back to a running spare");
+                    self.unclaim(&id);
+                }
+            }
+        }
+        self.poke.notify_one();
+        None
     }
 
     /// Claim one warm spare, excluding `bound` ids (schema-bound per the
@@ -273,8 +395,10 @@ impl SparePool {
     /// data disk for the life of the process, and the replenisher — which
     /// also can't see claimed ids as inventory — booted a replacement on top.
     pub async fn release_failed(&self, id: &str) {
-        // Whatever happens to the kill, this id is not inventory any more.
+        // Whatever happens to the kill, this id is not inventory any more —
+        // on either shelf.
         self.ready.lock().unwrap().retain(|r| r != id);
+        self.chilled.lock().unwrap().retain(|r| r != id);
         self.sick_since.lock().unwrap().remove(id);
         match Sandbox::connect(id.to_string(), vm::local_opts()) {
             Ok(sb) => match sb.kill().await {
@@ -356,10 +480,14 @@ impl SparePool {
         //    claim can use, so it must not hold the pool at target. It stays
         //    out of the plan entirely (it is running, so it is neither a
         //    restart nor a delete candidate) until its grace expires above.
+        //    Chilled vehicles are exempt for a different reason: they are
+        //    stopped on purpose, so the plan would read them as deficit to
+        //    restart or surplus to delete and spend every pass undoing them.
         let sick_ids: HashSet<&String> = sick.iter().collect();
+        let chilled_ids = self.chilled_ids();
         let plan_input: Vec<(String, bool)> = spares
             .iter()
-            .filter(|(id, _)| !sick_ids.contains(id))
+            .filter(|(id, _)| !sick_ids.contains(id) && !chilled_ids.contains(id))
             .cloned()
             .collect();
         let plan = {
@@ -417,12 +545,25 @@ impl SparePool {
             )
             .await;
         healthy.extend(fresh);
+
+        // 6. Chill the vehicle deficit: stop healthy running spares until the
+        //    vehicle shelf is at target. Here, in the replenisher, is the
+        //    whole point — a stop costs the daemon a couple of seconds, and
+        //    paying it in the background is what takes it off the critical
+        //    path of the image restore that would otherwise pay it with a
+        //    client waiting. Chilling shrinks the warm shelf by what it takes,
+        //    and the next pass's deficit rebuilds it.
+        let chilled_now = self.chill_deficit(&mut healthy, bound).await;
+        acted += chilled_now;
+
         let shelved = self.publish(healthy, bound);
 
-        if acted > 0 || shelved < self.target {
+        let (chilled_depth, chilled_target) = self.chilled_depth();
+        if acted > 0 || shelved < self.target || chilled_depth < chilled_target {
             info!(
-                "warm-spares: pass done — {shelved}/{} ready, restarted {}, created {}, \
-                 deleted {} surplus, {} sick",
+                "warm-spares: pass done — {shelved}/{} ready, {chilled_depth}/{chilled_target} \
+                 chilled, restarted {}, created {}, chilled {chilled_now}, deleted {} surplus, \
+                 {} sick",
                 self.target,
                 plan.start.len(),
                 plan.create,
@@ -431,6 +572,86 @@ impl SparePool {
             );
         }
         acted
+    }
+
+    /// Stop healthy running spares until the chilled shelf reaches its target,
+    /// moving each out of `healthy` (it is no longer a warm spare) and onto
+    /// the vehicle shelf. Returns how many were chilled.
+    ///
+    /// Held to the same politeness rule as building: nothing is chilled while
+    /// clients are queued for bring-ups. Chilling takes a spare *off* the warm
+    /// shelf, and doing that during the burst that is draining it would make
+    /// the queued clients cold-create — spares exist to make clients faster,
+    /// and that applies to the vehicle shelf as much as to the warm one.
+    async fn chill_deficit(&self, healthy: &mut Vec<String>, bound: &HashSet<String>) -> usize {
+        let need = self
+            .chilled_target
+            .saturating_sub(self.chilled.lock().unwrap().len());
+        if need == 0 {
+            return 0;
+        }
+        let queued = vm::bringups_waiting();
+        if queued > 0 {
+            info!(
+                "warm-spares: {queued} client bring-up(s) queued; not chilling {need} \
+                 vehicle(s) this pass"
+            );
+            return 0;
+        }
+        // Reserve before stopping, in one critical section: take the ids off
+        // the ready shelf AND into `claimed`. Chilling is the only pass
+        // operation that touches a spare a client could be claiming right now
+        // — sick culls and surplus deletes only ever act on spares that were
+        // never published — so without this a `take` can hand a running spare
+        // to a bring-up in the instant before this pass stops it, and the
+        // client's VM dies under it. `claimed` is the same exclusion a real
+        // claim uses, so nothing else can reach these while the stop is in
+        // flight; every path below releases it.
+        let candidates: Vec<String> = {
+            let mut claimed = self.claimed.lock().unwrap();
+            let mut ready = self.ready.lock().unwrap();
+            let picked: Vec<String> = healthy
+                .iter()
+                .filter(|id| !bound.contains(*id) && !claimed.contains(*id))
+                .take(need)
+                .cloned()
+                .collect();
+            for id in &picked {
+                claimed.insert(id.clone());
+                ready.retain(|r| r != id);
+            }
+            picked
+        };
+        if candidates.is_empty() {
+            return 0;
+        }
+        let results: Vec<(String, bool)> =
+            futures::stream::iter(candidates.into_iter().map(|id| async move {
+                let ok = chill_spare(id.clone()).await.is_some();
+                (id, ok)
+            }))
+            .buffer_unordered(SPARE_CHILL_CONCURRENCY)
+            .collect()
+            .await;
+
+        let (stopped, failed): (Vec<_>, Vec<_>) = results.into_iter().partition(|(_, ok)| *ok);
+        let stopped: Vec<String> = stopped.into_iter().map(|(id, _)| id).collect();
+        {
+            // Release every reservation. A stopped one moves to the vehicle
+            // shelf; one whose stop failed simply goes back to being a warm
+            // spare — it is still in `healthy`, so `publish` re-shelves it.
+            let mut claimed = self.claimed.lock().unwrap();
+            let mut chilled = self.chilled.lock().unwrap();
+            for id in &stopped {
+                claimed.remove(id);
+                chilled.push_back(id.clone());
+            }
+            for (id, _) in &failed {
+                claimed.remove(id);
+            }
+        }
+        healthy.retain(|id| !stopped.contains(id));
+        stopped.len()
     }
 
     /// Probe a set of spares, returning `(usable, sick)`. "Usable" folds in the
@@ -526,13 +747,21 @@ impl SparePool {
 
     /// Replace the shelf with `ids`, minus anything now bound or claimed.
     /// Returns the resulting depth.
+    /// Anything on the chilled shelf is excluded too: the two shelves must
+    /// stay disjoint, or a spare restarted out of band could sit on both and
+    /// be offered as a warm spare and a stopped vehicle at once.
     fn publish(&self, ids: Vec<String>, bound: &HashSet<String>) -> usize {
         let claimed = self.claimed.lock().unwrap();
         let mut ready = self.ready.lock().unwrap();
+        let chilled: HashSet<String> = self.chilled.lock().unwrap().iter().cloned().collect();
         ready.clear();
         let mut seen = HashSet::new();
         for id in ids {
-            if !bound.contains(&id) && !claimed.contains(&id) && seen.insert(id.clone()) {
+            if !bound.contains(&id)
+                && !claimed.contains(&id)
+                && !chilled.contains(&id)
+                && seen.insert(id.clone())
+            {
                 ready.push_back(id);
             }
         }
@@ -595,6 +824,40 @@ async fn restart_spare(id: String) -> Option<String> {
         }
         Err(e) => {
             warn!("warm-spares: restarted spare {id} never became ready: {e:#}");
+            None
+        }
+    }
+}
+
+/// Stop a verified-healthy spare so it can serve as an image-restore vehicle.
+/// `Some(id)` once the daemon has acked the stop.
+///
+/// Only the stop — no wait for Firecracker to release the disk file. The
+/// restore that eventually claims this vehicle still runs that check before it
+/// touches the disk, and by then the VM will have been stopped for a tick or
+/// more, so it is free on the first scan.
+async fn chill_spare(id: String) -> Option<String> {
+    let sb = match Sandbox::connect(id.clone(), vm::local_opts()) {
+        Ok(sb) => sb,
+        Err(e) => {
+            warn!("warm-spares: connecting to spare {id} to chill it failed: {e:#}");
+            return None;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(60), sb.stop()).await {
+        Ok(Ok(())) => {
+            info!("warm-spares: chilled spare {id} — parked stopped as an image-restore vehicle");
+            Some(id)
+        }
+        // Left in `healthy`, so it stays a warm spare and the next pass tries
+        // again. A stop that half-landed reads as a stranded stopped spare
+        // next pass and is restarted or deleted like any other.
+        Ok(Err(e)) => {
+            warn!("warm-spares: chilling spare {id} failed (retried next pass): {e:#}");
+            None
+        }
+        Err(_) => {
+            warn!("warm-spares: chilling spare {id} timed out (retried next pass)");
             None
         }
     }
@@ -686,8 +949,8 @@ mod tests {
 
     #[test]
     fn target_is_capped() {
-        assert_eq!(SparePool::new(100).target, MAX_SPARES);
-        assert_eq!(SparePool::new(2).target, 2);
+        assert_eq!(SparePool::new(100, 0).target, MAX_SPARES);
+        assert_eq!(SparePool::new(2, 0).target, 2);
     }
 
     #[test]
@@ -732,7 +995,7 @@ mod tests {
 
     #[test]
     fn publishing_the_shelf_excludes_bound_claimed_and_duplicate_ids() {
-        let pool = SparePool::new(4);
+        let pool = SparePool::new(4, 0);
         pool.claimed.lock().unwrap().insert("claimed".into());
         let depth = pool.publish(
             vec![
@@ -756,7 +1019,7 @@ mod tests {
         // The claim path must never fall back to a listing: an empty pool has
         // to answer "cold-create" immediately, not pay heyvmd's slowest call
         // to discover there is nothing to hand out.
-        let pool = SparePool::new(4);
+        let pool = SparePool::new(4, 0);
         assert!(pool.take(&HashSet::new()).await.is_none());
         assert!(pool.claimed.lock().unwrap().is_empty());
     }
@@ -785,4 +1048,83 @@ mod tests {
         let p = plan_replenish(&running, &ids(&["bound-run"]), &HashSet::new(), 1);
         assert_eq!(p.create, 1, "a bound spare is not pool inventory");
     }
+
+    #[test]
+    fn chilled_target_is_capped() {
+        assert_eq!(SparePool::new(4, 100).chilled_target, MAX_SPARES);
+        assert_eq!(SparePool::new(4, 3).chilled_target, 3);
+    }
+
+    #[test]
+    fn a_chilled_vehicle_must_be_exempt_from_the_replenish_plan() {
+        // A chilled vehicle is stopped, unbound and unclaimed — exactly the
+        // shape the plan restarts as deficit or deletes as surplus. Both
+        // halves are asserted: the hazard is real, and the exemption is what
+        // stops the pool spending every pass undoing its own vehicles.
+        let pool = SparePool::new(1, 1);
+        pool.chilled.lock().unwrap().push_back("chilled".into());
+        let spares: Vec<(String, bool)> = vec![("run1".into(), true), ("chilled".into(), false)];
+        let none = HashSet::new();
+
+        // Unfiltered: the vehicle is deleted as surplus (target met by run1).
+        let hazard = plan_replenish(&spares, &none, &none, 1);
+        assert_eq!(hazard.delete, vec!["chilled".to_string()]);
+
+        // Filtered the way `replenish` filters it: untouched in every set.
+        let chilled = pool.chilled_ids();
+        let plan_input: Vec<(String, bool)> = spares
+            .iter()
+            .filter(|(id, _)| !chilled.contains(id))
+            .cloned()
+            .collect();
+        let p = plan_replenish(&plan_input, &none, &none, 1);
+        assert!(p.delete.is_empty(), "a chilled vehicle is not surplus");
+        assert!(p.start.is_empty(), "a chilled vehicle is not deficit");
+        assert_eq!(p.create, 0);
+    }
+
+    #[test]
+    fn chilling_makes_the_warm_shelf_short_so_the_next_pass_rebuilds_it() {
+        // Chilling takes a spare *off* the warm shelf. Since the vehicle is
+        // then exempt from the plan, the next pass sees the warm target
+        // unmet and creates a replacement — which is how the pool settles at
+        // `target` running plus `chilled_target` stopped rather than
+        // cannibalising itself.
+        let pool = SparePool::new(2, 1);
+        pool.chilled.lock().unwrap().push_back("chilled".into());
+        let spares: Vec<(String, bool)> = vec![("run1".into(), true), ("chilled".into(), false)];
+        let chilled = pool.chilled_ids();
+        let plan_input: Vec<(String, bool)> = spares
+            .iter()
+            .filter(|(id, _)| !chilled.contains(id))
+            .cloned()
+            .collect();
+        let p = plan_replenish(&plan_input, &HashSet::new(), &HashSet::new(), 2);
+        assert_eq!(p.create, 1, "the chilled spare's slot is refilled");
+    }
+
+    #[test]
+    fn publishing_the_shelf_excludes_chilled_ids() {
+        // The two shelves must stay disjoint: a spare restarted out of band
+        // could otherwise sit on both and be offered as a warm spare and a
+        // stopped vehicle at once.
+        let pool = SparePool::new(4, 2);
+        pool.chilled.lock().unwrap().push_back("chilled".into());
+        let depth = pool.publish(vec!["free".into(), "chilled".into()], &HashSet::new());
+        assert_eq!(depth, 1);
+        assert_eq!(
+            pool.ready.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
+            vec!["free".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn taking_from_an_empty_chilled_shelf_asks_for_no_daemon_call() {
+        // Same contract as `take`: no chilled vehicle must answer immediately
+        // so the caller can fall back to a running spare, not pay a listing.
+        let pool = SparePool::new(4, 2);
+        assert!(pool.take_chilled(&HashSet::new()).await.is_none());
+        assert!(pool.claimed.lock().unwrap().is_empty());
+    }
+
 }

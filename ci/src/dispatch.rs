@@ -1172,6 +1172,8 @@ impl Dispatcher {
             .map_err(|e| DispatchError::BadPlan(e.to_string()))?;
 
         if crate::host_maintenance::owns_job(&self.store, &msg.job_id).await
+            .map_err(|e| DispatchError::StepFailed(e.to_string()))?
+            || crate::host_heyvm_bootstrap_coordinator::owns_job(&self.store, &msg.job_id).await
             .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Ok(JobStatus::Running); }
         let (runner, existing_vm) = self.pick_runner(&plan).await?;
 
@@ -1309,6 +1311,8 @@ impl Dispatcher {
         // Do not stop or repool here: another reconciler may already have done
         // so and that VM might now belong to a different job.
         if crate::host_maintenance::owns_job(&self.store, &msg.job_id).await
+            .map_err(|e| DispatchError::StepFailed(e.to_string()))?
+            || crate::host_heyvm_bootstrap_coordinator::owns_job(&self.store, &msg.job_id).await
             .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Ok(JobStatus::Running); }
         // Before the release, always: a VM with `reuse: false` is destroyed on
         // the next line, and the console of the boot that just failed is exactly
@@ -1558,7 +1562,10 @@ impl Dispatcher {
             {
                 crate::image::Claim::Ready => {
                     tracing::info!(job = %plan.key, runner, "image {name} is already on this host");
-                    return Ok(name);
+                    // Validate with the source builder even on catalog hits.
+                    // It rebuilds a missing file in this attempt, and joins an
+                    // existing build instead of failing the job on stale state.
+                    break;
                 }
                 crate::image::Claim::Build => break,
                 crate::image::Claim::InProgress => {
@@ -1578,7 +1585,8 @@ impl Dispatcher {
             }
         }
 
-        // This job owns the build.
+        // This job owns a build claim or is verifying a cached image. The
+        // daemon collapses concurrent requests for identical verified inputs.
         tracing::info!(
             job = %plan.key, runner,
             "asking the runner to build image {name} from {}", build.dockerfile
@@ -2610,7 +2618,7 @@ impl Dispatcher {
             .ok_or_else(|| DispatchError::StepFailed(format!("{action} requires with.{key}")));
 
         if matches!(action, "ci/merge-release" | "ci/publish-service-archive" |
-            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance" | "ci/rollout-service" | "ci/rollout-host-app-lb") {
+            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance" | "ci/bootstrap-host-heyvm" | "ci/rollout-service" | "ci/rollout-host-app-lb") {
             crate::submission::authorize_publication(&self.store, &msg.run_id).await
                 .map_err(DispatchError::StepFailed)?;
         }
@@ -2787,6 +2795,12 @@ impl Dispatcher {
                 crate::host_maintenance::request(self, msg, plan, sid, &required("runner")?, &required("url")?,
                     &required("archive-id")?, &secret, step_timeout(step, plan)).await
                     .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
+            }
+            "ci/bootstrap-host-heyvm" => {
+                required("token")?;
+                crate::host_heyvm_bootstrap_coordinator::request(self,msg,plan,sid,&required("target")?,
+                    step.with.get("token").map(String::as_str).unwrap_or(""),&required("workflow")?,&required("artifact")?,step_timeout(step,plan)).await
+                    .map(|note|(note,json!({}))).map_err(|e|DispatchError::StepFailed(e.to_string()))
             }
             "ci/upload-artifact" => {
                 let name = with("name").ok_or_else(|| {
@@ -3975,21 +3989,36 @@ impl Dispatcher {
         let mut destroyed = 0;
         let mut failed = Vec::new();
         for vm in taken {
-            let result = async {
+            let result = tokio::time::timeout(Duration::from_secs(30), async {
+                // Serialize deletion across controller processes. Keep the
+                // durable intent on error or cancellation, including after a
+                // daemon delete succeeds but this transaction cannot commit.
+                let mut tx = self.store.pool().begin().await?;
+                let owned: Option<String> = sqlx::query_scalar(
+                    "SELECT sandbox_id FROM ci_vm_pool WHERE sandbox_id=$1
+                     AND runner_hd_id=$2 AND status='draining' AND eviction_requested
+                     FOR UPDATE SKIP LOCKED",
+                ).bind(&vm.sandbox_id).bind(&vm.runner_hd_id)
+                    .fetch_optional(&mut *tx).await?;
+                if owned.is_none() { return Ok::<_, anyhow::Error>(false); }
                 let options = self.runners.options_for(&vm.runner_hd_id).await?;
                 let handle = self.vms.open(options, vm.sandbox_id.clone()).await?;
                 handle.destroy().await?;
-                Ok::<_, DispatchError>(())
-            }
-            .await;
+                anyhow::ensure!(matches!(handle.info().await,
+                    Err(VmError::Daemon { source: heyo_sdk::HeyoError::NotFound(_), .. })),
+                    "daemon has not confirmed cache VM removal");
+                sqlx::query("DELETE FROM ci_vm_pool WHERE sandbox_id=$1")
+                    .bind(&vm.sandbox_id).execute(&mut *tx).await?;
+                tx.commit().await?;
+                Ok(true)
+            }).await;
+            let result = result.unwrap_or_else(|_| Err(anyhow::anyhow!("cache eviction timed out")));
 
             match result {
-                Ok(()) => {
-                    if let Err(e) = self.pool.forget(&vm.sandbox_id).await {
-                        tracing::warn!(vm = %vm.sandbox_id, "destroyed but not forgotten: {e}");
-                    }
+                Ok(true) => {
                     destroyed += 1;
                 }
+                Ok(false) => {}
                 Err(e) => {
                     tracing::warn!(vm = %vm.sandbox_id, "could not destroy: {e}");
                     failed.push(format!("{}: {e}", vm.sandbox_id));
@@ -4095,6 +4124,28 @@ impl Dispatcher {
     /// sibling that dies is reclaimed within a lease period instead of leaking
     /// until somebody happens to restart this process.
     pub fn spawn_lease_loop(self: Arc<Self>) {
+        let images = self.clone();
+        // Slow image IO must not hold up VM lease/TTL renewal.
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Ok(_work) = images.lifecycle.work(&images.store).await else { continue };
+                for runner in images.served_runner_ids() {
+                    let result = async {
+                        let options = images.runners.options_for(&runner).await?;
+                        images.images.evict_one(&runner, images.config.heyvm.vm_idle, options).await?;
+                        Ok::<_, DispatchError>(())
+                    };
+                    match tokio::time::timeout(Duration::from_secs(30), result).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!(%runner, "CI image cleanup unresolved: {e}"),
+                        Err(_) => tracing::warn!(%runner, "CI image cleanup timed out; catalog retained"),
+                    }
+                }
+            }
+        });
         // Comfortably inside the lease, so a slow database or a paused process
         // gets several chances before its VMs are taken. Losing a lease that is
         // still in use would put two instances on one VM, which is much worse
@@ -6309,6 +6360,56 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; fake source builder"]
+    async fn cached_image_is_rebuilt_before_the_current_job_creates_a_vm() {
+        use axum::{Json, Router, routing::post};
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = posts.clone();
+        let name = "ci-img-012345abcdef";
+        let app = Router::new().route("/sources/src-rebuild/image", post(move || {
+            let calls = calls.clone();
+            async move {
+                let prior = calls.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"name":name,"status":if prior==0 { "building" } else { "ready" }}))
+            }
+        }).get(move || async move { Json(json!({"name":name,"status":"ready","size_bytes":8192})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        unsafe { std::env::set_var("CI_TEST_DAEMON", format!("http://{}", listener.local_addr().unwrap())); }
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let workflow = crate::workflow::Workflow::parse("rebuild.yml", "jobs:\n  build:\n    steps: [{run: echo test}]\n").unwrap();
+        let plan = crate::plan::Plan::build(&workflow).unwrap();
+        let run = crate::vm::new_id();
+        d.store.create_run(&run, &crate::store::RunRequest { repo_url: "https://example.test/repo.git".into(), ..Default::default() }, &plan).await.unwrap();
+        let job = d.store.jobs_of(&run).await.unwrap().remove(0);
+        assert!(d.store.claim_job(&job.id, "hd-local", 1).await.unwrap());
+        d.images.claim(name, "hd-local", "wf", &job.id, crate::image::BUILD_LEASE).await.unwrap();
+        d.images.mark_ready(name, "hd-local", 1024).await.unwrap();
+        let prepared = crate::image::PreparedSource { source_id: "src-rebuild".into(), cache_keys: Default::default(),
+            image: Some(crate::image::PreparedImage { name: name.into(), input_digest: "0".repeat(64) }) };
+        let build = serde_json::from_value(json!({"dockerfile":"Dockerfile"})).unwrap();
+        let msg = JobMessage { run_id: run.clone(), job_id: job.id.clone(), job_key: job.job_key.clone() };
+        let resolved = d.ensure_image("hd-local", &plan.jobs[0], &build, &prepared, &msg).await.unwrap();
+        assert_eq!(resolved, name);
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "a ready DB row must not bypass the daemon");
+        assert_eq!(d.images.inventory(&["hd-local".into()]).await.unwrap()[0].size_bytes, 8192);
+        // Active executor evidence blocks retention even with a zero window.
+        d.images.evict_one("hd-local", Duration::ZERO, d.runners.options_for("hd-local").await.unwrap()).await.unwrap();
+        assert_eq!(d.images.status_of(name, "hd-local").await.unwrap().as_deref(), Some("ready"));
+        d.ensure_image("hd-local", &plan.jobs[0], &build, &prepared, &msg).await.unwrap();
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
+        assert_eq!(d.images.inventory(&["hd-local".into()]).await.unwrap()[0].size_bytes, 8192,
+            "a ready receipt without size must not erase known accounting");
+        d.store.end_host_work(&job.id, "hd-local", 1).await.unwrap();
+        d.images.forget(name, "hd-local").await.unwrap();
+        sqlx::query("DELETE FROM ci_run WHERE id=$1").bind(&run).execute(d.store.pool()).await.unwrap();
+        d.bus.js_delete_streams().await.unwrap();
+        server.abort();
+        unsafe { std::env::remove_var("CI_TEST_DAEMON"); }
+    }
+
+    #[tokio::test]
     #[ignore = "needs empty disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; tests global drain with fake heyvm HTTP"]
     async fn durable_vm_cleanup_recovers_without_guessing_ownership() {
         use crate::vm_cleanup::{handoff, reconcile};
@@ -6628,10 +6729,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs CI_TEST_DATABASE_URL and CI_TEST_NATS_URL"]
     async fn disk_pressure_rechecks_space_and_stops_at_budget() {
-        use axum::{Json, Router, extract::Path, http::StatusCode, routing::{get, delete}};
+        use axum::{Json, Router, extract::Path, http::StatusCode, routing::get};
         use std::sync::atomic::AtomicU64;
         let free = Arc::new(AtomicU64::new(50));
         let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let confirm = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let confirmed = confirm.clone();
         let deleted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let storage = free.clone();
         let disk = free.clone();
@@ -6642,7 +6745,13 @@ mod tests {
                 let storage = storage.clone();
                 async move { Json(serde_json::json!({"free_bytes": storage.load(Ordering::SeqCst)})) }
             }))
-            .route("/deployed-sandboxes/{id}", delete(move |Path(id): Path<String>| {
+            .route("/deployed-sandboxes/{id}", get(move || {
+                let confirmed = confirmed.clone();
+                async move {
+                    if confirmed.load(Ordering::SeqCst) { StatusCode::NOT_FOUND }
+                    else { StatusCode::SERVICE_UNAVAILABLE }
+                }
+            }).delete(move |Path(id): Path<String>| {
                 let (disk, errors, calls) = (disk.clone(), errors.clone(), calls.clone());
                 async move {
                     calls.lock().unwrap().push(id);
@@ -6677,6 +6786,27 @@ mod tests {
         assert_eq!(d.pool.get(&format!("{runner}-new")).await.unwrap().unwrap().status, "draining");
         let error = d.reclaim_disk_space(&runner, 101).await.unwrap_err();
         assert!(error.to_string().contains("no idle caches left"), "{error}");
+
+        // A new controller finds the persistent eviction even though it is
+        // fresh and its fingerprint is still wanted. A successful DELETE is
+        // not enough if the follow-up absence check fails.
+        let restarted = test_dispatcher(workspace.path()).await;
+        fail.store(false, Ordering::SeqCst);
+        confirm.store(false, Ordering::SeqCst);
+        let retry = restarted.pool.take_for_sweep(&[runner.clone()], &["fp".into()], 86400)
+            .await.unwrap();
+        assert_eq!(retry.len(), 1);
+        let (count, errors) = restarted.destroy_swept(retry).await;
+        assert_eq!(count, 0);
+        assert_eq!(errors.len(), 1);
+        assert!(restarted.pool.get(&format!("{runner}-new")).await.unwrap().is_some());
+        confirm.store(true, Ordering::SeqCst);
+        let retry = restarted.pool.take_for_sweep(&[runner.clone()], &["fp".into()], 86400)
+            .await.unwrap();
+        let (count, errors) = restarted.destroy_swept(retry).await;
+        assert_eq!(count, 1);
+        assert!(errors.is_empty());
+        assert!(restarted.pool.get(&format!("{runner}-new")).await.unwrap().is_none());
         server.abort();
         unsafe { std::env::remove_var("CI_TEST_DAEMON"); }
     }

@@ -614,7 +614,8 @@ impl SchemaRegistry {
             .reclaim
             .as_ref()
             .map(|r| Arc::new(Reclaimer::new(r.cmd.clone(), cfg.run_dir.clone())));
-        let spares = (cfg.warm_spares > 0).then(|| Arc::new(SparePool::new(cfg.warm_spares)));
+        let spares = (cfg.warm_spares > 0)
+            .then(|| Arc::new(SparePool::new(cfg.warm_spares, cfg.chilled_vehicles)));
         // The dump server has two consumers: the frozen tier (freeze + thaw)
         // and the S3 archive tier, whose dumps *stream* through it so they
         // never touch the guest's data disk. Either one enables it.
@@ -1250,6 +1251,13 @@ impl SchemaRegistry {
     /// "reap to S3" control.
     pub fn archive_enabled(&self) -> bool {
         self.cfg.archive.is_some()
+    }
+
+    /// Whether any offload tier is configured — local compaction or S3. That
+    /// is all the manual TTL sweep needs, so it gates that dashboard control:
+    /// a compaction-only host still gets a way to drain its backlog on demand.
+    pub fn offload_enabled(&self) -> bool {
+        self.cfg.archive.is_some() || self.cfg.compact.is_some()
     }
 
     /// Point `schema` back at its S3 archive: set its tier to `Archived` so the
@@ -3328,7 +3336,7 @@ impl SchemaRegistry {
     /// is configured or a sweep is already running.
     pub fn spawn_ttl_sweep_now(self: &Arc<Self>, ttl_secs: u64) -> Result<()> {
         anyhow::ensure!(
-            self.cfg.archive.is_some() || self.cfg.compact.is_some(),
+            self.offload_enabled(),
             "no offload tier is configured (set PG_VM_POOL_ARCHIVE_AFTER_SECS + PG_VM_POOL_S3_* \
              and/or PG_VM_POOL_COMPACT_AFTER_SECS)"
         );
@@ -5010,6 +5018,14 @@ impl SchemaRegistry {
     /// new-schema connect pays a full create + boot instead of a spare claim.
     pub fn spare_pool_depth(&self) -> Option<(usize, usize)> {
         self.spares.as_ref().map(|p| p.depth())
+    }
+
+    /// Chilled-vehicle depth `(chilled, target)`; `None` when the pool is
+    /// disabled. Zero chilled is the image-restore equivalent of zero warm
+    /// spares: the next thaw falls back to stopping a running spare and
+    /// waiting out the disk release, which is several seconds a client feels.
+    pub fn chilled_vehicle_depth(&self) -> Option<(usize, usize)> {
+        self.spares.as_ref().map(|p| p.chilled_depth())
     }
 
     /// The schemas currently claimed by an offload, whatever started it

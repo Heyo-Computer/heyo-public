@@ -241,6 +241,19 @@ pub struct Config {
     /// spare holds its size class's RAM while parked. Env
     /// `PG_VM_POOL_WARM_SPARES` (capped at 16).
     pub warm_spares: usize,
+    /// How many of the spare VMs to keep deliberately **stopped**, reserved as
+    /// image-restore vehicles. An image restore overwrites its vehicle's data
+    /// disk wholesale, so it needs a stopped sandbox, not a running one —
+    /// handing it a booted warm spare means stopping the VM the pool just
+    /// booted and waiting for Firecracker to release the disk, ~4.8s of the
+    /// ~6.9s a compacted-image thaw used to take. A chilled spare skips both:
+    /// the restore writes the disk and starts the VM once.
+    ///
+    /// Stopped VMs hold no RAM, so these do not compete with `warm_spares` for
+    /// memory — they cost one thin data disk each. Env
+    /// `PG_VM_POOL_CHILLED_VEHICLES`, default 2, forced to 0 when the spare
+    /// pool is off (there is no replenisher to maintain them).
+    pub chilled_vehicles: usize,
     /// Automatic disk-slack reclamation: periodically offline-trim stopped VMs'
     /// sparse data disks so freed guest blocks return to the host (Firecracker's
     /// virtio-blk has no discard passthrough, so they never come back on their
@@ -1249,6 +1262,17 @@ impl Config {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(0);
+        // Zero without a spare pool: the chilled shelf is maintained by the
+        // replenisher, so with no replenisher the knob would only promise
+        // vehicles nothing ever builds.
+        let chilled_vehicles = if warm_spares == 0 {
+            0
+        } else {
+            std::env::var("PG_VM_POOL_CHILLED_VEHICLES")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(2)
+        };
         let offload_workers = match std::env::var("PG_VM_POOL_OFFLOAD_WORKERS") {
             Ok(v) => match v.trim().parse::<usize>() {
                 Ok(n) => n.clamp(1, 16),
@@ -1389,6 +1413,7 @@ impl Config {
             dump_net: DumpNetConfig::from_env()?,
             compact,
             warm_spares,
+            chilled_vehicles,
             reclaim,
             run_dir,
             orphan_sweep,

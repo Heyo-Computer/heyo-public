@@ -204,6 +204,13 @@ ownership are prerequisites to active replicas, not consequences of adding a gat
 
 ## Existing implementation foundation and next regional change
 
+The opt-in [regional service rollout API](../orchestrator/docs/regional-rollouts.md)
+now persists per-region replica slots and runtime overrides, region exclusions,
+observed app-lb drain gates, health/bake gates, and explicit rollback. This is a
+service deployment operation over already configured discovery ingress, not the
+whole-region host maintenance or continuous capacity reconciliation proposed below.
+It does not establish CI data replication or background-worker ownership.
+
 Orchestrator service deployment already accepts `desiredReplicas` and
 `replicaRegions`, preserves replica regions during rolling replacement, and fails a
 rollout that does not establish the requested regional coverage. It also accepts the

@@ -1340,7 +1340,7 @@ impl Store {
         // this running job and must drain it before submitting.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 222))")
             .bind(runner_hd_id).execute(&mut *tx).await.map_err(StoreError::sql)?;
-        let cordoned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed')")
+        let cordoned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase NOT IN ('passed','superseded'))")
             .bind(runner_hd_id).fetch_one(&mut *tx).await.map_err(StoreError::sql)?;
         if cordoned { return Ok(false); }
         let row = sqlx::query(
@@ -1350,6 +1350,7 @@ impl Store {
               WHERE id = $1
                 AND status NOT IN ('success','failure','skipped','cancelled')
                 AND NOT EXISTS (SELECT 1 FROM ci_service_deployment s JOIN ci_host_maintenance h ON h.id=s.id WHERE s.job_id=ci_job.id)
+                AND NOT EXISTS (SELECT 1 FROM ci_service_deployment s JOIN ci_host_heyvm_bootstrap h ON h.id=s.id WHERE s.job_id=ci_job.id)
               RETURNING run_id, job_key",
         )
         .bind(job_id)
@@ -1553,7 +1554,8 @@ impl Store {
         let row = sqlx::query(
             "UPDATE ci_job
                 SET status = $2,
-                    error = COALESCE($3, error),
+                    error = CASE WHEN $2 IN ('success','skipped') THEN $3
+                                 ELSE COALESCE($3, error) END,
                     finished_at = CASE WHEN $2 IN ('success','failure','skipped','cancelled')
                                        THEN now() ELSE finished_at END
               WHERE id = $1 RETURNING run_id, job_key",
@@ -2444,6 +2446,22 @@ mod tests {
         assert_eq!(again.id, first.id);
         assert_eq!(again.payload, first.payload);
         restarted.mark_outbox_published(again.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Postgres"]
+    async fn successful_retry_clears_the_previous_attempt_error() {
+        let store = test_store().await;
+        let run_id = crate::vm::new_id();
+        store.create_run(&run_id, &RunRequest::default(), &test_plan()).await.unwrap();
+        let job = store.jobs_of(&run_id).await.unwrap().remove(0);
+
+        store.note_job_error(&job.id, "attempt 1 failed; retrying").await.unwrap();
+        assert_eq!(store.get_job(&job.id).await.unwrap().unwrap().error.as_deref(), Some("attempt 1 failed; retrying"));
+        store.set_job_status(&job.id, JobStatus::Success, None).await.unwrap();
+        let finished = store.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(finished.status, "success");
+        assert_eq!(finished.error, None, "a successful retry must not display an earlier attempt as its final error");
     }
 
     #[tokio::test]

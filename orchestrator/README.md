@@ -10,6 +10,11 @@ diagnostic metadata, not proof of which binary answered. The public CI workflow
 stamps the validated Git SHA and packages a relocatable `start.sh` with migrations
 for a read-only release mount. These artifacts alone do not activate regional CD.
 
+The opt-in [regional service rollout API](docs/regional-rollouts.md) persists
+region-by-region drain, replacement, observation, and rollback gates. It requires
+existing discovery-routed ingress and an observer for every app-lb instance;
+it does not by itself activate whole-region infrastructure upgrades.
+
 ## How it fits with CICD and HeyoSecret
 
 ```

@@ -1007,28 +1007,43 @@ impl Runners {
     /// Fresh free-space measurement from the same daemon inventory app-lb uses.
     /// Unlike driver capabilities this must not be cached across allocations.
     pub async fn free_disk_bytes(&self, runner_id: &str) -> Result<u64, RunnerError> {
-        let options = self.options_for(runner_id).await?;
-        let result = async {
-            let client = HeyoClient::new(options.options.clone())?;
-            let response = client.raw_request(
-                Method::GET, "/storage", None::<&()>,
-                RequestOptions { timeout: Some(Duration::from_secs(15)), query: Vec::new() },
-            ).await?;
-            let response = response.error_for_status()?;
-            #[derive(serde::Deserialize)]
-            struct Storage { free_bytes: u64 }
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(response.json::<Storage>().await?.free_bytes)
-        }.await;
-        if result.is_err() {
-            // Placement failures happen before run_claimed, so its transport
-            // recovery never sees them. Do not retry the same dead tunnel on
-            // every delivery. Existing VMs retain their own connection owner.
-            self.evict(runner_id).await;
+        let mut first_error = None;
+        for attempt in 0..2 {
+            let result = async {
+                let options = self.options_for(runner_id).await?;
+                let client = HeyoClient::new(options.options.clone())?;
+                let response = client.raw_request(
+                    Method::GET, "/storage", None::<&()>,
+                    RequestOptions { timeout: Some(Duration::from_secs(15)), query: Vec::new() },
+                ).await?;
+                let response = response.error_for_status()?;
+                #[derive(serde::Deserialize)]
+                struct Storage { free_bytes: u64 }
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(response.json::<Storage>().await?.free_bytes)
+            }.await;
+            match result {
+                Ok(free) => return Ok(free),
+                Err(error) => {
+                    if attempt == 0 { first_error = Some(error.to_string()); }
+                    // Placement failures happen before run_claimed, so its
+                    // transport recovery never sees them. Evict now and retry
+                    // this idempotent read once through a freshly dialed tunnel
+                    // instead of consuming a whole job attempt and 60s backoff.
+                    self.evict(runner_id).await;
+                    if attempt == 1 {
+                        let detail = match first_error {
+                            Some(first) if first != error.to_string() => format!("{first}; fresh-tunnel retry failed: {error}"),
+                            _ => error.to_string(),
+                        };
+                        return Err(RunnerError::Unreachable {
+                            runner: runner_id.to_string(),
+                            reason: format!("GET /storage free-space measurement failed: {detail}"),
+                        });
+                    }
+                }
+            }
         }
-        result.map_err(|e| RunnerError::Unreachable {
-            runner: runner_id.to_string(),
-            reason: format!("GET /storage free-space measurement failed: {e}"),
-        })
+        unreachable!("capacity read performs exactly two attempts")
     }
 
     /// Drop a runner's tunnel so the next `client_for` redials.
@@ -1807,7 +1822,9 @@ mod tests {
                 match calls.fetch_add(1, Ordering::SeqCst) {
                     0 => (StatusCode::OK, Json(serde_json::json!({"free_bytes": 100}))),
                     1 => (StatusCode::OK, Json(serde_json::json!({"free_bytes": 0}))),
-                    2 => (StatusCode::OK, Json(serde_json::json!({}))),
+                    2 => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"free_bytes": 999}))),
+                    3 => (StatusCode::OK, Json(serde_json::json!({"free_bytes": 75}))),
+                    4 | 5 => (StatusCode::OK, Json(serde_json::json!({}))),
                     _ => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"free_bytes": 999}))),
                 }
             }
@@ -1825,12 +1842,14 @@ mod tests {
         assert_eq!(runners.free_disk_bytes("hd-local").await.unwrap(), 100);
         assert_eq!(runners.free_disk_bytes("hd-local").await.unwrap(), 0);
         assert!(runners.tunnels.lock().await.contains_key("hd-local"), "low capacity is not a broken connection");
+        assert_eq!(runners.free_disk_bytes("hd-local").await.unwrap(), 75,
+            "an idempotent capacity read retries immediately after a fresh connection");
         assert!(runners.free_disk_bytes("hd-local").await.is_err());
         assert!(!runners.tunnels.lock().await.contains_key("hd-local"), "unknown capacity must not poison every retry");
         runners.tunnels.lock().await.insert("hd-local".into(), cached);
         assert!(runners.free_disk_bytes("hd-local").await.is_err());
         assert!(!runners.tunnels.lock().await.contains_key("hd-local"), "HTTP failure must force a fresh connection");
-        assert_eq!(reads.load(Ordering::SeqCst), 4);
+        assert_eq!(reads.load(Ordering::SeqCst), 8);
         server.abort();
         let _ = server.await;
         runners.tunnels.lock().await.insert("hd-local".into(), HeyoClient::new(runners.client_options()).unwrap());

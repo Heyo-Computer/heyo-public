@@ -315,6 +315,8 @@ pub struct Config {
     pub host_maintenance_targets: Option<String>,
     /// Repository-scoped managed systemd app-lb targets; never workflow supplied.
     pub host_app_lb_targets: Option<String>,
+    /// Operator-owned native heyvm bootstrap targets; never workflow supplied.
+    pub host_heyvm_bootstrap_targets: Option<String>,
 
     /// Shared secret the `git submit` client HMACs its payload with, when it
     /// has no repository token.
@@ -653,6 +655,7 @@ impl Config {
             expected_sha: opt("CI_EXPECTED_SHA"),
             host_maintenance_targets: opt("CI_HOST_MAINTENANCE_TARGETS"),
             host_app_lb_targets: opt("CI_HOST_APP_LB_TARGETS"),
+            host_heyvm_bootstrap_targets: opt("CI_HOST_HEYVM_BOOTSTRAP_TARGETS"),
             webhook_secret,
             require_repo_token: flag("CI_REQUIRE_REPO_TOKEN", false)?,
             native_runner_secret: opt("CI_NATIVE_RUNNER_SECRET"),

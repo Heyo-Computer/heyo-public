@@ -546,10 +546,25 @@ for an image already in the catalog answers `ready` without building — so even
 a lost claim collapses into one docker build rather than two racing for the
 same tag.
 
-Nothing sweeps images. A rootfs is expensive to rebuild and cheap to keep, and
-unlike a pooled VM it carries no state from the run that made it. To force a
-rebuild, delete it on the host (`rm ~/.heyo/images/firecracker/ci-img-*.ext4`);
-the next job finds the file gone, forgets the row and builds it again.
+CI sweeps unused source-built base images after `CI_VM_IDLE_SECS` (default
+seven days), separately from VM eviction. Cache hits refresh the image's last
+use; existing catalog entries receive a full grace period when the retention
+migration is first applied. Each minute, CI considers at most one image per
+served runner and refuses cleanup while that runner has active job work or
+maintenance. Failed deletions stay recorded and retry after five minutes.
+
+Deletion uses heyvmd's protected `POST /images/:name/evict` contract. The daemon
+requires the source builder's matching ownership digest, serializes against
+builds and VM creation across processes, and protects references from stopped
+as well as running sandboxes. Busy, referenced, unmanaged, or uncertain images
+are retained. Older daemons without this endpoint cannot reclaim images; a
+404 is not a deletion receipt. Deploy compatible heyvmd on runner hosts before
+expecting disk reclamation. Upgrade other CLI writers sharing that catalog too.
+
+CI verifies cached images through the source builder before creating a VM, so
+a missing file is rebuilt within the current job. Do not delete base-image
+files directly on a live host or substitute `heyvm prune --images`: those
+paths do not provide this ownership/reference-checking contract.
 
 **A named VM is somebody else's machine**, and the executor treats it that way.
 It is resolved on the pinned node by id or name, started if it is merely stopped,
@@ -923,7 +938,15 @@ disk budget: its data disk, two declared rootfs copies, and 5 GiB host headroom.
 Free space is read again after every deletion, and checked again before a cold
 VM creation. Claimed, building, and already-draining VMs are never victims;
 only CI pool rows on that host qualify. A failed deletion stays tracked as
-draining and stops that cleanup attempt. If no idle caches remain and space is
+draining and stops that cleanup attempt. An explicit, persisted eviction intent
+makes the lease-loop sweep retry it after failures or controller restarts, even
+if its fingerprint is still wanted. Deletion holds a database row lock across
+the bounded daemon call and requires a follow-up not-found response before
+forgetting the pool row. Resize operations also use `draining`, but carry no
+eviction intent and are never selected for deletion. Pre-existing ambiguous
+draining rows are not automatically adopted as eviction requests.
+
+If no idle caches remain and space is
 still insufficient, the host cannot admit a new VM. This is admission headroom,
 not a disk reservation against concurrent allocations or unknown build scratch.
 
@@ -1412,6 +1435,11 @@ The operator must configure `CI_HOST_MAINTENANCE_TARGETS` as a JSON object:
   "artifact_user_id":"archive-owner","target":"stage-eu1-host-heyvm","region":"eu1"}}
 ```
 
+When the environment variable is absent, the controller reads the same JSON
+from the fixed HeyoSecret path `ci-controller/host-maintenance-targets`. An
+explicit environment value takes precedence. Repository workflow secrets cannot
+replace this operator-owned mapping.
+
 Runner `hd` IDs and Cloud `backendServerId` are **different namespaces**. The
 mapping explicitly attests their association and the archive database/storage
 association: Orchestrator's `CLOUD_INTERNAL_URL` must use the **same Cloud archive
@@ -1518,6 +1546,61 @@ Archive APIs lack idempotency keys: a retry can leave an extra uploaded archive,
 but failed/uncertain finalization never authorizes a deployment. Publication,
 release and deployment state write NATS outbox events transactionally. These
 actions do not change app-lb, namespaces, existing VM pages, or Retail.
+
+### One-time native heyvm host bootstrap
+
+`ci/bootstrap-host-heyvm` is a release-only, final-step action used to install the
+managed host heyvm service before normal host maintenance is available. It accepts
+only `target`, a direct `${{ secrets.NAME }}` app-lb namespace-admin `token`, and
+the frozen validation `workflow` and `artifact` names. The coordinator must run in
+a CI-owned VM on a runner other than the target. The artifact must have been
+uploaded as a public artifact to CI's configured HTTP artifact sink and contain
+exactly one `*heyvm.tar.gz` with exactly one ELF `heyvm`.
+
+Set `CI_HOST_HEYVM_BOOTSTRAP_TARGETS`, or preferably store the same JSON at the
+operator-only HeyoSecret path `ci-controller/host-heyvm-bootstrap-targets` (the
+environment variable wins):
+
+```json
+{"eu1":{"repository":"https://github.com/Heyo-Computer/heyo.git","app_lb_admin_url":"https://eu1.heyo.computer/app-lb-admin","app_lb_deployment":"app-lb-eu1","app_lb_namespace":"default","runner_hd_id":"target-runner-id","backend_server_id":"eu1-backend-id","executable":"/usr/local/bin/heyvm","unit":"heyvm.service","state_dir":"/var/lib/heyvm-host-update","config_json_path":"/etc/heyvm-host-update.json","systemd_drop_in_path":"/etc/systemd/system/heyvm.service.d/host-update.conf","local_health_url":"http://127.0.0.1:4455/health","target_alias":"eu1","region":"eu1"}}
+```
+
+Prerequisites are app-lb's authenticated admin launcher and job-history APIs, a
+namespace-admin token in the workflow secret named by `token`, the target runner
+registered with this controller, and a confirmed merged release whose exact
+successful frozen validation produced the artifact. Delivery is durably armed
+before its single launcher POST; restart recovery only adopts exactly one update
+job. Cancellation, timeout, mapping drift, missing identity, ambiguous launcher
+history, failure, or rollback retain the target fence. Only an exact authenticated
+success receipt uncordons it.
+
+The coordinator polls `/deployments/{launcher}/jobs` and selects the persisted
+job ID, preserving namespace-scoped access. It does not require fleet-wide
+`/jobs/{id}` access. Missing or duplicate job IDs and mismatched deployment or
+job-kind identities retain the fence; the selected job still requires the exact
+success receipt before uncordoning.
+
+The initial eu1 installation is explicitly a **one-time** use: run one release job
+with `target: eu1`, verify its deployment event reaches `passed`, then use normal
+`ci/host-heyvm-maintenance` for subsequent upgrades. Do not rerun bootstrap to
+repair a retained fence; reconcile the persisted operation and launcher job.
+
+For a failed attempt whose installer succeeded, explicitly invoke
+`POST /api/runs/{run_id}/bootstrap/{operation_id}/recover` with that repository's
+submit bearer token. This is a production scheduling-state change, not a status
+query. It requires the original successful launcher receipt and unchanged trusted
+target mapping, then launches a fresh **read-only** app-lb verification job to check
+the host journal, active executable, config, drop-in, permissions, environment,
+and health identity. It never downloads or reinstalls the binary or restarts the
+service. Missing history, drift, or conflicting operations retain the fence.
+
+Successful recovery atomically releases this operation's fence and emits
+`ci.host.bootstrap.recovered.v1` in the run's `/events` API. The original failed
+run, job, step, and deployment history remain failed; the recovery response and
+audit event are the evidence of recovery. Repeating a completed recovery returns
+`already_passed` without running another verification job. A request interrupted
+before commit retains the fence; inspect events before retrying. Verification
+launcher records are retained for audit, not automatically deleted.
 
 ### Host app-lb executable rollout
 

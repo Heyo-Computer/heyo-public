@@ -109,8 +109,24 @@ pub struct Config {
     #[serde(default)]
     pub discovery_routed_services: String,
 
+    /// All ingress app-lb instances for each discovery service. Regional
+    /// rollouts require an observer in every target region and query them all.
+    #[serde(default)]
+    pub discovery_observers: Vec<DiscoveryObserver>,
+
     #[serde(default)]
     pub nats: NatsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryObserver {
+    pub service_id: String,
+    pub region: String,
+    pub deployment_id: String,
+    pub base_url: String,
+    /// HeyoSecret path containing an app-lb admin bearer. Never persisted in
+    /// rollout requests or returned by status APIs.
+    pub token_secret_path: String,
 }
 
 impl Config {

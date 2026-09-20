@@ -3540,6 +3540,68 @@ async fn get_one(State(state): State<AdminState>, Path(id): Path<String>) -> imp
     }
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryStatusResponse {
+    service_id: String,
+    version: Option<u64>,
+    upstreams: Vec<DiscoveryUpstreamStatus>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryUpstreamStatus {
+    peer: String,
+    draining: bool,
+    in_flight: usize,
+}
+
+fn discovery_status_locked(
+    registry: &Registry,
+    id: &str,
+) -> Result<DiscoveryStatusResponse, Response> {
+    let Some(deployment) = registry.get(id) else {
+        return Err(
+            err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response(),
+        );
+    };
+    let Some(discovery) = deployment.spec.discovery.as_ref() else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("deployment {id:?} is not discovery-backed"),
+        )
+        .into_response());
+    };
+    let mut upstreams: BTreeMap<String, (bool, usize)> = BTreeMap::new();
+    for backend in registry.discovery_backends(id) {
+        let value = upstreams.entry(backend.peer.clone()).or_insert((true, 0));
+        value.0 &= backend.is_draining();
+        value.1 += backend.in_flight();
+    }
+    Ok(DiscoveryStatusResponse {
+        service_id: discovery.service_id.clone(),
+        version: deployment.state().discovery_version,
+        upstreams: upstreams
+            .into_iter()
+            .map(|(peer, (draining, in_flight))| DiscoveryUpstreamStatus {
+                peer,
+                draining,
+                in_flight,
+            })
+            .collect(),
+    })
+}
+
+/// Observed discovery state. The registry mutation gate makes the durable
+/// version and all live/retired generation counters one coherent observation.
+async fn discovery_status(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    let _change = state.registry.change_guard().await;
+    match discovery_status_locked(&state.registry, &id) {
+        Ok(status) => Json(status).into_response(),
+        Err(response) => response,
+    }
+}
+
 const MAX_DRAIN_REASON_LEN: usize = 512;
 
 /// Optional operator context for a static-upstream drain.
@@ -5078,6 +5140,7 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/rollouts", post(start_rollout))
         .route("/deployments/:id/rollouts/:operation", get(get_rollout))
         .route("/deployments/:id", get(get_one).put(update).delete(deregister))
+        .route("/deployments/:id/discovery-status", get(discovery_status))
         .route("/deployments/:id/scaling", patch(scale))
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
         .route(
@@ -5511,6 +5574,42 @@ async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -
 mod tests {
     use super::*;
 
+    #[test]
+    fn discovery_status_uses_durable_version_and_rejects_other_deployments() {
+        let registry = Registry::new("unused-discovery-status.json");
+        let ordinary: DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id": "ordinary",
+            "routes": [{"host": "ordinary.example"}],
+            "upstreams": ["ordinary.example:80"]
+        }))
+        .unwrap();
+        registry.upsert(ordinary);
+        let rejected = discovery_status_locked(&registry, "ordinary").unwrap_err();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        let discovered: DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id": "cloud",
+            "routes": [{"host": "cloud.example"}],
+            "upstreams": ["cloud.example:80"],
+            "discovery": {"service_id": "cloud-service"}
+        }))
+        .unwrap();
+        let deployment = registry.upsert(discovered);
+        let before = discovery_status_locked(&registry, "cloud").unwrap();
+        assert_eq!(before.version, None);
+        deployment.mutate_state(|state| state.discovery_version = Some(9));
+        let after = discovery_status_locked(&registry, "cloud").unwrap();
+        assert_eq!(after.version, Some(9));
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::json!({
+                "serviceId": "cloud-service",
+                "version": 9,
+                "upstreams": [{"peer": "cloud.example:80", "draining": false, "inFlight": 0}]
+            })
+        );
+    }
+
     #[tokio::test]
     async fn healthz_reports_compiled_revision() {
         let response = healthz().await.into_response();
@@ -5518,6 +5617,34 @@ mod tests {
         assert_eq!(response.headers()["x-heyo-revision"], env!("APP_LB_BUILD_REVISION"));
         let body = axum::body::to_bytes(response.into_body(), 32).await.unwrap();
         assert_eq!(body.as_ref(), b"ok\n");
+    }
+
+    #[test]
+    fn discovery_status_tracks_removed_and_readded_peer_generations() {
+        let registry = Registry::new("unused-discovery-generations.json");
+        let spec: DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id":"svc", "routes":[{"host":"svc.example"}],
+            "upstreams":["eu:8080"], "discovery":{"service_id":"svc"}
+        })).unwrap();
+        let first = registry.upsert(spec.clone());
+        let old = first.backends()[0].clone();
+        assert!(old.try_acquire());
+        // Admin deletion/re-registration must not lose requests retained by
+        // the old proxy generation, either.
+        registry.remove("svc");
+        assert!(!old.try_acquire());
+        let replacement = registry.upsert(spec);
+        replacement.mutate_state(|s| s.discovery_version = Some(12));
+        let status = discovery_status_locked(&registry,"svc").unwrap();
+        assert_eq!(status.upstreams.len(),1);
+        assert_eq!(status.upstreams[0].in_flight,1);
+        assert!(!status.upstreams[0].draining,"one accepting generation prevents a drained claim");
+        registry.apply_discovery_upstreams(&replacement,vec![]);
+        let withdrawn = discovery_status_locked(&registry,"svc").unwrap();
+        assert!(withdrawn.upstreams[0].draining);
+        assert_eq!(withdrawn.upstreams[0].in_flight,1);
+        old.release();
+        assert!(discovery_status_locked(&registry,"svc").unwrap().upstreams.is_empty());
     }
 
     mod deployment_etags {

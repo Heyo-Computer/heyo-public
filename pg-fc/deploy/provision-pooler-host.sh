@@ -75,6 +75,9 @@ PG_VM_POOL_S3_REGION="${PG_VM_POOL_S3_REGION:-}"
 
 # Pooler tunables (defaults match the shipped conf).
 WARM_SPARES="${WARM_SPARES:-12}"
+# Of those spares, how many are parked stopped as image-restore vehicles.
+# Stopped VMs hold no RAM, so this does not come out of the warm pool's memory.
+CHILLED_VEHICLES="${CHILLED_VEHICLES:-2}"
 ARCHIVE_AFTER_SECS="${ARCHIVE_AFTER_SECS:-86400}"
 COMPACT_AFTER_SECS="${COMPACT_AFTER_SECS:-3600}"
 
@@ -498,6 +501,7 @@ HDR
   printf '    PG_VM_POOL_READY_TIMEOUT_SECS="300",\n'
   printf '    PG_VM_POOL_MAX_CONCURRENT_BRINGUPS="3",\n'
   printf '    PG_VM_POOL_WARM_SPARES="%s",\n' "$WARM_SPARES"
+  printf '    PG_VM_POOL_CHILLED_VEHICLES="%s",\n' "$CHILLED_VEHICLES"
   printf '    PG_VM_POOL_DATA_DISK_GB="2",\n'
   printf '    PG_VM_POOL_DISK_GROW_PCT="85",\n'
   printf '    PG_VM_POOL_DISK_MAX_GB="25",\n'

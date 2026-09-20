@@ -138,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(handlers::service_deploy::run_retirement_reconciler(
         state.clone(),
     ));
+    tokio::spawn(handlers::regional_rollout::run_reconciler(state.clone()));
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -215,6 +216,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/orchestration/services/deployments/{deployment_id}",
             get(handlers::service_deploy::get_service_deployment_run),
+        )
+        .route(
+            "/orchestration/services/regional-rollouts",
+            post(handlers::regional_rollout::create),
+        )
+        .route(
+            "/orchestration/services/regional-rollouts/{operation_id}",
+            get(handlers::regional_rollout::get),
+        )
+        .route(
+            "/orchestration/services/regional-rollouts/{operation_id}/resume",
+            post(handlers::regional_rollout::resume),
+        )
+        .route(
+            "/orchestration/services/regional-rollouts/{operation_id}/rollback",
+            post(handlers::regional_rollout::rollback),
         )
         .route(
             "/orchestration/services/archives/presign",

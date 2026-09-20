@@ -381,6 +381,7 @@ pub fn monitoring_page(
     let queued_bringups = crate::vm::bringups_waiting();
     let reclaim_running = crate::reclaim::pass_running();
     let spare_depth = st.registry.spare_pool_depth();
+    let chilled_depth = st.registry.chilled_vehicle_depth();
 
     shell(
         "Monitoring",
@@ -396,6 +397,10 @@ pub fn monitoring_page(
                                 "sweep idle → S3 now"
                             }
                         }
+                    }
+                    // Not S3-only: the TTL sweep drains through whichever tiers
+                    // are configured, so a compaction-only host needs it too.
+                    @if st.registry.offload_enabled() {
                         form method="post" action="/monitoring/ttl-sweep" class="inline-form" {
                             input type="number" name="ttl_secs" value="1800" min="0" step="60"
                                 style="width:7em"
@@ -469,6 +474,11 @@ pub fn monitoring_page(
                     (stat("warm spares ready", &ready.to_string(),
                         Some(&format!("target {target}{}", if ready == 0 { " — cold creates!" } else { "" }))))
                 }
+                @if let Some((chilled, target)) = chilled_depth && target > 0 {
+                    (stat("chilled vehicles", &chilled.to_string(),
+                        Some(&format!("target {target}{}",
+                            if chilled == 0 { " — image restores pay a stop!" } else { "" }))))
+                }
                 (stat("running, untracked", &untracked.to_string(),
                     if untracked > 0 { Some("no warm entry — reaper stops these in ≤2 passes") } else { None }))
                 (stat("past idle budget", &past_budget.to_string(),
@@ -487,10 +497,12 @@ pub fn monitoring_page(
                     } else {
                         Some("global boot gate — boots preempt it, ~1 disk of latency")
                     }))
-                @if st.registry.archive_enabled() {
+                @if st.registry.offload_enabled() {
                     (stat("compacted (local)", &compacted.to_string(), None))
                     (stat("frozen (local)", &frozen.to_string(), None))
-                    (stat("archived (S3)", &archived.to_string(), None))
+                    @if st.registry.archive_enabled() {
+                        (stat("archived (S3)", &archived.to_string(), None))
+                    }
                     (stat("offloads in flight", &offloading.len().to_string(),
                         if offloading.is_empty() { None } else { Some(offloading_names.as_str()) }))
                 }

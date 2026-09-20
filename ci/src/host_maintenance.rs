@@ -100,7 +100,7 @@ pub fn executable_digest(bytes: &[u8]) -> Result<String> {
 }
 
 pub async fn cordoned(store: &Store, runner: &str) -> Result<bool> {
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed')")
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase NOT IN ('passed','superseded'))")
         .bind(runner).fetch_one(store.pool()).await?)
 }
 
@@ -109,11 +109,23 @@ pub async fn owns_job(store: &Store, job: &str) -> Result<bool> {
         .bind(job).fetch_one(store.pool()).await?)
 }
 
+async fn trusted_target(d: &Dispatcher, alias: &str) -> Result<Target> {
+    let managed;
+    let raw = match d.config.host_maintenance_targets.as_deref() {
+        Some(raw) => raw,
+        None => {
+            managed = d.secrets.host_maintenance_targets().await?;
+            managed.as_str()
+        }
+    };
+    mapping(Some(raw), alias)
+}
+
 pub async fn request(d: &Dispatcher, msg: &JobMessage, plan: &JobPlan, step: &str,
     alias: &str, cloud_url: &str, archive: &str, secret: &str, timeout: Duration) -> Result<String> {
     validate_plan(plan)?;
     crate::submission::authorize_publication(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?;
-    let target = mapping(d.config.host_maintenance_targets.as_deref(), alias)?;
+    let target = trusted_target(d, alias).await?;
     ensure!(endpoint(cloud_url)? == endpoint(&target.cloud_url)?, "workflow Cloud URL differs from trusted mapping");
     ensure!(d.runners.snapshot().locate(&target.runner_hd_id).is_some(), "mapped runner is not served by this controller");
     let run = d.store.get_run(&msg.run_id).await?.ok_or_else(|| anyhow::anyhow!("missing run"))?;
@@ -142,6 +154,13 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, plan: &JobPlan, step: &st
         ensure!(existing == value, "maintenance payload changed on replay");
         return Ok(format!("[ci] maintenance {id} already recorded\n"));
     }
+    let bootstrap_fenced: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase NOT IN ('passed','superseded'))",
+    )
+    .bind(&request.target.runner_hd_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    ensure!(!bootstrap_fenced, "runner has an unresolved native heyvm bootstrap");
     let inserted = sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) SELECT $1,$2,$3,$4,$5,$6,'running','releasing',$7,$8 WHERE EXISTS(SELECT 1 FROM ci_job WHERE id=$4 AND status='running')")
         .bind(&id).bind(step).bind(&msg.run_id).bind(&msg.job_id).bind(&request.target.backend_server_id)
         .bind(hash).bind(&sha).bind(&release.prepared.git_ref).execute(&mut *tx).await?.rows_affected();
@@ -308,7 +327,7 @@ pub fn spawn(d: Arc<Dispatcher>) {
                 let id: String = row.get("id"); let run: String = row.get("run_id");
                 let result: Result<()> = async {
                     let request: Request = serde_json::from_value(row.get("request"))?;
-                    let target = mapping(d.config.host_maintenance_targets.as_deref(), &request.alias).ok();
+                    let target = trusted_target(&d, &request.alias).await.ok();
                     // Local cancellation/deadline/configuration checks do not
                     // depend on either the runner or credential store working.
                     poll(&d.store, &id, "", target.as_ref()).await?;
