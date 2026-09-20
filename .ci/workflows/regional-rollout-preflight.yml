@@ -26,13 +26,20 @@ jobs:
           set -eu
           python3 - <<'PY'
           import json, os, urllib.request, urllib.error
+          problems = []
+          print(json.dumps({'credentialsPresent': {k: bool(os.environ.get(k)) for k in ['US3_TOKEN', 'EU1_TOKEN', 'ORCHESTRATOR_TOKEN']}}), flush=True)
           for region, deployment in [('us3', 'orchestrator-us3-next'), ('eu1', 'orchestrator-eu1')]:
               token = os.environ[region.upper() + '_TOKEN']
               request = urllib.request.Request(
-                  f'https://admin.{region}.heyo.work/deployments/{deployment}?namespace=default',
+                  f'https://admin.{region}.heyo.work/deployments/{deployment}',
                   headers={'Authorization': 'Bearer ' + token})
-              with urllib.request.urlopen(request, timeout=20) as response:
-                  spec = json.load(response)['spec']
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      spec = json.load(response)['spec']
+              except urllib.error.HTTPError as error:
+                  problems.append(f'{region}: app-lb deployment read returned HTTP {error.code}')
+                  print(problems[-1], flush=True)
+                  continue
               vm = spec.get('vm') or {}
               env = vm.get('env_vars') or {}
               refs = vm.get('env_from') or []
@@ -61,4 +68,6 @@ jobs:
                   if body.get('error') != 'Regional rollout not found':
                       raise SystemExit(f'{region}: regional rollout API not installed')
               print(region + ': authenticated regional rollout API available', flush=True)
+          if problems:
+              raise SystemExit('; '.join(problems))
           PY
