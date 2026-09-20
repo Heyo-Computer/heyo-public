@@ -546,10 +546,25 @@ for an image already in the catalog answers `ready` without building — so even
 a lost claim collapses into one docker build rather than two racing for the
 same tag.
 
-Nothing sweeps images. A rootfs is expensive to rebuild and cheap to keep, and
-unlike a pooled VM it carries no state from the run that made it. To force a
-rebuild, delete it on the host (`rm ~/.heyo/images/firecracker/ci-img-*.ext4`);
-the next job finds the file gone, forgets the row and builds it again.
+CI sweeps unused source-built base images after `CI_VM_IDLE_SECS` (default
+seven days), separately from VM eviction. Cache hits refresh the image's last
+use; existing catalog entries receive a full grace period when the retention
+migration is first applied. Each minute, CI considers at most one image per
+served runner and refuses cleanup while that runner has active job work or
+maintenance. Failed deletions stay recorded and retry after five minutes.
+
+Deletion uses heyvmd's protected `POST /images/:name/evict` contract. The daemon
+requires the source builder's matching ownership digest, serializes against
+builds and VM creation across processes, and protects references from stopped
+as well as running sandboxes. Busy, referenced, unmanaged, or uncertain images
+are retained. Older daemons without this endpoint cannot reclaim images; a
+404 is not a deletion receipt. Deploy compatible heyvmd on runner hosts before
+expecting disk reclamation. Upgrade other CLI writers sharing that catalog too.
+
+CI verifies cached images through the source builder before creating a VM, so
+a missing file is rebuilt within the current job. Do not delete base-image
+files directly on a live host or substitute `heyvm prune --images`: those
+paths do not provide this ownership/reference-checking contract.
 
 **A named VM is somebody else's machine**, and the executor treats it that way.
 It is resolved on the pinned node by id or name, started if it is merely stopped,

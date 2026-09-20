@@ -1562,7 +1562,10 @@ impl Dispatcher {
             {
                 crate::image::Claim::Ready => {
                     tracing::info!(job = %plan.key, runner, "image {name} is already on this host");
-                    return Ok(name);
+                    // Validate with the source builder even on catalog hits.
+                    // It rebuilds a missing file in this attempt, and joins an
+                    // existing build instead of failing the job on stale state.
+                    break;
                 }
                 crate::image::Claim::Build => break,
                 crate::image::Claim::InProgress => {
@@ -1582,7 +1585,8 @@ impl Dispatcher {
             }
         }
 
-        // This job owns the build.
+        // This job owns a build claim or is verifying a cached image. The
+        // daemon collapses concurrent requests for identical verified inputs.
         tracing::info!(
             job = %plan.key, runner,
             "asking the runner to build image {name} from {}", build.dockerfile
@@ -4120,6 +4124,28 @@ impl Dispatcher {
     /// sibling that dies is reclaimed within a lease period instead of leaking
     /// until somebody happens to restart this process.
     pub fn spawn_lease_loop(self: Arc<Self>) {
+        let images = self.clone();
+        // Slow image IO must not hold up VM lease/TTL renewal.
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Ok(_work) = images.lifecycle.work(&images.store).await else { continue };
+                for runner in images.served_runner_ids() {
+                    let result = async {
+                        let options = images.runners.options_for(&runner).await?;
+                        images.images.evict_one(&runner, images.config.heyvm.vm_idle, options).await?;
+                        Ok::<_, DispatchError>(())
+                    };
+                    match tokio::time::timeout(Duration::from_secs(30), result).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!(%runner, "CI image cleanup unresolved: {e}"),
+                        Err(_) => tracing::warn!(%runner, "CI image cleanup timed out; catalog retained"),
+                    }
+                }
+            }
+        });
         // Comfortably inside the lease, so a slow database or a paused process
         // gets several chances before its VMs are taken. Losing a lease that is
         // still in use would put two instances on one VM, which is much worse
@@ -6331,6 +6357,56 @@ mod tests {
             // takes anyway.
             objects: Arc::new(crate::objects::Workflows::new(&config)),
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; fake source builder"]
+    async fn cached_image_is_rebuilt_before_the_current_job_creates_a_vm() {
+        use axum::{Json, Router, routing::post};
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = posts.clone();
+        let name = "ci-img-012345abcdef";
+        let app = Router::new().route("/sources/src-rebuild/image", post(move || {
+            let calls = calls.clone();
+            async move {
+                let prior = calls.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"name":name,"status":if prior==0 { "building" } else { "ready" }}))
+            }
+        }).get(move || async move { Json(json!({"name":name,"status":"ready","size_bytes":8192})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        unsafe { std::env::set_var("CI_TEST_DAEMON", format!("http://{}", listener.local_addr().unwrap())); }
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let workflow = crate::workflow::Workflow::parse("rebuild.yml", "jobs:\n  build:\n    steps: [{run: echo test}]\n").unwrap();
+        let plan = crate::plan::Plan::build(&workflow).unwrap();
+        let run = crate::vm::new_id();
+        d.store.create_run(&run, &crate::store::RunRequest { repo_url: "https://example.test/repo.git".into(), ..Default::default() }, &plan).await.unwrap();
+        let job = d.store.jobs_of(&run).await.unwrap().remove(0);
+        assert!(d.store.claim_job(&job.id, "hd-local", 1).await.unwrap());
+        d.images.claim(name, "hd-local", "wf", &job.id, crate::image::BUILD_LEASE).await.unwrap();
+        d.images.mark_ready(name, "hd-local", 1024).await.unwrap();
+        let prepared = crate::image::PreparedSource { source_id: "src-rebuild".into(), cache_keys: Default::default(),
+            image: Some(crate::image::PreparedImage { name: name.into(), input_digest: "0".repeat(64) }) };
+        let build = serde_json::from_value(json!({"dockerfile":"Dockerfile"})).unwrap();
+        let msg = JobMessage { run_id: run.clone(), job_id: job.id.clone(), job_key: job.job_key.clone() };
+        let resolved = d.ensure_image("hd-local", &plan.jobs[0], &build, &prepared, &msg).await.unwrap();
+        assert_eq!(resolved, name);
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "a ready DB row must not bypass the daemon");
+        assert_eq!(d.images.inventory(&["hd-local".into()]).await.unwrap()[0].size_bytes, 8192);
+        // Active executor evidence blocks retention even with a zero window.
+        d.images.evict_one("hd-local", Duration::ZERO, d.runners.options_for("hd-local").await.unwrap()).await.unwrap();
+        assert_eq!(d.images.status_of(name, "hd-local").await.unwrap().as_deref(), Some("ready"));
+        d.ensure_image("hd-local", &plan.jobs[0], &build, &prepared, &msg).await.unwrap();
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
+        assert_eq!(d.images.inventory(&["hd-local".into()]).await.unwrap()[0].size_bytes, 8192,
+            "a ready receipt without size must not erase known accounting");
+        d.store.end_host_work(&job.id, "hd-local", 1).await.unwrap();
+        d.images.forget(name, "hd-local").await.unwrap();
+        sqlx::query("DELETE FROM ci_run WHERE id=$1").bind(&run).execute(d.store.pool()).await.unwrap();
+        d.bus.js_delete_streams().await.unwrap();
+        server.abort();
+        unsafe { std::env::remove_var("CI_TEST_DAEMON"); }
     }
 
     #[tokio::test]

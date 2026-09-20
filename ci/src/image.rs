@@ -33,13 +33,9 @@
 //!
 //! ## What is left in the catalog
 //!
-//! Images are not swept. A rootfs is expensive to rebuild and cheap to keep,
-//! and unlike a pooled VM it holds no state from the run that made it — the
-//! blunt cleanup is `rm ~/.heyo/images/firecracker/ci-img-*.ext4` on the host,
-//! after which the next job rebuilds. `ci_vm_image` is this orchestrator's
-//! record of what it has put on each host, and a create that fails because the
-//! file went away forgets the row and rebuilds, the same way `acquire_vm`
-//! already recovers from a pooled VM the daemon lost.
+//! CI selects old, unused catalog rows; the daemon owns reference checks and
+//! serialization with builds and VM creation. A failed or unsupported eviction
+//! retains the row for retry. Never unlink base images directly on a live host.
 
 use heyo_sdk::{HeyoClient, HeyoClientOptions, RequestOptions};
 use reqwest::Method;
@@ -427,6 +423,7 @@ impl Catalog {
         job_id: &str,
         lease: Duration,
     ) -> Result<Claim, ImageError> {
+        let mut tx = self.db.begin().await.map_err(ImageError::sql)?;
         let row = sqlx::query(
             "INSERT INTO ci_vm_image
                 (name, runner_hd_id, workflow_id, status, built_by_job, leased_until)
@@ -443,19 +440,67 @@ impl Catalog {
         .bind(workflow_id)
         .bind(job_id)
         .bind(lease.as_secs() as f64)
-        .fetch_optional(&self.db)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(ImageError::sql)?;
 
-        if row.is_some() {
-            return Ok(Claim::Build);
+        // The upsert holds the row lock even when its WHERE rejects takeover.
+        // Touch ready hits too, before a sweeper may select this image.
+        let status: String = sqlx::query_scalar("UPDATE ci_vm_image SET last_used_at=now() WHERE name=$1 AND runner_hd_id=$2 RETURNING status")
+            .bind(name).bind(runner).fetch_one(&mut *tx).await.map_err(ImageError::sql)?;
+        tx.commit().await.map_err(ImageError::sql)?;
+        Ok(if row.is_some() { Claim::Build } else if status == "ready" { Claim::Ready } else { Claim::InProgress })
+    }
+
+    /// One candidate per host/pass, with durable backoff for refusals. The row
+    /// lock serializes claims and competing sweepers until the explicit daemon
+    /// receipt is committed. Lost responses leave a retryable catalog entry.
+    pub async fn evict_one(&self, runner: &str, idle: Duration,
+        connection: impl Into<crate::runners::Connection>) -> Result<(), ImageError> {
+        let mut tx = self.db.begin().await.map_err(ImageError::sql)?;
+        // Same runner admission lock as Store::claim_job and maintenance.
+        // New host work cannot appear between the idle check and deletion.
+        let admitted: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 222))")
+            .bind(runner).fetch_one(&mut *tx).await.map_err(ImageError::sql)?;
+        if !admitted { return Ok(()) }
+        let name: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM ci_vm_image i WHERE runner_hd_id=$1 AND status='ready'
+             AND name ~ '^ci-img-[a-f0-9]{12}$'
+             AND last_used_at < now()-make_interval(secs => $2) AND cleanup_after<=now()
+             AND NOT EXISTS (SELECT 1 FROM ci_vm_pool p WHERE p.runner_hd_id=$1 AND p.status IN ('building','claimed'))
+             AND NOT EXISTS (SELECT 1 FROM ci_host_work w WHERE w.runner_hd_id=$1)
+             AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h WHERE h.runner_hd_id=$1 AND h.phase<>'passed')
+             AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h WHERE h.runner_hd_id=$1 AND h.phase NOT IN ('passed','superseded'))
+             ORDER BY cleanup_after,last_used_at LIMIT 1 FOR UPDATE OF i SKIP LOCKED")
+            .bind(runner).bind(idle.as_secs() as f64).fetch_optional(&mut *tx).await.map_err(ImageError::sql)?;
+        let Some(name) = name else { return Ok(()) };
+        let connection = connection.into();
+        let result = async {
+            let client = HeyoClient::new(connection.options.clone())
+                .map_err(|source| ImageError::Daemon { what: "opening image cleanup client", source })?;
+            #[derive(Deserialize)]
+            struct Receipt { name: String, status: String }
+            let receipt: Receipt = client.request(Method::POST, &format!("/images/{name}/evict"), None::<&()>,
+                RequestOptions { timeout: Some(Duration::from_secs(20)), query: vec![] }).await
+                .map_err(|source| ImageError::Daemon { what: "evicting CI base image", source })?;
+            if receipt.name != name || !matches!(receipt.status.as_str(), "deleted" | "missing") {
+                return Err(ImageError::Protocol(format!("image eviction not confirmed: {} {}", receipt.name, receipt.status)));
+            }
+            Ok(())
+        }.await;
+        match &result {
+            Ok(()) => {
+                sqlx::query("DELETE FROM ci_vm_image WHERE name=$1 AND runner_hd_id=$2")
+                    .bind(&name).bind(runner).execute(&mut *tx).await.map_err(ImageError::sql)?;
+            }
+            Err(e) => {
+                sqlx::query("UPDATE ci_vm_image SET cleanup_after=now()+interval '5 minutes',error=$3 WHERE name=$1 AND runner_hd_id=$2")
+                    .bind(&name).bind(runner).bind(e.to_string()).execute(&mut *tx).await.map_err(ImageError::sql)?;
+            }
         }
-        // The upsert did nothing, so a row exists that it was not allowed to
-        // take: either it is ready, or somebody's lease is still live.
-        match self.status_of(name, runner).await? {
-            Some(s) if s == "ready" => Ok(Claim::Ready),
-            _ => Ok(Claim::InProgress),
-        }
+        tx.commit().await.map_err(ImageError::sql)?;
+        if result.is_ok() { tracing::info!(runner, image=%name, "CI base image eviction confirmed"); }
+        result
     }
 
     pub async fn status_of(&self, name: &str, runner: &str) -> Result<Option<String>, ImageError> {
@@ -493,7 +538,7 @@ impl Catalog {
         sqlx::query(
             "UPDATE ci_vm_image
                 SET status='ready', ready_at=now(), leased_until=NULL, error=NULL,
-                    size_bytes=$3
+                    size_bytes=CASE WHEN $3>0 THEN $3 ELSE size_bytes END
               WHERE name = $1 AND runner_hd_id = $2",
         )
         .bind(name)
@@ -960,6 +1005,88 @@ mod tests {
 
     const LEASE: Duration = Duration::from_secs(600);
     const LAPSED: Duration = Duration::from_secs(0);
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL; fake daemon HTTP"]
+    async fn image_eviction_is_scoped_retryable_and_serialized_with_claims() {
+        use axum::{Json, Router, extract::{Path, State}, http::StatusCode, response::IntoResponse, routing::post};
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Remote { mode: String, removed: bool, calls: usize, deletes: usize }
+        let remote = Arc::new(Mutex::new(Remote::default()));
+        let app = Router::new().route("/images/{name}/evict", post(
+            |State(remote): State<Arc<Mutex<Remote>>>, Path(name): Path<String>| async move {
+                let mut r = remote.lock().unwrap(); r.calls += 1;
+                match r.mode.as_str() {
+                    "unsupported" => return StatusCode::NOT_FOUND.into_response(),
+                    "busy" => return Json(serde_json::json!({"name":name,"status":"busy"})).into_response(),
+                    "wrong" => return Json(serde_json::json!({"name":"another-image","status":"deleted"})).into_response(),
+                    _ => {}
+                }
+                let status = if r.removed { "missing" } else { r.removed=true; r.deletes+=1; "deleted" };
+                if r.mode == "lost" { return StatusCode::BAD_GATEWAY.into_response(); }
+                Json(serde_json::json!({"name":name,"status":status})).into_response()
+            })).with_state(remote.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let options = HeyoClientOptions { base_url: Some(format!("http://{}", listener.local_addr().unwrap())), ..Default::default() };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let c = test_catalog().await;
+        let name = "ci-img-012345abcdef";
+        let idle = Duration::from_secs(3600);
+        for mode in ["unsupported", "busy", "wrong", "lost"] {
+            *remote.lock().unwrap() = Remote { mode: mode.into(), ..Default::default() };
+            let runner = runner_id();
+            let foreign = runner_id();
+            for host in [&runner, &foreign] {
+                c.claim(name, host, "wf", "job", LEASE).await.unwrap();
+                c.mark_ready(name, host, 1024).await.unwrap();
+            }
+            c.evict_one(&runner, idle, options.clone()).await.unwrap();
+            assert_eq!(remote.lock().unwrap().calls, 0, "new images get a grace period");
+            sqlx::query("UPDATE ci_vm_image SET last_used_at=now()-interval '2 hours' WHERE runner_hd_id IN ($1,$2)")
+                .bind(&runner).bind(&foreign).execute(&c.db).await.unwrap();
+            // A ready cache hit refreshes usage, not just builds.
+            assert!(matches!(c.claim(name, &runner, "wf", "new-job", LEASE).await.unwrap(), Claim::Ready));
+            c.evict_one(&runner, idle, options.clone()).await.unwrap();
+            assert_eq!(remote.lock().unwrap().calls, 0);
+            sqlx::query("UPDATE ci_vm_image SET last_used_at=now()-interval '2 hours' WHERE runner_hd_id=$1")
+                .bind(&runner).execute(&c.db).await.unwrap();
+            // A competing claimant owns the row: sweep must skip it rather
+            // than deciding from an unlocked/stale candidate list.
+            let mut tx = c.db.begin().await.unwrap();
+            sqlx::query("SELECT name FROM ci_vm_image WHERE runner_hd_id=$1 FOR UPDATE")
+                .bind(&runner).fetch_one(&mut *tx).await.unwrap();
+            c.evict_one(&runner, idle, options.clone()).await.unwrap();
+            assert_eq!(remote.lock().unwrap().calls, 0);
+            tx.rollback().await.unwrap();
+            assert!(c.evict_one(&runner, idle, options.clone()).await.is_err());
+            assert_eq!(c.status_of(name, &runner).await.unwrap().as_deref(), Some("ready"));
+            let error: Option<String> = sqlx::query_scalar("SELECT error FROM ci_vm_image WHERE name=$1 AND runner_hd_id=$2")
+                .bind(name).bind(&runner).fetch_one(&c.db).await.unwrap();
+            assert!(error.is_some());
+            let calls = remote.lock().unwrap().calls;
+            c.evict_one(&runner, idle, options.clone()).await.unwrap();
+            assert_eq!(remote.lock().unwrap().calls, calls, "retry backoff is durable");
+            sqlx::query("UPDATE ci_vm_image SET cleanup_after=now() WHERE runner_hd_id=$1")
+                .bind(&runner).execute(&c.db).await.unwrap();
+            remote.lock().unwrap().mode.clear();
+            let restarted = test_catalog().await;
+            restarted.evict_one(&runner, idle, options.clone()).await.unwrap();
+            assert_eq!(remote.lock().unwrap().deletes, 1, "lost response must not delete twice");
+            assert!(c.status_of(name, &runner).await.unwrap().is_none());
+            assert_eq!(c.status_of(name, &foreign).await.unwrap().as_deref(), Some("ready"));
+            assert!(matches!(c.claim(name, &runner, "wf", "next-job", LEASE).await.unwrap(), Claim::Build));
+            // Even an old building row must not be swept.
+            sqlx::query("UPDATE ci_vm_image SET last_used_at=now()-interval '2 hours' WHERE runner_hd_id=$1")
+                .bind(&runner).execute(&c.db).await.unwrap();
+            let calls = remote.lock().unwrap().calls;
+            c.evict_one(&runner, idle, options.clone()).await.unwrap();
+            assert_eq!(remote.lock().unwrap().calls, calls);
+            c.forget(name, &runner).await.unwrap();
+            c.forget(name, &foreign).await.unwrap();
+        }
+        server.abort();
+    }
 
     /// The whole point of the table: one build per host, and every later job
     /// finds it ready instead of rebuilding a multi-gigabyte rootfs.
