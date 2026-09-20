@@ -382,6 +382,7 @@ pub fn monitoring_page(
     let reclaim_running = crate::reclaim::pass_running();
     let spare_depth = st.registry.spare_pool_depth();
     let chilled_depth = st.registry.chilled_vehicle_depth();
+    let create_gate = crate::vm::create_gate_available();
 
     shell(
         "Monitoring",
@@ -473,6 +474,14 @@ pub fn monitoring_page(
                 @if let Some((ready, target)) = spare_depth {
                     (stat("warm spares ready", &ready.to_string(),
                         Some(&format!("target {target}{}", if ready == 0 { " — cold creates!" } else { "" }))))
+                }
+                @if let Some(slots) = create_gate {
+                    (stat("daemon create slots", &slots.to_string(),
+                        Some(if slots == 0 {
+                            "gate full — creates are queuing inside heyvmd"
+                        } else {
+                            "free slots in heyvmd's create gate"
+                        })))
                 }
                 @if let Some((chilled, target)) = chilled_depth && target > 0 {
                     (stat("chilled vehicles", &chilled.to_string(),

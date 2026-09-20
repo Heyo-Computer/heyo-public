@@ -2865,6 +2865,176 @@ async fn resize_disk_at(base_url: &str, sandbox_id: &str, target_gb: u64) -> Res
     Ok(())
 }
 
+/// Remaining slots in heyvm's process-wide create gate, or `None` when it has
+/// not been sampled (or the daemon did not report one).
+///
+/// The gate is a `Semaphore` whose width defaults to **4** regardless of host
+/// size, and its permit is held across a create *and* its boot. It is
+/// therefore the real bound on create throughput — not CPU, RAM or disk, all
+/// of which sit idle while creates queue FIFO behind it. A burst deeper than
+/// the gate turns into a queue whose wait is bounded by nothing
+/// (`HEYVMD_CREATE_TIMEOUT_SECS` bounds one slot's execution, not the line
+/// behind it), which is how a create p99 reaches minutes on an idle-looking
+/// host. Worth a tile next to spare depth for exactly that reason: it is the
+/// difference between "the host is busy" and "we are queued".
+static CREATE_GATE_AVAILABLE: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
+
+/// Sample the daemon's create-gate depth. Called once per warm-spare pass —
+/// the pool is both the biggest source of concurrent creates and the thing
+/// most starved when the gate is full, so its cadence is the right one.
+pub(crate) async fn refresh_create_gate() {
+    let url = format!("{}/health", daemon_base_url());
+    let read = async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .ok()?;
+        let body: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+        body.get("createGate")?.get("available")?.as_i64()
+    };
+    let value = read.await.unwrap_or(-1);
+    CREATE_GATE_AVAILABLE.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Last sampled create-gate depth; `None` when unknown.
+pub(crate) fn create_gate_available() -> Option<i64> {
+    match CREATE_GATE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        v if v < 0 => None,
+        v => Some(v),
+    }
+}
+
+/// Does the local daemon understand `data_image_path` on create — i.e. can it
+/// build a VM straight onto an image we already hold, with no vehicle to
+/// borrow, stop and overwrite?
+///
+/// Probed once and cached. It **must** be an explicit positive. heyvm's request
+/// structs carry no `deny_unknown_fields`, so a daemon that predates the field
+/// does not reject it — it silently drops it and provisions a *blank* disk.
+/// Optimistically sending it would turn every restore against an older daemon
+/// into a VM serving an empty cluster while reporting success, which is
+/// indistinguishable from data loss. Anything short of a daemon naming the
+/// capability sends us down the vehicle path: slower, and correct.
+pub(crate) async fn daemon_adopts_data_images() -> bool {
+    static CAP: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    *CAP.get_or_init(|| async {
+        let url = format!("{}/health", daemon_base_url());
+        let probe = async {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .ok()?;
+            let body: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+            Some(
+                body.get("capabilities")?
+                    .as_array()?
+                    .iter()
+                    .any(|c| c.as_str() == Some("data_image_path")),
+            )
+        };
+        let supported = probe.await.unwrap_or(false);
+        if supported {
+            info!(
+                "daemon advertises data_image_path: image restores will build a VM directly on \
+                 the restored disk (no vehicle, no stop, no copy)"
+            );
+        } else {
+            info!(
+                "daemon does not advertise data_image_path: image restores keep using the \
+                 chilled-vehicle path"
+            );
+        }
+        supported
+    })
+    .await
+}
+
+/// Create a VM whose data disk **is** `image` — the daemon renames the file
+/// into the new sandbox and boots on it once.
+///
+/// The SDK has no field for this (it predates the route), so this speaks raw
+/// HTTP to the daemon's synchronous `POST /sandboxes`, exactly as
+/// [`resize_disk_at`] does for the workspace resize. Field names are heyvm's
+/// `CreateSandboxRequest` (snake_case, no rename_all); `size_class` and
+/// `backend_type` are both `rename_all = "lowercase"` on each side, so the
+/// SDK's `as_str()` is the right wire value.
+///
+/// `adopt: "move"` hands the file over: on the run dir's own filesystem that
+/// is a `rename(2)`, so the image is attached without copying a byte. The
+/// caller must therefore treat `image` as consumed once this returns.
+pub(crate) async fn create_vm_on_image(
+    cfg: &Config,
+    name: &str,
+    keepalive: bool,
+    image: &std::path::Path,
+) -> Result<Sandbox> {
+    let _slot = bringup_slot(name).await;
+    let started = Instant::now();
+    let body = serde_json::json!({
+        "name": name,
+        "image": cfg.image,
+        "backend_type": "firecracker",
+        "size_class": cfg.size_class.as_str(),
+        "open_ports": [VM_PG_PORT],
+        // Always 0: the pooler owns VM lifecycle, as in `create_vm`.
+        "ttl_seconds": 0,
+        "data_image_path": image.to_string_lossy(),
+        "data_image_adopt": "move",
+    });
+    let url = format!("{}/sandboxes", daemon_base_url());
+    let client = reqwest::Client::builder()
+        .timeout(DEPLOY_HTTP_TIMEOUT)
+        .build()
+        .context("building HTTP client for the adopt-image create")?;
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .context("calling the daemon's create-on-image")?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "daemon create-on-image returned {status}: {} (a 404 means this daemon has no \
+             /sandboxes route; a 422 naming data_image_path means it predates the field)",
+            text.trim()
+        );
+    }
+    let id = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("id").and_then(|i| i.as_str().map(str::to_string)))
+        .ok_or_else(|| anyhow::anyhow!("daemon create-on-image returned no sandbox id: {text}"))?;
+    let sandbox = Sandbox::connect(id.clone(), local_opts())
+        .with_context(|| format!("connecting to adopted-image VM {id}"))?;
+    if let Some(schema) = name.strip_prefix("pg-") {
+        crate::pending::record(schema, &id).await;
+    }
+    crate::inventory::insert(name, &id);
+    // The synchronous create returns only once the guest has been started, so
+    // this is a confirmation rather than a wait — but it is the same guard
+    // `create_vm` uses, and a daemon that 201s an unstarted VM must not slip
+    // through to a client.
+    let ready_timeout = cfg.ready_timeout;
+    if let Err(e) = wait_ready(&sandbox, ready_timeout, name).await {
+        warn!("{name}: adopted-image VM {id} never became ready; killing it");
+        let _ = tokio::time::timeout(Duration::from_secs(30), sandbox.kill()).await;
+        crate::inventory::remove_id(&id);
+        if let Some(schema) = name.strip_prefix("pg-") {
+            crate::pending::clear(schema).await;
+        }
+        return Err(e).with_context(|| format!("waiting for adopted-image VM {name}"));
+    }
+    if keepalive && let Err(e) = sandbox.set_ttl(0).await {
+        warn!("failed to pin keep-alive VM {name} (set_ttl 0): {e:#}");
+    }
+    crate::events::record_timing(crate::events::Timing::VmCreate, started.elapsed());
+    info!("created VM {name} on the restored disk in {:?}", started.elapsed());
+    Ok(sandbox)
+}
+
 /// Best-effort stop of whatever VM a failed offload bring-up may have left
 /// running — the ready-timeout case: the sandbox started, but Postgres never
 /// answered (sick disk, wedged boot), so `ensure_vm` errored without ever

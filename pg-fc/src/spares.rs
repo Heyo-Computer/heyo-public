@@ -224,6 +224,20 @@ impl SparePool {
         (self.chilled.lock().unwrap().len(), self.chilled_target)
     }
 
+    /// Any spare id currently on either shelf, **without claiming it**.
+    ///
+    /// For reading a property of the *host* rather than using the VM: every
+    /// spare's data disk was `initdb`'d by this host's image, so its
+    /// `PG_VERSION` is what this host serves. An image restore that builds its
+    /// own VM has no vehicle to read that from, and it must not guess — see
+    /// `imgarchive::host_pg_major`.
+    pub fn peek_any_id(&self) -> Option<String> {
+        if let Some(id) = self.ready.lock().unwrap().front().cloned() {
+            return Some(id);
+        }
+        self.chilled.lock().unwrap().front().cloned()
+    }
+
     /// Ids on the chilled shelf — the exemption set the replenish plan needs.
     /// A chilled spare is stopped, unbound and unclaimed, which is precisely
     /// what [`plan_replenish`] restarts as deficit or deletes as surplus, so
@@ -557,6 +571,11 @@ impl SparePool {
         acted += chilled_now;
 
         let shelved = self.publish(healthy, bound);
+
+        // Sample the daemon's create gate on the pool's own cadence: this pass
+        // is usually the largest single source of concurrent creates, so a
+        // gate that is empty here is the reason client bring-ups are queuing.
+        vm::refresh_create_gate().await;
 
         let (chilled_depth, chilled_target) = self.chilled_depth();
         if acted > 0 || shelved < self.target || chilled_depth < chilled_target {

@@ -1237,6 +1237,48 @@ async fn adopt_zst_image_inner(
     }
     ensure_restore_headroom(cfg, schema, raw).await?;
 
+    // Fast path: hand the verified image to the daemon and let it build the VM
+    // around it. No vehicle to borrow, so no stop, no wait for Firecracker to
+    // release the disk, and no copy — the daemon renames the file into the new
+    // sandbox. The whole vehicle/spare/chill apparatus below exists only
+    // because older daemons cannot do this.
+    if crate::vm::daemon_adopts_data_images().await {
+        // The major gate still has to run, and it has to fail *closed*. On the
+        // vehicle path the server's major is read off the vehicle's own disk;
+        // with no vehicle there is nothing to read, so an unknown answer sends
+        // this restore down the slow path rather than booting an archive this
+        // host may not be able to serve. Booting a cross-major cluster costs a
+        // full ready_timeout per attempt against a failure no retry can fix.
+        match host_pg_major(cfg, spares).await {
+            Some(server) => {
+                if let MajorVerdict::Mismatch { archived, server } =
+                    major_verdict(pg_version_of(raw).await, Some(server))
+                {
+                    bail!(
+                        "schema {schema}: the archived cluster was initialized by PostgreSQL \
+                         {archived}, but this host's image serves PostgreSQL {server} — \
+                         refusing to adopt it. The archive is untouched; it needs a PostgreSQL \
+                         {archived} server to dump it before this host can serve it (see \
+                         pg-fc/dump-oldpg.sh and docs/runbook-pg-major-mismatch.md)"
+                    );
+                }
+                let name = format!("pg-{schema}");
+                let sandbox =
+                    crate::vm::create_vm_on_image(cfg, &name, pinned, raw).await.with_context(
+                        || format!("schema {schema}: building a VM on the restored disk"),
+                    )?;
+                // `Created`, not a spare: nothing was claimed from the pool, and
+                // a failed bring-up downstream must kill this VM rather than
+                // hand it back.
+                return Ok((sandbox, crate::vm::Provenance::Created));
+            }
+            None => info!(
+                "schema {schema}: cannot determine this host's PostgreSQL major (no spare to \
+                 read it from) — using the vehicle path, which reads it off the vehicle"
+            ),
+        }
+    }
+
     // The readopt maneuver: a booted, ready VM — a warm spare whenever the
     // pool has one — stopped, its empty disk overwritten in place with the
     // image, then booted on the real data.
@@ -1752,6 +1794,30 @@ fn major_verdict(archived: Option<String>, server: Option<String>) -> MajorVerdi
         (Some(archived), Some(server)) => MajorVerdict::Mismatch { archived, server },
         _ => MajorVerdict::Unknown,
     }
+}
+
+/// The PostgreSQL major this host's image serves, read once off any warm
+/// spare's data disk and cached.
+///
+/// Every spare was `initdb`'d by this host's own rootfs image moments ago, so
+/// its `PG_VERSION` is exactly what a VM booted here will serve — the same
+/// reasoning `swap_and_boot` uses when it reads the vehicle's disk, minus the
+/// need to claim anything. The spare is only *read*; it stays on the shelf.
+///
+/// Only a successful read is cached: an empty pool at startup must not pin the
+/// answer to "unknown" for the life of the process.
+async fn host_pg_major(cfg: &Config, spares: crate::vm::Spares<'_>) -> Option<String> {
+    static MAJOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(cached) = MAJOR.get() {
+        return Some(cached.clone());
+    }
+    let run_dir = cfg.run_dir.as_ref()?;
+    let (pool, _) = spares?;
+    let id = pool.peek_any_id()?;
+    let version = pg_version_of(&run_dir.join(&id).join("data.ext4")).await?;
+    info!("this host's image serves PostgreSQL {version} (read from spare {id})");
+    let _ = MAJOR.set(version.clone());
+    Some(version)
 }
 
 async fn pg_version_of(disk: &Path) -> Option<String> {
