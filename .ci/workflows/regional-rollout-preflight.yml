@@ -16,12 +16,12 @@ jobs:
       disk_size_gb: 10
       ttl_seconds: 1800
     timeout-minutes: 20
-    env:
-      US3_TOKEN: ${{ secrets.APP_LB_US3_TOKEN }}
-      EU1_TOKEN: ${{ secrets.APP_LB_EU1_TOKEN }}
-      ORCHESTRATOR_TOKEN: ${{ secrets.ORCHESTRATOR_INTERNAL_API_KEY || '' }}
     steps:
       - name: Inspect live rollout prerequisites without changing services
+        env:
+          US3_TOKEN: ${{ secrets.APP_LB_US3_TOKEN }}
+          EU1_TOKEN: ${{ secrets.APP_LB_EU1_TOKEN }}
+          ORCHESTRATOR_TOKEN: ${{ secrets.ORCHESTRATOR_INTERNAL_API_KEY || '' }}
         run: |
           set -eu
           python3 - <<'PY'
