@@ -5,7 +5,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait, Value as SeaValue};
+use sea_orm::{AccessMode, ConnectionTrait, DbBackend, IsolationLevel, Statement, TransactionTrait, Value as SeaValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -61,8 +61,23 @@ pub async fn get_service_discovery(
 }
 
 pub async fn read_snapshot(service_id: &str) -> Result<Option<ServiceDiscoverySnapshot>> {
+    read_snapshot_with_region_drains(service_id, true).await
+}
+
+/// Compensation must save individual drain intent, not materialize temporary
+/// region exclusions as permanent replica drains.
+pub(super) async fn read_stored_snapshot(service_id: &str) -> Result<Option<ServiceDiscoverySnapshot>> {
+    read_snapshot_with_region_drains(service_id, false).await
+}
+
+async fn read_snapshot_with_region_drains(service_id: &str, effective: bool) -> Result<Option<ServiceDiscoverySnapshot>> {
     let db = db::get_db()?;
-    let set = db
+    // Version and membership must come from the same committed snapshot. A
+    // watcher must never acknowledge a new version with an older endpoint set.
+    let transaction = db.begin_with_config(
+        Some(IsolationLevel::RepeatableRead), Some(AccessMode::ReadOnly),
+    ).await?;
+    let set = transaction
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "SELECT version, updated_at FROM service_discovery_sets WHERE service_id = $1",
@@ -76,14 +91,18 @@ pub async fn read_snapshot(service_id: &str) -> Result<Option<ServiceDiscoverySn
 
     let version: i64 = set.try_get("", "version")?;
     let updated_at: DateTime<chrono::FixedOffset> = set.try_get("", "updated_at")?;
-    let rows = db
+    let rows = transaction
         .query_all(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT deployment_id, backend_server_id, region, revision, backend_url, health_status, draining
-             FROM service_discovery_endpoints
-             WHERE service_id = $1
+            "SELECT deployment_id, backend_server_id, region, revision, backend_url, health_status,
+                (draining OR ($2 AND EXISTS (
+                    SELECT 1 FROM service_region_drains r
+                    WHERE r.service_id = e.service_id AND r.region = e.region
+                ))) AS draining
+             FROM service_discovery_endpoints e
+             WHERE e.service_id = $1
              ORDER BY deployment_id ASC",
-            [service_id.into()],
+            vec![service_id.into(), effective.into()],
         ))
         .await
         .context("failed to query service discovery endpoints")?;
@@ -101,6 +120,7 @@ pub async fn read_snapshot(service_id: &str) -> Result<Option<ServiceDiscoverySn
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    transaction.commit().await?;
 
     Ok(Some(ServiceDiscoverySnapshot {
         service_id: service_id.to_string(),
@@ -207,6 +227,28 @@ pub async fn set_endpoint_region(
     Ok(())
 }
 
+/// Region exclusion applies even to candidates published after the drain.
+/// Clearing it never clears a replica's independent retirement/operator drain.
+pub async fn set_region_draining(service_id: &str, region: &str, draining: bool) -> Result<()> {
+    let db = db::get_db()?;
+    let transaction = db.begin().await?;
+    ensure_set(&transaction, service_id).await?;
+    let sql = if draining {
+        "INSERT INTO service_region_drains (service_id, region) VALUES ($1, $2)
+         ON CONFLICT (service_id, region) DO NOTHING"
+    } else {
+        "DELETE FROM service_region_drains WHERE service_id = $1 AND region = $2"
+    };
+    let result = transaction.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres, sql, [service_id.into(), region.into()],
+    )).await?;
+    if result.rows_affected() > 0 {
+        bump_version(&transaction, service_id).await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
 pub async fn mark_endpoint_draining(service_id: &str, deployment_id: &str) -> Result<()> {
     let db = db::get_db()?;
     let transaction = db.begin().await?;
@@ -229,6 +271,21 @@ pub async fn mark_endpoint_draining(service_id: &str, deployment_id: &str) -> Re
 pub async fn mark_endpoint_active(service_id: &str, deployment_id: &str) -> Result<()> {
     let db = db::get_db()?;
     let transaction = db.begin().await?;
+    // Membership is authoritative for multi-replica rollback. Reactivating a
+    // non-scalar replica must revoke historical retirement authority too.
+    transaction.execute(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO service_deployment_events(deployment_id,service_id,phase,status,message,metadata)
+         SELECT DISTINCT intent.deployment_id,intent.service_id,'previous-retire-cancelled','passed',
+             'Retirement cancelled by discovery reactivation.',
+             jsonb_build_object('response',jsonb_build_object('previousDeploymentId',$2::TEXT))
+         FROM service_deployment_events intent
+         WHERE intent.service_id=$1 AND intent.phase='previous-retire-wait'
+             AND intent.metadata->'response'->>'previousDeploymentId'=$2
+             AND NOT EXISTS (SELECT 1 FROM service_deployment_events cancelled
+                 WHERE cancelled.deployment_id=intent.deployment_id
+                     AND cancelled.phase='previous-retire-cancelled'
+                     AND cancelled.metadata->'response'->>'previousDeploymentId'=$2)",
+        [service_id.into(),deployment_id.into()])).await?;
     let result = transaction
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,

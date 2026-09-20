@@ -135,9 +135,7 @@ impl DiscoveryWatcher {
         ) {
             return Ok(false);
         }
-        let mut spec = current.spec.clone();
-        spec.upstreams = upstreams;
-        let deployment = self.registry.upsert(spec);
+        let deployment = self.registry.apply_discovery_upstreams(&current, upstreams);
         deployment.mutate_state(|state| state.discovery_version = Some(snapshot.version));
         if let Err(error) = self.registry.persist_one(deployment_id) {
             // Keep the previous version eligible for retry. The in-memory

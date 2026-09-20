@@ -657,6 +657,20 @@ Orchestrator endpoints and persists the last good set. Failed or stale snapshots
 The same deployment can be registered with
 `heyctl create deployment cloud --host cloud.example.com --discovery-service cloud`.
 
+`GET /deployments/:id/discovery-status` is on the same admin CRUD/auth tier as deployment
+reads and returns the locally observed drain state:
+
+```json
+{"serviceId":"cloud","version":42,"upstreams":[{"peer":"10.0.0.9:8080","draining":true,"inFlight":1}]}
+```
+
+`version` is the last discovery snapshot whose deployment state was durably written (`null`
+before the first successful write). `upstreams` includes current backends and withdrawn backend
+generations until their already-admitted requests reach zero; entries with the same `peer` are
+combined. A withdrawn generation is fenced from new admission before its snapshot can be
+acknowledged. The endpoint returns `400 Bad Request` for a deployment without `discovery` and
+`404 Not Found` for an unknown id.
+
 #### Cordoning and draining a static upstream
 
 Health and operator intent are deliberately separate. A failed probe excludes an upstream until

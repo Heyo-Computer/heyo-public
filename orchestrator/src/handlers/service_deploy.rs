@@ -483,6 +483,7 @@ async fn deploy_service_inner(
     let _guard = try_service_lifecycle_lock(db::get_db()?, &service_id)
         .await?
         .with_context(|| format!("service {service_id} has a deployment or retirement in progress"))?;
+    super::regional_rollout::ensure_no_regional_rollout(db::get_db()?, &service_id).await?;
     if request.desired_replicas.is_none() {
         return deploy_service_candidate(state, request, None).await;
     }
@@ -509,7 +510,7 @@ async fn deploy_service_inner(
     result
 }
 
-async fn validate_service_deployment_request(
+pub(super) async fn validate_service_deployment_request(
     state: &AppState,
     request: &ServiceDeployRequest,
 ) -> std::result::Result<(), (StatusCode, String)> {
@@ -1412,7 +1413,7 @@ async fn deploy_service_candidate(
 ) -> Result<ServiceDeployResponse> {
     let service_id = sanitize_service_id(&request.service_id)?;
     let mut current_state = read_service_state(&state, &service_id).await?;
-    let previous_discovery = service_discovery::read_snapshot(&service_id).await?;
+    let previous_discovery = service_discovery::read_stored_snapshot(&service_id).await?;
     let excluded_backend_server_ids = match placement_exclusions {
         Some(exclusions) => exclusions,
         None if request.retire_previous => Vec::new(),
@@ -1559,7 +1560,7 @@ async fn deploy_service_candidate(
     let mut route_updated = false;
     let mut discovery_updated = false;
     let mut dependent_routes_updated = Vec::new();
-    let mut ingress_backend_url = None;
+    let mut ingress_backend_url = current_state.ingress_backend_url.clone();
 
     let deployment_result = async {
         verify_applied_placement(
@@ -1803,7 +1804,7 @@ async fn deploy_service_candidate(
             previous_metadata,
             desired_replicas: request.desired_replicas.unwrap_or(1),
             replica_regions: request.replica_regions.clone(),
-            route: request.route.clone(),
+            route: request.route.clone().or_else(|| previous_state.route.clone()),
             ingress_backend_url,
             updated_at: Some(Utc::now()),
             discovery: Some(discovery),
@@ -2395,7 +2396,7 @@ pub async fn run_retirement_reconciler(state: AppState) {
     }
 }
 
-async fn try_service_lifecycle_lock(
+pub(super) async fn try_service_lifecycle_lock(
     db: &DatabaseConnection,
     service_id: &str,
 ) -> Result<Option<DatabaseTransaction>> {
@@ -2418,6 +2419,9 @@ async fn reconcile_pending_service_retirements(state: &AppState) -> Result<()> {
         let Some(guard) = try_service_lifecycle_lock(db, &retirement.service_id).await? else {
             continue;
         };
+        if super::regional_rollout::ensure_no_regional_rollout(&guard, &retirement.service_id).await.is_err() {
+            continue;
+        }
         // The initial scan is only a hint. A rollout or another reconciler may have
         // changed eligibility since then. Recheck while holding the lifecycle lock
         // and retain that lock until the external stop/delete has finished.
@@ -3336,6 +3340,64 @@ async fn cleanup_failed_candidate_once(state: &AppState, service_id: &str, deplo
             "timed out cleaning up failed service deployment candidate"
         );
     }
+}
+
+pub(super) use super::regional_observers::{regional_observe, validate_regional_observers};
+
+pub(super) async fn regional_baseline(state: &AppState, request: &ServiceDeployRequest) -> Result<ServiceDeploymentState> {
+    let baseline = read_service_state(state, &request.service_id).await?;
+    if baseline.ingress_backend_url.as_deref().is_none_or(str::is_empty)
+        || baseline.route.is_none()
+        || serde_json::to_value(&baseline.route)? != serde_json::to_value(&request.route)?
+    {
+        anyhow::bail!("regional rollout requires an already established discovery ingress and its unchanged route");
+    }
+    Ok(baseline)
+}
+
+pub(super) async fn restore_regional_baseline(state: &AppState, baseline: &ServiceDeploymentState) -> Result<()> {
+    write_service_state(state, baseline).await
+}
+
+pub(super) async fn regional_revision(state: &AppState, request: &ServiceDeployRequest) -> Result<String> {
+    Ok(format!("{:x}", Sha256::digest(load_archive_bytes(state, request).await?)))
+}
+
+/// The regional controller owns the lifecycle lock and journals the create
+/// intent before calling this non-idempotent operation.
+pub(super) async fn regional_create_candidate(
+    state: &AppState, request: &ServiceDeployRequest, candidate_id: &str, region: &str,
+) -> Result<()> {
+    let mut candidate = request.clone();
+    candidate.deployment_id = Some(candidate_id.to_string());
+    candidate.region = region.to_string();
+    candidate.retire_previous = false;
+    candidate.retire_previous_async = false;
+    candidate.delete_previous = false;
+    candidate.route = None;
+    deploy_service_candidate(state.clone(), candidate, Some(Vec::new())).await?;
+    Ok(())
+}
+
+pub(super) async fn regional_probe(
+    _state: &AppState, request: &ServiceDeployRequest,
+    endpoint: &service_discovery::ServiceDiscoveryEndpoint,
+) -> Result<()> {
+    service_discovery::validate_endpoint_url(&endpoint.url)?;
+    if !request.health_path.starts_with('/') || request.health_path.starts_with("//") {
+        anyhow::bail!("healthPath must be an absolute path, not an authority");
+    }
+    let mut url = reqwest::Url::parse(&endpoint.url)?;
+    url.set_path(&request.health_path);
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(request.health_probe_timeout_seconds.clamp(1, 30)))
+        .build()?;
+    let response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("regional health probe for {} returned {}", endpoint.deployment_id, response.status());
+    }
+    Ok(())
 }
 
 async fn load_archive_bytes(state: &AppState, request: &ServiceDeployRequest) -> Result<Vec<u8>> {

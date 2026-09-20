@@ -223,6 +223,10 @@ pub struct Registry {
     /// Every deployment uses a deterministic temporary filename. Serialize
     /// writes so concurrent background and admin persistence cannot clobber it.
     persist_lock: std::sync::Mutex<()>,
+    /// Backend generations withdrawn by discovery but still observable while
+    /// requests admitted before the withdrawal hold their Arcs. Runtime-only:
+    /// a restart terminates those connections, so there is nothing to restore.
+    retired_discovery: std::sync::Mutex<HashMap<String, Vec<Arc<crate::deployment::VmBackend>>>>,
     #[cfg(test)]
     pub(crate) fail_after_rename: std::sync::atomic::AtomicBool,
     /// Whether the last [`load`](Registry::load) left a file on disk that it
@@ -240,6 +244,7 @@ impl Registry {
             persist_path: persist_path.into(),
             change_lock: tokio::sync::Mutex::new(()),
             persist_lock: std::sync::Mutex::new(()),
+            retired_discovery: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             load_skipped: std::sync::atomic::AtomicBool::new(false),
@@ -280,17 +285,30 @@ impl Registry {
     /// target back into service.
     pub fn upsert(&self, spec: DeploymentSpec) -> Arc<Deployment> {
         let previous = self.get(&spec.id);
+        if let Some(previous) = previous.as_ref().filter(|d| d.spec.discovery.is_some()) {
+            self.fence_discovery_removals(previous, &spec.upstreams);
+        }
         let previous_state = previous.as_ref().and_then(|previous| {
             (spec.is_static() && previous.spec.is_static()).then(|| {
                 let mut state = (*previous.state()).clone();
-                if previous.spec.discovery.as_ref().map(|value| &value.service_id)
-                    != spec.discovery.as_ref().map(|value| &value.service_id)
-                {
+                let same_discovery_service = previous
+                    .spec
+                    .discovery
+                    .as_ref()
+                    .map(|value| &value.service_id)
+                    == spec.discovery.as_ref().map(|value| &value.service_id);
+                if !same_discovery_service {
                     state.discovery_version = None;
                 }
-                state
-                    .upstream_drains
-                    .retain(|drain| spec.upstreams.contains(&drain.upstream));
+                // Discovery can temporarily withdraw an address and later
+                // return it. Do not turn that absence into an implicit operator
+                // uncordon. Ordinary static spec edits retain the historical
+                // behavior of forgetting intent for explicitly removed peers.
+                if spec.discovery.is_none() || !same_discovery_service {
+                    state
+                        .upstream_drains
+                        .retain(|drain| spec.upstreams.contains(&drain.upstream));
+                }
                 state
             })
         });
@@ -337,6 +355,63 @@ impl Registry {
         deployment
     }
 
+    /// Replace a discovery-owned upstream set while fencing every withdrawn
+    /// backend generation. The caller holds [`change_guard`](Self::change_guard),
+    /// making this transition coherent with persistence and status reads.
+    pub fn apply_discovery_upstreams(
+        &self,
+        deployment: &Arc<Deployment>,
+        upstreams: Vec<String>,
+    ) -> Arc<Deployment> {
+        let mut spec = deployment.spec.clone();
+        spec.upstreams = upstreams;
+        self.upsert(spec)
+    }
+
+    fn fence_discovery_removals(&self, deployment: &Arc<Deployment>, upstreams: &[String]) {
+        let retained: HashSet<&str> = upstreams.iter().map(String::as_str).collect();
+        let removed: Vec<_> = deployment
+            .backends()
+            .iter()
+            .filter(|backend| !retained.contains(backend.peer.as_str()))
+            .cloned()
+            .collect();
+
+        // This happens before publishing the replacement (and therefore before
+        // snapshot acknowledgement). A request holding either the old
+        // Deployment or backend Arc now fails its authoritative admission gate.
+        for backend in &removed {
+            backend.set_draining(true);
+        }
+        if !removed.is_empty() {
+            let mut retired = self.retired_discovery.lock().unwrap_or_else(|e| e.into_inner());
+            let generations = retired.entry(deployment.spec.id.clone()).or_default();
+            generations.retain(|backend| backend.in_flight() != 0);
+            generations.extend(removed);
+        }
+    }
+
+    /// Current and not-yet-quiescent withdrawn discovery backend generations.
+    /// Duplicate peers are intentionally left for the API layer to aggregate.
+    pub fn discovery_backends(&self, id: &str) -> Vec<Arc<crate::deployment::VmBackend>> {
+        let mut result: Vec<_> = self
+            .get(id)
+            .map(|d| d.backends().iter().cloned().collect())
+            .unwrap_or_default();
+        let mut retired = self
+            .retired_discovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(backends) = retired.get_mut(id) {
+            backends.retain(|backend| backend.in_flight() != 0);
+            result.extend(backends.iter().cloned());
+            if backends.is_empty() {
+                retired.remove(id);
+            }
+        }
+        result
+    }
+
     /// Update a deployment's spec in place, **preserving its live VM pool**.
     ///
     /// Unlike `upsert` (which abandons the old pool for the autoscaler to reap),
@@ -367,6 +442,9 @@ impl Registry {
 
     pub fn remove(&self, id: &str) -> Option<Arc<Deployment>> {
         let removed = self.get(id)?;
+        if removed.spec.discovery.is_some() {
+            self.fence_discovery_removals(&removed, &[]);
+        }
         self.install(None, id);
         Some(removed)
     }
@@ -1309,6 +1387,64 @@ mod tests {
         let deployment = r.upsert(auth);
 
         assert_eq!(deployment.state().discovery_version, None);
+    }
+
+    #[tokio::test]
+    async fn discovery_replacement_fences_and_observes_retired_generations() {
+        let r = Registry::new("unused.json");
+        let mut first = static_spec(
+            "stage",
+            vec![host("stage.example.com")],
+            &["a.example:80", "b.example:80"],
+        );
+        first.discovery = Some(DiscoverySpec { service_id: "stage".into() });
+        let deployment = r.upsert(first);
+        deployment.mutate_state(|state| {
+            state.discovery_version = Some(1);
+            state.upstream_drains.push(crate::deployment::UpstreamDrain {
+                upstream: "b.example:80".into(),
+                reason: Some("maintenance".into()),
+                started_at: 10,
+            });
+        });
+        let old_a = deployment.backends().iter().find(|b| b.peer == "a.example:80").unwrap().clone();
+        let old_b = deployment.backends().iter().find(|b| b.peer == "b.example:80").unwrap().clone();
+        assert!(old_a.try_acquire(), "request is admitted before withdrawal");
+
+        let _guard = r.change_guard().await;
+        let second = r.apply_discovery_upstreams(
+            &deployment,
+            vec!["b.example:80".into(), "c.example:80".into()],
+        );
+        assert!(!old_a.try_acquire(), "a stale backend Arc must be fenced");
+        assert_eq!(old_a.in_flight(), 1, "the held request remains observable");
+        let second_backends = second.backends();
+        let second_b = second_backends
+            .iter()
+            .find(|b| b.peer == "b.example:80")
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&old_b, second_b),
+            "unchanged backends keep their generation"
+        );
+        assert!(second_b.is_draining(), "operator drain intent survives discovery");
+
+        let third = r.apply_discovery_upstreams(&second, vec!["c.example:80".into()]);
+        assert!(!old_b.try_acquire(), "a second update fences its newly removed backend");
+        let observed = r.discovery_backends("stage");
+        assert!(observed.iter().any(|b| Arc::ptr_eq(b, &old_a)));
+        assert!(observed.iter().any(|b| b.peer == "c.example:80" && !b.is_draining()));
+        assert_eq!(third.backends().len(), 1);
+        assert!(
+            third.upstream_drain("b.example:80").is_some(),
+            "temporary discovery absence must not erase operator intent"
+        );
+
+        old_a.release();
+        assert!(
+            r.discovery_backends("stage").iter().all(|b| !Arc::ptr_eq(b, &old_a)),
+            "a quiescent retired generation is pruned",
+        );
     }
 
     #[test]
