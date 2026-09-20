@@ -1,0 +1,64 @@
+name: regional-rollout-preflight
+
+on:
+  submit:
+    paths: ['.ci/workflows/regional-rollout-preflight.yml']
+
+jobs:
+  inspect:
+    vm:
+      driver: firecracker
+      build:
+        dockerfile: .ci/image/ci/Dockerfile
+        context: .ci/image/ci
+        size_mb: 6144
+      size_class: small
+      disk_size_gb: 10
+      ttl_seconds: 1800
+    timeout-minutes: 20
+    env:
+      US3_TOKEN: ${{ secrets.APP_LB_US3_TOKEN }}
+      EU1_TOKEN: ${{ secrets.APP_LB_EU1_TOKEN }}
+      ORCHESTRATOR_TOKEN: ${{ secrets.ORCHESTRATOR_INTERNAL_API_KEY || '' }}
+    steps:
+      - name: Inspect live rollout prerequisites without changing services
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error
+          for region, deployment in [('us3', 'orchestrator-us3-next'), ('eu1', 'orchestrator-eu1')]:
+              token = os.environ[region.upper() + '_TOKEN']
+              request = urllib.request.Request(
+                  f'https://admin.{region}.heyo.work/deployments/{deployment}?namespace=default',
+                  headers={'Authorization': 'Bearer ' + token})
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  spec = json.load(response)['spec']
+              vm = spec.get('vm') or {}
+              env = vm.get('env_vars') or {}
+              refs = vm.get('env_from') or []
+              print(json.dumps({
+                  'region': region, 'deployment': deployment,
+                  'driver': vm.get('driver'), 'image': vm.get('image'),
+                  'configFileConfigured': any(env.get(k) for k in ['HEYO_ORCHESTRATOR_CONFIG_PATH', 'HEYO_CONFIG_PATH']),
+                  'discoveryRoutedServices': env.get('ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES', ''),
+                  'secretEnvironmentKeys': [r.get('as') for r in refs],
+                  'mountPaths': [m.get('path') for m in vm.get('mounts', [])],
+              }), flush=True)
+          token = os.environ.get('ORCHESTRATOR_TOKEN', '')
+          if not token:
+              raise SystemExit('Live rollout test blocked: ORCHESTRATOR_INTERNAL_API_KEY is not provisioned in this workflow\'s HeyoSecret scope. No service changes made.')
+          for region in ['us3', 'eu1']:
+              request = urllib.request.Request(
+                  f'https://orchestrator.{region}.heyo.work/orchestration/services/regional-rollouts/preflight-nonexistent',
+                  headers={'Authorization': 'Bearer ' + token})
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      raise SystemExit('Unexpected pre-existing preflight operation')
+              except urllib.error.HTTPError as error:
+                  if error.code != 404:
+                      raise SystemExit(f'{region}: rollout API credential rejected or endpoint unavailable (HTTP {error.code})')
+                  body = json.load(error)
+                  if body.get('error') != 'Regional rollout not found':
+                      raise SystemExit(f'{region}: regional rollout API not installed')
+              print(region + ': authenticated regional rollout API available', flush=True)
+          PY
