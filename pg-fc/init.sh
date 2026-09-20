@@ -54,6 +54,46 @@ mount -t devtmpfs devtmpfs /dev       2>/dev/null || true
 mount -t tmpfs    tmpfs    /run       2>/dev/null || true
 mount -t tmpfs    tmpfs    /tmp       2>/dev/null || true
 
+# Read-only rootfs support.
+#
+# heyvm can attach one shared base image to every VM read-only
+# (HEYO_FC_SHARED_ROOTFS), which removes a ~400-600MB per-VM copy from every
+# boot — the single largest item in a cold start — and the tens of GB of
+# duplicated rootfs that copy leaves on the host. The image is already
+# disposable by design: the database lives on /workspace and everything else
+# this script writes is a tmpfs. What is left is /etc, which heyvm mutates at
+# runtime (its /etc/hosts injection) and which Postgres reads at startup.
+#
+# So when / is read-only, shadow /etc with a writable tmpfs copy. A copy rather
+# than an overlay mount: overlayfs needs CONFIG_OVERLAY_FS in the guest kernel,
+# and /etc is a couple of MB, so the copy costs milliseconds and depends on
+# nothing. Detected rather than configured — the same image has to boot on
+# hosts that share the rootfs and hosts that still hand out a private rw copy.
+if touch /.rw-probe 2>/dev/null; then
+    rm -f /.rw-probe
+else
+    echo "[init] rootfs is read-only: shadowing /etc with a writable tmpfs copy"
+    mkdir -p /run/etc-rw
+    # /etc must arrive complete: passwd/group decide whether `gosu postgres`
+    # resolves at all, so a partial copy is a boot failure, not a degradation.
+    if ! cp -a /etc/. /run/etc-rw/ 2>/dev/null; then
+        echo "[init] FATAL: could not copy /etc into tmpfs"
+        exit 1
+    fi
+    if ! mount --bind /run/etc-rw /etc; then
+        echo "[init] FATAL: could not bind writable /etc over the read-only one"
+        exit 1
+    fi
+    # Postgres' account home. Empty in this image (PGDATA is on /workspace),
+    # but psql and friends expect to be able to write a history/dotfile there,
+    # and an EROFS from a read-only home is an obscure way to fail.
+    if [ -d /var/lib/postgresql ]; then
+        mkdir -p /run/pgsql-home
+        cp -a /var/lib/postgresql/. /run/pgsql-home/ 2>/dev/null || true
+        mount --bind /run/pgsql-home /var/lib/postgresql 2>/dev/null || true
+    fi
+fi
+
 # /dev/shm: where Postgres puts its DYNAMIC shared memory segments (parallel
 # query, parallel index builds) whenever a cluster's `dynamic_shared_memory_type`
 # is `posix`. devtmpfs carries device nodes only, so without this explicit mount
