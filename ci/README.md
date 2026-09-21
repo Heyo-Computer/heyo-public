@@ -819,6 +819,12 @@ a `ci-` name or terminal job status.
 
 ## Re-running a run
 
+Jobs without an explicit `if:` require every dependency to succeed. Failure,
+cancellation, and skipped dependencies propagate through the entire dependent
+chain before scheduling stops; matrix dependencies wait for every cell. An
+explicit `if: always()` can still schedule cleanup, and independent jobs are
+not skipped. A failed run cannot be rerun while those jobs are active.
+
 Two buttons on a finished run's page, and the routes behind them:
 
 - **Run again** — `POST /runs/{id}/rerun`. Every job, from the top.
@@ -1372,6 +1378,10 @@ Validation workflows in a coordinated submission cannot contain merge or deploy
 actions. `--only`, explicit workflow selections, and individual reruns are
 validation-only and cannot publish or deploy. The submit client computes changed
 paths across the full trunk-to-feature diff, including earlier feature commits.
+For a failed deployment of an already-merged revision, reconcile its remote
+operation first, then use a full `git submit --submit-empty --ref <revision>`.
+This creates fresh validation runs and a new coordinator rather than rewriting
+the failed run or substituting evidence in its frozen validation membership.
 
 This repository's `.ci/workflows/regional-release.yml` sequences public app-lb
 and Orchestrator updates as `merge → us3 → eu1 → controller`. The three build
@@ -1765,6 +1775,11 @@ dependencies. The script must run from its release directory, not assume
 stripped, executes `<mount-path>/start.sh`, and sets the requested revision
 environment variable. Existing routes, runtime settings and secret references
 are preserved; a conflicting secret revision override is refused.
+When adding the first release mount, CI reuses the rootfs artifact's auth
+reference only when both artifacts use the same store URL (ignoring trailing
+slashes). Existing mount credentials are preserved. A different store needs an
+explicitly configured release-mount auth reference; credentials are never copied
+across stores. Only secret references, not their values, enter the rollout intent.
 
 This action requires app-lb's conditional candidate rollout API, a pinned
 rootfs artifact, pinned read-only mounts and an HTTP readiness path. Catalog

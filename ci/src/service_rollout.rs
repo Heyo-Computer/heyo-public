@@ -52,6 +52,9 @@ fn desired_spec(mut spec: Value, target: &Target, store: &str, artifact: &str, s
         "service startup must execute the validated release mount start.sh");
     ensure!(!target.revision_env.is_empty() && target.revision_env.bytes().enumerate()
         .all(|(i,b)| b == b'_' || b.is_ascii_uppercase() || (i > 0 && b.is_ascii_digit())), "invalid revision environment name");
+    let rootfs_auth = (spec["artifact"]["store"].as_str().map(|s| s.trim_end_matches('/'))
+        == Some(store.trim_end_matches('/')))
+        .then(|| spec["artifact"]["auth"].clone()).filter(|auth| !auth.is_null());
     let vm = spec["vm"].as_object_mut().ok_or_else(|| anyhow::anyhow!("missing VM template"))?;
     let mounts = vm.entry("mounts").or_insert_with(|| json!([])).as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("invalid artifact mounts"))?;
@@ -62,7 +65,11 @@ fn desired_spec(mut spec: Value, target: &Target, store: &str, artifact: &str, s
             "existing release mount uses a different artifact store");
         ensure!(mounts[*index]["read_only"] == true, "release mount is writable");
         mounts[*index].clone()
-    } else { json!({"path":target.mount_path,"store":store,"read_only":true}) };
+    } else {
+        let mut mount = json!({"path":target.mount_path,"store":store,"read_only":true});
+        if let Some(auth) = rootfs_auth { mount["auth"] = auth; }
+        mount
+    };
     mount["ref"] = json!(artifact);
     mount["digest"] = json!(artifact);
     mount["strip_components"] = json!(1);
@@ -268,6 +275,22 @@ mod tests {
         assert_ne!(digest(&before), digest(&after));
         let mut shuffled = after.clone(); shuffled.sort_all_objects();
         assert_eq!(digest(&after), digest(&shuffled));
+    }
+
+    #[test]
+    fn new_release_mount_inherits_only_same_store_rootfs_auth() {
+        for (root_store, expected) in [
+            ("https://art.test/", json!({"secret":"rootfs","key":"api-key","namespace":"default"})),
+            ("https://different.test", Value::Null),
+        ] {
+            let mut spec = current();
+            spec["artifact"] = json!({"store":root_store,"auth":{"secret":"rootfs","key":"api-key","namespace":"default"}});
+            let existing = desired_spec(spec.clone(), &target(), "https://art.test", "bundle", "sha").unwrap();
+            assert_eq!(existing["vm"]["mounts"][0]["auth"], json!({"secret":"art","key":"token"}));
+            spec["vm"].as_object_mut().unwrap().remove("mounts");
+            let added = desired_spec(spec, &target(), "https://art.test", "bundle", "sha").unwrap();
+            assert_eq!(added["vm"]["mounts"][0]["auth"], expected);
+        }
     }
 
     #[test]

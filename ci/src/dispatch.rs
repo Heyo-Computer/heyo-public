@@ -764,11 +764,19 @@ impl Dispatcher {
             }
             crate::submission::Gate::Unmanaged | crate::submission::Gate::Ready => {}
         }
-        let jobs = self.store.jobs_of(run_id).await?;
-        let needs = self.store.needs_context(run_id).await?;
         // One read for the whole wave, not one per job: the commit a run is for
         // does not change between two jobs of the same run.
         let ci = Self::ci_scope(self.store.get_run(run_id).await?.as_ref());
+        // A skip/failure has no worker completion to schedule the next wave.
+        // Re-read dependency results until all such transitions have propagated.
+        while self.advance_run_wave(run_id, &ci).await? {}
+        Ok(self.store.roll_up_run(run_id).await?)
+    }
+
+    async fn advance_run_wave(&self, run_id: &str, ci: &Value) -> Result<bool, DispatchError> {
+        let jobs = self.store.jobs_of(run_id).await?;
+        let needs = self.store.needs_context(run_id).await?;
+        let mut changed = false;
 
         // A base id is only satisfied once *every* cell of it is terminal —
         // `needs: [build]` cannot mean "the first cell of build".
@@ -798,6 +806,7 @@ impl Dispatcher {
                             Some(&format!("stored plan could not be read: {e}")),
                         )
                         .await?;
+                    changed = true;
                     continue;
                 }
             };
@@ -813,12 +822,13 @@ impl Dispatcher {
             // Decide `if:` now that dependencies have results. A dependency that
             // failed makes the default guard false, which is what stops a deploy
             // job from shipping a broken build.
-            match self.should_run(&plan, &needs, &ci) {
+            match self.should_run(&plan, &needs, ci) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.store
                         .set_job_status(&job.id, JobStatus::Skipped, None)
                         .await?;
+                    changed = true;
                     continue;
                 }
                 Err(e) => {
@@ -830,6 +840,7 @@ impl Dispatcher {
                             Some(&format!("could not evaluate `if:` — {e}")),
                         )
                         .await?;
+                    changed = true;
                     continue;
                 }
             }
@@ -847,6 +858,7 @@ impl Dispatcher {
                     self.store
                         .set_job_status(&job.id, JobStatus::Failure, Some(&e.to_string()))
                         .await?;
+                    changed = true;
                     continue;
                 }
             };
@@ -895,7 +907,7 @@ impl Dispatcher {
             }
         }
 
-        Ok(self.store.roll_up_run(run_id).await?)
+        Ok(changed)
     }
 
     /// The `ci` expression scope: which commit this run is for, and what it
@@ -939,8 +951,8 @@ impl Dispatcher {
 
     /// Evaluate a job's `if:`.
     ///
-    /// The default when there is no `if:` is GitHub's: run only if nothing this
-    /// job needs failed. Writing an explicit `if:` opts out of that — which is
+    /// The default when there is no `if:` is GitHub's: run only if every dependency
+    /// succeeded. Writing an explicit `if:` opts out of that — which is
     /// how `if: always()` gets a cleanup job to run after a failure.
     fn should_run(&self, plan: &JobPlan, needs: &Value, ci: &Value) -> Result<bool, DispatchError> {
         let any_failed = plan.needs.iter().any(|n| {
@@ -954,7 +966,7 @@ impl Dispatcher {
         });
 
         let Some(condition) = &plan.condition else {
-            return Ok(!any_failed);
+            return Ok(plan.needs.iter().all(|n| needs[n]["result"] == "success"));
         };
 
         let mut ctx = plan.base_context();
@@ -6357,6 +6369,61 @@ mod tests {
             // takes anyway.
             objects: Arc::new(crate::objects::Workflows::new(&config)),
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
+    async fn failed_dependency_settles_transitive_jobs_without_skipping_cleanup() {
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let wf = crate::workflow::Workflow::parse("cascade.yml", r#"
+jobs:
+  z-build:
+    strategy:
+      matrix:
+        cell: [one, two]
+    steps: [{run: 'true'}]
+  y-first:
+    needs: [z-build]
+    steps: [{run: 'true'}]
+  b-second:
+    needs: [y-first]
+    steps: [{run: 'true'}]
+  a-third:
+    needs: [b-second]
+    steps: [{run: 'true'}]
+  cleanup:
+    needs: [a-third]
+    if: ${{ always() }}
+    steps: [{run: 'true'}]
+  independent:
+    steps: [{run: 'true'}]
+"#).unwrap();
+        let plan = crate::plan::Plan::build(&wf).unwrap();
+        let run = format!("cascade-{}", crate::vm::new_id());
+        d.store.create_run(&run, &crate::store::RunRequest {
+            workflow_id: "cascade".into(), source: "test".into(), ..Default::default()
+        }, &plan).await.unwrap();
+        let jobs = d.store.jobs_of(&run).await.unwrap();
+        let cells: Vec<_> = jobs.iter().filter(|j| j.base_id == "z-build").collect();
+        assert_eq!(cells.len(), 2);
+        d.store.set_job_status(&cells[0].id, JobStatus::Failure, Some("build failed")).await.unwrap();
+        d.store.set_job_status(&cells[1].id, JobStatus::Running, None).await.unwrap();
+        d.advance_run(&run).await.unwrap();
+        let states = d.store.jobs_of(&run).await.unwrap();
+        assert_eq!(states.iter().find(|j| j.base_id == "y-first").unwrap().status, "pending", "wait for all matrix cells");
+        assert_eq!(states.iter().find(|j| j.base_id == "independent").unwrap().status, "queued");
+        d.store.set_job_status(&cells[1].id, JobStatus::Success, None).await.unwrap();
+        d.advance_run(&run).await.unwrap();
+        let states = d.store.jobs_of(&run).await.unwrap();
+        for name in ["y-first", "b-second", "a-third"] {
+            assert_eq!(states.iter().find(|j| j.base_id == name).unwrap().status, "skipped", "{name}");
+        }
+        assert_eq!(states.iter().find(|j| j.base_id == "cleanup").unwrap().status, "queued");
+        assert!(!states.iter().any(|j| j.status == "pending"));
+        assert_eq!(d.store.get_run(&run).await.unwrap().unwrap().status, "failure");
+        // A failed run is still unsafe to rerun while independent/cleanup jobs run.
+        assert!(d.rerun(&run, true, None).await.err().unwrap().to_string().contains("still active"));
     }
 
     #[tokio::test]
