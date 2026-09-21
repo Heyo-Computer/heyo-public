@@ -15,6 +15,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -163,6 +165,22 @@ def service(host, target):
     return {"boot_id": host.boot_id(), "pid": pid, "starttime": host.starttime(pid), "disk_sha256": sha(pathlib.Path(target["executable"]).read_bytes()), "running_sha256": host.proc_digest(pid)}
 
 
+def wait_for_health(host, url):
+    # Type=simple only waits for the process to start, not its HTTP listener.
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            return host.health(url)
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+                if error.code not in (502, 503, 504):
+                    raise
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(1)
+
+
 def secure_file(path, limit, allow_symlink=False):
     p = pathlib.Path(path)
     if not p.exists() and not p.is_symlink(): return {"present": False}
@@ -259,22 +277,27 @@ def install(target, req, binary, host=None):
         if pathlib.Path(target["config_json_path"]).read_bytes() != config or pathlib.Path(target["systemd_drop_in_path"]).read_bytes() != drop: raise ValueError("installed file verification failed")
         if not exact_regular(target["executable"], 0o755) or not exact_regular(target["config_json_path"], 0o600) or not exact_regular(target["systemd_drop_in_path"], 0o644): raise ValueError("installed ownership or mode verification failed")
         if not host.environment_has(now["pid"], target["config_json_path"]): raise ValueError("service environment verification failed")
-        health = host.health(target["local_health_url"])
+        health = wait_for_health(host, target["local_health_url"])
         if health.get("backendId", health.get("backend_id")) != target["backend_server_id"] or health.get("backendRegion", health.get("backend_region")) != target["region"] or health.get("status") not in ("ok", "healthy", "running"):
             raise ValueError("health identity or API status differs")
+        if service(host, target) != now: raise ValueError("service changed during health verification")
         result = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
                   "target_alias": target["target_alias"], "status": "succeeded", "heyvm_sha256": req["heyvm_sha256"],
                   "config_sha256": sha(config), "systemd_drop_in_sha256": sha(drop),
                   "backend_server_id": target["backend_server_id"], "region": target["region"]}
         journal.update(status="succeeded", result=result); save_journal(journal_path, journal); return result
-    except Exception:
+    except Exception as error:
+        # Keep the failing source location without logging command arguments,
+        # response bodies, or exception messages that may contain credentials.
+        journal["failure"] = {"type": type(error).__name__, "line": error.__traceback__.tb_lineno}
         try:
             restore(host, target, journal)
             result = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
                       "target_alias": target["target_alias"], "status": "rolled_back",
                       "backend_server_id": target["backend_server_id"], "region": target["region"]}
             journal.update(status="rolled_back", result=result); save_journal(journal_path, journal); return result
-        except Exception:
+        except Exception as rollback_error:
+            journal["rollback_failure"] = {"type": type(rollback_error).__name__, "line": rollback_error.__traceback__.tb_lineno}
             result = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
                       "target_alias": target["target_alias"], "status": "rollback_failed",
                       "backend_server_id": target["backend_server_id"], "region": target["region"]}

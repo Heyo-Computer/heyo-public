@@ -147,11 +147,13 @@ fn response(status: StatusCode, value: impl Serialize) -> ApiResponse {
 pub async fn create(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(request): Json<RegionalRolloutRequest>,
+    Json(mut request): Json<RegionalRolloutRequest>,
 ) -> ApiResponse {
     if let Err(s) = auth::require_internal_api_key(&headers, &state.config.internal_api_key) {
         return response(s, json!({"error":"Unauthorized"}));
     }
+    request.deployment.deployment_environment = request.deployment.deployment_environment
+        .as_deref().map(str::trim).map(str::to_owned);
     if let Ok(db) = db::get_db() {
         if let Ok(Some(existing)) = load(Some(db), &request.operation_id).await {
             let stored = db
@@ -1069,6 +1071,31 @@ mod tests {
         assert_eq!(r.deployment.driver,"firecracker");
         r.runtime_by_region.insert("unknown".into(),persisted.runtime.unwrap());
         assert!(validate_policy(&r).is_err());
+    }
+    #[test]
+    fn deployment_environment_survives_durable_request_roundtrip() {
+        let mut r = request(&["eu", "us"]);
+        r.deployment.deployment_environment = Some("production".into());
+        r.deployment.placement_pool = Some("platform".into());
+        let persisted = serde_json::to_value(&r.deployment).unwrap();
+        let loaded: ServiceDeployRequest = serde_json::from_value(persisted).unwrap();
+        assert_eq!(loaded.deployment_environment.as_deref(), Some("production"));
+        assert_eq!(loaded.placement_pool.as_deref(), Some("platform"));
+        assert_ne!(payload_hash(&r).unwrap(), payload_hash(&request(&["eu", "us"])).unwrap());
+    }
+    #[test]
+    fn absent_deployment_environment_preserves_legacy_payload_hash() {
+        let r = request(&["eu", "us"]);
+        let serialized = serde_json::to_value(&r).unwrap();
+        assert!(serialized["deployment"].get("deploymentEnvironment").is_none());
+
+        let mut legacy = serialized;
+        legacy["deployment"].as_object_mut().unwrap().remove("deploymentEnvironment");
+        let expected = hex_prefix(
+            &Sha256::digest(serde_json::to_vec(&legacy).unwrap()),
+            64,
+        );
+        assert_eq!(payload_hash(&r).unwrap(), expected);
     }
     #[test]
     fn uncertain_create_adopts_only_an_exact_healthy_match() {

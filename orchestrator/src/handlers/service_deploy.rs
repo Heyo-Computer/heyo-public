@@ -65,8 +65,9 @@ pub struct ServiceDeployRequest {
     pub archive_bytes_base64: Option<String>,
     #[serde(default = "default_region")]
     pub region: String,
-    /// Optional Cloud placement pool. Cloud pairs it with its own deployment
-    /// environment, so callers select a workload class rather than host IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_environment: Option<String>,
+    /// Optional Cloud placement pool within `deploymentEnvironment`.
     #[serde(default)]
     pub placement_pool: Option<String>,
     #[serde(default = "default_driver")]
@@ -175,6 +176,8 @@ pub struct ServiceRouteRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ServiceDeploymentState {
     pub service_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_environment: Option<String>,
     pub active_deployment_id: Option<String>,
     pub active_archive_id: Option<String>,
     pub active_backend_url: Option<String>,
@@ -473,6 +476,7 @@ async fn deploy_service_inner(
     state: AppState,
     mut request: ServiceDeployRequest,
 ) -> Result<ServiceDeployResponse> {
+    request.deployment_environment = request.deployment_environment.as_deref().map(str::trim).map(str::to_owned);
     validate_service_deployment_request(&state, &request)
         .await
         .map_err(|(_, message)| anyhow::anyhow!(message))?;
@@ -484,6 +488,12 @@ async fn deploy_service_inner(
         .await?
         .with_context(|| format!("service {service_id} has a deployment or retirement in progress"))?;
     super::regional_rollout::ensure_no_regional_rollout(db::get_db()?, &service_id).await?;
+    bind_deployment_environment_identity(
+        &state,
+        &service_id,
+        request.deployment_environment.as_deref(),
+    )
+    .await?;
     if request.desired_replicas.is_none() {
         return deploy_service_candidate(state, request, None).await;
     }
@@ -517,6 +527,16 @@ pub(super) async fn validate_service_deployment_request(
     let service_id = sanitize_service_id(&request.service_id)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let discovery_routed = state.config.service_uses_discovery_routing(&service_id);
+
+    if request.deployment_environment.as_deref().is_some_and(|value| value.trim().is_empty()) {
+        return Err((StatusCode::BAD_REQUEST, "deploymentEnvironment must not be empty".to_string()));
+    }
+    if request.deployment_environment.as_deref().is_some_and(|value| value.trim().chars().count() > 64) {
+        return Err((StatusCode::BAD_REQUEST, "deploymentEnvironment must be at most 64 characters".to_string()));
+    }
+    if request.placement_pool.is_some() && request.deployment_environment.is_none() {
+        return Err((StatusCode::BAD_REQUEST, "placementPool requires deploymentEnvironment".to_string()));
+    }
 
     if request
         .placement_pool
@@ -1047,6 +1067,7 @@ async fn deploy_service_rollout(
         current_state.active_backend_url = Some(retained.url.clone());
     }
     current_state.desired_replicas = desired_replicas;
+    current_state.deployment_environment = request.deployment_environment.clone();
     current_state.replica_regions = request.replica_regions.clone();
     current_state.route = request.route.clone();
     current_state.ingress_backend_url = ingress_backend_url;
@@ -1511,6 +1532,7 @@ async fn deploy_service_candidate(
                 setup_hooks: request.setup_hooks.clone(),
                 size_class: request.size_class.clone(),
                 ttl_seconds: Some(request.ttl_seconds.unwrap_or(0)),
+                deployment_environment: request.deployment_environment.clone(),
                 placement_pool: request.placement_pool.clone(),
                 excluded_backend_server_ids,
                 metadata: request.metadata.clone(),
@@ -1570,6 +1592,7 @@ async fn deploy_service_candidate(
 
     let deployment_result = async {
         verify_applied_placement(
+            request.deployment_environment.as_deref(),
             request.placement_pool.as_deref(),
             &request.region,
             &create_response,
@@ -1796,6 +1819,7 @@ async fn deploy_service_candidate(
 
         current_state = ServiceDeploymentState {
             service_id: service_id.clone(),
+            deployment_environment: request.deployment_environment.clone(),
             active_deployment_id: Some(deployment_id.clone()),
             active_archive_id: create_response.archive_id.clone(),
             active_backend_url: Some(backend_url.clone()),
@@ -1944,23 +1968,29 @@ async fn deploy_service_candidate(
 }
 
 fn verify_applied_placement(
+    requested_environment: Option<&str>,
     requested_pool: Option<&str>,
     requested_region: &str,
     response: &cloud_client::CreateDeploymentResponse,
 ) -> Result<()> {
-    let Some(requested_pool) = requested_pool.map(str::trim) else {
+    let Some(requested_environment) = requested_environment.map(str::trim) else {
         return Ok(());
     };
     let placement = response.placement.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
-            "Cloud did not confirm requested placement pool {requested_pool}; refusing an unscoped deployment"
+            "Cloud did not confirm requested deployment environment {requested_environment}; refusing an unscoped deployment"
         )
     })?;
-    if placement.placement_pool != requested_pool || placement.region != requested_region {
+    if placement.deployment_environment != requested_environment
+        || placement.region != requested_region
+        || requested_pool.is_some_and(|pool| placement.placement_pool.as_deref() != Some(pool))
+    {
         anyhow::bail!(
-            "Cloud applied placement pool {} in region {}, but the deployment requested pool {} in region {}",
+            "Cloud applied environment {} pool {:?} in region {}, but the deployment requested environment {} pool {:?} in region {}",
+            placement.deployment_environment,
             placement.placement_pool,
             placement.region,
+            requested_environment,
             requested_pool,
             requested_region,
         );
@@ -1989,6 +2019,7 @@ fn service_deployment_request_metadata(request: &ServiceDeployRequest) -> serde_
         "archiveName": request.archive_name,
         "archiveBytesBase64Length": request.archive_bytes_base64.as_ref().map(|value| value.len()),
         "region": request.region,
+        "deploymentEnvironment": request.deployment_environment,
         "placementPool": request.placement_pool,
         "driver": request.driver,
         "image": request.image,
@@ -3351,7 +3382,12 @@ async fn cleanup_failed_candidate_once(state: &AppState, service_id: &str, deplo
 pub(super) use super::regional_observers::{regional_observe, validate_regional_observers};
 
 pub(super) async fn regional_baseline(state: &AppState, request: &ServiceDeployRequest) -> Result<ServiceDeploymentState> {
-    let baseline = read_service_state(state, &request.service_id).await?;
+    let baseline = bind_deployment_environment_identity(
+        state,
+        &request.service_id,
+        request.deployment_environment.as_deref(),
+    )
+    .await?;
     if baseline.ingress_backend_url.as_deref().is_none_or(str::is_empty)
         || baseline.route.is_none()
         || serde_json::to_value(&baseline.route)? != serde_json::to_value(&request.route)?
@@ -3359,6 +3395,49 @@ pub(super) async fn regional_baseline(state: &AppState, request: &ServiceDeployR
         anyhow::bail!("regional rollout requires an already established discovery ingress and its unchanged route");
     }
     Ok(baseline)
+}
+
+fn enforce_deployment_environment_identity(
+    state: &ServiceDeploymentState,
+    requested: Option<&str>,
+) -> Result<()> {
+    let occupied = state.active_deployment_id.is_some()
+        || state.previous_deployment_id.is_some()
+        || state.active_backend_url.is_some()
+        || state.discovery.as_ref().is_some_and(|snapshot| !snapshot.endpoints.is_empty());
+    match (state.deployment_environment.as_deref(), requested) {
+        (None, Some(environment)) if occupied => anyhow::bail!(
+            "service {} is an occupied legacy identity and cannot be adopted into deployment environment {environment}",
+            state.service_id
+        ),
+        (Some(existing), Some(requested)) if existing != requested => anyhow::bail!(
+            "service {} is bound to deployment environment {existing}, not {requested}",
+            state.service_id
+        ),
+        (Some(existing), None) => anyhow::bail!(
+            "service {} is bound to deployment environment {existing}; deploymentEnvironment is required",
+            state.service_id
+        ),
+        _ => Ok(()),
+    }
+}
+
+async fn bind_deployment_environment_identity(
+    state: &AppState,
+    service_id: &str,
+    requested: Option<&str>,
+) -> Result<ServiceDeploymentState> {
+    let mut service_state = read_service_state(state, service_id).await?;
+    enforce_deployment_environment_identity(&service_state, requested)?;
+    if service_state.deployment_environment.is_none() {
+        if let Some(environment) = requested {
+            service_state.deployment_environment = Some(environment.to_owned());
+            // The caller owns the service lifecycle lock. Persist the identity before
+            // archive loading, rollout admission, or any Cloud request can occur.
+            write_service_state(state, &service_state).await?;
+        }
+    }
+    Ok(service_state)
 }
 
 pub(super) async fn restore_regional_baseline(state: &AppState, baseline: &ServiceDeploymentState) -> Result<()> {
@@ -4049,7 +4128,7 @@ async fn read_service_state_from_db(service_id: &str) -> Result<Option<ServiceDe
             DbBackend::Postgres,
             "SELECT service_id, active_deployment_id, active_archive_id, active_backend_url, \
              previous_deployment_id, previous_archive_id, active_metadata, previous_metadata, \
-             desired_replicas, replica_regions, route, ingress_backend_url, updated_at \
+             deployment_environment, desired_replicas, replica_regions, route, ingress_backend_url, updated_at \
              FROM service_deployment_states WHERE service_id = $1 LIMIT 1",
             [service_id.into()],
         ))
@@ -4077,6 +4156,9 @@ async fn read_service_state_from_db(service_id: &str) -> Result<Option<ServiceDe
         service_id: row
             .try_get("", "service_id")
             .context("failed to read service_id")?,
+        deployment_environment: row
+            .try_get("", "deployment_environment")
+            .context("failed to read deployment_environment")?,
         active_deployment_id: row
             .try_get("", "active_deployment_id")
             .context("failed to read active_deployment_id")?,
@@ -4140,8 +4222,8 @@ async fn write_service_state_to_db(service_state: &ServiceDeploymentState) -> Re
         "INSERT INTO service_deployment_states (
             service_id, active_deployment_id, active_archive_id, active_backend_url,
             previous_deployment_id, previous_archive_id, active_metadata, previous_metadata,
-            desired_replicas, replica_regions, route, ingress_backend_url, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+            deployment_environment, desired_replicas, replica_regions, route, ingress_backend_url, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
         ON CONFLICT (service_id) DO UPDATE SET
             active_deployment_id = EXCLUDED.active_deployment_id,
             active_archive_id = EXCLUDED.active_archive_id,
@@ -4150,6 +4232,7 @@ async fn write_service_state_to_db(service_state: &ServiceDeploymentState) -> Re
             previous_archive_id = EXCLUDED.previous_archive_id,
             active_metadata = EXCLUDED.active_metadata,
             previous_metadata = EXCLUDED.previous_metadata,
+            deployment_environment = COALESCE(service_deployment_states.deployment_environment, EXCLUDED.deployment_environment),
             desired_replicas = EXCLUDED.desired_replicas,
             replica_regions = EXCLUDED.replica_regions,
             route = EXCLUDED.route,
@@ -4164,6 +4247,7 @@ async fn write_service_state_to_db(service_state: &ServiceDeploymentState) -> Re
             service_state.previous_archive_id.clone().into(),
             active_metadata,
             previous_metadata,
+            service_state.deployment_environment.clone().into(),
             i32::from(service_state.desired_replicas).into(),
             replica_regions,
             route_value,
@@ -4205,6 +4289,7 @@ fn build_deployment_metadata(
             "driver": request.driver,
             "image": request.image,
             "region": request.region,
+            "deploymentEnvironment": request.deployment_environment,
             "sizeClass": request.size_class,
             "ports": request.ports,
             "portMappings": request.port_mappings,
@@ -4470,7 +4555,8 @@ mod tests {
         rollout_old_endpoints, rollout_replacement, target_endpoint_count,
         target_regions_covered, target_regions_ready, validate_revision_ref,
         validate_revision_repository_url, validate_revision_sha, validate_service_traffic_mode,
-        verify_applied_placement, SecretVersionSelector, ServiceDeployRequest, ServiceRouteRequest,
+        verify_applied_placement, enforce_deployment_environment_identity,
+        SecretVersionSelector, ServiceDeploymentState, ServiceDeployRequest, ServiceRouteRequest,
         list_pending_service_retirements, try_service_lifecycle_lock,
     };
     use crate::cloud_client::CreateDeploymentResponse;
@@ -4687,16 +4773,60 @@ mod tests {
             "status": "running"
         }))
         .unwrap();
-        assert!(verify_applied_placement(Some("platform"), "EU", &confirmed).is_ok());
-        assert!(verify_applied_placement(Some("platform"), "US", &confirmed).is_err());
+        assert!(verify_applied_placement(Some("staging"), Some("platform"), "EU", &confirmed).is_ok());
+        assert!(verify_applied_placement(Some("production"), Some("platform"), "EU", &confirmed).is_err());
+        assert!(verify_applied_placement(Some("staging"), Some("platform"), "US", &confirmed).is_err());
+
+        let production: CreateDeploymentResponse = serde_json::from_value(serde_json::json!({
+            "deploymentId": "dep-production",
+            "placement": {
+                "deploymentEnvironment": "production",
+                "nodeId": "eu2",
+                "placementPool": "platform",
+                "region": "EU"
+            },
+            "status": "running"
+        })).unwrap();
+        assert!(verify_applied_placement(Some("production"), Some("platform"), "EU", &production).is_ok());
+        assert!(verify_applied_placement(Some("staging"), Some("platform"), "EU", &production).is_err());
+        assert!(verify_applied_placement(Some("production"), Some("other"), "EU", &production).is_err());
+
+        let environment_only: CreateDeploymentResponse = serde_json::from_value(serde_json::json!({
+            "deploymentId": "dep-env",
+            "placement": {
+                "deploymentEnvironment": "staging",
+                "nodeId": "eu1",
+                "region": "EU"
+            },
+            "status": "running"
+        })).unwrap();
+        assert!(verify_applied_placement(Some("staging"), None, "EU", &environment_only).is_ok());
 
         let legacy: CreateDeploymentResponse = serde_json::from_value(serde_json::json!({
             "deploymentId": "dep-2",
             "status": "running"
         }))
         .unwrap();
-        assert!(verify_applied_placement(None, "US", &legacy).is_ok());
-        assert!(verify_applied_placement(Some("platform"), "US", &legacy).is_err());
+        assert!(verify_applied_placement(None, None, "US", &legacy).is_ok());
+        assert!(verify_applied_placement(Some("staging"), None, "US", &legacy).is_err());
+        assert!(verify_applied_placement(Some("staging"), Some("platform"), "US", &legacy).is_err());
+    }
+
+    #[test]
+    fn deployment_environment_is_immutable_for_occupied_service_identity() {
+        let mut state = ServiceDeploymentState {
+            service_id: "api".into(),
+            active_deployment_id: Some("dep-1".into()),
+            ..Default::default()
+        };
+        assert!(enforce_deployment_environment_identity(&state, Some("production")).is_err());
+        state.deployment_environment = Some("staging".into());
+        assert!(enforce_deployment_environment_identity(&state, Some("staging")).is_ok());
+        assert!(enforce_deployment_environment_identity(&state, Some("production")).is_err());
+        assert!(enforce_deployment_environment_identity(&state, None).is_err());
+
+        state.active_deployment_id = None;
+        assert!(enforce_deployment_environment_identity(&state, Some("production")).is_err());
     }
 
     #[test]
@@ -4900,6 +5030,49 @@ mod tests {
         assert!(try_service_lifecycle_lock(&first, &service).await?.is_none());
         retirement.rollback().await?;
         assert!(try_service_lifecycle_lock(&first, &service).await?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ORCHESTRATOR_TEST_DATABASE_URL (disposable PostgreSQL)"]
+    async fn deployment_environment_binding_survives_failure_and_restart_postgres() -> Result<()> {
+        let url = std::env::var("ORCHESTRATOR_TEST_DATABASE_URL")?;
+        let first = sea_orm::Database::connect(url.clone()).await?;
+        let schema = format!("environment_test_{}", Uuid::new_v4().simple());
+        let setup = first.begin().await?;
+        setup.execute_unprepared(&format!("CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema};")).await?;
+        setup.execute_unprepared(include_str!("../../migrations/028_add_service_deployment_state.sql")).await?;
+        setup.execute_unprepared(include_str!("../../migrations/031_add_service_discovery.sql")).await?;
+        setup.execute_unprepared(include_str!("../../migrations/033_add_service_replica_placement.sql")).await?;
+        setup.execute_unprepared(include_str!("../../migrations/036_add_service_deployment_environment.sql")).await?;
+        // Startup migration replay must also be safe.
+        setup.execute_unprepared(include_str!("../../migrations/036_add_service_deployment_environment.sql")).await?;
+        setup.execute_unprepared("INSERT INTO service_deployment_states(service_id,deployment_environment) VALUES ('api','production')").await?;
+        setup.commit().await?;
+
+        // A fresh pool represents a process restart after candidate failure. The
+        // identity row has no active endpoint, but its binding remains authoritative.
+        let restarted = sea_orm::Database::connect(url).await?;
+        let read = restarted.begin().await?;
+        read.execute_unprepared(&format!("SET LOCAL search_path TO {schema}")).await?;
+        let row = read.query_one(Statement::from_string(DbBackend::Postgres,
+            "SELECT service_id,deployment_environment,active_deployment_id FROM service_deployment_states WHERE service_id='api'")).await?.unwrap();
+        let state = ServiceDeploymentState {
+            service_id: row.try_get("", "service_id")?,
+            deployment_environment: row.try_get("", "deployment_environment")?,
+            active_deployment_id: row.try_get("", "active_deployment_id")?,
+            ..Default::default()
+        };
+        assert_eq!(state.deployment_environment.as_deref(), Some("production"));
+        assert!(enforce_deployment_environment_identity(&state, Some("staging")).is_err(),
+            "wrong environment must fail before candidate creation or a Cloud request");
+        assert!(enforce_deployment_environment_identity(&state, None).is_err());
+        assert!(read.execute_unprepared("UPDATE service_deployment_states SET deployment_environment='staging' WHERE service_id='api'").await.is_err());
+        read.rollback().await?;
+
+        let cleanup = first.begin().await?;
+        cleanup.execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE")).await?;
+        cleanup.commit().await?;
         Ok(())
     }
 }

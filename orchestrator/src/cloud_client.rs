@@ -82,6 +82,7 @@ pub(crate) struct CreateDeploymentRequest {
     pub setup_hooks: Option<Vec<String>>,
     pub size_class: String,
     pub ttl_seconds: Option<u64>,
+    pub deployment_environment: Option<String>,
     pub placement_pool: Option<String>,
     pub excluded_backend_server_ids: Vec<String>,
     pub metadata: Option<Value>,
@@ -185,6 +186,8 @@ struct CreateDeploymentHttpRequest {
     size_class: String,
     ttl_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    deployment_environment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     placement_pool: Option<String>,
     excluded_backend_server_ids: Vec<String>,
     metadata: Option<Value>,
@@ -195,7 +198,8 @@ struct CreateDeploymentHttpRequest {
 pub(crate) struct DeploymentPlacement {
     pub deployment_environment: String,
     pub node_id: String,
-    pub placement_pool: String,
+    #[serde(default)]
+    pub placement_pool: Option<String>,
     pub region: String,
 }
 
@@ -366,6 +370,7 @@ pub(crate) async fn create_deployment(
         setup_hooks: request.setup_hooks.clone(),
         size_class: request.size_class.clone(),
         ttl_seconds: request.ttl_seconds,
+        deployment_environment: request.deployment_environment.clone(),
         placement_pool: request.placement_pool.clone(),
         excluded_backend_server_ids: request.excluded_backend_server_ids.clone(),
         metadata: request.metadata.clone(),
@@ -873,7 +878,53 @@ fn authorized_request(
 
 #[cfg(test)]
 mod tests {
-    use super::DeploymentHealthcheckUrls;
+    use std::{collections::HashMap, sync::Arc};
+
+    use anyhow::Result;
+    use axum::{extract::State, routing::post, Json, Router};
+    use serde_json::{json, Value};
+
+    use super::{create_deployment, CreateDeploymentRequest, DeploymentHealthcheckUrls};
+    use crate::AppState;
+
+    #[tokio::test]
+    async fn create_deployment_sends_environment_without_placement_pool() -> Result<()> {
+        let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+        let sender = Arc::new(tokio::sync::Mutex::new(Some(body_tx)));
+        let app = Router::new()
+            .route("/internal/orchestration/deployments", post(|State(sender): State<Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<Value>>>>>, Json(body): Json<Value>| async move {
+                sender.lock().await.take().unwrap().send(body).unwrap();
+                Json(json!({"deploymentId":"dep-1","status":"running","placement":{"deploymentEnvironment":"production","nodeId":"node-1","region":"US"}}))
+            }))
+            .with_state(sender);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = serde_json::from_value(json!({
+            "server_port":0,"database_url":"postgres://unused","agent_provider":"test",
+            "agent_model":"test","agent_api_key":"","agent_timeout_seconds":1,
+            "agent_max_iterations":1,"jwt_secret":"test","cloud_internal_url":base_url,
+            "internal_api_key":"test"
+        }))?;
+        let state = AppState { config: Arc::new(config), http_client: reqwest::Client::new(),
+            worker_id: Arc::new("test".into()), ci_workspace_cache: Default::default() };
+        let response = create_deployment(&state, &CreateDeploymentRequest {
+            deployment_id: "dep-1".into(), user_id: "user".into(), account_id: "account".into(),
+            name: "service".into(), slug: None, target: "linux".into(), archive_id: Some("archive".into()),
+            archive_name: None, archive_bytes: vec![], region: "US".into(), backend_type: "libvirt".into(),
+            image: "image".into(), ports: vec![8080], port_mappings: vec![], mounts: vec![],
+            env: Some(HashMap::new()), env_refs: vec![], start_command: None, working_directory: None,
+            setup_hooks: None, size_class: "small".into(), ttl_seconds: None,
+            deployment_environment: Some("production".into()), placement_pool: None,
+            excluded_backend_server_ids: vec![], metadata: None,
+        }).await?;
+        let body = body_rx.await?;
+        assert_eq!(body["deploymentEnvironment"], "production");
+        assert!(body.get("placementPool").is_none());
+        assert_eq!(response.placement.unwrap().deployment_environment, "production");
+        server.abort();
+        Ok(())
+    }
 
     #[test]
     fn preserves_distinct_internal_and_public_healthcheck_urls() {
