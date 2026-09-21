@@ -79,6 +79,11 @@ orchestrator TOML file (`HEYO_ORCHESTRATOR_CONFIG_PATH`). At least one observer
 must be configured in each target region. Each URL addresses a specific app-lb
 instance, not a load-balanced URL that can hide an unobserved ingress.
 
+Managed VM deployments can instead set `ORCHESTRATOR_DISCOVERY_OBSERVERS_JSON`
+to a JSON array with the same observer fields in their persisted `vm.env_vars`.
+TOML takes precedence, including an explicitly empty `discovery_observers = []`.
+Invalid JSON fails startup; these settings contain secret references, never tokens.
+
 ```toml
 [[discovery_observers]]
 service_id = "example"
@@ -116,9 +121,14 @@ discovery_url = "https://orchestrator.example.com/orchestration/services/example
 
 `ingress_url` addresses that specific ingress, not a global load balancer. Health
 probes use the service route's Host header and preserve its prefix. TLS validates
-the ingress URL hostname. The `discovery_url` must be identical across observers;
-each app-lb must already have `APP_LB_DISCOVERY_URL` pointing to that authority's
-base URL and `APP_LB_DISCOVERY_TOKEN` configured through its managed secrets.
+the ingress URL hostname. The `discovery_url` must be identical across observers.
+Set `discovery_token_secret = "discovery-reader"` on each observer to register
+the authority with the route through app-lb's managed API. Provision this app-lb
+secret in the default namespace with a `token` key through the existing secrets
+API, using HeyoSecret as the source of truth. This is the discovery reader token,
+not the observer's app-lb admin token. Bootstrap checks support and persists only
+the reference. No host environment edit is required. If the field is omitted,
+the legacy `APP_LB_DISCOVERY_URL/TOKEN` host configuration remains required.
 Controllers executing the same rollout must share the same PostgreSQL state;
 this feature does not replicate independent regional databases.
 

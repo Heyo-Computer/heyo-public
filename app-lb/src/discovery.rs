@@ -1,6 +1,7 @@
 //! Polls Orchestrator-owned service endpoint sets into static deployments.
 
 use crate::registry::Registry;
+use crate::secrets::SecretStore;
 use async_trait::async_trait;
 use futures::future::join_all;
 use pingora_core::server::ShutdownWatch;
@@ -65,24 +66,25 @@ struct Endpoint {
 enum HealthStatus { Healthy, Unhealthy, Unknown }
 
 pub struct DiscoveryWatcher {
-    cfg: DiscoveryConfig,
+    cfg: Option<DiscoveryConfig>,
     registry: Arc<Registry>,
+    secrets: Arc<SecretStore>,
     client: reqwest::Client,
     failed: tokio::sync::Mutex<HashSet<(String, String)>>,
 }
 
 impl DiscoveryWatcher {
-    pub fn new(cfg: DiscoveryConfig, registry: Arc<Registry>) -> Self {
+    pub fn new(cfg: Option<DiscoveryConfig>, registry: Arc<Registry>, secrets: Arc<SecretStore>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("discovery HTTP client configuration is valid");
-        Self { cfg, registry, client, failed: Default::default() }
+        Self { cfg, registry, secrets, client, failed: Default::default() }
     }
 
     fn service_url(&self, service_id: &str) -> Result<reqwest::Url, String> {
-        let mut url = self.cfg.base_url.clone();
+        let mut url = self.cfg.as_ref().ok_or("discovery source is not configured")?.base_url.clone();
         let mut segments = url.path_segments_mut().map_err(|_| "discovery base URL cannot be a base".to_string())?;
         segments.pop_if_empty();
         segments.extend(["orchestration", "services", service_id, "discovery"]);
@@ -116,9 +118,24 @@ impl DiscoveryWatcher {
     }
 
     async fn refresh(&self, deployment_id: &str, service_id: &str) -> Result<bool, String> {
-        let source = self.service_url(service_id)?.to_string();
+        let Some(before) = self.registry.get(deployment_id) else { return Ok(false) };
+        let Some(discovery) = &before.spec.discovery else { return Ok(false) };
+        if discovery.service_id != service_id { return Ok(false); }
+        let (source, token) = if let Some(source) = &discovery.source {
+            let url = validate_source_url(&source.url)?;
+            let mut auth = source.auth.clone();
+            auth.scope_to(&before.spec.namespace);
+            let token = self.secrets.resolve(&auth).map_err(|e| e.to_string())?;
+            if token.trim().is_empty() { return Err("discovery credential is empty".into()); }
+            (url.to_string(), token)
+        } else {
+            (self.service_url(service_id)?.to_string(), self.cfg.as_ref().unwrap().token.clone())
+        };
+        if before.state().discovery_source_url.as_ref().is_some_and(|old| old != &source) {
+            return Err("discovery authority changed; refusing to reuse the previous source's version".into());
+        }
         let snapshot: Snapshot = self.client.get(&source)
-            .bearer_auth(&self.cfg.token).send().await.map_err(|e| e.to_string())?
+            .bearer_auth(&token).send().await.map_err(|e| e.to_string())?
             .error_for_status().map_err(|e| e.to_string())?
             .json().await.map_err(|e| e.to_string())?;
         if snapshot.service_id != service_id {
@@ -127,7 +144,9 @@ impl DiscoveryWatcher {
         let upstreams = snapshot_upstreams(&snapshot)?;
         let _guard = self.registry.change_guard().await;
         let Some(current) = self.registry.get(deployment_id) else { return Ok(false) };
-        if current.spec.discovery.as_ref().map(|d| d.service_id.as_str()) != Some(service_id) {
+        // Do not apply an in-flight response after its deployment was replaced,
+        // even when the replacement has the same service ID and source URL.
+        if !Arc::ptr_eq(&before, &current) {
             return Ok(false);
         }
         let previous_version = current.state().discovery_version;
@@ -159,6 +178,17 @@ impl DiscoveryWatcher {
         }
         Ok(true)
     }
+}
+
+pub(crate) fn validate_source_url(value: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(value).map_err(|_| "source URL is invalid".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none()
+        || !url.username().is_empty() || url.password().is_some()
+        || url.query().is_some() || url.fragment().is_some()
+    {
+        return Err("source URL must be credential-free HTTP(S) without query or fragment".into());
+    }
+    Ok(url)
 }
 
 fn should_apply(
@@ -210,7 +240,7 @@ fn upstream_from_url(value: &str) -> Result<String, String> {
 #[async_trait]
 impl BackgroundService for DiscoveryWatcher {
     async fn start(&self, mut shutdown: ShutdownWatch) {
-        let mut ticker = tokio::time::interval(self.cfg.interval);
+        let mut ticker = tokio::time::interval(self.cfg.as_ref().map_or(Duration::from_secs(5), |c| c.interval));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -225,6 +255,100 @@ impl BackgroundService for DiscoveryWatcher {
 mod tests {
     use super::*;
     use crate::config::{DeploymentSpec, SpecError};
+
+    #[tokio::test]
+    async fn managed_source_survives_restart_and_scopes_rotated_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/snapshot", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let app = axum::Router::new().route("/snapshot", axum::routing::get(move |headers: axum::http::HeaderMap| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().unwrap().push(headers["authorization"].to_str().unwrap().to_owned());
+                axum::Json(serde_json::json!({"serviceId":"svc","version":9,"endpoints":[
+                    {"url":"http://east:8081","healthStatus":"healthy","draining":false},
+                    {"url":"http://west:9092","healthStatus":"healthy","draining":true}]}))
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let dir = std::env::temp_dir().join(format!("app-lb-managed-discovery-{}", crate::rollout::revision()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = Arc::new(Registry::new(dir.join("state.json")));
+        let secrets = Arc::new(SecretStore::new(dir.join("secrets.json"), None));
+        let put = |namespace: &str, token: &str| {
+            secrets.put(serde_json::from_value(serde_json::json!({"id":"reader","namespace":namespace,"data":{"token":token}})).unwrap());
+        };
+        put("default", "wrong-namespace");
+        put("team", "first");
+        let mut spec: DeploymentSpec = serde_json::from_value(serde_json::json!({"id":"svc","namespace":"team",
+            "routes":[{"host":"svc.example"}],"discovery":{"service_id":"svc",
+            "source":{"url":url,"auth":{"secret":"reader","namespace":"default"}}}})).unwrap();
+        spec.normalize();
+        spec.validate().unwrap();
+        assert_eq!(spec.secret_ids(), vec!["reader"]);
+        assert_eq!(spec.discovery.as_ref().unwrap().source.as_ref().unwrap().auth.namespace(), "team");
+        registry.upsert(spec);
+        let watcher = DiscoveryWatcher::new(None, registry.clone(), secrets.clone());
+        assert!(watcher.refresh("svc", "svc").await.unwrap());
+        assert_eq!(registry.get("svc").unwrap().spec.upstreams, ["east:8081"]);
+        put("team", "rotated");
+        secrets.persist().unwrap();
+        let loaded = Arc::new(Registry::new(dir.join("state.json")));
+        loaded.load().unwrap();
+        let loaded_secrets = Arc::new(SecretStore::new(dir.join("secrets.json"), None));
+        loaded_secrets.load().unwrap();
+        let restarted = DiscoveryWatcher::new(None, loaded.clone(), loaded_secrets.clone());
+        assert!(!restarted.refresh("svc", "svc").await.unwrap());
+        assert_eq!(*seen.lock().unwrap(), ["Bearer first", "Bearer rotated"]);
+        assert_eq!(loaded.get("svc").unwrap().state().discovery_source_url.as_deref(), Some(url.as_str()));
+        loaded_secrets.remove("team", "reader");
+        assert!(restarted.refresh("svc", "svc").await.is_err());
+        assert_eq!(loaded.get("svc").unwrap().spec.upstreams, ["east:8081"]);
+        assert_eq!(seen.lock().unwrap().len(), 2, "missing own credential must not use another namespace");
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_for_replaced_deployment_is_discarded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (a, r) = (arrived.clone(), release.clone());
+        let app = axum::Router::new().route("/orchestration/services/svc/discovery", axum::routing::get(move || {
+            let (a, r) = (a.clone(), r.clone());
+            async move {
+                a.notify_one(); r.notified().await;
+                axum::Json(serde_json::json!({"serviceId":"svc","version":99,"endpoints":[
+                    {"url":"http://stale:8080","healthStatus":"healthy","draining":false}]}))
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let registry = Arc::new(Registry::new("unused.json"));
+        let spec: DeploymentSpec = serde_json::from_value(serde_json::json!({"id":"svc",
+            "routes":[{"host":"svc.example"}],"discovery":{"service_id":"svc"},"upstreams":["original:8080"]})).unwrap();
+        registry.upsert(spec.clone());
+        let watcher = DiscoveryWatcher::new(Some(DiscoveryConfig { base_url: base.parse().unwrap(), token:"test".into(), interval:Duration::from_secs(1) }),
+            registry.clone(), Arc::new(SecretStore::new("unused-secrets.json", None)));
+        let refresh = tokio::spawn(async move { watcher.refresh("svc", "svc").await });
+        tokio::time::timeout(Duration::from_secs(3), arrived.notified()).await.unwrap();
+        registry.upsert(spec);
+        release.notify_one();
+        assert!(!refresh.await.unwrap().unwrap());
+        assert_eq!(registry.get("svc").unwrap().spec.upstreams, ["original:8080"]);
+        assert_eq!(registry.get("svc").unwrap().state().discovery_version, None);
+        server.abort();
+    }
+
+    #[test]
+    fn managed_source_rejects_credentials_and_non_http_urls() {
+        for url in ["file:///tmp/snapshot", "https://user:password@example.com/snapshot", "https://example.com/?token=x", "https://example.com/#fragment"] {
+            assert!(validate_source_url(url).is_err());
+        }
+        assert!(validate_source_url("https://authority.example/snapshot").is_ok());
+    }
 
     #[tokio::test]
     async fn applied_source_is_persisted_and_cannot_be_relabelled_after_restart() {
@@ -243,7 +367,8 @@ mod tests {
             "routes":[{"host":"svc.example"}],"discovery":{"service_id":"svc"},"upstreams":["node:8080"]})).unwrap();
         registry.upsert(spec).mutate_state(|s| s.discovery_version = Some(7));
         let cfg = DiscoveryConfig { base_url: base.parse().unwrap(), token: "test".into(), interval: Duration::from_secs(1) };
-        let watcher = DiscoveryWatcher::new(cfg.clone(), registry.clone());
+        let secrets = Arc::new(SecretStore::new(dir.join("secrets.json"), None));
+        let watcher = DiscoveryWatcher::new(Some(cfg.clone()), registry.clone(), secrets.clone());
         // Even unchanged legacy membership must acquire an actual source stamp.
         assert!(watcher.refresh("svc", "svc").await.unwrap());
         let source = format!("{base}/orchestration/services/svc/discovery");
@@ -253,7 +378,7 @@ mod tests {
         loaded.load().unwrap();
         assert_eq!(loaded.get("svc").unwrap().state().discovery_source_url.as_deref(), Some(source.as_str()));
         loaded.get("svc").unwrap().mutate_state(|s| s.discovery_source_url = Some("http://original-authority".into()));
-        let restarted = DiscoveryWatcher::new(cfg, loaded.clone());
+        let restarted = DiscoveryWatcher::new(Some(cfg), loaded.clone(), secrets);
         assert!(restarted.refresh("svc", "svc").await.unwrap_err().contains("authority changed"));
         assert_eq!(loaded.get("svc").unwrap().state().discovery_source_url.as_deref(), Some("http://original-authority"));
         server.abort();

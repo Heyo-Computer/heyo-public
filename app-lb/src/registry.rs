@@ -1377,6 +1377,7 @@ mod tests {
         let mut cloud = static_spec("stage", vec![host("stage.example.com")], &[]);
         cloud.discovery = Some(DiscoverySpec {
             service_id: "cloud".into(),
+            source: None,
         });
         let deployment = r.upsert(cloud);
         deployment.mutate_state(|state| state.discovery_version = Some(7));
@@ -1384,6 +1385,7 @@ mod tests {
         let mut auth = static_spec("stage", vec![host("stage.example.com")], &[]);
         auth.discovery = Some(DiscoverySpec {
             service_id: "auth".into(),
+            source: None,
         });
         let deployment = r.upsert(auth);
 
@@ -1398,7 +1400,7 @@ mod tests {
             vec![host("stage.example.com")],
             &["a.example:80", "b.example:80"],
         );
-        first.discovery = Some(DiscoverySpec { service_id: "stage".into() });
+        first.discovery = Some(DiscoverySpec { service_id: "stage".into(), source: None });
         let deployment = r.upsert(first);
         deployment.mutate_state(|state| {
             state.discovery_version = Some(1);

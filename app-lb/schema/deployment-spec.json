@@ -446,11 +446,37 @@
         }
       }
     },
+    "DiscoverySource": {
+      "type": "object",
+      "properties": {
+        "auth": {
+          "$ref": "#/$defs/SecretRef"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "auth"
+      ]
+    },
     "DiscoverySpec": {
       "type": "object",
       "properties": {
         "service_id": {
           "type": "string"
+        },
+        "source": {
+          "description": "Managed per-deployment authority; absent preserves the host env default.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiscoverySource"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [

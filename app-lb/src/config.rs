@@ -3365,6 +3365,15 @@ impl IngressSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct DiscoverySpec {
     pub service_id: String,
+    /// Managed per-deployment authority; absent preserves the host env default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<DiscoverySource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DiscoverySource {
+    pub url: String,
+    pub auth: SecretRef,
 }
 
 /// The namespace a spec gets when it names none. One word, so an installation
@@ -3732,6 +3741,7 @@ pub enum SpecError {
     NoBackendKind,
     EmptyDiscoveryServiceId,
     DiscoveryWithOtherBackend,
+    InvalidDiscoverySource(String),
     /// A static upstream address is not a valid plaintext `host:port` or HTTPS URL.
     BadUpstream(String),
     /// A static deployment declared a `build` block; there is no image to build.
@@ -4068,6 +4078,7 @@ impl std::fmt::Display for SpecError {
                  `upstreams` (static proxy_pass)"
             ),
             Self::EmptyDiscoveryServiceId => write!(f, "discovery.service_id must not be empty"),
+            Self::InvalidDiscoverySource(error) => write!(f, "invalid discovery source: {error}"),
             Self::DiscoveryWithOtherBackend => write!(
                 f,
                 "discovery supplies a static upstream set and cannot be combined with `vm` or `site`"
@@ -4582,6 +4593,9 @@ impl DeploymentSpec {
     /// refs and are handled beside this in [`normalize`](Self::normalize).
     fn secret_refs_mut(&mut self) -> Vec<&mut SecretRef> {
         let mut out: Vec<&mut SecretRef> = Vec::new();
+        if let Some(source) = self.discovery.as_mut().and_then(|d| d.source.as_mut()) {
+            out.push(&mut source.auth);
+        }
         if let Some(b) = &mut self.build {
             out.extend(b.auth.as_mut());
         }
@@ -4612,6 +4626,7 @@ impl DeploymentSpec {
     /// a delete checks before refusing.
     pub fn secret_ids(&self) -> Vec<String> {
         let mut refs: Vec<Option<&SecretRef>> = vec![
+            self.discovery.as_ref().and_then(|d| d.source.as_ref()).map(|s| &s.auth),
             self.build.as_ref().and_then(|b| b.auth.as_ref()),
             self.artifact.as_ref().and_then(|a| a.auth.as_ref()),
             self.update.as_ref().and_then(|u| u.auth.as_ref()),
@@ -4832,6 +4847,10 @@ impl DeploymentSpec {
         if let Some(discovery) = &self.discovery {
             if discovery.service_id.trim().is_empty() {
                 return Err(SpecError::EmptyDiscoveryServiceId);
+            }
+            if let Some(source) = &discovery.source {
+                crate::discovery::validate_source_url(&source.url).map_err(SpecError::InvalidDiscoverySource)?;
+                source.auth.validate().map_err(|e| SpecError::InvalidDiscoverySource(e.to_string()))?;
             }
             if self.vm.is_some() || self.site.is_some() {
                 return Err(SpecError::DiscoveryWithOtherBackend);

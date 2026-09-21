@@ -301,6 +301,7 @@ fn static_spec() -> DeploymentSpec {
         upstreams: vec!["10.0.0.4:8080".into(), "10.0.0.5:8080".into()],
         discovery: Some(crate::config::DiscoverySpec {
             service_id: "cloud".into(),
+            source: None,
         }),
         build: None,
         artifact: None,

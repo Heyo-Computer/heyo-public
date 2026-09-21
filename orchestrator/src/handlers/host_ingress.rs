@@ -34,6 +34,10 @@ pub(super) fn validate(state: &AppState, service: &str, route: &ServiceRouteRequ
         if source.as_ref().is_some_and(|s| s != &discovery) {
             bail!("all ingress instances must consume one authoritative discovery URL");
         }
+        if observer.discovery_token_secret.as_ref().is_some_and(|s| s.is_empty() || s.len() > 64 || s.contains("..")
+            || !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')) {
+            bail!("discovery_token_secret must be an app-lb secret ID");
+        }
         source = Some(discovery);
     }
     if source.is_none() { bail!("host ingress requires observers"); }
@@ -44,8 +48,13 @@ pub(super) fn validate(state: &AppState, service: &str, route: &ServiceRouteRequ
 }
 
 fn spec(observer: &DiscoveryObserver, route: &ServiceRouteRequest) -> Value {
-    json!({"id":observer.deployment_id,"discovery":{"service_id":observer.service_id},
-        "routes":[{"host":route.host,"path_prefix":route.path_prefix}]})
+    let mut spec = json!({"id":observer.deployment_id,"discovery":{"service_id":observer.service_id},
+        "routes":[{"host":route.host,"path_prefix":route.path_prefix}]});
+    if let Some(secret) = &observer.discovery_token_secret {
+        spec["discovery"]["source"] = json!({"url":observer.discovery_url,
+            "auth":{"secret":secret,"key":"token","namespace":"default"}});
+    }
+    spec
 }
 
 fn matches_spec(actual: &Value, expected: &Value) -> bool {
@@ -65,6 +74,10 @@ async fn ensure_route(client: &reqwest::Client, observer: &DiscoveryObserver, ro
         let capability = client.get(collection.clone()).bearer_auth(token).send().await?.error_for_status()?;
         if capability.headers().get("x-app-lb-create-only").is_none_or(|v| v != "1") {
             bail!("app-lb does not support safe create-only registration; upgrade it first");
+        }
+        if observer.discovery_token_secret.is_some()
+            && capability.headers().get("x-app-lb-discovery-source").is_none_or(|v| v != "1") {
+            bail!("app-lb does not support managed discovery sources; upgrade it first");
         }
         let created = client.post(collection).bearer_auth(token)
             .header("If-None-Match", "*").json(&expected).send().await?;
@@ -163,7 +176,8 @@ mod tests {
                 "status":"active","valueBase64":"dGVzdA==","createdAt":"2026-09-21T00:00:00Z","metadata":{}})) }))
             .route("/orchestration/services/smoke/discovery", get(|State(s): State<Mock>| async move { Json(s.snapshot) }))
             .route("/deployments", get(|State(s): State<Mock>| async move {
-                ([("x-app-lb-create-only", if s.mode.load(Ordering::SeqCst) == 4 { "0" } else { "1" })], Json(json!([])))
+                ([("x-app-lb-create-only", if s.mode.load(Ordering::SeqCst) == 4 { "0" } else { "1" }),
+                    ("x-app-lb-discovery-source", if s.mode.load(Ordering::SeqCst) == 6 { "0" } else { "1" })], Json(json!([])))
             }).post(|State(s): State<Mock>, headers: HeaderMap, Json(spec): Json<Value>| async move {
                 assert_eq!(headers["if-none-match"], "*");
                 assert_eq!(headers["authorization"], "Bearer test");
@@ -193,6 +207,31 @@ mod tests {
             })).with_state(state.clone());
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         (base, state, task)
+    }
+
+    #[tokio::test]
+    async fn managed_source_registration_is_capability_checked_and_never_replaced() {
+        let (base, mock, task) = mock().await;
+        let observer: DiscoveryObserver = serde_json::from_value(json!({
+            "service_id":"smoke","region":"us","deployment_id":"smoke","base_url":base,
+            "ingress_url":base,"discovery_url":format!("{base}/orchestration/services/smoke/discovery"),
+            "token_secret_path":"test/observer","discovery_token_secret":"reader"
+        })).unwrap();
+        let route: ServiceRouteRequest = serde_json::from_value(json!({"host":"smoke.example","pathPrefix":"/smoke","stripPrefix":false})).unwrap();
+        let client = reqwest::Client::new();
+        mock.mode.store(6, Ordering::SeqCst);
+        assert!(ensure_route(&client, &observer, &route, "test").await.unwrap_err().to_string().contains("managed discovery sources"));
+        assert_eq!(mock.creates.load(Ordering::SeqCst), 0);
+        mock.mode.store(0, Ordering::SeqCst);
+        ensure_route(&client, &observer, &route, "test").await.unwrap();
+        ensure_route(&client, &observer, &route, "test").await.unwrap();
+        assert_eq!(mock.creates.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.stored.lock().unwrap().as_ref().unwrap()["discovery"]["source"],
+            json!({"url":observer.discovery_url,"auth":{"secret":"reader","key":"token","namespace":"default"}}));
+        mock.stored.lock().unwrap().as_mut().unwrap()["discovery"]["source"]["auth"]["secret"] = json!("other");
+        assert!(ensure_route(&client, &observer, &route, "test").await.unwrap_err().to_string().contains("refusing replacement"));
+        assert_eq!(mock.creates.load(Ordering::SeqCst), 1);
+        task.abort();
     }
 
     #[tokio::test]

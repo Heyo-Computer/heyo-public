@@ -942,7 +942,7 @@ fn main() {
             }),
             certs.clone(),
             acme_signal,
-            secrets,
+            secrets.clone(),
             workflows,
             namespaces,
             auth_providers.clone(),
@@ -990,12 +990,10 @@ fn main() {
 
     let autoscaler_handle = server.add_service(autoscaler_svc);
     server.add_service(admin_svc);
-    if let Some(discovery_cfg) = discovery_cfg {
-        server.add_service(background_service(
-            "discovery",
-            discovery::DiscoveryWatcher::new(discovery_cfg, registry),
-        ));
-    }
+    server.add_service(background_service(
+        "discovery",
+        discovery::DiscoveryWatcher::new(discovery_cfg, registry, secrets),
+    ));
     // Log shipping, when `APP_LB_OBS_URL` is set. Pointedly *not* a dependency of
     // the proxy handle below: whether this service is running, and whether app-obs
     // answers it, must make no difference to serving traffic.

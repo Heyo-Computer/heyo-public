@@ -3543,7 +3543,7 @@ async fn list(
         .map(|d| status_of(&state, d))
         .collect();
     out.sort_by(|a, b| a.spec.id.cmp(&b.spec.id));
-    ([("x-app-lb-create-only", "1")], Json(out))
+    ([("x-app-lb-create-only", "1"), ("x-app-lb-discovery-source", "1")], Json(out))
 }
 
 async fn get_one(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {

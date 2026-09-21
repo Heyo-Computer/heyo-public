@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use config::{Config as ConfigBuilder, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -128,6 +128,10 @@ pub struct DiscoveryObserver {
     /// ingress, with the service route's Host header (not a global LB URL).
     #[serde(default)]
     pub ingress_url: Option<String>,
+    /// Existing app-lb secret ID, in the route's default namespace, with a
+    /// `token` key for this discovery authority. The value stays in app-lb.
+    #[serde(default)]
+    pub discovery_token_secret: Option<String>,
     /// Exact authoritative service discovery URL, identical at every ingress.
     #[serde(default)]
     pub discovery_url: Option<String>,
@@ -392,7 +396,10 @@ impl Config {
         );
 
         let config = config_builder.build()?;
+        let observers = Self::load_discovery_observers(&config,
+            env::var("ORCHESTRATOR_DISCOVERY_OBSERVERS_JSON").ok().as_deref())?;
         let mut orchestrator_config: Config = config.try_deserialize()?;
+        orchestrator_config.discovery_observers = observers;
 
         if let Ok(server_port) = env::var("ORCHESTRATOR_SERVER_PORT") {
             if !server_port.is_empty() {
@@ -520,6 +527,16 @@ impl Config {
         Ok(orchestrator_config)
     }
 
+    fn load_discovery_observers(config: &ConfigBuilder, env_json: Option<&str>) -> Result<Vec<DiscoveryObserver>> {
+        // An explicitly empty TOML list disables observers, even if the VM
+        // deployment supplies an environment fallback.
+        if config.get::<config::Value>("discovery_observers").is_ok() {
+            return Ok(config.get("discovery_observers")?);
+        }
+        serde_json::from_str(env_json.filter(|s| !s.trim().is_empty()).unwrap_or("[]"))
+            .context("invalid ORCHESTRATOR_DISCOVERY_OBSERVERS_JSON")
+    }
+
     fn get_config_path() -> Option<std::path::PathBuf> {
         if let Ok(config_path) = env::var("HEYO_ORCHESTRATOR_CONFIG_PATH") {
             return Some(std::path::PathBuf::from(config_path));
@@ -530,5 +547,25 @@ impl Config {
         }
 
         dirs::home_dir().map(|home| home.join(".heyo/orchestrator/orchestrator.toml"))
+    }
+}
+
+#[cfg(test)]
+mod observer_config_tests {
+    use super::*;
+
+    #[test]
+    fn managed_observer_env_is_a_fallback_not_a_file_override() {
+        let empty = ConfigBuilder::builder().build().unwrap();
+        assert!(Config::load_discovery_observers(&empty, None).unwrap().is_empty());
+        assert!(Config::load_discovery_observers(&empty, Some("not json")).is_err());
+        let json = r#"[{"service_id":"smoke","region":"us","deployment_id":"smoke","base_url":"https://admin.example","token_secret_path":"observer/token","discovery_token_secret":"reader"}]"#;
+        let observers = Config::load_discovery_observers(&empty, Some(json)).unwrap();
+        assert_eq!(observers[0].region, "us");
+        assert_eq!(observers[0].discovery_token_secret.as_deref(), Some("reader"));
+        let file = ConfigBuilder::builder()
+            .add_source(File::from_str("discovery_observers = []", config::FileFormat::Toml)).build().unwrap();
+        assert!(Config::load_discovery_observers(&file, Some(json)).unwrap().is_empty());
+        assert!(Config::load_discovery_observers(&file, Some("invalid ignored fallback")).unwrap().is_empty());
     }
 }

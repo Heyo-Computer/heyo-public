@@ -657,6 +657,24 @@ Orchestrator endpoints and persists the last good set. Failed or stale snapshots
 The same deployment can be registered with
 `heyctl create deployment cloud --host cloud.example.com --discovery-service cloud`.
 
+For managed configuration without host environment changes, include a source in the
+deployment registered through the admin API:
+
+```json
+{"id":"example","routes":[{"host":"example.com"}],"discovery":{"service_id":"example","source":{"url":"https://orchestrator.example.com/orchestration/services/example/discovery","auth":{"secret":"discovery-reader","key":"token"}}}}
+```
+
+Provision `discovery-reader` through the existing secrets API from the service's
+HeyoSecret-backed configuration. Its token is resolved in the deployment's namespace
+on every poll, so rotation needs no restart. Specs and responses contain only the
+reference. The source is persisted with the deployment and takes precedence over
+`APP_LB_DISCOVERY_URL/TOKEN`; omitting it preserves those legacy defaults. The watcher
+runs even without the environment defaults. Missing credentials or an unreachable
+authority retain the last good membership. Changing an already-observed authority
+is rejected; create a distinct deployment for an intentional authority migration.
+`GET /deployments` advertises `X-App-Lb-Discovery-Source: 1` for callers that must
+check support before registration.
+
 `GET /deployments/:id/discovery-status` is on the same admin CRUD/auth tier as deployment
 reads and returns the locally observed drain state:
 
