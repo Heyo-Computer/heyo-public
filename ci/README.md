@@ -1595,6 +1595,12 @@ with `target: eu1`, verify its deployment event reaches `passed`, then use norma
 `ci/host-heyvm-maintenance` for subsequent upgrades. Do not rerun bootstrap to
 repair a retained fence; reconcile the persisted operation and launcher job.
 
+After restarting the service, bootstrap retries transient health connection
+failures and HTTP 502/503/504 responses for 30 seconds. A reachable endpoint with
+the wrong backend identity still fails immediately. Rollback journals retain
+the original exception type and installer source line, plus a separate rollback
+failure when applicable; command arguments and exception messages are not logged.
+
 For a failed attempt whose installer succeeded, explicitly invoke
 `POST /api/runs/{run_id}/bootstrap/{operation_id}/recover` with that repository's
 submit bearer token. This is a production scheduling-state change, not a status

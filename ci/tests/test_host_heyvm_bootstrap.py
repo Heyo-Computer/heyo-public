@@ -180,6 +180,12 @@ class Tests(unittest.TestCase):
             temp,target,_host,result,old,_new=self.run_install(failure)
             try:
                 self.assertEqual(result["status"],"rolled_back",failure); self.assertEqual(pathlib.Path(target["executable"]).read_bytes(),old)
+                journal=json.loads((pathlib.Path(target["state_dir"])/"op-1.json").read_text())
+                self.assertEqual(journal["failure"]["type"],"ValueError" if failure=="environment" else "RuntimeError")
+                line=SOURCE.read_text().splitlines()[journal["failure"]["line"]-1]
+                self.assertIn({"daemon-reload":"daemon-reload", "restart":"restart", "health":"wait_for_health", "environment":"host.environment_has"}[failure],line)
+                self.assertNotIn("rollback_failure",journal)
+                self.assertEqual(journal["result"],result)
             finally: temp.cleanup()
         # Atomic write failures at each of the three writes.
         for index in range(3):
@@ -198,7 +204,54 @@ class Tests(unittest.TestCase):
         temp,target,host,result,_old,_new=self.run_install("health",True)
         try:
             self.assertEqual(result["status"],"rollback_failed")
+            journal=json.loads((pathlib.Path(target["state_dir"])/"op-1.json").read_text())
+            self.assertEqual(journal["failure"]["type"],"RuntimeError")
+            self.assertEqual(journal["rollback_failure"]["type"],"ValueError")
+            self.assertNotEqual(journal["failure"]["line"],journal["rollback_failure"]["line"])
             self.assertEqual(b.install(target,self.req(),b"\x7fELFnew",host)["status"],"rollback_failed")
+            self.assertEqual(json.loads((pathlib.Path(target["state_dir"])/"op-1.json").read_text()),journal)
+        finally: temp.cleanup()
+
+
+    def test_listener_startup_wait_is_bounded_and_does_not_hide_bad_identity(self):
+        from unittest.mock import patch
+        import urllib.error
+        original=FakeHost.health
+        attempts=[]
+        def starting(host,url):
+            attempts.append(url)
+            if len(attempts)==1: raise urllib.error.URLError("listener not ready")
+            if len(attempts)==2: raise urllib.error.HTTPError(url,503,"starting",{},io.BytesIO())
+            return original(host,url)
+        with patch.object(FakeHost,"health",starting), patch.object(b.time,"sleep"):
+            temp,target,host,result,old,new=self.run_install()
+        try:
+            self.assertEqual(result["status"],"succeeded")
+            self.assertEqual(len(attempts),3)
+        finally: temp.cleanup()
+        for failure in (urllib.error.URLError("still starting"), urllib.error.HTTPError("http://localhost",401,"denied",{},io.BytesIO())):
+            with patch.object(FakeHost,"health",side_effect=failure) as health, patch.object(b.time,"monotonic",side_effect=[0,31]), patch.object(b.time,"sleep") as sleep:
+                temp,target,host,result,old,new=self.run_install()
+            try:
+                self.assertEqual(result["status"],"rolled_back")
+                self.assertEqual(health.call_count,1)
+                sleep.assert_not_called()
+            finally: temp.cleanup()
+        with patch.object(FakeHost,"health",return_value={"status":"healthy","backendId":"other","backendRegion":"eu1"}) as health, patch.object(b.time,"sleep") as sleep:
+            temp,target,host,result,old,new=self.run_install()
+        try:
+            self.assertEqual(result["status"],"rolled_back")
+            self.assertEqual(health.call_count,1)
+            sleep.assert_not_called()
+        finally: temp.cleanup()
+        def restarted(host,url):
+            host.pid += 1
+            return original(host,url)
+        with patch.object(FakeHost,"health",restarted):
+            temp,target,host,result,old,new=self.run_install()
+        try:
+            self.assertEqual(result["status"],"rolled_back")
+            self.assertEqual(pathlib.Path(target["executable"]).read_bytes(),old)
         finally: temp.cleanup()
 
 
