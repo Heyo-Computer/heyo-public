@@ -130,6 +130,8 @@ pub struct DeploySpec {
     #[serde(default = "default_region")]
     pub region: String,
     #[serde(default)]
+    pub deployment_environment: Option<String>,
+    #[serde(default)]
     pub placement_pool: Option<String>,
     #[serde(default)]
     pub replica_regions: Vec<String>,
@@ -288,7 +290,9 @@ impl ServiceSpecRequest {
             async_deploy: self.deploy.async_deploy, deployment_id: self.deploy.deployment_id,
             name: self.deploy.name, archive_id: self.deploy.archive_id,
             archive_name: self.deploy.archive_name, archive_bytes_base64: self.deploy.archive_bytes_base64,
-            region: self.deploy.region, placement_pool: self.deploy.placement_pool,
+            region: self.deploy.region,
+            deployment_environment: self.deploy.deployment_environment,
+            placement_pool: self.deploy.placement_pool,
             driver: self.vm.driver, image: self.vm.image, ports, port_mappings: vec![], mounts,
             env: Some(env), env_refs, start_command: self.vm.start_command,
             working_directory: self.vm.working_directory, setup_hooks: self.vm.setup_hooks,
