@@ -1,8 +1,8 @@
 name: regional-rollout-preflight
 
-on:
-  submit:
-    paths: ['.ci/workflows/regional-rollout-preflight.yml']
+# Explicit diagnostic, not a release gate: a fresh installation has no baseline.
+# Include this file using ci.workflowPath and select it with --only.
+on: submit
 
 jobs:
   inspect:
