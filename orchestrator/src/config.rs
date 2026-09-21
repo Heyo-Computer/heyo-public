@@ -124,6 +124,13 @@ pub struct DiscoveryObserver {
     pub region: String,
     pub deployment_id: String,
     pub base_url: String,
+    /// Opt in to host-managed ingress. Origin used to probe this particular
+    /// ingress, with the service route's Host header (not a global LB URL).
+    #[serde(default)]
+    pub ingress_url: Option<String>,
+    /// Exact authoritative service discovery URL, identical at every ingress.
+    #[serde(default)]
+    pub discovery_url: Option<String>,
     /// HeyoSecret path containing an app-lb admin bearer. Never persisted in
     /// rollout requests or returned by status APIs.
     pub token_secret_path: String,

@@ -25,8 +25,22 @@ jobs:
         run: |
           set -eu
           python3 - <<'PY'
-          import json, os, urllib.request, urllib.error
+          import json, os, urllib.request, urllib.error, urllib.parse
           problems = []
+          service = 'regional-rollout-smoke'
+          def read(url, token):
+              request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + token})
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  return json.load(response)
+          def peer(url):
+              parsed = urllib.parse.urlsplit(url)
+              host = parsed.hostname
+              if not host or parsed.scheme != 'http' or parsed.username or parsed.password:
+                  raise ValueError('discovery endpoint must be a credential-free HTTP URL')
+              if ':' in host:
+                  host = '[' + host + ']'
+              return f'{host}:{parsed.port or 80}'
+          snapshots = []
           print(json.dumps({'credentialsPresent': {k: bool(os.environ.get(k)) for k in ['US3_TOKEN', 'EU1_TOKEN', 'ORCHESTRATOR_TOKEN']}}), flush=True)
           for region, deployment in [('us3', 'orchestrator-us3-next'), ('eu1', 'orchestrator-eu1')]:
               token = os.environ[region.upper() + '_TOKEN']
@@ -68,6 +82,36 @@ jobs:
                   if body.get('error') != 'Regional rollout not found':
                       raise SystemExit(f'{region}: regional rollout API not installed')
               print(region + ': authenticated regional rollout API available', flush=True)
+              base = f'https://orchestrator.{region}.heyo.work/orchestration/services/{service}'
+              baseline = read(base, token)
+              if not baseline.get('route') or not baseline.get('ingressBackendUrl'):
+                  problems.append(f'{region}: {service} has no established discovery ingress')
+              try:
+                  snapshot = read(base + '/discovery', token)
+              except urllib.error.HTTPError as error:
+                  if error.code != 404:
+                      raise
+                  problems.append(f'{region}: {service} has no discovery snapshot')
+                  continue
+              snapshots.append(snapshot)
+              accepting = {peer(e['url']) for e in snapshot['endpoints'] if e['healthStatus'] == 'healthy' and not e['draining']}
+              covered = {e.get('region') for e in snapshot['endpoints'] if e['healthStatus'] == 'healthy' and not e['draining']}
+              if not {'us3', 'eu1'}.issubset(covered):
+                  problems.append(f'{region}: healthy baseline replicas do not cover both regions')
+              admin = f'https://admin.{region}.heyo.work'
+              admin_token = os.environ[region.upper() + '_TOKEN']
+              deployments = read(admin + '/deployments', admin_token)
+              observers = [d['spec'] for d in deployments if (d.get('spec', {}).get('discovery') or {}).get('service_id') == service]
+              if not observers:
+                  problems.append(f'{region}: no app-lb deployment discovers {service}')
+              for spec in observers:
+                  observation = read(admin + '/deployments/' + urllib.parse.quote(spec['id'], safe='') + '/discovery-status', admin_token)
+                  observed = {u['peer'] for u in observation['upstreams'] if not u['draining']}
+                  if observation.get('serviceId') != service or observation.get('version') != snapshot['version'] or observed != accepting:
+                      problems.append(f'{region}: app-lb has not adopted the exact discovery baseline')
+          if len(snapshots) == 2 and snapshots[0] != snapshots[1]:
+              problems.append('Regional orchestrators return different service discovery snapshots; one shared rollout authority is not established')
           if problems:
               raise SystemExit('; '.join(problems))
+          print('Live ingress prerequisites verified; this is not proof of a completed regional rollout', flush=True)
           PY

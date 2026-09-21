@@ -38,7 +38,7 @@ const SERVICE_CANDIDATE_EVENT_SUBSCRIBE_TIMEOUT_SECONDS: u64 = 10;
 const SERVICE_CANDIDATE_STATUS_POLL_INTERVAL_SECONDS: u64 = 5;
 const SERVICE_HEALTH_REQUEST_TIMEOUT_SECONDS: u64 = 5;
 const SERVICE_HEALTH_MAX_BACKOFF_SECONDS: u64 = 10;
-const SERVICE_HEALTH_STABILIZATION_SECONDS: u64 = 10;
+pub(super) const SERVICE_HEALTH_STABILIZATION_SECONDS: u64 = 10;
 const SERVICE_REVISION_CHECK_TIMEOUT_SECONDS: u64 = 30;
 const SERVICE_RETIREMENT_RECONCILE_INTERVAL_SECONDS: u64 = 15;
 const MAX_SERVICE_REPLICAS: u16 = 16;
@@ -568,6 +568,12 @@ pub(super) async fn validate_service_deployment_request(
             ));
         }
         let route = request.route.as_ref().expect("traffic mode requires route");
+        if super::host_ingress::enabled(state, &service_id) {
+            super::host_ingress::validate(state, &service_id, route)
+                .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+            validate_regional_observers(state, &service_id, &request.replica_regions).await
+                .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+        }
         if route.path_prefix.as_deref().is_none_or(str::is_empty) {
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -3870,6 +3876,16 @@ async fn cutover_service_ingress_to_app_lb(
     health_path: &str,
     timeout_seconds: u64,
 ) -> Result<String> {
+    if super::host_ingress::enabled(state, service_id) {
+        let snapshot = service_discovery::read_snapshot(service_id).await?.context("no service discovery baseline")?;
+        let ingress = super::host_ingress::establish(state, service_id, route, health_path, timeout_seconds, &snapshot).await?;
+        persist_service_ingress_target(service_id, route, &ingress).await?;
+        record_service_deployment_event(state, rollout_id, service_id,
+            "app-lb-ingress-active", "running",
+            "Host-managed ingress instances adopted discovery and passed routed health checks.",
+            None, Some(json!({"route": route, "ingressBackendUrl": ingress})), None).await?;
+        return Ok(ingress);
+    }
     let app_lb_state = read_service_state(state, "app-lb").await?;
     let app_lb_backend_url = app_lb_state
         .active_backend_url

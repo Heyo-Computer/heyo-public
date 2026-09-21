@@ -671,6 +671,12 @@ combined. A withdrawn generation is fenced from new admission before its snapsho
 acknowledged. The endpoint returns `400 Bad Request` for a deployment without `discovery` and
 `404 Not Found` for an unknown id.
 
+`sourceUrl`, when present, is the exact Orchestrator discovery endpoint that supplied
+the durably applied snapshot. It is persisted with `version`, not inferred from the
+current environment. Legacy state acquires it after a successful poll. Once stamped,
+a different discovery authority is rejected rather than mixing its version sequence
+with the old one. Discovery redirects are not followed.
+
 #### Cordoning and draining a static upstream
 
 Health and operator intent are deliberately separate. A failed probe excludes an upstream until
@@ -781,7 +787,17 @@ wins (the body's id can't retarget another deployment). Crucially, the running
 pool is *preserved* whenever the `vm` template is unchanged — a scaling, route,
 or health edit never disturbs live VMs; only a change to the `vm` block reboots
 them, because the existing VMs were built from the old template. (This is unlike
-`POST /deployments`, which always replaces and tears the pool down.)
+`POST /deployments`, which replaces and tears the pool down unless create-only is requested.)
+
+For safe bootstrap, send `If-None-Match: *` on `POST /deployments`. An existing id
+returns **412 Precondition Failed**, checked under the deployment change lock before
+mutation or teardown. A failed initial persistence returns an error rather than
+claiming registration succeeded. `GET /deployments` advertises this support with
+`X-App-Lb-Create-Only: 1`; clients must check it before relying on the header with
+older servers. Requests without the header retain replacement semantics.
+Create-only discovery registration also requires exact-host routes and rejects
+overlap with another deployment's routes with **409 Conflict**. This prevents a
+new deployment id from silently capturing existing production traffic.
 
 `GET /deployments/:id` returns an `ETag` for the response's complete normalized
 `spec`. To make a compare-and-swap update, send that exact value in

@@ -368,6 +368,10 @@ pub struct DeploymentState {
     /// than the last upstream membership it routed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_version: Option<u64>,
+    /// Source that actually supplied the durable discovery version, not just
+    /// the current environment setting. Prevents falsely attesting a new source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_source_url: Option<String>,
 }
 
 #[derive(Debug)]

@@ -101,6 +101,48 @@ rollout plan. Use authenticated app-lb admin endpoints. The controller queries
 discovery version, matching serving membership, and zero in-flight requests for
 withdrawn peers at every observer. A sleep alone is never proof of drain.
 
+## Bootstrap with existing host-managed app-lbs
+
+For a new service, use the ordinary `POST /orchestration/services/deployments`
+API with `desiredReplicas`, `replicaRegions`, and a route with `host`,
+`pathPrefix`, and `stripPrefix: false`. Include the service in
+`discovery_routed_services`. Opt into host-managed ingress by adding both fields
+below to **every** observer for that service:
+
+```toml
+ingress_url = "https://eu-ingress.example.com"
+discovery_url = "https://orchestrator.example.com/orchestration/services/example/discovery"
+```
+
+`ingress_url` addresses that specific ingress, not a global load balancer. Health
+probes use the service route's Host header and preserve its prefix. TLS validates
+the ingress URL hostname. The `discovery_url` must be identical across observers;
+each app-lb must already have `APP_LB_DISCOVERY_URL` pointing to that authority's
+base URL and `APP_LB_DISCOVERY_TOKEN` configured through its managed secrets.
+Controllers executing the same rollout must share the same PostgreSQL state;
+this feature does not replicate independent regional databases.
+
+Bootstrap verifies that the authoritative snapshot equals the controller's
+snapshot, then creates missing discovery deployments through app-lb. It requires
+the app-lb create-only capability and uses `If-None-Match: *`, never a replacing
+POST. Existing deployments must have the same discovery service and route.
+Use an unclaimed service hostname/prefix; this is not a migration of existing
+production routing. Legacy Traefik-specific route options are rejected.
+
+Only after **all** observers attest the applied source, membership, and version,
+and all ingress health probes remain successful, does orchestrator persist the
+ingress baseline. It does not require an orchestrator service named `app-lb` or
+call the legacy `/service-routes` API. The scalar `ingressBackendUrl` retains the
+first configured ingress origin for compatibility; the observer configuration
+represents the full ingress set. Regional plans pin that set, including source
+and probe URLs, so changes cannot silently bypass an admitted plan's gates.
+
+A failed or interrupted bootstrap may leave discovery registrations and healthy
+candidates. They are retained, not destructively rolled back; retry the same
+deployment revision to reconcile them. Conflicting routes or credentials require
+operator correction. After bootstrap, use `regional-rollouts` for subsequent
+drain-before-upgrade revisions; the regional API never registers or changes routes.
+
 ## Scope and verification
 
 This is a **service** rollout primitive. It does not yet orchestrate a whole-region

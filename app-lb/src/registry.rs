@@ -299,6 +299,7 @@ impl Registry {
                     == spec.discovery.as_ref().map(|value| &value.service_id);
                 if !same_discovery_service {
                     state.discovery_version = None;
+                    state.discovery_source_url = None;
                 }
                 // Discovery can temporarily withdraw an address and later
                 // return it. Do not turn that absence into an implicit operator

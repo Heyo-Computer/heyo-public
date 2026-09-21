@@ -3157,11 +3157,29 @@ fn check_etag_precondition(expected: Option<&str>, current: &DeploymentSpec) -> 
     }
 }
 
+fn discovery_route_conflicts(registry: &Registry, spec: &DeploymentSpec) -> bool {
+    spec.routes.iter().any(|new| {
+        let Some(host) = new.host.as_deref() else { return true };
+        let prefix = new.path_prefix.as_deref().unwrap_or("/");
+        registry.deployments().values().any(|d| d.spec.routes.iter().any(|old| {
+            let old_prefix = old.path_prefix.as_deref().unwrap_or("/");
+            old.matches(Some(host), old_prefix)
+                && (prefix.starts_with(old_prefix) || old_prefix.starts_with(prefix))
+        }))
+    })
+}
+
 async fn register(
     State(state): State<AdminState>,
     caller: Option<axum::Extension<Caller>>,
+    headers: axum::http::HeaderMap,
     Json(mut spec): Json<DeploymentSpec>,
 ) -> impl IntoResponse {
+    let create_only = match headers.get(axum::http::header::IF_NONE_MATCH) {
+        None => false,
+        Some(value) if value == "*" => true,
+        Some(_) => return err(StatusCode::BAD_REQUEST, "If-None-Match must be *").into_response(),
+    };
     // A namespace token may omit the namespace and have its own filled in.
     // Runs first, so the assumed namespace is what secret refs bind to.
     assume_namespace(&mut spec, caller.as_ref().map(|c| &c.0));
@@ -3230,6 +3248,12 @@ async fn register(
     // from booting until teardown's final old-state capture has published.
     let change = state.registry.change_guard().await;
     let old = state.registry.get(&id);
+    if create_only && old.is_some() {
+        return err(StatusCode::PRECONDITION_FAILED, "deployment already exists").into_response();
+    }
+    if create_only && spec.discovery.is_some() && discovery_route_conflicts(&state.registry, &spec) {
+        return err(StatusCode::CONFLICT, "discovery bootstrap needs an unclaimed exact-host route").into_response();
+    }
     if old.as_ref().is_some_and(|d| crate::rollout::reserved(d)) {
         return err(StatusCode::CONFLICT, "candidate rollout reserves this deployment").into_response();
     }
@@ -3247,6 +3271,10 @@ async fn register(
     let deployment = state.registry.upsert(spec);
     if let Err(e) = state.registry.persist_one(&id) {
         tracing::error!(deployment = %id, error = %e, "failed to persist state");
+        if create_only {
+            state.registry.remove(&id);
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "failed to persist new deployment").into_response();
+        }
     }
     drop(change);
     if let Some(old) = old {
@@ -3515,7 +3543,7 @@ async fn list(
         .map(|d| status_of(&state, d))
         .collect();
     out.sort_by(|a, b| a.spec.id.cmp(&b.spec.id));
-    Json(out)
+    ([("x-app-lb-create-only", "1")], Json(out))
 }
 
 async fn get_one(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
@@ -3544,6 +3572,8 @@ async fn get_one(State(state): State<AdminState>, Path(id): Path<String>) -> imp
 #[serde(rename_all = "camelCase")]
 struct DiscoveryStatusResponse {
     service_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_url: Option<String>,
     version: Option<u64>,
     upstreams: Vec<DiscoveryUpstreamStatus>,
 }
@@ -3580,6 +3610,7 @@ fn discovery_status_locked(
     }
     Ok(DiscoveryStatusResponse {
         service_id: discovery.service_id.clone(),
+        source_url: deployment.state().discovery_source_url.clone(),
         version: deployment.state().discovery_version,
         upstreams: upstreams
             .into_iter()
@@ -5573,6 +5604,20 @@ async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_bootstrap_cannot_shadow_another_route() {
+        let registry = Registry::new("unused.json");
+        let spec = |id: &str, host: &str, prefix: &str| -> DeploymentSpec {
+            serde_json::from_value(serde_json::json!({"id":id,"discovery":{"service_id":id},
+                "routes":[{"host":host,"path_prefix":prefix}]})).unwrap()
+        };
+        registry.upsert(spec("production", "app.example", "/api"));
+        assert!(discovery_route_conflicts(&registry, &spec("new", "app.example", "/api/v2")));
+        assert!(discovery_route_conflicts(&registry, &spec("new", "APP.example", "/")));
+        assert!(!discovery_route_conflicts(&registry, &spec("new", "app.example", "/test")));
+        assert!(!discovery_route_conflicts(&registry, &spec("new", "other.example", "/api")));
+    }
 
     #[test]
     fn discovery_status_uses_durable_version_and_rejects_other_deployments() {

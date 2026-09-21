@@ -1,4 +1,5 @@
 pub mod internal;
+mod host_ingress;
 pub mod orchestration;
 mod regional_observers;
 mod regional_plan;

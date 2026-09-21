@@ -13,6 +13,8 @@ use crate::{config::DiscoveryObserver, AppState};
 #[serde(rename_all = "camelCase")]
 struct Observation {
     service_id: String,
+    #[serde(default)]
+    source_url: Option<String>,
     version: Option<u64>,
     upstreams: Vec<Upstream>,
 }
@@ -39,6 +41,13 @@ fn observer_url(observer: &DiscoveryObserver) -> Result<reqwest::Url> {
 }
 
 pub(super) fn topology(state: &AppState, service_id: &str) -> Result<String> {
+    if super::host_ingress::enabled(state, service_id) {
+        let mut members = state.config.discovery_observers.iter().filter(|o| o.service_id == service_id)
+            .map(|o| Ok((o.region.clone(), observer_url(o)?.to_string(), o.ingress_url.clone(), o.discovery_url.clone())))
+            .collect::<Result<Vec<_>>>()?;
+        members.sort();
+        return Ok(serde_json::to_string(&members)?);
+    }
     let mut members = state.config.discovery_observers.iter().filter(|o| o.service_id == service_id)
         .map(|o| Ok((o.region.clone(), observer_url(o)?.to_string())))
         .collect::<Result<Vec<_>>>()?;
@@ -102,6 +111,13 @@ pub(super) async fn regional_observe(
         if token.trim().is_empty() { bail!("observer credential is empty"); }
         let observation: Observation = client.get(observer_url(observer)?)
             .bearer_auth(token.trim()).send().await?.error_for_status()?.json().await?;
+        if let Some(expected) = &observer.discovery_url {
+            match observation.source_url.as_ref() {
+                None => ready = false, // first poll has not been durably applied
+                Some(source) if source != expected => bail!("ingress is not consuming the configured authoritative discovery URL"),
+                Some(_) => {}
+            }
+        }
         ready &= observation_ready(&observation, service_id, snapshot.version, &peers)?;
         // Adoption means the serving set matches too: a manually edited or
         // operator-cordoned pool must not claim successful traffic restoration.
@@ -133,7 +149,7 @@ mod tests {
 
     #[test]
     fn stale_empty_and_wrong_service_observations_are_not_drain_proof() {
-        let mut o = Observation { service_id: "ci".into(), version: None, upstreams: vec![] };
+        let mut o = Observation { service_id: "ci".into(), source_url: None, version: None, upstreams: vec![] };
         let peers = vec!["eu:8080".into()];
         assert!(!observation_ready(&o, "ci", 9, &peers).unwrap());
         o.version = Some(8);

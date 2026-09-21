@@ -35,8 +35,10 @@ impl DiscoveryConfig {
         }
         let base_url = reqwest::Url::parse(&url)
             .map_err(|e| format!("APP_LB_DISCOVERY_URL is invalid: {e}"))?;
-        if !matches!(base_url.scheme(), "http" | "https") {
-            return Err("APP_LB_DISCOVERY_URL must use http or https".into());
+        if !matches!(base_url.scheme(), "http" | "https") || !base_url.username().is_empty()
+            || base_url.password().is_some() || base_url.query().is_some() || base_url.fragment().is_some()
+        {
+            return Err("APP_LB_DISCOVERY_URL must be credential-free HTTP(S) without query or fragment".into());
         }
         Ok(Some(Self { base_url, token, interval: Duration::from_secs(interval) }))
     }
@@ -73,6 +75,7 @@ impl DiscoveryWatcher {
     pub fn new(cfg: DiscoveryConfig, registry: Arc<Registry>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("discovery HTTP client configuration is valid");
         Self { cfg, registry, client, failed: Default::default() }
@@ -113,7 +116,8 @@ impl DiscoveryWatcher {
     }
 
     async fn refresh(&self, deployment_id: &str, service_id: &str) -> Result<bool, String> {
-        let snapshot: Snapshot = self.client.get(self.service_url(service_id)?)
+        let source = self.service_url(service_id)?.to_string();
+        let snapshot: Snapshot = self.client.get(&source)
             .bearer_auth(&self.cfg.token).send().await.map_err(|e| e.to_string())?
             .error_for_status().map_err(|e| e.to_string())?
             .json().await.map_err(|e| e.to_string())?;
@@ -127,20 +131,30 @@ impl DiscoveryWatcher {
             return Ok(false);
         }
         let previous_version = current.state().discovery_version;
-        if !should_apply(
+        let previous_source = current.state().discovery_source_url.clone();
+        if previous_source.as_ref().is_some_and(|old| old != &source) {
+            return Err("discovery authority changed; refusing to reuse the previous source's version".into());
+        }
+        if previous_version.is_some_and(|v| snapshot.version < v) || (previous_source.is_some() && !should_apply(
             previous_version,
             snapshot.version,
             &current.spec.upstreams,
             &upstreams,
-        ) {
+        )) {
             return Ok(false);
         }
         let deployment = self.registry.apply_discovery_upstreams(&current, upstreams);
-        deployment.mutate_state(|state| state.discovery_version = Some(snapshot.version));
+        deployment.mutate_state(|state| {
+            state.discovery_version = Some(snapshot.version);
+            state.discovery_source_url = Some(source);
+        });
         if let Err(error) = self.registry.persist_one(deployment_id) {
             // Keep the previous version eligible for retry. The in-memory
             // upstream set is already safe to route, but it is not durable yet.
-            deployment.mutate_state(|state| state.discovery_version = previous_version);
+            deployment.mutate_state(|state| {
+                state.discovery_version = previous_version;
+                state.discovery_source_url = previous_source;
+            });
             return Err(error.to_string());
         }
         Ok(true)
@@ -211,6 +225,40 @@ impl BackgroundService for DiscoveryWatcher {
 mod tests {
     use super::*;
     use crate::config::{DeploymentSpec, SpecError};
+
+    #[tokio::test]
+    async fn applied_source_is_persisted_and_cannot_be_relabelled_after_restart() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route("/orchestration/services/svc/discovery", axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"serviceId":"svc","version":7,"endpoints":[
+                {"url":"http://node:8080","healthStatus":"healthy","draining":false}]}))
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let dir = std::env::temp_dir().join(format!("app-lb-discovery-{}", crate::rollout::revision()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let registry = Arc::new(Registry::new(&path));
+        let spec: DeploymentSpec = serde_json::from_value(serde_json::json!({"id":"svc",
+            "routes":[{"host":"svc.example"}],"discovery":{"service_id":"svc"},"upstreams":["node:8080"]})).unwrap();
+        registry.upsert(spec).mutate_state(|s| s.discovery_version = Some(7));
+        let cfg = DiscoveryConfig { base_url: base.parse().unwrap(), token: "test".into(), interval: Duration::from_secs(1) };
+        let watcher = DiscoveryWatcher::new(cfg.clone(), registry.clone());
+        // Even unchanged legacy membership must acquire an actual source stamp.
+        assert!(watcher.refresh("svc", "svc").await.unwrap());
+        let source = format!("{base}/orchestration/services/svc/discovery");
+        assert_eq!(registry.get("svc").unwrap().state().discovery_source_url.as_deref(), Some(source.as_str()));
+        assert!(!watcher.refresh("svc", "svc").await.unwrap());
+        let loaded = Arc::new(Registry::new(&path));
+        loaded.load().unwrap();
+        assert_eq!(loaded.get("svc").unwrap().state().discovery_source_url.as_deref(), Some(source.as_str()));
+        loaded.get("svc").unwrap().mutate_state(|s| s.discovery_source_url = Some("http://original-authority".into()));
+        let restarted = DiscoveryWatcher::new(cfg, loaded.clone());
+        assert!(restarted.refresh("svc", "svc").await.unwrap_err().contains("authority changed"));
+        assert_eq!(loaded.get("svc").unwrap().state().discovery_source_url.as_deref(), Some("http://original-authority"));
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn converts_only_plain_pathless_urls() {
