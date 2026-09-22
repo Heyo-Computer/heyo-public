@@ -9,6 +9,7 @@ use sqlx::Row;
 use std::{collections::BTreeMap, io::Read, sync::Arc, time::Duration};
 
 pub const ACTION: &str = "ci/bootstrap-host-heyvm";
+pub const HEYVMD_ACTION: &str = "ci/rollout-host-heyvmd";
 const REPOSITORY: &str = "https://github.com/Heyo-Computer/heyo.git";
 const LIMIT: usize = 512 * 1024 * 1024;
 
@@ -18,6 +19,8 @@ pub struct Target {
     repository: String, app_lb_admin_url: String, app_lb_deployment: String, app_lb_namespace: String,
     runner_hd_id: String, backend_server_id: String, executable: String, unit: String, state_dir: String,
     config_json_path: String, systemd_drop_in_path: String, local_health_url: String, target_alias: String, region: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_manager: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -28,9 +31,17 @@ struct Request { alias: String, target: Target, token_secret: String, artifact: 
 fn sha(bytes: &[u8]) -> String { hex::encode(Sha256::digest(bytes)) }
 fn canonical(value:&Value)->Value { match value { Value::Object(m)=>Value::Object(m.iter().map(|(k,v)|(k.clone(),canonical(v))).collect::<BTreeMap<_,_>>().into_iter().collect()), Value::Array(a)=>Value::Array(a.iter().map(canonical).collect()), v=>v.clone() } }
 fn terminal_phase(phase:&str)->bool { matches!(phase,"passed"|"failed"|"superseded") }
+async fn reconnect_daemon(d:&Dispatcher,req:&Request)->Result<()> {
+    if req.artifact.component.as_deref()==Some("heyvmd") {
+        ensure!(d.config.heyvm.local_runner.is_none(),"daemon rollout requires a real runner tunnel, not local-runner mode");
+        d.runners.evict(&req.target.runner_hd_id).await;
+        d.runners.options_for(&req.target.runner_hd_id).await?;
+    }
+    Ok(())
+}
 
 pub fn validate_plan(plan: &JobPlan) -> Result<()> {
-    for (i, step) in plan.steps.iter().enumerate().filter(|(_,s)| s.uses.as_deref()==Some(ACTION)) {
+    for (i, step) in plan.steps.iter().enumerate().filter(|(_,s)| matches!(s.uses.as_deref(),Some(ACTION|HEYVMD_ACTION))) {
         ensure!(i+1==plan.steps.len() && !step.continue_on_error && !plan.continue_on_error,
             "host heyvm bootstrap must be the final job step and may not tolerate errors");
         ensure!(!plan.target.is_existing_vm() && plan.native_labels.is_empty(), "host heyvm bootstrap requires a CI-owned VM");
@@ -57,7 +68,7 @@ async fn trusted(d:&Dispatcher, alias:&str)->Result<Target>{
     mapping(raw,alias)
 }
 
-fn inspect(bytes:&[u8])->Result<(String,String,String)> {
+fn inspect_component(bytes:&[u8],component:&str)->Result<(String,String,String)> {
     ensure!(bytes.len()<=LIMIT,"bootstrap artifact exceeds bound");
     let mut unpacked=Vec::new();
     flate2::read::GzDecoder::new(bytes).take((LIMIT+1) as u64).read_to_end(&mut unpacked)?;
@@ -70,11 +81,12 @@ fn inspect(bytes:&[u8])->Result<(String,String,String)> {
         if name.starts_with("heyvm-") && name.ends_with("-unknown-linux-gnu-x86_64.tar.gz") { ensure!(found.is_none()&&e.header().entry_type().is_file(),"ambiguous inner heyvm archive"); let mut b=Vec::new(); e.take((LIMIT+1) as u64).read_to_end(&mut b)?; ensure!(b.len()<=LIMIT,"inner archive exceeds bound"); found=Some((p.to_string_lossy().into_owned(),b)); }
     }
     let (path,inner)=found.ok_or_else(||anyhow::anyhow!("exactly one inner heyvm tarball is required"))?;
-    let elf=crate::host_maintenance::executable_digest(&inner)?;
+    let elf=crate::host_maintenance::component_executable_digest(&inner,component)?;
     Ok((path,sha(&inner),elf))
 }
 
-fn expected_files(t:&Target)->(String,String){
+fn expected_files(t:&Target,component:&str)->(String,String){
+    if component=="heyvmd" { return (sha(b""),sha(b"")); }
     let config=(serde_json::to_string(&json!({"executable":t.executable,"maintenanceStateDirectory":t.state_dir,"systemdUnit":t.unit,"target":t.target_alias})).unwrap()+"\n").into_bytes();
     let drop=format!("[Service]\nEnvironment=HEYVM_HOST_UPDATE_CONFIG={}\n",t.config_json_path);
     (sha(&config),sha(drop.as_bytes()))
@@ -84,7 +96,7 @@ fn launcher_spec(id:&str, namespace:&str, command:String)->Value { json!({"id":i
     "routes":[{"host":format!("{id}.invalid")}],"maintenance":true,"upstreams":["bootstrap-unreachable.invalid:1"],
     "health":{"path":null,"timeout_secs":2},"update":{"working_dir":"/","commands":[command],"timeout_secs":600,"verify_timeout_secs":0}}) }
 
-pub async fn request(d:&Dispatcher,msg:&JobMessage,plan:&JobPlan,step:&str,alias:&str,token_expression:&str,workflow:&str,name:&str,timeout:Duration)->Result<String>{
+pub async fn request(d:&Dispatcher,msg:&JobMessage,plan:&JobPlan,step:&str,alias:&str,token_expression:&str,workflow:&str,name:&str,timeout:Duration,component:&str)->Result<String>{
     validate_plan(plan)?; crate::submission::authorize_publication(&d.store,&msg.run_id).await.map_err(anyhow::Error::msg)?;
     let target=trusted(d,alias).await?; let secret=crate::host_maintenance::token_secret(token_expression)?;
     let run=d.store.get_run(&msg.run_id).await?.ok_or_else(||anyhow::anyhow!("missing run"))?;
@@ -98,10 +110,16 @@ pub async fn request(d:&Dispatcher,msg:&JobMessage,plan:&JobPlan,step:&str,alias
     let store=d.config.artifacts.as_ref().ok_or_else(||anyhow::anyhow!("CI artifact HTTP sink is not configured"))?.url.trim_end_matches('/');
     let expected_url=format!("{store}/blobs/{digest}"); ensure!(stored.public_url.as_deref()==Some(expected_url.as_str()),"bootstrap artifact must be public from the configured CI HTTP sink");
     let bytes=d.artifacts.get(&stored).await.map_err(|e|anyhow::anyhow!(e.to_string()))?; ensure!(sha(&bytes)==digest,"artifact digest mismatch");
-    let (inner_path,inner_archive_sha256,heyvm_sha256)=inspect(&bytes)?;
+    ensure!(matches!(component,"heyvm"|"heyvmd"),"unsupported host component");
+    if component=="heyvmd" {
+        ensure!(matches!(target.process_manager.as_deref(),Some("systemd"|"supervisor")),"heyvmd target requires an explicit process manager");
+        ensure!(d.config.heyvm.local_runner.is_none(),"daemon rollout requires a real runner tunnel, not local-runner mode");
+        ensure!(std::path::Path::new(&target.executable).file_name().is_some_and(|name|name=="heyvmd"),"daemon rollout target must name heyvmd");
+    }
+    let (inner_path,inner_archive_sha256,heyvm_sha256)=inspect_component(&bytes,component)?;
     let id=format!("ci-heyvm-{}",sha(step.as_bytes())); let launcher=format!("heyvm-bootstrap-{}",sha(id.as_bytes())[..32].to_string());
-    let artifact=Artifact{operation_id:id.clone(),artifact_url:expected_url,artifact_sha256:digest,artifact_size:stored.size_bytes,inner_path,inner_archive_sha256,heyvm_sha256};
-    let request_hash=sha(&serde_json::to_vec(&canonical(&serde_json::to_value(&artifact)?))?); let (config_sha256,systemd_drop_in_sha256)=expected_files(&target);
+    let artifact=Artifact{operation_id:id.clone(),artifact_url:expected_url,artifact_sha256:digest,artifact_size:stored.size_bytes,inner_path,inner_archive_sha256,heyvm_sha256,component:(component=="heyvmd").then(||component.into())};
+    let request_hash=sha(&serde_json::to_vec(&canonical(&serde_json::to_value(&artifact)?))?); let (config_sha256,systemd_drop_in_sha256)=expected_files(&target,component);
     let req=Request{alias:alias.into(),target:target.clone(),token_secret:secret,artifact,request_sha256:request_hash,config_sha256,systemd_drop_in_sha256};
     let command=crate::host_heyvm_bootstrap::recipe(&serde_json::to_string(&BTreeMap::from([(alias.to_string(),target.clone())]))?,alias,&req.artifact)?;
     let spec=launcher_spec(&launcher,&target.app_lb_namespace,command); let value=serde_json::to_value(&req)?;
@@ -198,7 +216,9 @@ async fn reconcile(d:&Dispatcher,id:&str,token:&str,configured:Option<&Target>)-
         if matches.len()==1 {job_id=matches[0]["id"].as_str().map(str::to_string);} else if matches.is_empty(){return Ok(())} else {bail!("launcher job ambiguity; target remains fenced")}
         if let Some(j)=&job_id{sqlx::query("UPDATE ci_host_heyvm_bootstrap SET launcher_job_id=$2,phase='polling',updated_at=now() WHERE id=$1 AND phase='armed' AND launcher_job_id IS NULL").bind(id).bind(j).execute(d.store.pool()).await?;}return Ok(())}
     let Some(job_id)=job_id else{return Ok(())};let jobv=launcher_job(&http,base,token,&launcher,&job_id).await?;
-    match jobv["status"].as_str(){Some("queued"|"running")=>{},Some("succeeded")=>match receipt(&jobv,&req,&launcher){Ok(r)=>finish(&d.store,id,true,"Exact native heyvm bootstrap receipt verified; target uncordoned.",Some(&r)).await?,Err(_)=>finish(&d.store,id,false,"Launcher receipt was missing, ambiguous, mismatched, or reported rollback; target remains fenced.",None).await?},_=>finish(&d.store,id,false,"Launcher/bootstrap failed or rolled back; target remains fenced.",None).await?};
+    match jobv["status"].as_str(){Some("queued"|"running")=>{},Some("succeeded")=>match receipt(&jobv,&req,&launcher){Ok(r)=>{
+        reconnect_daemon(d,&req).await?;
+        finish(&d.store,id,true,"Exact native host executable receipt and runner tunnel reconnection verified; target uncordoned.",Some(&r)).await?},Err(_)=>finish(&d.store,id,false,"Launcher receipt was missing, ambiguous, mismatched, or reported rollback; target remains fenced.",None).await?},_=>finish(&d.store,id,false,"Launcher/bootstrap failed or rolled back; target remains fenced.",None).await?};
     let _=run;Ok(())
 }
 
@@ -269,6 +289,7 @@ pub async fn recover(d:&Dispatcher,run_id:&str,id:&str)->Result<Value> {
     }).await??;
     ensure!(live==original,"live verification differs from original receipt");
     ensure!(trusted(d,&req.alias).await?==req.target,"bootstrap target configuration drifted during recovery");
+    reconnect_daemon(d,&req).await?;
     let result=json!({"operation_id":id,"status":"recovered","receipt":live,"original_job_id":original_job,
         "verification_deployment":verifier,"verification_job_id":verify_job,"recovered_at":chrono::Utc::now()});
     sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase='passed',result=$2,updated_at=now() WHERE id=$1").bind(id).bind(&result).execute(&mut *tx).await?;
@@ -333,12 +354,17 @@ mod tests {
 
     #[test]
     fn plan_and_receipt_are_closed() {
-        let wf=crate::workflow::Workflow::parse("x.yml","jobs:\n  x:\n    vm: {driver: firecracker}\n    steps:\n      - uses: ci/bootstrap-host-heyvm\n        with: {target: eu1, token: '${{ secrets.ADMIN }}', workflow: build.yml, artifact: heyvm}\n").unwrap();
-        assert!(validate_plan(&crate::plan::Plan::build(&wf).unwrap().jobs[0]).is_ok());
-        let mut bad=wf.clone();
-        let step=bad.jobs[0].1.steps[0].clone();
-        bad.jobs[0].1.steps.push(step);
-        assert!(crate::plan::Plan::build(&bad).is_err());
+        for action in [ACTION,HEYVMD_ACTION] {
+            let yaml="jobs:\n  x:\n    vm: {driver: firecracker}\n    steps:\n      - uses: ACTION\n        with: {target: eu1, token: '${{ secrets.ADMIN }}', workflow: build.yml, artifact: heyvm}\n".replace("ACTION",action);
+            let wf=crate::workflow::Workflow::parse("x.yml",&yaml).unwrap();
+            let plan=crate::plan::Plan::build(&wf).unwrap();
+            assert!(validate_plan(&plan.jobs[0]).is_ok());
+            assert!(crate::submission::validate_validation_plan(&plan).is_err());
+            let mut bad=wf.clone();
+            let step=bad.jobs[0].1.steps[0].clone();
+            bad.jobs[0].1.steps.push(step);
+            assert!(crate::plan::Plan::build(&bad).is_err());
+        }
     }
 
     #[test]
@@ -353,6 +379,10 @@ mod tests {
             header.set_mode(0o755);
             header.set_cksum();
             archive.append_data(&mut header,"heyvm",&binary[..]).unwrap();
+            let daemon=b"\x7fELFnetwork-daemon";
+            header.set_size(daemon.len() as u64);
+            header.set_cksum();
+            archive.append_data(&mut header,"heyvmd",&daemon[..]).unwrap();
             archive.into_inner().unwrap().finish().unwrap();
         }
         let mut outer_tar=Vec::new();
@@ -368,10 +398,11 @@ mod tests {
         let mut encoder=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default());
         std::io::Write::write_all(&mut encoder,&outer_tar).unwrap();
         let outer=encoder.finish().unwrap();
-        let (path,archive_sha,binary_sha)=inspect(&outer).unwrap();
+        let (path,archive_sha,binary_sha)=inspect_component(&outer,"heyvm").unwrap();
         assert_eq!(path,"dist/heyvm-0.48.1-unknown-linux-gnu-x86_64.tar.gz");
         assert_eq!(archive_sha,sha(&inner));
         assert_eq!(binary_sha,sha(b"\x7fELFbootstrap"));
+        assert_eq!(inspect_component(&outer,"heyvmd").unwrap().2,sha(b"\x7fELFnetwork-daemon"));
 
         let mut ambiguous_tar=Vec::new();
         {
@@ -388,7 +419,7 @@ mod tests {
         let mut encoder=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default());
         std::io::Write::write_all(&mut encoder,&ambiguous_tar).unwrap();
         let ambiguous=encoder.finish().unwrap();
-        assert!(inspect(&ambiguous).is_err());
+        assert!(inspect_component(&ambiguous,"heyvm").is_err());
     }
 
     #[test]

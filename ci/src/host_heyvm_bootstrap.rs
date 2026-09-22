@@ -19,6 +19,8 @@ pub(crate) struct Artifact {
     pub inner_path: String,
     pub inner_archive_sha256: String,
     pub heyvm_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
 }
 
 #[cfg(test)]
@@ -53,7 +55,7 @@ mod tests {
 
     fn artifact() -> Artifact { Artifact { operation_id:"op-1".into(), artifact_url:"https://art.example/blob".into(),
         artifact_sha256:"a".repeat(64), artifact_size:42, inner_path:"validation/heyvm.tar.gz".into(),
-        inner_archive_sha256:"b".repeat(64), heyvm_sha256:"c".repeat(64) } }
+        inner_archive_sha256:"b".repeat(64), heyvm_sha256:"c".repeat(64), component:None } }
 
     #[test]
     fn recipe_is_bounded_secret_free_deterministic_and_does_not_embed_executable() {

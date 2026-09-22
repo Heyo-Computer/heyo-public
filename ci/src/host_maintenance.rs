@@ -73,6 +73,11 @@ pub fn token_secret(expression: &str) -> Result<String> {
 /// Hash exactly the executable Cloud will extract. Ambiguous or unsafe archives
 /// never acquire executable provenance, even if otherwise publishable as services.
 pub fn executable_digest(bytes: &[u8]) -> Result<String> {
+    component_executable_digest(bytes, "heyvm")
+}
+
+pub fn component_executable_digest(bytes: &[u8], component: &str) -> Result<String> {
+    ensure!(matches!(component, "heyvm" | "heyvmd"), "unsupported executable component");
     const LIMIT: u64 = 512 * 1024 * 1024;
     ensure!(bytes.len() as u64 <= LIMIT, "archive exceeds verification budget");
     let decoder = flate2::read::GzDecoder::new(bytes).take(LIMIT + 1);
@@ -85,18 +90,19 @@ pub fn executable_digest(bytes: &[u8]) -> Result<String> {
         ensure!(total <= LIMIT, "archive expansion exceeds verification budget");
         let path = entry.path()?.into_owned();
         ensure!(path.components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)), "unsafe archive member path");
-        if path.file_name().is_some_and(|n| n == "heyvm") {
+        if (component == "heyvm" && path.file_name().is_some_and(|n| n == "heyvm"))
+            || (component == "heyvmd" && path == std::path::Path::new(component)) {
             ensure!(digest.is_none() && entry.header().entry_type().is_file() && (4..=256*1024*1024).contains(&entry.size()),
-                "ambiguous, linked or oversized heyvm executable");
+                "ambiguous, linked or oversized host executable");
             let mut magic = [0; 4]; entry.read_exact(&mut magic)?;
-            ensure!(&magic == b"\x7fELF", "heyvm is not ELF");
+            ensure!(&magic == b"\x7fELF", "host executable is not ELF");
             let mut hash = Sha256::new(); hash.update(magic);
             std::io::copy(&mut entry, &mut hash)?;
             digest = Some(hex::encode(hash.finalize()));
         }
     }
     ensure!(archive.into_inner().limit() > 0, "archive expansion exceeds verification budget");
-    digest.ok_or_else(|| anyhow::anyhow!("archive has no heyvm executable"))
+    digest.ok_or_else(|| anyhow::anyhow!("archive has no requested host executable"))
 }
 
 pub async fn cordoned(store: &Store, runner: &str) -> Result<bool> {

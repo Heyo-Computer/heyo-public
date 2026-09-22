@@ -1595,6 +1595,57 @@ with `target: eu1`, verify its deployment event reaches `passed`, then use norma
 `ci/host-heyvm-maintenance` for subsequent upgrades. Do not rerun bootstrap to
 repair a retained fence; reconcile the persisted operation and launcher job.
 
+### Managed heyvmd rollout
+
+`ci/rollout-host-heyvmd` uses the same durable coordinator, runner fence, drain,
+single app-lb launcher delivery, receipt reconciliation, and explicit recovery
+contract as `ci/bootstrap-host-heyvm`. Its inputs are the same closed set:
+`target`, direct `${{ secrets.NAME }}` `token`, frozen validation `workflow`, and
+public `artifact`. Unlike the bootstrap action, it selects the exact root
+`heyvmd` ELF from the validated inner `heyvm-*-unknown-linux-gnu-x86_64.tar.gz`;
+it never installs or renames `heyvm`.
+
+The trusted operator mapping remains at
+`ci-controller/host-heyvm-bootstrap-targets`. A heyvmd target adds the required
+`process_manager`, whose only accepted values are `systemd` and `supervisor`.
+`unit` is the existing systemd unit (for example `heyvmd-eu1.service`) or the
+existing Supervisor program name (for example `heyvmd-ci`). `executable` must be
+the existing `/usr/local/bin/heyvmd`. All other fields are unchanged from the
+mapping above; config/drop-in paths remain required for schema compatibility but
+are not read or modified by heyvmd rollout. The action does not modify units or
+VMs.
+
+Systemd `KillMode=process` remains required for heyvm. For heyvmd only,
+`KillMode=control-group` is also accepted when the unit's cgroup and every child
+cgroup contain only its main daemon PID. Missing cgroup evidence or any other
+process blocks the operation. Local-runner development mode cannot verify a
+regional tunnel and is rejected for daemon rollout.
+
+The installer durably journals and retains the previous binary, verifies the
+predecessor disk/running identity, atomically replaces only the daemon binary,
+restarts through the selected manager, and verifies changed PID/start time plus
+the exact disk and `/proc/PID/exe` hashes. Failure restores and restarts the old
+binary; rollback failure is terminal and retained. A local health response alone
+cannot release the fence: after the exact launcher receipt, CI evicts its old
+runner tunnel and must establish a fresh authenticated tunnel probe to that
+runner. Failed reconnection keeps the operation polling and the runner fenced.
+
+Complete operator mapping examples (replace identities and URLs with the trusted
+values for each region) are:
+
+```json
+{
+  "heyvmd-eu1": {"repository":"https://github.com/Heyo-Computer/heyo.git","app_lb_admin_url":"https://eu1.heyo.computer/app-lb-admin","app_lb_deployment":"app-lb-eu1","app_lb_namespace":"default","runner_hd_id":"<eu1-hd-id>","backend_server_id":"<eu1-backend-id>","executable":"/usr/local/bin/heyvmd","unit":"heyvmd-eu1.service","state_dir":"/var/lib/heyvmd-host-update","config_json_path":"/etc/heyvmd-host-update-unused.json","systemd_drop_in_path":"/etc/systemd/system/heyvmd-eu1.service.d/host-update-unused.conf","local_health_url":"http://127.0.0.1:<eu1-backend-port>/health","target_alias":"heyvmd-eu1","region":"eu1","process_manager":"systemd"},
+  "heyvmd-us3": {"repository":"https://github.com/Heyo-Computer/heyo.git","app_lb_admin_url":"https://us3.heyo.computer/app-lb-admin","app_lb_deployment":"app-lb-us3","app_lb_namespace":"default","runner_hd_id":"<us3-hd-id>","backend_server_id":"<us3-backend-id>","executable":"/usr/local/bin/heyvmd","unit":"heyvmd-ci","state_dir":"/var/lib/heyvmd-host-update","config_json_path":"/etc/heyvmd-host-update-unused.json","systemd_drop_in_path":"/etc/supervisor/conf.d/heyvmd-host-update-unused.conf","local_health_url":"http://127.0.0.1:<us3-backend-port>/health","target_alias":"heyvmd-us3","region":"us3","process_manager":"supervisor"}
+}
+```
+
+The parent release workflow invokes one final step per target with this input
+shape: `uses: ci/rollout-host-heyvmd`, `with.target` equal to the mapping key,
+`with.token` a direct app-lb namespace-admin secret expression, and
+`with.workflow` / `with.artifact` naming the frozen validation artifact that
+contains both Linux executables.
+
 After restarting the service, bootstrap retries transient health connection
 failures and HTTP 502/503/504 responses for 30 seconds. A reachable endpoint with
 the wrong backend identity still fails immediately. Rollback journals retain

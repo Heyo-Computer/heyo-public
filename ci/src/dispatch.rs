@@ -2630,7 +2630,7 @@ impl Dispatcher {
             .ok_or_else(|| DispatchError::StepFailed(format!("{action} requires with.{key}")));
 
         if matches!(action, "ci/merge-release" | "ci/publish-service-archive" |
-            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance" | "ci/bootstrap-host-heyvm" | "ci/rollout-service" | "ci/rollout-host-app-lb") {
+            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance" | "ci/bootstrap-host-heyvm" | "ci/rollout-host-heyvmd" | "ci/rollout-service" | "ci/rollout-host-app-lb") {
             crate::submission::authorize_publication(&self.store, &msg.run_id).await
                 .map_err(DispatchError::StepFailed)?;
         }
@@ -2808,10 +2808,11 @@ impl Dispatcher {
                     &required("archive-id")?, &secret, step_timeout(step, plan)).await
                     .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
             }
-            "ci/bootstrap-host-heyvm" => {
+            "ci/bootstrap-host-heyvm" | "ci/rollout-host-heyvmd" => {
                 required("token")?;
+                let component=if step.uses.as_deref()==Some("ci/rollout-host-heyvmd"){"heyvmd"}else{"heyvm"};
                 crate::host_heyvm_bootstrap_coordinator::request(self,msg,plan,sid,&required("target")?,
-                    step.with.get("token").map(String::as_str).unwrap_or(""),&required("workflow")?,&required("artifact")?,step_timeout(step,plan)).await
+                    step.with.get("token").map(String::as_str).unwrap_or(""),&required("workflow")?,&required("artifact")?,step_timeout(step,plan),component).await
                     .map(|note|(note,json!({}))).map_err(|e|DispatchError::StepFailed(e.to_string()))
             }
             "ci/upload-artifact" => {

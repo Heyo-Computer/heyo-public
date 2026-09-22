@@ -27,8 +27,10 @@ REPOSITORY = "https://github.com/Heyo-Computer/heyo.git"
 TARGET_FIELDS = {"repository", "app_lb_admin_url", "app_lb_deployment", "app_lb_namespace",
                  "runner_hd_id", "backend_server_id", "executable", "unit", "state_dir",
                  "config_json_path", "systemd_drop_in_path", "local_health_url", "target_alias", "region"}
+DAEMON_TARGET_FIELDS = TARGET_FIELDS | {"process_manager"}
 REQUEST_FIELDS = {"operation_id", "artifact_url", "artifact_sha256", "artifact_size", "inner_path",
                   "inner_archive_sha256", "heyvm_sha256"}
+DAEMON_REQUEST_FIELDS = REQUEST_FIELDS | {"component"}
 TERMINAL = {"succeeded", "rolled_back", "rollback_failed"}
 
 
@@ -66,15 +68,18 @@ def mapping(raw, alias):
     if not isinstance(values, dict) or alias not in values:
         raise ValueError("unknown target alias")
     target = values[alias]
-    closed(target, TARGET_FIELDS, "target")
+    if not isinstance(target, dict) or set(target) not in (TARGET_FIELDS, DAEMON_TARGET_FIELDS):
+        raise ValueError("target fields differ from closed schema")
     if target["target_alias"] != alias or target["repository"] != REPOSITORY:
         raise ValueError("target identity mismatch")
     endpoint(target["app_lb_admin_url"])
     endpoint(target["local_health_url"], True)
     for field in ("executable", "state_dir", "config_json_path", "systemd_drop_in_path"):
         safe_path(target[field], field == "state_dir")
-    if not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", target["unit"]):
-        raise ValueError("invalid systemd service unit")
+    manager = target.get("process_manager", "systemd")
+    if manager not in ("systemd", "supervisor"): raise ValueError("invalid process manager")
+    if manager == "systemd" and not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", target["unit"]): raise ValueError("invalid systemd service unit")
+    if manager == "supervisor" and not re.fullmatch(r"[A-Za-z0-9_.@-]+", target["unit"]): raise ValueError("invalid Supervisor process name")
     for field in ("app_lb_deployment", "app_lb_namespace", "runner_hd_id", "backend_server_id", "region"):
         if not isinstance(target[field], str) or not target[field] or len(target[field]) > 128:
             raise ValueError("invalid target identity")
@@ -82,7 +87,8 @@ def mapping(raw, alias):
 
 
 def request(value):
-    closed(value, REQUEST_FIELDS, "request")
+    if not isinstance(value, dict) or set(value) not in (REQUEST_FIELDS, DAEMON_REQUEST_FIELDS): raise ValueError("request fields differ from closed schema")
+    if value.get("component", "heyvm") not in ("heyvm", "heyvmd"): raise ValueError("invalid component")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value["operation_id"]): raise ValueError("invalid operation ID")
     endpoint(value["artifact_url"])
     if not isinstance(value["artifact_size"], int) or not 0 < value["artifact_size"] <= MAX_ARTIFACT: raise ValueError("invalid artifact size")
@@ -123,11 +129,12 @@ def executable(outer, req):
     archive.close()
     if sha(inner) != req["inner_archive_sha256"]: raise ValueError("inner archive identity mismatch")
     archive, members = _members(inner, "r:gz")
-    found = [m for m in members if m.name == "heyvm"]
-    if len(found) != 1 or not found[0].isfile() or not 4 <= found[0].size <= MAX_HEYVM: raise ValueError("missing or ambiguous heyvm")
+    component = req.get("component", "heyvm")
+    found = [m for m in members if (pathlib.PurePosixPath(m.name).name == "heyvm" if component == "heyvm" else pathlib.PurePosixPath(m.name) == pathlib.PurePosixPath(component))]
+    if len(found) != 1 or not found[0].isfile() or not 4 <= found[0].size <= MAX_HEYVM: raise ValueError("missing or ambiguous requested executable")
     binary = archive.extractfile(found[0]).read(MAX_HEYVM + 1)
     archive.close()
-    if not binary.startswith(b"\x7fELF") or sha(binary) != req["heyvm_sha256"]: raise ValueError("heyvm identity mismatch")
+    if not binary.startswith(b"\x7fELF") or sha(binary) != req["heyvm_sha256"]: raise ValueError("executable identity mismatch")
     return binary
 
 
@@ -138,6 +145,11 @@ class Host:
     def starttime(self, pid): return pathlib.Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()[19]
     def proc_exe(self, pid): return os.path.realpath(f"/proc/{pid}/exe")
     def proc_digest(self, pid): return sha(pathlib.Path(f"/proc/{pid}/exe").read_bytes())
+    def cgroup_pids(self, group):
+        safe_path(group, directory=True)
+        root = pathlib.Path("/sys/fs/cgroup") / group.lstrip("/")
+        files = [root / "cgroup.procs", *root.glob("**/*/cgroup.procs")]
+        return {int(pid) for path in files for pid in path.read_text().split()}
     def environment_has(self, pid, expected):
         data = pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
         return data.count(("HEYVM_HOST_UPDATE_CONFIG=" + expected).encode()) == 1
@@ -148,12 +160,21 @@ class Host:
             return json.loads(response.read(1024 * 1024 + 1))
 
 
-def service(host, target):
-    keys = "LoadState ActiveState KillMode MainPID ExecStart".split()
+def service(host, target, component="heyvm"):
+    if target.get("process_manager", "systemd") == "supervisor":
+        text = host.command(["supervisorctl", "pid", target["unit"]]).strip()
+        if not text.isdigit() or int(text) <= 1: raise ValueError("unsafe Supervisor process state")
+        pid = int(text)
+        if host.proc_exe(pid) != os.path.realpath(target["executable"]): raise ValueError("service executable differs")
+        return {"boot_id": host.boot_id(), "pid": pid, "starttime": host.starttime(pid), "disk_sha256": sha(pathlib.Path(target["executable"]).read_bytes()), "running_sha256": host.proc_digest(pid)}
+    keys = "LoadState ActiveState KillMode MainPID ExecStart ControlGroup".split()
     text = host.command(["systemctl", "show", target["unit"], "--property=" + ",".join(keys)])
     values = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
-    if values.get("LoadState") != "loaded" or values.get("ActiveState") != "active" or values.get("KillMode") != "process": raise ValueError("unsafe service state")
+    if values.get("LoadState") != "loaded" or values.get("ActiveState") != "active": raise ValueError("unsafe service state")
     pid = int(values.get("MainPID", "0")); command = values.get("ExecStart", "")
+    if values.get("KillMode") != "process":
+        if component != "heyvmd" or values.get("KillMode") != "control-group" or host.cgroup_pids(values.get("ControlGroup", "")) != {pid}:
+            raise ValueError("unsafe service process group")
     # systemctl show serializes ExecCommand with an authoritative path= field.
     paths = re.findall(r"(?:^|[ {;])path=([^ ;}]+)", command)
     # The legacy eu1 service starts a stable symlink. Before the one-time
@@ -239,14 +260,22 @@ def exact_files(target):
     return config_bytes, drop
 
 
+def restart(host, target):
+    if target.get("process_manager", "systemd") == "supervisor": host.command(["supervisorctl", "restart", target["unit"]])
+    else: host.command(["systemctl", "restart", target["unit"]])
+
+
 def restore(host, target, journal):
-    for key, path in (("executable", target["executable"]), ("config", target["config_json_path"]), ("drop_in", target["systemd_drop_in_path"])):
+    daemon = journal.get("component") == "heyvmd"
+    files = (("executable", target["executable"]),) if daemon else (("executable", target["executable"]), ("config", target["config_json_path"]), ("drop_in", target["systemd_drop_in_path"]))
+    for key, path in files:
         old = journal["predecessors"][key]
         if old.get("link_target") is not None: atomic_symlink(path, old["link_target"])
         elif old["present"]: atomic(path, base64.b64decode(old["bytes"], validate=True), old["mode"])
         elif pathlib.Path(path).exists() or pathlib.Path(path).is_symlink(): pathlib.Path(path).unlink(); fsync_dir(pathlib.Path(path).parent)
-    host.command(["systemctl", "daemon-reload"]); host.command(["systemctl", "restart", target["unit"]])
-    now = service(host, target)
+    if not daemon: host.command(["systemctl", "daemon-reload"])
+    restart(host, target)
+    now = service(host, target, journal.get("component", "heyvm"))
     before = journal["service"]
     if now["disk_sha256"] != before["disk_sha256"] or now["running_sha256"] != before["running_sha256"] or host.proc_exe(now["pid"]) != os.path.realpath(target["executable"]):
         raise ValueError("rollback verification failed")
@@ -260,30 +289,33 @@ def install(target, req, binary, host=None):
         if old.get("request_sha256") != operation_hash: raise ValueError("operation ID request conflict")
         if old.get("status") in TERMINAL: return old["result"]
         raise ValueError("operation is nonterminal; operator reconciliation required")
-    before = service(host, target)
+    component=req.get("component", "heyvm"); daemon=component == "heyvmd"
+    before = service(host, target, component)
     if before["disk_sha256"] != before["running_sha256"]: raise ValueError("predecessor executable drift")
-    journal = {"version": 1, "operation_id": req["operation_id"], "request_sha256": operation_hash, "status": "prepared", "service": before,
-               "predecessors": {"executable": secure_file(target["executable"], MAX_HEYVM, allow_symlink=True), "config": secure_file(target["config_json_path"], MAX_SMALL_BACKUP),
-                                "drop_in": secure_file(target["systemd_drop_in_path"], MAX_SMALL_BACKUP)}}
+    predecessors={"executable": secure_file(target["executable"], MAX_HEYVM, allow_symlink=True)}
+    if not daemon: predecessors.update(config=secure_file(target["config_json_path"], MAX_SMALL_BACKUP), drop_in=secure_file(target["systemd_drop_in_path"], MAX_SMALL_BACKUP))
+    journal = {"version": 1, "component":component, "operation_id": req["operation_id"], "request_sha256": operation_hash, "status": "prepared", "service": before, "predecessors":predecessors}
     pathlib.Path(target["state_dir"]).mkdir(parents=True, exist_ok=True, mode=0o700)
     save_journal(journal_path, journal)  # durable before the first mutation
     config, drop = exact_files(target)
     try:
-        atomic(target["executable"], binary, 0o755); atomic(target["config_json_path"], config, 0o600); atomic(target["systemd_drop_in_path"], drop, 0o644)
-        host.command(["systemctl", "daemon-reload"]); host.command(["systemctl", "restart", target["unit"]])
-        now = service(host, target)
+        atomic(target["executable"], binary, 0o755)
+        if not daemon:
+            atomic(target["config_json_path"], config, 0o600); atomic(target["systemd_drop_in_path"], drop, 0o644); host.command(["systemctl", "daemon-reload"])
+        restart(host, target)
+        now = service(host, target, component)
         if now["boot_id"] != before["boot_id"] or now["pid"] == before["pid"] or now["starttime"] == before["starttime"]: raise ValueError("service generation did not change")
         if now["disk_sha256"] != req["heyvm_sha256"] or now["running_sha256"] != req["heyvm_sha256"] or host.proc_exe(now["pid"]) != os.path.realpath(target["executable"]): raise ValueError("new executable verification failed")
-        if pathlib.Path(target["config_json_path"]).read_bytes() != config or pathlib.Path(target["systemd_drop_in_path"]).read_bytes() != drop: raise ValueError("installed file verification failed")
-        if not exact_regular(target["executable"], 0o755) or not exact_regular(target["config_json_path"], 0o600) or not exact_regular(target["systemd_drop_in_path"], 0o644): raise ValueError("installed ownership or mode verification failed")
-        if not host.environment_has(now["pid"], target["config_json_path"]): raise ValueError("service environment verification failed")
+        if not daemon and (pathlib.Path(target["config_json_path"]).read_bytes() != config or pathlib.Path(target["systemd_drop_in_path"]).read_bytes() != drop): raise ValueError("installed file verification failed")
+        if not exact_regular(target["executable"], 0o755) or (not daemon and (not exact_regular(target["config_json_path"], 0o600) or not exact_regular(target["systemd_drop_in_path"], 0o644))): raise ValueError("installed ownership or mode verification failed")
+        if not daemon and not host.environment_has(now["pid"], target["config_json_path"]): raise ValueError("service environment verification failed")
         health = wait_for_health(host, target["local_health_url"])
         if health.get("backendId", health.get("backend_id")) != target["backend_server_id"] or health.get("backendRegion", health.get("backend_region")) != target["region"] or health.get("status") not in ("ok", "healthy", "running"):
             raise ValueError("health identity or API status differs")
-        if service(host, target) != now: raise ValueError("service changed during health verification")
+        if service(host, target, component) != now: raise ValueError("service changed during health verification")
         result = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
                   "target_alias": target["target_alias"], "status": "succeeded", "heyvm_sha256": req["heyvm_sha256"],
-                  "config_sha256": sha(config), "systemd_drop_in_sha256": sha(drop),
+                  "config_sha256": sha(config) if not daemon else sha(b""), "systemd_drop_in_sha256": sha(drop) if not daemon else sha(b""),
                   "backend_server_id": target["backend_server_id"], "region": target["region"]}
         journal.update(status="succeeded", result=result); save_journal(journal_path, journal); return result
     except Exception as error:
@@ -312,20 +344,20 @@ def verify_existing(target, req, host=None):
     operation_hash = sha(json.dumps(req, sort_keys=True, separators=(",", ":")).encode())
     if old.get("status") != "succeeded" or old.get("request_sha256") != operation_hash:
         raise ValueError("no matching successful bootstrap journal")
-    config, drop = exact_files(target)
+    config, drop = exact_files(target); daemon=req.get("component", "heyvm") == "heyvmd"
     expected = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
                 "target_alias": target["target_alias"], "status": "succeeded", "heyvm_sha256": req["heyvm_sha256"],
-                "config_sha256": sha(config), "systemd_drop_in_sha256": sha(drop),
+                "config_sha256": sha(config) if not daemon else sha(b""), "systemd_drop_in_sha256": sha(drop) if not daemon else sha(b""),
                 "backend_server_id": target["backend_server_id"], "region": target["region"]}
     if old.get("result") != expected: raise ValueError("saved receipt differs")
-    now = service(host, target)
+    now = service(host, target, req.get("component", "heyvm"))
     if now["disk_sha256"] != req["heyvm_sha256"] or now["running_sha256"] != req["heyvm_sha256"] or host.proc_exe(now["pid"]) != os.path.realpath(target["executable"]):
         raise ValueError("current executable differs")
-    if pathlib.Path(target["config_json_path"]).read_bytes() != config or pathlib.Path(target["systemd_drop_in_path"]).read_bytes() != drop:
+    if not daemon and (pathlib.Path(target["config_json_path"]).read_bytes() != config or pathlib.Path(target["systemd_drop_in_path"]).read_bytes() != drop):
         raise ValueError("current bootstrap files differ")
-    if not exact_regular(target["executable"], 0o755) or not exact_regular(target["config_json_path"], 0o600) or not exact_regular(target["systemd_drop_in_path"], 0o644):
+    if not exact_regular(target["executable"], 0o755) or (not daemon and (not exact_regular(target["config_json_path"], 0o600) or not exact_regular(target["systemd_drop_in_path"], 0o644))):
         raise ValueError("current ownership or mode differs")
-    if not host.environment_has(now["pid"], target["config_json_path"]): raise ValueError("current environment differs")
+    if not daemon and not host.environment_has(now["pid"], target["config_json_path"]): raise ValueError("current environment differs")
     health = host.health(target["local_health_url"])
     if health.get("backendId", health.get("backend_id")) != target["backend_server_id"] or health.get("backendRegion", health.get("backend_region")) != target["region"] or health.get("status") not in ("ok", "healthy", "running"):
         raise ValueError("current health identity differs")

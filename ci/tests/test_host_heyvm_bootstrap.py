@@ -51,12 +51,26 @@ class FakeHost(b.Host):
     def starttime(self, _pid): return self.start
     def proc_exe(self, _pid): return os.path.realpath(self.target["executable"])
     def proc_digest(self, _pid): return b.sha(self.current)
+    def cgroup_pids(self, _group): return {self.pid}
     def environment_has(self, _pid, _expected):
         if self.fail == "environment": self.fail=None; return False
         return True
     def health(self, _url):
         if self.fail == "health": self.fail=None; raise RuntimeError("health")
         return {"status":"healthy","backendId":self.target["backend_server_id"],"backendRegion":self.target["region"]}
+
+
+class SupervisorHost(FakeHost):
+    def command(self, argv):
+        self.calls.append(tuple(argv))
+        if argv[:2] == ["supervisorctl", "pid"]: return str(self.pid)
+        if argv[:2] == ["supervisorctl", "restart"]:
+            if self.fail == "restart": self.fail=None; raise RuntimeError("restart")
+            disk=pathlib.Path(self.target["executable"]).read_bytes()
+            if self.rollback_fail and disk == self.old: self.current=self.new
+            else: self.current=disk
+            self.pid += 1; self.start=str(int(self.start)+1); return "restarted"
+        raise AssertionError(argv)
 
 
 class Tests(unittest.TestCase):
@@ -108,6 +122,18 @@ class Tests(unittest.TestCase):
             b.restore(host,target,journal)
             self.assertTrue(exe.is_symlink()); self.assertEqual(os.readlink(exe),str(release)); self.assertEqual(exe.read_bytes(),old)
 
+    def test_control_group_restart_is_only_allowed_for_an_isolated_daemon(self):
+        with tempfile.TemporaryDirectory() as td:
+            target=self.target(pathlib.Path(td)); exe=pathlib.Path(target["executable"]); exe.parent.mkdir(); exe.write_bytes(b"old")
+            host=FakeHost(target,b"old",b"new"); command=host.command
+            host.command=lambda argv: command(argv).replace("KillMode=process", "KillMode=control-group\nControlGroup=/system.slice/heyvmd.service")
+            self.assertEqual(b.service(host,target,"heyvmd")["pid"],10)
+            with self.assertRaises(ValueError): b.service(host,target,"heyvm")
+            for members in ({10,11}, set(), {11}):
+                host.cgroup_pids=lambda _group: members
+                with self.assertRaises(ValueError): b.service(host,target,"heyvmd")
+            self.assertEqual(exe.read_bytes(),b"old")
+
     def test_archives_reject_traversal_links_ambiguity_and_hashes(self):
         binary=b"\x7fELFpayload"; inner=tar([("heyvm",binary,"file")]); outer=tar([("validation/heyvm.tar.gz",inner,"file")],False)
         req=self.req(binary); req.update(artifact_size=len(outer),artifact_sha256=b.sha(outer),inner_archive_sha256=b.sha(inner))
@@ -119,6 +145,14 @@ class Tests(unittest.TestCase):
             with self.assertRaises(ValueError): b.executable(value,req)
         linked=tar([("heyvm",b"","link")]); out=tar([("validation/heyvm.tar.gz",linked,"file")],False); bad=req.copy(); bad["inner_archive_sha256"]=b.sha(linked)
         with self.assertRaises(ValueError): b.executable(out,bad)
+
+    def test_heyvmd_member_is_selected_exactly_and_corruption_precedes_side_effects(self):
+        daemon=b"\x7fELFdaemon"; cli=b"\x7fELFcli"; inner=tar([("heyvm",cli,"file"),("heyvmd",daemon,"file")]); outer=tar([("validation/heyvm.tar.gz",inner,"file")],False)
+        req=self.req(daemon); req.update(component="heyvmd",artifact_size=len(outer),artifact_sha256=b.sha(outer),inner_archive_sha256=b.sha(inner))
+        self.assertEqual(b.executable(outer,req),daemon)
+        for corrupt in (tar([("heyvm",cli,"file")]), tar([("heyvmd",daemon,"file"),("heyvmd",daemon,"file")])):
+            badouter=tar([("validation/heyvm.tar.gz",corrupt,"file")],False); bad=req.copy(); bad["inner_archive_sha256"]=b.sha(corrupt)
+            with self.assertRaises(ValueError): b.executable(badouter,bad)
 
     def run_install(self, fail=None, rollback_fail=False):
         temp=tempfile.TemporaryDirectory(); root=pathlib.Path(temp.name); target=self.target(root)
@@ -211,6 +245,32 @@ class Tests(unittest.TestCase):
             self.assertEqual(b.install(target,self.req(),b"\x7fELFnew",host)["status"],"rollback_failed")
             self.assertEqual(json.loads((pathlib.Path(target["state_dir"])/"op-1.json").read_text()),journal)
         finally: temp.cleanup()
+
+    def test_heyvmd_systemd_and_supervisor_restart_identity_rollback_and_replay(self):
+        for manager in ("systemd", "supervisor"):
+            with tempfile.TemporaryDirectory() as td:
+                root=pathlib.Path(td); target=self.target(root); target["process_manager"]=manager
+                if manager == "supervisor": target["unit"]="heyvmd-ci"
+                old=b"\x7fELFold"; new=b"\x7fELFdaemon"; exe=pathlib.Path(target["executable"]); exe.parent.mkdir(); exe.write_bytes(old); exe.chmod(0o755)
+                host=(SupervisorHost if manager == "supervisor" else FakeHost)(target,old,new)
+                req=self.req(new); req["component"]="heyvmd"
+                original_regular,original_secure=b.exact_regular,b.secure_file; b.exact_regular=lambda path,mode: stat.S_IMODE(pathlib.Path(path).stat().st_mode)==mode
+                b.secure_file=lambda path,limit,**opts: {"present":True,"mode":0o755,"bytes":__import__('base64').b64encode(pathlib.Path(path).read_bytes()).decode()}
+                try:
+                    result=b.install(target,req,new,host); self.assertEqual(result["status"],"succeeded")
+                    self.assertEqual(b.install(target,req,new,host),result)
+                    self.assertFalse(pathlib.Path(target["config_json_path"]).exists(),"daemon rollout must not modify unit/drop-in config")
+                finally: b.exact_regular=original_regular; b.secure_file=original_secure
+            with tempfile.TemporaryDirectory() as td:
+                root=pathlib.Path(td); target=self.target(root); target["process_manager"]=manager
+                if manager == "supervisor": target["unit"]="heyvmd-ci"
+                old=b"\x7fELFold"; new=b"\x7fELFdaemon"; exe=pathlib.Path(target["executable"]); exe.parent.mkdir(); exe.write_bytes(old); exe.chmod(0o755)
+                host=(SupervisorHost if manager == "supervisor" else FakeHost)(target,old,new,fail="health")
+                req=self.req(new); req["component"]="heyvmd"; original_regular,original_secure=b.exact_regular,b.secure_file; b.exact_regular=lambda path,mode: True
+                b.secure_file=lambda path,limit,**opts: {"present":True,"mode":0o755,"bytes":__import__('base64').b64encode(pathlib.Path(path).read_bytes()).decode()}
+                try:
+                    result=b.install(target,req,new,host); self.assertEqual(result["status"],"rolled_back"); self.assertEqual(exe.read_bytes(),old)
+                finally: b.exact_regular=original_regular; b.secure_file=original_secure
 
 
     def test_listener_startup_wait_is_bounded_and_does_not_hide_bad_identity(self):
