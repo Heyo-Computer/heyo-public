@@ -30,6 +30,7 @@
 //! they use it — the same indirection a deployment's git credential uses.
 
 pub mod pgfc;
+pub mod tunnel;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;

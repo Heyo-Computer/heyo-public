@@ -72,7 +72,14 @@ impl Drop for Ctx {
 /// The URL prefix Let's Encrypt fetches to validate an HTTP-01 challenge.
 const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 
+#[derive(Clone)]
 pub struct LbProxy {
+    /// True for the instance that serves streams arriving over an app-lb
+    /// tunnel (see `plugins::tunnel`). Those have no socket peer — the cloud
+    /// edge is the far end of the stream — so the visitor's address comes
+    /// from the edge's `X-Heyo-Client-IP` instead. Only on this instance: on
+    /// every other ingress the header is the client's own claim.
+    tunnel_ingress: bool,
     registry: Arc<Registry>,
     metrics: Arc<Metrics>,
     /// Outstanding HTTP-01 challenge responses, published by the ACME manager.
@@ -119,6 +126,7 @@ impl LbProxy {
         secrets: Arc<crate::secrets::SecretStore>,
     ) -> Self {
         Self {
+            tunnel_ingress: false,
             registry,
             metrics,
             challenges,
@@ -129,6 +137,14 @@ impl LbProxy {
             feed,
             auth_providers,
             secrets,
+        }
+    }
+
+    /// The same proxy, for streams that arrived over an app-lb tunnel.
+    pub fn for_tunnel_ingress(&self) -> Self {
+        Self {
+            tunnel_ingress: true,
+            ..self.clone()
         }
     }
 
@@ -181,9 +197,7 @@ impl LbProxy {
         // The socket peer, never `X-Forwarded-For`. Keying enforcement on a
         // client-supplied header would let anyone get anyone else refused, and
         // let the attacker exempt themselves by setting it.
-        let client = session
-            .client_addr()
-            .and_then(|a| a.as_inet().map(|inet| inet.ip()));
+        let client = peer_ip(session, self.tunnel_ingress);
         let facts = RequestFacts {
             client,
             host: host.as_deref(),
@@ -529,6 +543,29 @@ async fn serve_site(session: &mut Session, spec: &crate::config::SiteSpec, path:
     Ok(())
 }
 
+/// The header the cloud edge sets on tunnel ingress: the visitor's address as
+/// the edge's own proxy saw it.
+pub const TUNNEL_CLIENT_IP: &str = "x-heyo-client-ip";
+
+/// The address the request came from.
+///
+/// The socket peer, never a client-settable header — except on tunnel
+/// ingress, where there is no socket peer and the edge (the only party that
+/// can open a tunnel stream) vouches for the visitor in [`TUNNEL_CLIENT_IP`].
+pub(crate) fn peer_ip(session: &Session, tunnel_ingress: bool) -> Option<std::net::IpAddr> {
+    if tunnel_ingress {
+        return session
+            .req_header()
+            .headers
+            .get(TUNNEL_CLIENT_IP)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok());
+    }
+    session
+        .client_addr()
+        .and_then(|addr| addr.as_inet().map(|inet| inet.ip()))
+}
+
 /// Collect what the gate needs out of the live request.
 fn request_info<'a>(
     session: &'a Session,
@@ -536,6 +573,7 @@ fn request_info<'a>(
     path: &'a str,
     secure: bool,
     fronts_admin_api: bool,
+    client: Option<std::net::IpAddr>,
 ) -> RequestInfo<'a> {
     let req = session.req_header();
     let cookies = req
@@ -573,12 +611,11 @@ fn request_info<'a>(
         wants_html,
         fronts_admin_api,
         bearer,
-        // The socket peer, for the SIEM's per-source sign-in rules. Never an
-        // `X-Forwarded-For`: keying a detector on a client-supplied header is an
-        // alert-spoofing primitive on an unauthenticated path.
-        client: session
-            .client_addr()
-            .and_then(|addr| addr.as_inet().map(|inet| inet.ip())),
+        // The socket peer (see `peer_ip`), for the SIEM's per-source sign-in
+        // rules. Never an `X-Forwarded-For`: keying a detector on a
+        // client-supplied header is an alert-spoofing primitive on an
+        // unauthenticated path.
+        client,
     }
 }
 
@@ -796,6 +833,7 @@ impl ProxyHttp for LbProxy {
                 &path,
                 secure,
                 self.auth.fronts_admin_api(&deployment.spec),
+                peer_ip(session, self.tunnel_ingress),
             );
             let decision = if login_post {
                 let request_origin = session.req_header().headers.get("origin").and_then(|v| v.to_str().ok());
@@ -857,6 +895,9 @@ impl ProxyHttp for LbProxy {
         upstream: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // The edge's word about the visitor is for app-lb, never for an
+        // upstream — and on any other ingress it is only a client's claim.
+        upstream.remove_header(TUNNEL_CLIENT_IP);
         if let Some(assignment) = &ctx.regional_assignment {
             if let Some((spec, token, environment)) = &assignment.forward {
                 let mut headers = http::HeaderMap::new();
@@ -1168,10 +1209,9 @@ impl ProxyHttp for LbProxy {
                 bytes: session.body_bytes_sent(),
                 // The address only. The ephemeral port identifies the
                 // connection, not the caller.
-                client: session.client_addr().map(|addr| match addr.as_inet() {
-                    Some(inet) => inet.ip().to_string(),
-                    None => addr.to_string(),
-                }),
+                client: peer_ip(session, self.tunnel_ingress)
+                    .map(|ip| ip.to_string())
+                    .or_else(|| session.client_addr().map(|addr| addr.to_string())),
                 error: e.map(|err| err.to_string()),
             };
 
