@@ -2345,6 +2345,29 @@ which appear only when there is more than one page.
 
 ### Shared control-plane view
 
+Configure an already-running gateway with fleet-admin GET and PUT at
+`/control-plane/config`; these routes require authentication even when the admin
+or dashboard gates are disabled. GET returns `revision`, `config`, and
+`externally_managed`. PUT takes `{"expected_revision":0,"config":{"gateways":[],"control_plane":[]}}`,
+using the revision from GET and the origin/secret-reference arrays described
+below. Empty arrays explicitly disable that view. Credentials must already
+resolve in the gateway's secret store. Values are never part of this document.
+Only unconfined fleet admins may read or replace the bindings; view-only,
+deployment-scoped, and namespace-scoped tokens cannot change them.
+
+The complete configuration persists atomically beside `APP_LB_STATE_PATH` with the
+extension replaced by `.views.json`, then becomes visible to new requests without
+restarting app-lb. Stale revisions return 409; after a lost response, GET the
+current revision/config before retrying. Invalid input or unresolved credentials
+leave the previous snapshot active. Restart fails on corrupt persisted data
+rather than silently starting unconfigured. This is a single-owner local state
+file, not replicated application state: install the same bindings on both
+gateways and verify each against the shared authority.
+
+Explicit startup files below override the corresponding persisted bindings and
+make the configuration API read-only (PUT returns 409). Do not use the one-time
+host bootstrap to modify an already-bootstrapped host's service configuration.
+
 **Global applications** reads `GET /services`, which queries Orchestrator's
 shared PostgreSQL inventory rather than any gateway's local registry. Configure
 `APP_LB_CONTROL_PLANE_FILE` on each regional app-lb with a JSON array using the

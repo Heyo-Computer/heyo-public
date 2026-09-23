@@ -150,8 +150,7 @@ fn html_escape(s: &str) -> String {
 
 #[derive(Clone)]
 struct AdminState {
-    fleet: Option<Arc<crate::fleet::Fleet>>,
-    control_plane: Option<Arc<crate::fleet::Fleet>>,
+    views: Option<Arc<crate::fleet::ViewStore>>,
     rollouts: Arc<crate::rollout::Rollouts>,
     registry: Arc<Registry>,
     autoscaler: Arc<Autoscaler>,
@@ -321,8 +320,7 @@ impl AdminApi {
         Self {
             addr,
             state: AdminState {
-                fleet: None,
-                control_plane: None,
+                views: None,
                 rollouts: Arc::new(crate::rollout::Rollouts::new(registry.clone(), autoscaler.clone(), jobs.clone())),
                 registry,
                 autoscaler,
@@ -362,9 +360,8 @@ impl AdminApi {
         }
     }
 
-    pub fn with_fleet(mut self, fleet: Option<Arc<crate::fleet::Fleet>>, control_plane: Option<Arc<crate::fleet::Fleet>>) -> Self {
-        self.state.fleet = fleet;
-        self.state.control_plane = control_plane;
+    pub fn with_views(mut self, views: Arc<crate::fleet::ViewStore>) -> Self {
+        self.state.views = Some(views);
         self
     }
 }
@@ -5215,12 +5212,14 @@ async fn fleet_snapshot(State(state): State<AdminState>, axum::Extension(caller)
     if matches!(caller, Caller::Ungated) || !caller.covers_fleet() {
         return forbidden("authenticated fleet view required");
     }
-    let observations = match &state.fleet {
+    let snapshot = state.views.as_ref().map(|views| views.snapshot());
+    let fleet = snapshot.as_ref().and_then(|s| s.fleet.as_ref());
+    let observations = match fleet {
         Some(fleet) => fleet.observe().await,
         None => Vec::new(),
     };
     ([(header::CACHE_CONTROL, "no-store")], Json(serde_json::json!({
-        "configured": state.fleet.is_some(), "gateways": observations,
+        "configured": fleet.is_some(), "gateways": observations,
     }))).into_response()
 }
 
@@ -5236,7 +5235,8 @@ async fn services_snapshot(State(state): State<AdminState>, axum::Extension(call
     if matches!(caller, Caller::Ungated) || !caller.covers_fleet() {
         return forbidden("authenticated fleet view required");
     }
-    let Some(control) = &state.control_plane else {
+    let snapshot = state.views.as_ref().map(|views| views.snapshot());
+    let Some(control) = snapshot.as_ref().and_then(|s| s.control_plane.as_ref()) else {
         return ([(header::CACHE_CONTROL, "no-store")], Json(serde_json::json!({"configured":false}))).into_response();
     };
     match control.inventory(query.after.as_deref()).await {
@@ -5244,6 +5244,22 @@ async fn services_snapshot(State(state): State<AdminState>, axum::Extension(call
             "configured":true,"inventory":inventory,
         }))).into_response(),
         Err(error) => err(StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    }
+}
+
+async fn view_configuration(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>) -> Response {
+    if matches!(caller, Caller::Ungated) || !caller.covers_fleet() { return forbidden("authenticated fleet admin required"); }
+    let Some(views) = &state.views else { return err(StatusCode::SERVICE_UNAVAILABLE, "view store unavailable").into_response(); };
+    ([(header::CACHE_CONTROL, "no-store")], Json(views.snapshot())).into_response()
+}
+
+async fn configure_views(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Json(request): Json<crate::fleet::ConfigureViews>) -> Response {
+    if matches!(caller, Caller::Ungated) || !caller.covers_fleet() { return forbidden("authenticated fleet admin required"); }
+    let Some(views) = &state.views else { return err(StatusCode::SERVICE_UNAVAILABLE, "view store unavailable").into_response(); };
+    match views.configure(request) {
+        Ok(snapshot) => ([(header::CACHE_CONTROL, "no-store")], Json(snapshot)).into_response(),
+        Err((status, message)) => err(status, message).into_response(),
     }
 }
 
@@ -5432,8 +5448,13 @@ fn router(state: AdminState) -> Router {
         .route("/services", get(services_snapshot))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_fleet_view));
 
+    let views = Router::new()
+        .route("/control-plane/config", get(view_configuration).put(configure_views))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
+
     Router::new()
         .route("/healthz", get(healthz))
+        .merge(views)
         .merge(fleet)
         .merge(regional)
         .merge(recovery)
@@ -7616,6 +7637,7 @@ mod tests {
             for route in [
                 "/fleet",
                 "/services",
+                "/control-plane/config",
                 "/deployments",
                 "/secrets",
                 "/secrets/:id",
@@ -7633,6 +7655,20 @@ mod tests {
                     "{route} should be refused a deployment-scoped token",
                 );
             }
+        }
+
+        #[test]
+        fn control_plane_configuration_requires_fleet_admin() {
+            let t = store();
+            let route = "/control-plane/config";
+            let view = format!("Bearer {}", mint(&t, AdminScope::View, &["*"]));
+            let admin = format!("Bearer {}", mint(&t, AdminScope::Admin, &["*"]));
+            let namespace = format!("Bearer {}", mint_in_namespace(&t, AdminScope::Admin, "team-a"));
+            for credential in [&view, &namespace] {
+                assert!(matches!(on(Some(&basic()), &t, Some(credential), route, route, AdminScope::Admin), Verdict::Forbidden(_)));
+            }
+            assert!(matches!(on(Some(&basic()), &t, None, route, route, AdminScope::Admin), Verdict::Unauthorized));
+            assert!(matches!(on(Some(&basic()), &t, Some(&admin), route, route, AdminScope::Admin), Verdict::Allow(_)));
         }
 
         /// Minting is how you escalate, so it must not be reachable by anything

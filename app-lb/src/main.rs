@@ -959,12 +959,10 @@ fn main() {
             event_feed.clone(),
             &cfg.public_ips,
             cfg.deploy_host_base().map(str::to_string),
-        ).with_fleet(
-            fleet::Fleet::from_env("APP_LB_FLEET_FILE", secrets.clone())
-                .unwrap_or_else(|error| panic!("invalid fleet configuration: {error}")),
-            fleet::Fleet::from_env("APP_LB_CONTROL_PLANE_FILE", secrets.clone())
-                .unwrap_or_else(|error| panic!("invalid control plane configuration: {error}")),
-        ),
+        ).with_views(Arc::new(fleet::ViewStore::open(
+            std::path::Path::new(&cfg.state_path).with_extension("views.json"), secrets.clone(),
+            ["APP_LB_FLEET_FILE", "APP_LB_CONTROL_PLANE_FILE"].map(|key| std::env::var_os(key).map(Into::into)),
+        ).unwrap_or_else(|error| panic!("invalid view configuration: {error}")))),
     );
 
     let mut proxy_svc = pingora_proxy::http_proxy_service(

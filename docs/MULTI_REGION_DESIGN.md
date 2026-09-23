@@ -12,11 +12,40 @@ work. This document does not itself change running infrastructure.
   entry point; Retail is not the implementation surface. Regional entry points
   must show shared application state, not reinterpret their local registries as
   separate global inventories.
-- Local, not deployed: Orchestrator now exposes a paginated, internal-key-gated
+- Delivery status at 06:36 UTC: [PR 107](https://github.com/Heyo-Computer/heyo-public/pull/107)
+  merged through [release 37](https://ci.eu1.heyo.work/runs/01a0cce793b9-00000037).
+  Both Linux validations passed. us3 app-lb is publicly healthy at the new
+  revision, but us3 Orchestrator replacement failed; eu1 was skipped. Both
+  Orchestrators and eu1 app-lb still serve the previous revision. The first
+  submission failed during a CI daemon-tunnel timeout before merge; no failed
+  validation evidence was substituted into the fresh submission.
+- Concrete deployment blocker: operation
+  `ci-service-9e027fc01defe58b9324fb6be666d1d1a79021c67ff008b37e475afe63424171`
+  allocated `sb-eb09681b`, but us3 heyvm rejected its creation because `heyo-net`
+  has no usable `/30` TAP subnet in `10.88.0.0/24`. Read-only host receipts
+  `job-988efb8e0678` and `job-b327fac1f855` show the exact failure and 63 distinct
+  persisted allocations under `/var/lib/heyvm/run`; the gateway excludes the
+  remaining block. The operation failed in verification, retained predecessor
+  `sb-8ae305f1`, and performed no cutover. No network records or VMs were manually
+  deleted. A new release alone cannot fix capacity. Changing the global network
+  also changes allocation behavior for stopped VMs on restart, so blindly
+  enlarging/replacing the existing network is not a verified safe remedy.
+- Shared inventory implementation (not yet deployed in Orchestrator):
+  Orchestrator now exposes a paginated, internal-key-gated
   shared-database inventory. App-lb's global application view consumes it using
   server-side secret references and read-only regional API fallback. It does not
   replay mutations, merge independent databases, or fall back to local files.
   Independent regional gateway counters remain separately labelled observations.
+- Follow-up configuration API is locally verified: fleet-admin GET/PUT
+  `/control-plane/config` persists conditional, secret-reference-only bindings
+  and updates read snapshots without changing host supervision. Explicit startup
+  files retain precedence and refuse API writes. This closes the gap where an
+  unchanged-configuration binary rollout could not enable the view. Tests cover
+  concurrent/stale writes, persistence/restart, invalid origins, unavailable
+  credentials, failed writes and scoped authorization. A compiled local HTTP
+  check exercised anonymous denial with both optional gates disabled, successful
+  configuration, stale/invalid rejection and restart persistence. This API is
+  not yet deployed or configured on either regional gateway.
 - Verification: the new PostgreSQL inventory test ran against an isolated schema
   on disposable `heyo-policy-proposals-test`, using two independent connections.
   It covered identical reads, 100-row pagination, region drains, revision identity,
