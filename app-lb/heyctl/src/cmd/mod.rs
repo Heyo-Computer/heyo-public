@@ -4,6 +4,7 @@ pub mod artifact;
 pub mod auth;
 pub mod feed;
 pub mod observe;
+pub mod plugins;
 pub mod read;
 pub mod session;
 pub mod token;

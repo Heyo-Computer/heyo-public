@@ -39,6 +39,7 @@ mod metrics;
 mod mounts;
 mod namespaces;
 mod obs;
+mod plugins;
 mod proxy;
 mod registry;
 mod rollout;
@@ -498,6 +499,21 @@ fn main() {
             "restored declared namespaces; some objects were unreadable and were left on disk"
         ),
     }
+    // Plugins: which built-in plugins run, and with what configuration, is an
+    // object per plugin beside the other stores. None are compiled in yet; the
+    // host, its routes and the Plugins page are the frame they slot into.
+    let plugin_store = plugins::PluginStore::new(plugins::plugin_dir(&cfg.state_path));
+    match plugin_store.load() {
+        (0, 0) => tracing::debug!(dir = %plugin_store.dir().display(), "no plugin records"),
+        (n, 0) => tracing::info!(count = n, "restored plugin records"),
+        (n, skipped) => tracing::warn!(
+            count = n,
+            skipped,
+            dir = %plugin_store.dir().display(),
+            "restored plugin records; some were unreadable and were left on disk"
+        ),
+    }
+    let plugin_host = Arc::new(plugins::PluginHost::new(Vec::new(), plugin_store));
     let auth_providers = Arc::new(crate::auth_providers::AuthProviderStore::new(
         crate::auth_providers::auth_provider_dir(&cfg.state_path),
     ));
@@ -959,6 +975,7 @@ fn main() {
             event_feed.clone(),
             &cfg.public_ips,
             cfg.deploy_host_base().map(str::to_string),
+            plugin_host.clone(),
         ).with_views(Arc::new(fleet::ViewStore::open(
             std::path::Path::new(&cfg.state_path).with_extension("views.json"), secrets.clone(),
             ["APP_LB_FLEET_FILE", "APP_LB_CONTROL_PLANE_FILE"].map(|key| std::env::var_os(key).map(Into::into)),
@@ -1043,6 +1060,9 @@ fn main() {
         "workspaces",
         workspace::WorkspaceWorker::new(workspaces.clone()),
     ));
+    // Plugins own their tasks; this only starts the enabled ones and stops
+    // them on shutdown. Not a dependency of the proxy, like the others.
+    server.add_service(background_service("plugins", plugins::PluginService::new(plugin_host)));
     let proxy_handle = server.add_service(proxy_svc);
     // Don't accept traffic until the autoscaler has adopted existing VMs and
     // built the warm pool; otherwise the first requests all eat a cold start.

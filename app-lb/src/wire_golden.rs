@@ -1377,3 +1377,39 @@ fn a_minimal_workflow_fills_its_defaults() {
     assert!(minimal.enabled);
     golden("workflow-minimal", &minimal);
 }
+
+/// `GET /api/plugins` — the plugin list the console and `heyctl plugins` read.
+#[test]
+fn plugin_list_is_stable() {
+    use crate::plugins::{PluginMeta, PluginView};
+    let enabled = PluginView {
+        meta: PluginMeta {
+            id: "example",
+            name: "Example",
+            description: "A plugin that is switched on and failing.",
+            config_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+            }),
+        },
+        enabled: true,
+        config: serde_json::json!({"url": "http://127.0.0.1:34199"}),
+        updated_at: 1_760_000_000,
+        last_error: Some("connection refused".into()),
+        status: serde_json::json!({"state": "retrying"}),
+    };
+    let disabled = PluginView {
+        meta: PluginMeta {
+            id: "idle",
+            name: "Idle",
+            description: "A plugin nobody switched on.",
+            config_schema: serde_json::json!({"type": "object"}),
+        },
+        enabled: false,
+        config: serde_json::Value::Null,
+        updated_at: 0,
+        last_error: None,
+        status: serde_json::json!({}),
+    };
+    golden("plugins", &vec![enabled, disabled]);
+}

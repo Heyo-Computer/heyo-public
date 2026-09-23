@@ -16,7 +16,7 @@
 //!   `UPDATE_GOLDEN=1 cargo test -p app-lb wire_golden`
 
 use heyctl::types::{
-    AuthProviderView, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse,
+    AuthProviderView, DeploymentSpec, DeploymentStatus, DiskInventory, DiskState, JobRecord, MetricsResponse, PluginView,
     UpstreamTrafficStatus, WorkflowList, WorkflowView,
 };
 use std::path::PathBuf;
@@ -419,4 +419,24 @@ fn an_inherited_gate_names_the_provider_it_came_from() {
     assert_eq!(gate.provider_ref.as_deref(), Some("corp-google"));
     assert_eq!(spec.namespace(), "team-a", "the provider is looked up in this namespace");
     assert!(gate.client_id.is_none(), "an inheriting gate carries no identity of its own");
+}
+
+/// The plugin list `heyctl plugins` renders.
+#[test]
+fn plugin_view_understands_every_field() {
+    let plugins: Vec<PluginView> = serde_json::from_str(&fixture("plugins")).expect("fixture parses");
+    for p in &plugins {
+        assert!(
+            p.extra.is_empty(),
+            "heyctl does not understand these fields app-lb sends: {:?}\n\
+             Add them to PluginView in src/types.rs.",
+            p.extra.keys().collect::<Vec<_>>()
+        );
+    }
+    let on = &plugins[0];
+    assert_eq!(on.id, "example");
+    assert!(on.enabled);
+    assert_eq!(on.last_error.as_deref(), Some("connection refused"), "enabled and failing is a state");
+    assert_eq!(on.config["url"], "http://127.0.0.1:34199");
+    assert!(!plugins[1].enabled);
 }
