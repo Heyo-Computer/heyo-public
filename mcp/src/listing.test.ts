@@ -118,33 +118,22 @@ test("a tool that advertises its own schema still agrees with the one that valid
 });
 
 test("the listing stays within its size budget", () => {
-  // Measured 2026-09-10: 62,691 bytes across 64 tools, up from 35,287 across 56.
+  // Measured 2026-09-15: 66,069 bytes across 65 tools, up from 62,691 across 64.
   //
-  // Two deliberate increases, in order. The first +13,917 bought the thing the field report ranked highest: the
-  // deployment spec is now *on* `applb_create_deployment` — generated from
-  // app-lb's Rust types, pruned to a first-paragraph summary with the rarely
-  // hand-written blocks collapsed — instead of being an untyped blob a caller
-  // had to read our source to fill in. `applb_spec_schema` carries the rest at
-  // no listing cost.
-  //
-  // The second +9,840 is seven new tools and one more generated block: the two
-  // job tools that did not exist (`applb_pull`, `applb_pull_mounts`), the edit
-  // path that preserves the pool (`applb_update_deployment`), job polling by id,
-  // the drain pair, `applb_deploy` (the composite the spec schema now lives on),
-  // and `applb_scale`'s body typed from the generated `ScalingPolicy` instead of
-  // being an untyped blob. The spec tree moved from `applb_create_deployment`
-  // onto `applb_deploy` rather than being copied — `spec.test.ts` asserts that
-  // exactly one tool carries it.
-  //
-  // The last +3,647 is annotations and one rewritten description. The
-  // annotations are 1,489 bytes of that, because they emit only what the MCP
-  // defaults do not already say — the long form would have been 6,410.
+  // The +3,378 is one new tool, `applb_security_events`, and nothing else. Its
+  // description is long because the SIEM has three non-obvious properties a
+  // reader needs before the first call — the ring is in memory and bounded, so
+  // a restart empties it; repeats fold into one row whose count climbs; and
+  // `enabled: false` means detection is off, not that nothing happened — and
+  // the alert's own `response` block is the runbook, so 'and now what?' is in
+  // the answer. The schema carries the five `/security` query parameters
+  // verbatim, which is the cheapest correct description of them.
   //
   // The headroom below is for ordinary description edits. It is deliberately
   // NOT enough for a second full spec schema: a tool that wants one shares this
   // one by pointing at it, because two copies of a 12 KB tree is a cost every
   // client pays on every connect.
-  const BUDGET = 66_000;
+  const BUDGET = 67_000;
   const bytes = JSON.stringify(toolListing(everything())).length;
   assert.ok(
     bytes <= BUDGET,

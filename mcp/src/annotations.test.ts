@@ -54,6 +54,7 @@ const ARGS: Record<string, Record<string, unknown>> = {
   art_get_tag: { tag: "t" },
   art_get_manifest: { reference: "sha256:abc" },
   applb_spec_schema: { block: "VmSpec" },
+  applb_security_events: { severity: "high", limit: 20 },
 };
 
 test("every tool is annotated, and destructiveness matches its own prose", () => {
