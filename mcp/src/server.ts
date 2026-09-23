@@ -191,6 +191,7 @@ const READ_ONLY = new Set([
   "applb_metrics",
   "applb_disks",
   "applb_certs",
+  "applb_security_events",
   "applb_spec_schema",
   "applb_job",
   "applb_deployment_jobs",

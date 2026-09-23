@@ -253,7 +253,7 @@ What the door exposes: `applb_list_deployments`, `applb_get_deployment`,
 `applb_scale`, `applb_build`, `applb_pull`, `applb_pull_mounts`,
 `applb_host_update`, `applb_job`, `applb_deployment_jobs`,
 `applb_delete_deployment`, `applb_spec_schema`,
-`applb_evict_vm`, `applb_exec` and `applb_metrics`. The fleet-wide operator
+`applb_evict_vm`, `applb_exec`, `applb_metrics` and `applb_security_events`. The fleet-wide operator
 tools — `applb_disks`, `applb_certs`, `applb_purge_disk`,
 `applb_purge_orphan_disks`, `applb_sweep_disks` — answer `404 route not exposed
 through the namespace proxy`, and `applb_request` is bounded by the same list.
@@ -331,7 +331,8 @@ multi-tenant.
 And know what `admin` buys, because it is coarser than it sounds. `none` passes
 the gate and reaches no admin route; `view` covers `/metrics`, `/disks`,
 `/feeds`, `/security`, `/ingress` and `/storage` — which is `applb_metrics`,
-`applb_disks` and the feed tools, and nothing else; `admin` is everything.
+`applb_security_events`, `applb_disks` and the feed tools, and nothing else;
+`admin` is everything.
 There is **no read-only tier for deployment routes**: `GET /deployments` and
 `GET /deployments/:id` are CRUD-tier, because a spec's env vars can hold
 secrets, so `applb_list_deployments`, `applb_get_deployment` and
@@ -552,6 +553,7 @@ Reads over app-lb's topology, plus the operations that move VMs and disks.
 | `applb_metrics` | read-only | app-lb's live metrics: per-deployment pool counters, request stats, and create/boot outcomes. |
 | `applb_disks` | read-only | Disk inventory and usage. |
 | `applb_certs` | read-only | TLS certificates app-lb holds, with their hostname, issuer and expiry. |
+| `applb_security_events` | read-only | app-lb's SIEM findings: authentication abuse, attack signatures and traffic anomalies, newest first, plus any block rules in force and the guard's counters. |
 | `applb_drain_upstream` | **destructive** | Take one upstream of a STATIC (`upstreams`) deployment out of rotation. |
 | `applb_uncordon_upstream` |  | Put a drained upstream back into rotation. |
 | `applb_evict_vm` | **destructive** | Removes one VM from a deployment's pool and destroys it. |
@@ -628,7 +630,7 @@ Everything without a dedicated tool. Prefer a named tool when one exists — a r
 | `ci_request` |  | Raw HTTP against ci, for endpoints without a dedicated tool above. |
 | `art_request` |  | Raw HTTP against the artifact store, for endpoints without a dedicated tool above. |
 
-_64 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
+_65 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
 
 <!-- END GENERATED CATALOGUE -->
 
