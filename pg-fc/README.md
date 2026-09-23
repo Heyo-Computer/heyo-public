@@ -1689,6 +1689,8 @@ What it gives you (browse to the listen address):
   the controls to start one, refresh it, promote a replica or detach. Same
   operations as JSON at `/api/replication` and `/api/peers` — see
   "Cross-host replication" above.
+- **JSON admin API** (`/api/…`) — everything above, for programs (app-lb's
+  pg-fc plugin reads it). See "JSON admin API" below.
 - **Logs** — tail the pooler log (`/logs/pooler`), the heyvmd log
   (`/logs/heyvmd`), and any VM's in-guest Postgres log (`/logs/vm/<id>`).
 - **Controls** — stop / start / reboot / resize any VM from its detail page.
@@ -1814,6 +1816,55 @@ endpoint is logged and never blocks the pooler. Rules persist to
 sibling of the schema registry) and survive restarts — including the paused
 flag; the firing state is in-memory, so a restart re-evaluates cleanly rather
 than replaying a stale edge.
+
+### JSON admin API
+
+The dashboard listener also serves a JSON API with the same reads and
+actions as the pages, behind the same Basic auth. It is keyed by **schema**
+(the database name clients connect with) rather than sandbox id, because a
+schema outlives its VMs: an offload deletes the VM and a restore creates a
+new one. The wire types live in the `pg-fc-api` crate (`api/`), which
+app-lb's pg-fc plugin depends on too, so the two sides cannot drift.
+
+| Route | What it does |
+|---|---|
+| `GET /api/health` | Version, uptime, listen address, warm/known schema counts, configured tiers. In-memory only. |
+| `GET /api/schemas[?tier=&q=]` | Every schema on every tier (`live`, `compacted`, `frozen`, `archived`, `pending`; `warm` filters to checked-in VMs), with sessions, slots and idle time when warm. |
+| `GET /api/schemas/{schema}` | One schema, plus live `db_size_bytes`/`backends` when warm. |
+| `POST /api/schemas/{schema}/{start,stop,reboot,resize,reap,restore,archive-image}` | The VM page's buttons. `resize` takes `{"size_class":"small"}`. Returns 409 for a pinned schema, or for a power action on an offloaded one. The long actions answer 202 and report in `/api/events`. |
+| `GET /api/host` | Host CPU/memory, disks, spare shelf, and schema counts by tier. |
+| `GET /api/events[?limit=&since=]` | The events journal, newest first. |
+| `GET /api/logs/{pooler,heyvmd}[?lines=]` and `GET /api/logs/schema/{schema}` | Log tails as JSON lines. The schema log is read from inside the VM. |
+| `POST /api/maintenance/{sweep,ttl-sweep,reclaim,stop-idle,purge}` | The monitoring page's buttons. `ttl-sweep` takes `{"ttl_secs":N}`. |
+| `GET /api/config`, `PUT /api/config` | Runtime configuration (below). |
+
+#### Runtime configuration
+
+A few knobs can change without a restart, which would drop every client
+session on the host:
+
+- `idle_timeout_secs`, `idle_timeout_fast_secs` (`0` turns the short timeout off)
+- `warm_spares`
+- `compact_after_secs`, `freeze_after_secs`, `archive_after_secs`
+
+`PUT /api/config` takes any subset of them; absent fields are left unchanged.
+The loops that use these knobs re-read them on every pass. Overrides are saved
+to `runtime-config.json` beside the registry file and applied over the
+environment at boot, so they survive a restart.
+
+`GET` reports each knob's effective value and where it came from (`override`,
+`env` or `default`). It also lists the env-only settings as read-only.
+
+A knob can only change if its subsystem was on at boot. For example, if
+`PG_VM_POOL_ARCHIVE_AFTER_SECS` was unset, the S3 tier has no loop and no
+credentials, so `archive_after_secs` is refused with a 400 until you set the
+variable and restart.
+
+```sh
+curl -u admin:secret http://127.0.0.1:8080/api/config
+curl -u admin:secret -X PUT http://127.0.0.1:8080/api/config \
+  -H 'content-type: application/json' -d '{"idle_timeout_secs": 300}'
+```
 
 ### Testing
 

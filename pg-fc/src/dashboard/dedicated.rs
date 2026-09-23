@@ -17,7 +17,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use maud::Markup;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::dedicated;
 
@@ -26,52 +26,8 @@ use super::handlers::Banner;
 use super::state::DashState;
 use super::views;
 
-/// Request body for `POST /api/databases`.
-///
-/// Only `database` is required: `username` defaults to the database name (the
-/// common single-tenant-app shape) and `password` to a freshly generated one,
-/// so the minimal call is `{"database":"acme"}`.
-#[derive(Deserialize)]
-pub struct CreateRequest {
-    pub database: String,
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub password: Option<String>,
-}
-
-/// Response body for a successful provision — the only place the password is
-/// ever returned.
-#[derive(Serialize)]
-pub struct CreateResponse {
-    pub database: String,
-    pub username: String,
-    pub password: String,
-    /// `provisioning` — the credential is live immediately (a client can
-    /// connect right now); the VM is being brought up in the background and the
-    /// first connection waits for it either way.
-    pub status: &'static str,
-    pub created_at: u64,
-}
-
-/// One record in `GET /api/databases`. No password, by construction.
-#[derive(Serialize)]
-pub struct DatabaseInfo {
-    pub database: String,
-    pub username: String,
-    pub created_at: u64,
-    /// Sandbox id backing it, once one exists — `null` before the first
-    /// bring-up completes.
-    pub sandbox_id: Option<String>,
-    /// Storage tier from the schema registry (`live`, `compacted`, `frozen`,
-    /// `archived`), or `null` when the pooler has never backed it yet.
-    pub tier: Option<&'static str>,
-}
-
-#[derive(Serialize)]
-pub struct ApiError {
-    pub error: String,
-}
+// The wire types live in `pg-fc-api`, shared with app-lb's pg-fc plugin.
+pub use pg_fc_api::{ApiError, CreateDatabase as CreateRequest, CreatedDatabase as CreateResponse, DatabaseInfo};
 
 /// `POST /api/databases` — provision a dedicated database.
 ///
@@ -89,7 +45,7 @@ pub async fn api_create(
                 database: cred.database,
                 username: cred.role,
                 password: cred.password,
-                status: "provisioning",
+                status: "provisioning".into(),
                 created_at: cred.created_at,
             }),
         )
@@ -221,7 +177,7 @@ fn rows(st: &DashState) -> Vec<DatabaseInfo> {
                 username: c.role,
                 created_at: c.created_at,
                 sandbox_id: record.as_ref().map(|r| r.sandbox_id.clone()),
-                tier: record.as_ref().map(|r| r.tier.as_str()),
+                tier: record.as_ref().map(|r| r.tier.as_str().to_string()),
             }
         })
         .collect()

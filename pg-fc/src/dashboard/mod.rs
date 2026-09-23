@@ -31,6 +31,7 @@
 //! and guest call is timeout-bounded so one wedged VM can't hang a request.
 
 mod alerts;
+mod api;
 mod archives;
 mod auth;
 mod dedicated;
@@ -67,6 +68,7 @@ pub async fn serve(cfg: DashboardConfig, registry: Arc<SchemaRegistry>) -> Resul
         alerts,
         history: Arc::new(history::VmHistory::new(history::CAPACITY)),
         inventory: Arc::new(model::InventoryCache::new()),
+        started_at: std::time::Instant::now(),
     };
     // Background webhook-alert evaluator: samples host metrics on an interval and
     // fires any crossed rules. Shares the same `AlertStore` the pages mutate.

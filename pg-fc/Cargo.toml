@@ -1,3 +1,7 @@
+# `api` is the JSON admin API's wire types, shared with app-lb.
+[workspace]
+members = ["api"]
+
 [package]
 name = "pg-vm-pool"
 version = "0.1.0"
@@ -52,3 +56,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # dev-dependency; already resolved in Cargo.lock via the axum stack, so this
 # adds no new compilation.
 serde_json = "1"
+# Wire types for the JSON admin API, shared with app-lb's pg-fc plugin so
+# the two sides cannot drift.
+pg-fc-api = { path = "api" }
