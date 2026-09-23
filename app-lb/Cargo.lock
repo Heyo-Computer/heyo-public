@@ -178,8 +178,10 @@ dependencies = [
  "hyper",
  "hyper-util",
  "instant-acme",
+ "iroh",
  "libc",
  "openssl",
+ "pg-fc-api",
  "pingora-core",
  "pingora-http",
  "pingora-proxy",
@@ -3307,6 +3309,13 @@ checksum = "3672b37090dbd86368a4145bc067582552b29c27377cad4e0a306c97f9bd7772"
 dependencies = [
  "fixedbitset",
  "indexmap 2.14.0",
+]
+
+[[package]]
+name = "pg-fc-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

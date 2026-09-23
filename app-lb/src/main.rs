@@ -39,6 +39,7 @@ mod metrics;
 mod mounts;
 mod namespaces;
 mod obs;
+mod plugins;
 mod proxy;
 mod registry;
 mod rollout;
@@ -498,6 +499,20 @@ fn main() {
             "restored declared namespaces; some objects were unreadable and were left on disk"
         ),
     }
+    // Plugins: which built-in plugins run, and with what configuration, is an
+    // object per plugin beside the other stores. The host is built once the
+    // secret store exists, which plugins resolve their credentials through.
+    let plugin_store = plugins::PluginStore::new(plugins::plugin_dir(&cfg.state_path));
+    match plugin_store.load() {
+        (0, 0) => tracing::debug!(dir = %plugin_store.dir().display(), "no plugin records"),
+        (n, 0) => tracing::info!(count = n, "restored plugin records"),
+        (n, skipped) => tracing::warn!(
+            count = n,
+            skipped,
+            dir = %plugin_store.dir().display(),
+            "restored plugin records; some were unreadable and were left on disk"
+        ),
+    }
     let auth_providers = Arc::new(crate::auth_providers::AuthProviderStore::new(
         crate::auth_providers::auth_provider_dir(&cfg.state_path),
     ));
@@ -884,6 +899,9 @@ fn main() {
     // ACME runs only when a contact address is configured. Its `Notify` goes to
     // the admin API so registering a deployment starts issuance immediately
     // rather than at the next 12-hour sweep.
+    // Filled by the tunnel plugin with the hostnames the cloud edge serves
+    // TLS for, so ACME never orders certificates it cannot validate.
+    let external_tls = plugins::tunnel::ExternalTlsHosts::default();
     let acme_svc = cfg.acme_email.clone().map(|email| {
         background_service(
             "acme",
@@ -901,6 +919,7 @@ fn main() {
                         .route53_zone_id
                         .clone()
                         .map(|zone| dns::Route53::new(cfg.aws_bin.clone(), zone)),
+                    external_tls: external_tls.clone(),
                 },
             ),
         )
@@ -918,6 +937,21 @@ fn main() {
              deployment is handled as before"
         ),
     }
+
+    // Built here, once the secret store and the daemon client both exist. The
+    // tunnel plugin is handed its proxy below, after the proxy is built.
+    let tunnel_plugin = plugins::tunnel::TunnelPlugin::new(
+        plugins::tunnel::key_path(&cfg.state_path),
+        vms.client().clone(),
+        external_tls,
+    );
+    let plugin_host = Arc::new(plugins::PluginHost::new(
+        vec![
+            plugins::pgfc::PgFcPlugin::new(secrets.clone()),
+            tunnel_plugin.clone(),
+        ],
+        plugin_store,
+    ));
 
     let admin_svc = background_service(
         "admin",
@@ -959,27 +993,33 @@ fn main() {
             event_feed.clone(),
             &cfg.public_ips,
             cfg.deploy_host_base().map(str::to_string),
+            plugin_host.clone(),
         ).with_views(Arc::new(fleet::ViewStore::open(
             std::path::Path::new(&cfg.state_path).with_extension("views.json"), secrets.clone(),
             ["APP_LB_FLEET_FILE", "APP_LB_CONTROL_PLANE_FILE"].map(|key| std::env::var_os(key).map(Into::into)),
         ).unwrap_or_else(|error| panic!("invalid view configuration: {error}")))),
     );
 
-    let mut proxy_svc = pingora_proxy::http_proxy_service(
-        &server.configuration,
-        LbProxy::new(
-            registry.clone(),
-            metrics,
-            challenges,
-            auth,
-            obs.as_ref().and_then(|o| o.access.clone()),
-            siem.as_ref().map(|s| s.sink.clone()),
-            guard.clone(),
-            event_feed,
-            auth_providers.clone(),
-            secrets.clone(),
-        ),
+    let lb_proxy = LbProxy::new(
+        registry.clone(),
+        metrics,
+        challenges,
+        auth,
+        obs.as_ref().and_then(|o| o.access.clone()),
+        siem.as_ref().map(|s| s.sink.clone()),
+        guard.clone(),
+        event_feed,
+        auth_providers.clone(),
+        secrets.clone(),
     );
+    // The same proxy serves streams from an app-lb tunnel, as its own pingora
+    // app: the plugin feeds it streams rather than a listener feeding it
+    // sockets. Only its idea of the client address differs.
+    tunnel_plugin.attach(Arc::new(pingora_proxy::http_proxy(
+        &server.configuration,
+        lb_proxy.for_tunnel_ingress(),
+    )));
+    let mut proxy_svc = pingora_proxy::http_proxy_service(&server.configuration, lb_proxy);
     proxy_svc.add_tcp(&cfg.proxy_addr);
 
     // HTTPS listener, alongside the plaintext one. The acceptor is built with no
@@ -1043,6 +1083,9 @@ fn main() {
         "workspaces",
         workspace::WorkspaceWorker::new(workspaces.clone()),
     ));
+    // Plugins own their tasks; this only starts the enabled ones and stops
+    // them on shutdown. Not a dependency of the proxy, like the others.
+    server.add_service(background_service("plugins", plugins::PluginService::new(plugin_host)));
     let proxy_handle = server.add_service(proxy_svc);
     // Don't accept traffic until the autoscaler has adopted existing VMs and
     // built the warm pool; otherwise the first requests all eat a cold start.

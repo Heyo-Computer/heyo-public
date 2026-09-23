@@ -48,6 +48,9 @@ const SIEM_HTML: &str = include_str!("siem.html");
 /// The disk console at `GET /storage`.
 const DISKS_HTML: &str = include_str!("disks.html");
 
+/// The plugin console at `GET /plugins`.
+const PLUGINS_HTML: &str = include_str!("plugins.html");
+
 /// How to turn a deployment's hostname into a URL somebody can click.
 ///
 /// The dashboard runs on the *admin* listener, so it cannot infer the data
@@ -232,6 +235,11 @@ struct AdminState {
     disks: Option<Arc<crate::disks::DiskStore>>,
     /// The disk console, with the display name already substituted.
     disks_html: Arc<str>,
+    /// The built-in plugins and their records. Always present: the set is
+    /// compiled in, and an empty set is a page that says so.
+    plugins: Arc<crate::plugins::PluginHost>,
+    /// The plugin console, with the display name already substituted.
+    plugins_html: Arc<str>,
     /// How to turn a deployment's hostname into a link, given where the data
     /// plane actually listens.
     public_url: PublicUrl,
@@ -288,6 +296,7 @@ impl AdminApi {
         feed: Arc<crate::feed::Feed>,
         public_ips: &[std::net::IpAddr],
         deploy_base_domain: Option<String>,
+        plugins: Arc<crate::plugins::PluginHost>,
     ) -> Self {
         let ingress = Arc::new(Ingress::from_ips(public_ips));
         // Render the display name into the page once; the placeholder appears in
@@ -299,6 +308,8 @@ impl AdminApi {
         let siem_html: Arc<str> = Arc::from(SIEM_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
         let disks_html: Arc<str> =
             Arc::from(DISKS_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
+        let plugins_html: Arc<str> =
+            Arc::from(PLUGINS_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
 
         // The gate turns on as soon as a password is set; the username is
         // optional and defaults to "admin", so one env var is enough to secure
@@ -353,6 +364,8 @@ impl AdminApi {
                 ui_cookies: Arc::new(crate::heyo_ui::CookieConfig::from_env("APP_LB")),
                 disks,
                 disks_html,
+                plugins,
+                plugins_html,
                 public_url,
                 feed,
                 deploy_base_domain: deploy_base_domain
@@ -2016,6 +2029,77 @@ async fn storage_console(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     Html(render_page(&state, &state.disks_html, &headers))
+}
+
+// ---- plugins --------------------------------------------------------------
+
+/// `GET /plugins` — the plugin console.
+async fn plugins_console(
+    State(state): State<AdminState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    Html(render_page(&state, &state.plugins_html, &headers))
+}
+
+/// `GET /api/plugins` — every built-in plugin, its record and its live status.
+///
+/// View tier: the console renders it. A plugin's configuration never holds a
+/// credential (those are secret references), so there is nothing here the
+/// view tier should not read.
+async fn list_plugins(State(state): State<AdminState>) -> Response {
+    Json(state.plugins.list().await).into_response()
+}
+
+/// `GET /api/plugins/:id`
+async fn get_plugin(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    match state.plugins.get(&id).await {
+        Some(view) => Json(view).into_response(),
+        None => err(StatusCode::NOT_FOUND, format!("no plugin named {id:?}")).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PutPlugin {
+    enabled: bool,
+    /// Omitted keeps the stored configuration.
+    #[serde(default)]
+    config: Option<serde_json::Value>,
+}
+
+/// `PUT /api/plugins/:id` — `{enabled, config?}`.
+async fn put_plugin(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(body): Json<PutPlugin>,
+) -> Response {
+    set_plugin(&state, &id, body.enabled, body.config).await
+}
+
+/// `POST /api/plugins/:id/enable`
+async fn enable_plugin(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    set_plugin(&state, &id, true, None).await
+}
+
+/// `POST /api/plugins/:id/disable`
+async fn disable_plugin(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    set_plugin(&state, &id, false, None).await
+}
+
+async fn set_plugin(
+    state: &AdminState,
+    id: &str,
+    enabled: bool,
+    config: Option<serde_json::Value>,
+) -> Response {
+    use crate::plugins::SetError;
+    match state.plugins.set(id, enabled, config).await {
+        Ok(view) => Json(view).into_response(),
+        Err(e @ SetError::NotFound) => err(StatusCode::NOT_FOUND, e.to_string()).into_response(),
+        Err(e @ SetError::Invalid(_)) => err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e @ SetError::Io(_)) => {
+            err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
 }
 
 // ---- the event feed -------------------------------------------------------
@@ -5332,7 +5416,13 @@ fn router(state: AdminState) -> Router {
         // put in the A record", which anyone who can read the directory of
         // hostnames may as well know.
         .route("/ingress", get(ingress))
-        .route("/storage", get(storage_console));
+        .route("/storage", get(storage_console))
+        // The plugin console and the list it renders. Fleet-wide, like the
+        // disk console: a plugin is a host-level capability, not a
+        // deployment's.
+        .route("/plugins", get(plugins_console))
+        .route("/api/plugins", get(list_plugins))
+        .route("/api/plugins/:id", get(get_plugin));
 
     // The deployment CRUD API — register/edit/scale/delete/evict, plus the reads
     // that expose the spec (env vars can hold secrets). Gated too iff
@@ -5421,6 +5511,12 @@ fn router(state: AdminState) -> Router {
             "/auth-providers/:namespace/:name",
             get(get_auth_provider).delete(delete_auth_provider),
         )
+        // Switching a plugin on can open a public hostname onto this host or
+        // hand out database credentials, so it is CRUD-tier. The item `PUT`
+        // shares its path with the view-tier `GET` above, as `/namespaces` does.
+        .route("/api/plugins/:id", put(put_plugin))
+        .route("/api/plugins/:id/enable", post(enable_plugin))
+        .route("/api/plugins/:id/disable", post(disable_plugin))
         .route("/tokens", post(mint_token).get(list_tokens))
         .route(
             "/tokens/:id",
@@ -5481,6 +5577,21 @@ fn router(state: AdminState) -> Router {
         .route("/control-plane/config", get(view_configuration).put(configure_views))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
 
+    // Each plugin's own routes, under `/api/plugins/<id>/…`, on the same two
+    // tiers. They carry no state of ours, so the gate goes on them here and
+    // they are merged after `with_state` below.
+    let (plugin_view, plugin_crud) = state.plugins.routers();
+    let plugin_view = if plugin_view.has_routes() {
+        plugin_view.route_layer(middleware::from_fn_with_state(state.clone(), require_view_auth))
+    } else {
+        plugin_view
+    };
+    let plugin_crud = if plugin_crud.has_routes() && state.gate_admin {
+        plugin_crud.route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth))
+    } else {
+        plugin_crud
+    };
+
     Router::new()
         .route("/healthz", get(healthz))
         // Embedded static assets contain no fleet state. Sign-in needs them
@@ -5498,6 +5609,8 @@ fn router(state: AdminState) -> Router {
         .merge(crud)
         .merge(open)
         .with_state(state)
+        .merge(plugin_view)
+        .merge(plugin_crud)
 }
 
 #[async_trait]
@@ -6596,13 +6709,28 @@ mod tests {
     mod page_consistency {
         use super::*;
 
-        fn pages() -> [(&'static str, &'static str); 4] {
+        fn pages() -> [(&'static str, &'static str); 5] {
             [
                 ("dashboard", DASHBOARD_HTML),
                 ("directory", DIRECTORY_HTML),
                 ("siem", SIEM_HTML),
                 ("disks", DISKS_HTML),
+                ("plugins", PLUGINS_HTML),
             ]
+        }
+
+        /// Every page links every other: a page missing from one nav bar is
+        /// a page nobody finds.
+        #[test]
+        fn every_page_links_every_page() {
+            for (name, html) in pages() {
+                for href in ["/", "/dashboard", "/siem", "/storage", "/plugins", "/metrics"] {
+                    assert!(
+                        html.contains(&format!(r#"<a href="{href}""#)),
+                        "{name}'s nav has no link to {href}",
+                    );
+                }
+            }
         }
 
         /// The theme is a **cookie** now, not this origin's localStorage, and no

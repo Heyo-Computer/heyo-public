@@ -2773,6 +2773,118 @@ owns any more.
 store, it is small (single-digit MB across a whole host), and deleting a daemon's persistence
 records to reclaim 23 KB is not a trade worth making.
 
+## Plugins
+
+Plugins are optional capabilities compiled into app-lb that you switch on at
+runtime from the **Plugins** page (`/plugins`) or with `heyctl plugins`. Each
+one's `{enabled, config}` record lives in `app-lb-plugins.d/<id>.json` beside
+the state file.
+
+A plugin's routes live under `/api/plugins/<id>/…`. Reads are on the view tier
+and actions on the CRUD tier, and every route answers 409 while the plugin is
+disabled. If a plugin fails to start, it stays enabled and the failure shows
+as `last_error` on its card.
+
+Plugin configs never contain credentials. A config names a secret in app-lb's
+secret store (`POST /secrets`) instead, and the plugin reads it at the moment
+it uses it, so rotating the secret needs no re-apply.
+
+```sh
+heyctl plugins ls
+heyctl plugins set pgfc -f pgfc.json --enable
+heyctl plugins disable pgfc
+```
+
+### pg-fc databases (`pgfc`)
+
+This plugin monitors and configures [pg-fc](../pg-fc) pools through their
+JSON admin API. It shows:
+
+- host health and schema counts by tier
+- every schema, with start/stop/reboot/restore/reap actions
+- dedicated databases: create one (the password is shown once, as a
+  connection string) or revoke one
+- the pooler's runtime settings
+- maintenance passes, recent events and log tails
+
+app-lb holds the pg-fc dashboard credential and calls pg-fc on the page's
+behalf, so the browser never sees it. A 401 from pg-fc becomes a 502 naming
+the misconfigured node, rather than looking like your session failed.
+
+Store the password, then configure one entry per pooler:
+
+```sh
+heyctl create secret pg-fc --from-stdin password < pg-fc-password.txt
+```
+
+```json
+{
+  "nodes": [
+    {
+      "name": "local",
+      "url": "http://127.0.0.1:34199",
+      "user": "admin",
+      "password": {"secret": "pg-fc", "key": "password"},
+      "pg_host": "db.example.com"
+    }
+  ],
+  "poll_secs": 15
+}
+```
+
+- `url` is `PG_VM_POOL_DASHBOARD_LISTEN`.
+- `pg_host` and `pg_port` (default 6432) only feed the connection strings
+  the page shows; `pg_host` defaults to the host in `url`.
+- A schema's Postgres log is read by running a command inside its VM, so that
+  route sits on the CRUD tier with the actions.
+
+### Heyo Cloud tunnel (`tunnel`)
+
+The `tunnel` plugin gives an app-lb that the internet cannot reach (a laptop,
+a home server, a machine behind NAT) a public
+`https://<subdomain>.heyo.computer` without opening a port.
+
+How a request gets here:
+
+1. app-lb runs its own iroh endpoint.
+2. heyvmd on the same machine registers a tunnel with Heyo Cloud on
+   app-lb's behalf, using the credential from `heyvm login`. heyvmd holds the
+   credential; app-lb never does.
+3. The cloud edge terminates TLS, dials the endpoint, and sends each request
+   over an iroh stream.
+4. app-lb serves the request through the same proxy as its own listeners, so
+   routing, sign-in gates, guard rules and the access log all apply.
+
+Requirements and behaviour:
+
+- heyvmd must be running on the same machine and logged in (`heyvm login`).
+  If it isn't, the plugin's card says so.
+- Only the cloud edge can open streams. The edge's endpoint ids come back
+  from registration, and any other endpoint is refused before a byte is
+  read.
+- The visitor's address arrives as `X-Heyo-Client-IP`. It is trusted only on
+  tunnel ingress, and removed before any request reaches an upstream.
+- The endpoint key is kept in `app-lb-tunnel.key` beside the state file
+  (mode 0600), so a hostname keeps pointing here across restarts.
+  Registrations refresh every minute.
+- ACME never orders certificates for tunnel hostnames, because the edge
+  terminates their TLS.
+
+To use it:
+
+- **Enable** it. With no configuration it claims one public hostname that
+  the cloud picks.
+- **Name hostnames** by listing them:
+  ```json
+  {"hostnames": [{"subdomain": "my-shop"}, {"subdomain": "my-admin", "public": false}]}
+  ```
+- **Private hostnames** (`public: false`) require a Heyo sign-in for your
+  account at the edge.
+- **Route a hostname** to a deployment by adding it as a `host` route. The
+  plugin card has a "Route to" picker that does this for you.
+- **Release a hostname** from the card, which also removes it from the
+  configuration.
+
 ## Clients
 
 | | |
