@@ -50,6 +50,8 @@ impl DiscoveryConfig {
 struct Snapshot {
     service_id: String,
     version: u64,
+    region: Option<String>,
+    regional_policy: Option<serde_json::Value>,
     endpoints: Vec<Endpoint>,
 }
 
@@ -57,6 +59,7 @@ struct Snapshot {
 #[serde(rename_all = "camelCase")]
 struct Endpoint {
     url: String,
+    region: Option<String>,
     health_status: HealthStatus,
     draining: bool,
 }
@@ -131,8 +134,51 @@ impl DiscoveryWatcher {
         } else {
             (self.service_url(service_id)?.to_string(), self.cfg.as_ref().unwrap().token.clone())
         };
+        let source = if let Some(region) = &discovery.region {
+            let mut url = reqwest::Url::parse(&source).map_err(|e| e.to_string())?;
+            url.query_pairs_mut().append_pair("region", region);
+            url.to_string()
+        } else { source };
         if before.state().discovery_source_url.as_ref().is_some_and(|old| old != &source) {
             return Err("discovery authority changed; refusing to reuse the previous source's version".into());
+        }
+        if let (Some(regional), Some(router)) = (&discovery.regional, &before.regional) {
+            let region = discovery.region.as_deref().ok_or("regional scope missing")?;
+            let mut url = reqwest::Url::parse(&source).map_err(|e| e.to_string())?;
+            url.query_pairs_mut().append_pair("protocol", "regional-v1")
+                .append_pair("gatewayId", &regional.gateway_id).append_pair("bootId", &router.boot_id);
+            let snapshot: crate::regional::Snapshot = self.client.get(url).bearer_auth(&token).send().await
+                .map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?
+                .json().await.map_err(|e| e.to_string())?;
+            let own_backend = snapshot.policies.iter().find(|p| p.generation == snapshot.proposal_generation)
+                .and_then(|p| p.policy.regions.iter().find(|r| r.region == region))
+                .and_then(|r| r.gateways.iter().find(|g| g.id == regional.gateway_id))
+                .ok_or("snapshot has no local gateway binding")?.backend_server_id.clone();
+            let mut upstreams = BTreeSet::new();
+            for endpoint in &snapshot.endpoints {
+                if endpoint.region != region || endpoint.backend_server_id.is_empty() || endpoint.deployment_id.is_empty()
+                    || !matches!(endpoint.health_status.as_str(), "healthy" | "unhealthy" | "unknown") {
+                    return Err("invalid regional endpoint scope/identity/health".into());
+                }
+                if endpoint.backend_server_id != own_backend { continue; }
+                let peer = upstream_from_url(&endpoint.url)?;
+                let addr: std::net::SocketAddr = peer.parse().map_err(|_| "local gateway endpoint is not a socket address")?;
+                if !addr.ip().is_loopback() { return Err("local gateway endpoint must be loopback".into()); }
+                if endpoint.health_status == "healthy" && !endpoint.draining { upstreams.insert(peer); }
+            }
+            let _guard = self.registry.change_guard().await;
+            let Some(current) = self.registry.get(deployment_id) else { return Ok(false); };
+            if !Arc::ptr_eq(&current, &before) { return Ok(false); }
+            if current.state().discovery_version.is_some_and(|v| snapshot.version < v) { return Ok(false); }
+            let version = snapshot.version;
+            let local: Vec<_> = upstreams.iter().map(|peer| current.backends().iter().find(|b| b.peer == *peer)
+                .cloned().unwrap_or_else(|| Arc::new(crate::deployment::VmBackend::for_upstream(peer.clone())))).collect();
+            if !router.apply(snapshot, regional, service_id, region, local.clone())? { return Ok(false); }
+            let deployment = self.registry.apply_discovery_upstreams(&current, upstreams.into_iter().collect());
+            deployment.set_backends(local);
+            deployment.mutate_state(|s| { s.discovery_version = Some(version); s.discovery_source_url = Some(source); });
+            self.registry.persist_one(deployment_id).map_err(|e| e.to_string())?;
+            return Ok(true);
         }
         let snapshot: Snapshot = self.client.get(&source)
             .bearer_auth(&token).send().await.map_err(|e| e.to_string())?
@@ -141,7 +187,7 @@ impl DiscoveryWatcher {
         if snapshot.service_id != service_id {
             return Err(format!("snapshot serviceId {:?} does not match {:?}", snapshot.service_id, service_id));
         }
-        let upstreams = snapshot_upstreams(&snapshot)?;
+        let upstreams = snapshot_upstreams(&snapshot, discovery.region.as_deref())?;
         let _guard = self.registry.change_guard().await;
         let Some(current) = self.registry.get(deployment_id) else { return Ok(false) };
         // Do not apply an in-flight response after its deployment was replaced,
@@ -204,7 +250,18 @@ fn should_apply(
     }
 }
 
-fn snapshot_upstreams(snapshot: &Snapshot) -> Result<Vec<String>, String> {
+fn snapshot_upstreams(snapshot: &Snapshot, region: Option<&str>) -> Result<Vec<String>, String> {
+    if snapshot.regional_policy.is_some() {
+        return Err("regional routing policy requires a hierarchical consumer; refusing flattened adoption".into());
+    }
+    if snapshot.region.as_deref() != region {
+        return Err("discovery response does not attest the requested region scope".into());
+    }
+    if let Some(region) = region {
+        if snapshot.endpoints.iter().any(|e| e.region.as_deref() != Some(region)) {
+            return Err("regional discovery contains foreign or unplaced endpoints".into());
+        }
+    }
     snapshot.endpoints.iter()
         .filter(|e| e.health_status == HealthStatus::Healthy && !e.draining)
         .map(|e| upstream_from_url(&e.url))
@@ -212,7 +269,7 @@ fn snapshot_upstreams(snapshot: &Snapshot) -> Result<Vec<String>, String> {
         .map(|upstreams| upstreams.into_iter().collect())
 }
 
-fn upstream_from_url(value: &str) -> Result<String, String> {
+pub(crate) fn upstream_from_url(value: &str) -> Result<String, String> {
     let url = reqwest::Url::parse(value).map_err(|e| format!("bad endpoint URL {value:?}: {e}"))?;
     if url.scheme() != "http" || !url.username().is_empty() || url.password().is_some()
         || url.query().is_some() || url.fragment().is_some() || url.path() != "/"
@@ -262,13 +319,15 @@ mod tests {
         let url = format!("http://{}/snapshot", listener.local_addr().unwrap());
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = seen.clone();
-        let app = axum::Router::new().route("/snapshot", axum::routing::get(move |headers: axum::http::HeaderMap| {
+        let app = axum::Router::new().route("/snapshot", axum::routing::get(move |headers: axum::http::HeaderMap,
+            axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| {
             let captured = captured.clone();
             async move {
+                assert_eq!(query.get("region").map(String::as_str), Some("eu1"));
                 captured.lock().unwrap().push(headers["authorization"].to_str().unwrap().to_owned());
-                axum::Json(serde_json::json!({"serviceId":"svc","version":9,"endpoints":[
-                    {"url":"http://east:8081","healthStatus":"healthy","draining":false},
-                    {"url":"http://west:9092","healthStatus":"healthy","draining":true}]}))
+                axum::Json(serde_json::json!({"serviceId":"svc","version":9,"region":"eu1","endpoints":[
+                    {"url":"http://east:8081","region":"eu1","healthStatus":"healthy","draining":false},
+                    {"url":"http://west:9092","region":"eu1","healthStatus":"healthy","draining":true}]}))
             }
         }));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
@@ -282,7 +341,7 @@ mod tests {
         put("default", "wrong-namespace");
         put("team", "first");
         let mut spec: DeploymentSpec = serde_json::from_value(serde_json::json!({"id":"svc","namespace":"team",
-            "routes":[{"host":"svc.example"}],"discovery":{"service_id":"svc",
+            "routes":[{"host":"svc.example"}],"discovery":{"service_id":"svc","region":"eu1",
             "source":{"url":url,"auth":{"secret":"reader","namespace":"default"}}}})).unwrap();
         spec.normalize();
         spec.validate().unwrap();
@@ -301,7 +360,7 @@ mod tests {
         let restarted = DiscoveryWatcher::new(None, loaded.clone(), loaded_secrets.clone());
         assert!(!restarted.refresh("svc", "svc").await.unwrap());
         assert_eq!(*seen.lock().unwrap(), ["Bearer first", "Bearer rotated"]);
-        assert_eq!(loaded.get("svc").unwrap().state().discovery_source_url.as_deref(), Some(url.as_str()));
+        assert_eq!(loaded.get("svc").unwrap().state().discovery_source_url.as_deref(), Some(format!("{url}?region=eu1").as_str()));
         loaded_secrets.remove("team", "reader");
         assert!(restarted.refresh("svc", "svc").await.is_err());
         assert_eq!(loaded.get("svc").unwrap().spec.upstreams, ["east:8081"]);
@@ -396,13 +455,37 @@ mod tests {
 
     #[test]
     fn filters_deduplicates_and_sorts_atomically() {
-        let snapshot = Snapshot { service_id: "cloud".into(), version: 2, endpoints: vec![
-            Endpoint { url: "http://b:80".into(), health_status: HealthStatus::Healthy, draining: false },
-            Endpoint { url: "http://a:80".into(), health_status: HealthStatus::Healthy, draining: false },
-            Endpoint { url: "http://a:80".into(), health_status: HealthStatus::Healthy, draining: false },
-            Endpoint { url: "http://c:80".into(), health_status: HealthStatus::Unhealthy, draining: false },
+        let snapshot = Snapshot { service_id: "cloud".into(), version: 2, region: None, regional_policy: None, endpoints: vec![
+            Endpoint { url: "http://b:80".into(), region: None, health_status: HealthStatus::Healthy, draining: false },
+            Endpoint { url: "http://a:80".into(), region: None, health_status: HealthStatus::Healthy, draining: false },
+            Endpoint { url: "http://a:80".into(), region: None, health_status: HealthStatus::Healthy, draining: false },
+            Endpoint { url: "http://c:80".into(), region: None, health_status: HealthStatus::Unhealthy, draining: false },
         ]};
-        assert_eq!(snapshot_upstreams(&snapshot).unwrap(), ["a:80", "b:80"]);
+        assert_eq!(snapshot_upstreams(&snapshot, None).unwrap(), ["a:80", "b:80"]);
+    }
+
+    #[test]
+    fn regional_membership_requires_explicit_scope_even_for_empty_or_unhealthy_sets() {
+        let mut snapshot: Snapshot = serde_json::from_value(serde_json::json!({
+            "serviceId":"svc", "version":17, "region":"eu1", "endpoints":[
+                {"region":"eu1", "url":"http://eu:8081", "healthStatus":"healthy", "draining":false},
+                {"region":"eu1", "url":"http://eu:8082", "healthStatus":"healthy", "draining":true}
+            ]
+        })).unwrap();
+        assert_eq!(snapshot_upstreams(&snapshot, Some("eu1")).unwrap(), ["eu:8081"]);
+        assert!(snapshot_upstreams(&snapshot, Some("us3")).is_err());
+        assert!(snapshot_upstreams(&snapshot, None).is_err());
+        snapshot.endpoints[1].region = Some("us3".into());
+        snapshot.endpoints[1].health_status = HealthStatus::Unhealthy;
+        assert!(snapshot_upstreams(&snapshot, Some("eu1")).is_err());
+        snapshot.endpoints[1].region = None;
+        assert!(snapshot_upstreams(&snapshot, Some("eu1")).is_err());
+        snapshot.endpoints.clear();
+        assert!(snapshot_upstreams(&snapshot, Some("eu1")).unwrap().is_empty());
+        snapshot.region = None;
+        assert!(snapshot_upstreams(&snapshot, Some("eu1")).is_err(), "legacy server must not silently ignore scope");
+        snapshot.regional_policy = Some(serde_json::json!({"version":1,"regions":[]}));
+        assert!(snapshot_upstreams(&snapshot, None).is_err(), "legacy membership must not attest regional policy adoption");
     }
 
     #[test]

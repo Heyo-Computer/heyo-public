@@ -122,6 +122,9 @@ pub struct Config {
 pub struct DiscoveryObserver {
     pub service_id: String,
     pub region: String,
+    /// Explicit hierarchical gateway identity; required for regional-v1 reports.
+    #[serde(default)]
+    pub gateway_id: Option<String>,
     pub deployment_id: String,
     pub base_url: String,
     /// Opt in to host-managed ingress. Origin used to probe this particular
@@ -132,6 +135,10 @@ pub struct DiscoveryObserver {
     /// `token` key for this discovery authority. The value stays in app-lb.
     #[serde(default)]
     pub discovery_token_secret: Option<String>,
+    /// Existing namespace-local app-lb peer-role secret ID for cold regional
+    /// enrollment. This is a reference, not a credential value.
+    #[serde(default)]
+    pub regional_peer_token_secret: Option<String>,
     /// Exact authoritative service discovery URL, identical at every ingress.
     #[serde(default)]
     pub discovery_url: Option<String>,

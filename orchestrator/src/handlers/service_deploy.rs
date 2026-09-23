@@ -488,6 +488,7 @@ async fn deploy_service_inner(
         .await?
         .with_context(|| format!("service {service_id} has a deployment or retirement in progress"))?;
     super::regional_rollout::ensure_no_regional_rollout(db::get_db()?, &service_id).await?;
+    super::regional_policy::require_legacy_topology(db::get_db()?, &service_id).await?;
     bind_deployment_environment_identity(
         &state,
         &service_id,
@@ -617,7 +618,7 @@ pub(super) async fn validate_service_deployment_request(
     Ok(())
 }
 
-fn validate_service_traffic_mode(
+pub(super) fn validate_service_traffic_mode(
     service_id: &str,
     desired_replicas: Option<u16>,
     has_ingress_route: bool,
@@ -1433,6 +1434,61 @@ fn excess_target_endpoints(
         .collect()
 }
 
+/// Resolve one immutable candidate request without creating VMs or changing routes.
+/// Callers may persist its fingerprint before the first Cloud request.
+pub(super) async fn prepare_cloud_candidate(
+    state: &AppState,
+    request: &mut ServiceDeployRequest,
+    deployment_id: &str,
+    excluded_backend_server_ids: Vec<String>,
+) -> Result<(CreateDeploymentRequest, String, Vec<ResolvedSecretRef>)> {
+    let service_id = sanitize_service_id(&request.service_id)?;
+    let archive_bytes = load_archive_bytes(state, request).await?;
+    let archive_sha256 = format!("{:x}", Sha256::digest(&archive_bytes));
+    let archive_bytes = if request.archive_id.is_some() && request.archive_bytes_base64.is_none() {
+        Vec::new()
+    } else {
+        archive_bytes
+    };
+    let account_id = request.account_id.clone().unwrap_or_else(|| request.user_id.clone());
+    let ports = if request.ports.is_empty() && request.port_mappings.is_empty() {
+        vec![8080]
+    } else {
+        request.ports.clone()
+    };
+    let resolved_secrets = resolve_env_refs(state, request).await?;
+    let cloud_request = CreateDeploymentRequest {
+        deployment_id: deployment_id.into(),
+        user_id: request.user_id.clone(),
+        account_id,
+        name: request.name.clone().unwrap_or_else(|| format!("service-{service_id}")),
+        slug: Some(format!("{service_id}-candidate")),
+        target: "service".to_string(),
+        archive_id: request.archive_id.clone(),
+        archive_name: request.archive_name.clone(),
+        archive_bytes,
+        region: request.region.clone(),
+        backend_type: request.driver.clone(),
+        image: request.image.clone(),
+        ports,
+        port_mappings: request.port_mappings.clone(),
+        mounts: request.mounts.clone(),
+        env: request.env.clone(),
+        env_refs: request.env_refs.clone(),
+        start_command: request.start_command.clone(),
+        working_directory: request.working_directory.clone(),
+        setup_hooks: request.setup_hooks.clone(),
+        size_class: request.size_class.clone(),
+        ttl_seconds: Some(request.ttl_seconds.unwrap_or(0)),
+        deployment_environment: request.deployment_environment.clone(),
+        placement_pool: request.placement_pool.clone(),
+        excluded_backend_server_ids,
+        allowed_backend_server_ids: None,
+        metadata: request.metadata.clone(),
+    };
+    Ok((cloud_request, archive_sha256, resolved_secrets))
+}
+
 async fn deploy_service_candidate(
     state: AppState,
     mut request: ServiceDeployRequest,
@@ -1451,23 +1507,9 @@ async fn deploy_service_candidate(
         .clone()
         .unwrap_or_else(|| format!("svc-{service_id}-{}", Uuid::new_v4()));
 
-    let archive_bytes = load_archive_bytes(&state, &request).await?;
-    let archive_sha256 = format!("{:x}", Sha256::digest(&archive_bytes));
-    let archive_bytes = if request.archive_id.is_some() && request.archive_bytes_base64.is_none() {
-        Vec::new()
-    } else {
-        archive_bytes
-    };
-    let account_id = request
-        .account_id
-        .clone()
-        .unwrap_or_else(|| request.user_id.clone());
-    let ports = if request.ports.is_empty() && request.port_mappings.is_empty() {
-        vec![8080]
-    } else {
-        request.ports.clone()
-    };
-    let resolved_secrets = resolve_env_refs(&state, &mut request).await?;
+    let (cloud_request, archive_sha256, resolved_secrets) = prepare_cloud_candidate(
+        &state, &mut request, &deployment_id, excluded_backend_server_ids,
+    ).await?;
 
     record_service_deployment_event(
         &state,
@@ -1504,40 +1546,7 @@ async fn deploy_service_candidate(
     .await?;
     let create_response = match timeout(
         Duration::from_secs(SERVICE_CANDIDATE_CREATE_TIMEOUT_SECONDS),
-        cloud_client::create_deployment(
-            &state,
-            &CreateDeploymentRequest {
-                deployment_id: deployment_id.clone(),
-                user_id: request.user_id.clone(),
-                account_id,
-                name: request
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("service-{service_id}")),
-                slug: Some(format!("{service_id}-candidate")),
-                target: "service".to_string(),
-                archive_id: request.archive_id.clone(),
-                archive_name: request.archive_name.clone(),
-                archive_bytes,
-                region: request.region.clone(),
-                backend_type: request.driver.clone(),
-                image: request.image.clone(),
-                ports,
-                port_mappings: request.port_mappings.clone(),
-                mounts: request.mounts.clone(),
-                env: request.env.clone(),
-                env_refs: request.env_refs.clone(),
-                start_command: request.start_command.clone(),
-                working_directory: request.working_directory.clone(),
-                setup_hooks: request.setup_hooks.clone(),
-                size_class: request.size_class.clone(),
-                ttl_seconds: Some(request.ttl_seconds.unwrap_or(0)),
-                deployment_environment: request.deployment_environment.clone(),
-                placement_pool: request.placement_pool.clone(),
-                excluded_backend_server_ids,
-                metadata: request.metadata.clone(),
-            },
-        ),
+        cloud_client::create_deployment(&state, &cloud_request),
     )
     .await
     {
@@ -1566,6 +1575,7 @@ async fn deploy_service_candidate(
             anyhow::bail!(error_message);
         }
     };
+    drop(cloud_request);
     record_service_deployment_event(
         &state,
         &deployment_id,
@@ -4123,6 +4133,10 @@ async fn write_service_state(_state: &AppState, service_state: &ServiceDeploymen
 
 async fn read_service_state_from_db(service_id: &str) -> Result<Option<ServiceDeploymentState>> {
     let db = db::get_db()?;
+    read_service_state_in(db,service_id).await
+}
+
+pub(super) async fn read_service_state_in(db: &impl ConnectionTrait, service_id: &str) -> Result<Option<ServiceDeploymentState>> {
     let row = db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -4200,6 +4214,10 @@ async fn read_service_state_from_db(service_id: &str) -> Result<Option<ServiceDe
 
 async fn write_service_state_to_db(service_state: &ServiceDeploymentState) -> Result<()> {
     let db = db::get_db()?;
+    write_service_state_in(db,service_state).await
+}
+
+pub(super) async fn write_service_state_in(db: &impl ConnectionTrait, service_state: &ServiceDeploymentState) -> Result<()> {
     let route = service_state
         .route
         .as_ref()
@@ -4311,7 +4329,7 @@ fn build_deployment_metadata(
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ResolvedSecretRef {
+pub(super) struct ResolvedSecretRef {
     env: String,
     path: String,
     version: i32,
@@ -4572,6 +4590,7 @@ mod tests {
         ServiceDiscoverySnapshot {
             service_id: "cloud".to_string(),
             version: 7,
+            regional_policy: None,
             endpoints: vec![
                 ServiceDiscoveryEndpoint {
                     deployment_id: "old-us2".to_string(),

@@ -25,6 +25,8 @@ mod disks;
 mod dns;
 mod federated;
 mod feed;
+mod gateway;
+mod regional;
 mod guard;
 mod health;
 mod host_bundle;
@@ -971,6 +973,7 @@ fn main() {
             guard.clone(),
             event_feed,
             auth_providers.clone(),
+            secrets.clone(),
         ),
     );
     proxy_svc.add_tcp(&cfg.proxy_addr);

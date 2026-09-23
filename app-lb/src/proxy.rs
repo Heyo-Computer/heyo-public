@@ -48,6 +48,9 @@ pub struct Ctx {
     /// The matched route prefix when that route opted into removing it before
     /// proxying. Routing happens before Pingora builds the upstream request.
     route_prefix: Option<String>,
+    /// Resolved once at admission; never recorded in access logs.
+    gateway_token: Option<String>,
+    regional_assignment: Option<crate::regional::Assignment>,
 }
 
 impl Ctx {
@@ -60,6 +63,10 @@ impl Ctx {
             b.release();
         }
     }
+}
+
+impl Drop for Ctx {
+    fn drop(&mut self) { self.release(); }
 }
 
 /// The URL prefix Let's Encrypt fetches to validate an HTTP-01 challenge.
@@ -94,6 +101,7 @@ pub struct LbProxy {
     /// with `auth.provider_ref`. Read only on the gated path; a deployment
     /// without a reference never touches it.
     auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
+    secrets: Arc<crate::secrets::SecretStore>,
 }
 
 impl LbProxy {
@@ -108,6 +116,7 @@ impl LbProxy {
         guard: Arc<Guard>,
         feed: Arc<crate::feed::Feed>,
         auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
+        secrets: Arc<crate::secrets::SecretStore>,
     ) -> Self {
         Self {
             registry,
@@ -119,6 +128,7 @@ impl LbProxy {
             guard,
             feed,
             auth_providers,
+            secrets,
         }
     }
 
@@ -650,6 +660,58 @@ impl ProxyHttp for LbProxy {
             return Ok(true); // response already written; stop proxying
         };
 
+        if session.req_header().headers.contains_key(crate::regional::PROBE)
+            || session.req_header().headers.contains_key(crate::regional::ACTIVE_PROBE) {
+            let result = if deployment.spec.maintenance { Err(503) }
+            else if let (Some(router),Some(discovery)) = (&deployment.regional,&deployment.spec.discovery) {
+                if session.req_header().headers.contains_key(crate::regional::ACTIVE_PROBE) {
+                    router.active_probe_local(discovery.regional.as_ref().unwrap(),&discovery.service_id,
+                        discovery.region.as_deref().unwrap(),&session.req_header().headers,&session.req_header().method,
+                        &session.req_header().uri,host.as_deref().unwrap_or(""),&deployment.spec.health,&self.secrets).await
+                        .map(|receipt| serde_json::to_string(&receipt).expect("active probe receipt serializes"))
+                } else {
+                    router.probe_local(discovery.regional.as_ref().unwrap(),&discovery.service_id,
+                        discovery.region.as_deref().unwrap(),&session.req_header().headers,&session.req_header().method,
+                        &session.req_header().uri,host.as_deref().unwrap_or(""),&deployment.spec.health,&self.secrets).await
+                        .map(|receipt| serde_json::to_string(&receipt).expect("probe receipt serializes"))
+                }
+            } else { Err(403) };
+            for name in crate::gateway::HEADERS.into_iter().chain([crate::regional::GENERATION,crate::regional::ENVIRONMENT,
+                crate::regional::PROBE,crate::regional::ACTIVE_PROBE]) {
+                session.req_header_mut().remove_header(name);
+            }
+            ctx.deployment = Some(deployment);
+            match result {
+                Ok(receipt) => write_plain(session,200,&receipt).await?,
+                Err(status) => write_plain(session,status,"candidate probe refused or unhealthy\n").await?,
+            }
+            return Ok(true);
+        }
+
+        let admission = if let Some(router) = &deployment.regional {
+            let discovery = deployment.spec.discovery.as_ref().expect("regional discovery configured");
+            router.admit(discovery.regional.as_ref().unwrap(), &discovery.service_id,
+                discovery.region.as_deref().unwrap(), &session.req_header().headers, &self.secrets)
+                .map(|assignment| { ctx.regional_assignment = Some(assignment); None })
+        } else if [crate::regional::GENERATION, crate::regional::ENVIRONMENT].iter().any(|h| session.req_header().headers.contains_key(*h)) {
+            Err(403)
+        } else {
+            crate::gateway::admit(deployment.spec.gateway.as_ref(), &session.req_header().headers, &self.secrets)
+        };
+        // Pingora tracks header names separately; raw HeaderMap mutation
+        // breaks that bookkeeping when serializing the upstream request.
+        for name in crate::gateway::HEADERS.into_iter().chain([crate::regional::GENERATION, crate::regional::ENVIRONMENT]) {
+            session.req_header_mut().remove_header(name);
+        }
+        match admission {
+            Ok(token) => ctx.gateway_token = token,
+            Err(status) => {
+                ctx.deployment = Some(deployment);
+                write_plain(session, status, "gateway admission refused\n").await?;
+                return Ok(true);
+            }
+        }
+
         // Maintenance is a deployment data-plane fence, not an admin outage.
         // Keep the route present and answer 503 so retrying clients wait while
         // operators continue to use the separate admin listener (including
@@ -795,6 +857,27 @@ impl ProxyHttp for LbProxy {
         upstream: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        if let Some(assignment) = &ctx.regional_assignment {
+            if let Some((spec, token, environment)) = &assignment.forward {
+                let mut headers = http::HeaderMap::new();
+                crate::gateway::write_forward_headers(&mut headers, spec, token)
+                    .map_err(|_| Error::explain(ErrorType::InternalError, "invalid regional headers"))?;
+                for (name, value) in &headers { upstream.insert_header(name, value)?; }
+                upstream.insert_header(crate::regional::GENERATION, assignment.generation.to_string())?;
+                upstream.insert_header(crate::regional::ENVIRONMENT, environment)?;
+            }
+        }
+        if let (Some(spec), Some(token)) = (
+            ctx.deployment.as_ref().and_then(|d| d.spec.gateway.as_ref()),
+            ctx.gateway_token.as_deref(),
+        ) {
+            let mut headers = http::HeaderMap::new();
+            crate::gateway::write_forward_headers(&mut headers, spec, token)
+                .map_err(|_| Error::explain(ErrorType::InternalError, "invalid gateway headers"))?;
+            for (name, value) in &headers {
+                upstream.insert_header(name, value)?;
+            }
+        }
         if let Some(prefix) = ctx.route_prefix.as_deref() {
             let rewritten = strip_uri_prefix(&upstream.uri, prefix);
             let mut parts = upstream.uri.clone().into_parts();
@@ -878,6 +961,17 @@ impl ProxyHttp for LbProxy {
         // Give back any slot from a failed attempt before reserving another.
         ctx.release();
 
+        if let Some(assignment) = &ctx.regional_assignment {
+            if ctx.attempts != 1 || !assignment.backend.try_acquire() {
+                return Err(Error::explain(ErrorType::ConnectProxyFailure, "regional assignment unavailable; replay forbidden"));
+            }
+            let backend = assignment.backend.clone();
+            ctx.backend = Some(backend.clone());
+            let addr = resolve_peer(&backend.address).await.ok_or_else(||
+                Error::explain(ErrorType::ConnectProxyFailure, "regional assignment address did not resolve"))?;
+            return Ok(Box::new(http_peer(&backend, addr)));
+        }
+
         // Pick a backend, atomically reserve it, and resolve its address to a
         // concrete `SocketAddr`. Reserving before the await is load-bearing: a
         // cordon can then either prevent this request or see it in `in_flight`,
@@ -897,6 +991,16 @@ impl ProxyHttp for LbProxy {
             changed.as_mut().enable();
             if let Some(current) = self.registry.get(&deployment.spec.id) {
                 if !Arc::ptr_eq(&current, &deployment) {
+                    // Admission consumed the peer headers and resolved the
+                    // forwarding credential against the original gateway.
+                    // Never apply that decision to a different gateway policy
+                    // (including changing an ordinary route into a peer route).
+                    if current.spec.gateway != deployment.spec.gateway {
+                        return Err(Error::explain(
+                            ErrorType::ConnectProxyFailure,
+                            "gateway policy changed after admission",
+                        ));
+                    }
                     drop(changed);
                     deployment = current;
                     ctx.deployment = Some(deployment.clone());
@@ -993,7 +1097,7 @@ impl ProxyHttp for LbProxy {
         // rather than holding it through the retry.
         ctx.release();
 
-        if ctx.attempts < MAX_ATTEMPTS {
+        if ctx.regional_assignment.is_none() && ctx.attempts < MAX_ATTEMPTS {
             e.set_retry(true);
         }
         e
@@ -1017,6 +1121,7 @@ impl ProxyHttp for LbProxy {
             false => None,
         };
         ctx.release();
+        ctx.regional_assignment.take();
 
         let status = session.response_written().map(|r| r.status.as_u16());
 
@@ -1331,6 +1436,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,
@@ -1349,16 +1455,18 @@ mod tests {
         b.acquire();
         assert_eq!(b.in_flight(), 1);
 
-        let mut ctx = Ctx {
-            backend: Some(b.clone()),
-            ..Default::default()
-        };
+        let mut ctx = Ctx::default();
+        ctx.backend = Some(b.clone());
         ctx.release();
         assert_eq!(b.in_flight(), 0);
         // A second release (e.g. fail_to_connect then logging) must not
         // decrement a slot it no longer owns.
         ctx.release();
         assert_eq!(b.in_flight(), 0);
+        b.acquire();
+        ctx.backend = Some(b.clone());
+        drop(ctx);
+        assert_eq!(b.in_flight(), 0, "cancellation must return the backend slot too");
     }
 
     #[test]

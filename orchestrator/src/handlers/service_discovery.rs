@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -31,21 +31,61 @@ pub struct ServiceDiscoveryEndpoint {
 pub struct ServiceDiscoverySnapshot {
     pub service_id: String,
     pub version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regional_policy: Option<super::regional_policy::RegionalPolicy>,
     pub endpoints: Vec<ServiceDiscoveryEndpoint>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryQuery {
+    pub region: Option<String>,
+    pub protocol: Option<String>,
+    pub gateway_id: Option<String>,
+    pub boot_id: Option<String>,
+}
+
+fn scoped_response(mut snapshot: ServiceDiscoverySnapshot, region: Option<&str>) -> serde_json::Value {
+    if let Some(region) = region {
+        snapshot.endpoints.retain(|endpoint| endpoint.region.as_deref() == Some(region));
+    }
+    // Preserve the authoritative generation even for an empty regional set.
+    // Echoing scope lets consumers distinguish a scoped empty response from
+    // an older server silently ignoring the query parameter.
+    let mut response = json!(snapshot);
+    response["region"] = json!(region);
+    response
 }
 
 pub async fn get_service_discovery(
     headers: HeaderMap,
     State(state): State<AppState>,
     AxumPath(service_id): AxumPath<String>,
+    Query(query): Query<DiscoveryQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if let Err(status) = auth::require_internal_api_key(&headers, &state.config.internal_api_key) {
         return (status, Json(json!({ "error": "Unauthorized" })));
     }
 
+    if let Some(protocol) = &query.protocol {
+        if protocol != "regional-v1" || query.region.is_none() || query.gateway_id.is_none() || query.boot_id.is_none() {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error":"regional-v1 requires region, gatewayId and bootId"})));
+        }
+        let result = async {
+            read_regional_snapshot(db::get_db()?, &service_id, query.region.as_deref().unwrap(),
+                query.gateway_id.as_deref().unwrap(), query.boot_id.as_deref().unwrap()).await
+        }.await;
+        return match result {
+            Ok(value) => (StatusCode::OK, Json(value)),
+            Err(error) => {
+                tracing::warn!(%service_id, %error, "regional snapshot unavailable");
+                (StatusCode::CONFLICT, Json(json!({"error":"regional snapshot is not authorized or ready"})))
+            }
+        };
+    }
     match read_snapshot(&service_id).await {
-        Ok(Some(snapshot)) => (StatusCode::OK, Json(json!(snapshot))),
+        Ok(Some(snapshot)) => (StatusCode::OK, Json(scoped_response(snapshot, query.region.as_deref()))),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Service discovery set not found" })),
@@ -64,6 +104,49 @@ pub async fn read_snapshot(service_id: &str) -> Result<Option<ServiceDiscoverySn
     read_snapshot_with_region_drains(service_id, true).await
 }
 
+/// One committed view of policy history, active reference, admission fences and
+/// region-scoped membership. Draft regional_policy is never an active policy.
+pub(super) async fn read_regional_snapshot(
+    db: &sea_orm::DatabaseConnection, service: &str, region: &str, gateway: &str, boot: &str,
+) -> Result<serde_json::Value> {
+    let tx = db.begin_with_config(Some(IsolationLevel::RepeatableRead), Some(AccessMode::ReadOnly)).await?;
+    let mut snapshot = read_snapshot_in(&tx, service, true).await?.context("discovery set is missing")?;
+    let rows = tx.query_all(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT p.generation,p.policy,p.step_id,r.operation_id,r.phase,r.plan,r.observer_topology,r.deployment_request
+         FROM regional_policy_proposals p JOIN regional_service_rollouts r USING(service_id,operation_id)
+         WHERE p.service_id=$1 ORDER BY p.generation", [service.into()])).await?;
+    let latest = rows.last().context("no published policy proposal")?;
+    let participants: Vec<super::regional_reports::Participant> = serde_json::from_str(
+        &latest.try_get::<String>("", "observer_topology")?)?;
+    anyhow::ensure!(participants.iter().any(|p| p.gateway_id == gateway && p.region == region && p.boot_id == boot),
+        "gateway boot is not pinned by current operation");
+    anyhow::ensure!(tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT 1 FROM regional_gateway_reports WHERE service_id=$1 AND gateway_id=$2 AND boot_id=$3 AND invalidated",
+        [service.into(), gateway.into(), boot.into()])).await?.is_none(), "gateway boot was invalidated");
+    let request: serde_json::Value = latest.try_get("", "deployment_request")?;
+    let environment = request.get("deploymentEnvironment").and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty()).context("regional operation must pin deploymentEnvironment")?;
+    let plan: super::regional_plan::Plan = serde_json::from_value(latest.try_get("", "plan")?)?;
+    let target = plan.publication(&latest.try_get::<String>("", "step_id")?)?.region.as_deref();
+    let active = tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT generation FROM service_active_regional_policies WHERE service_id=$1", [service.into()])).await?
+        .map(|r| r.try_get::<i64>("", "generation")).transpose()?;
+    let fence = tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT closed_through_generation FROM service_regional_admission_fences WHERE service_id=$1 AND region=$2",
+        [service.into(), region.into()])).await?.map(|r| r.try_get::<i64>("", "closed_through_generation")).transpose()?.unwrap_or(0);
+    let policies = rows.iter().map(|r| -> Result<_> {
+        Ok(json!({"generation":r.try_get::<i64>("", "generation")?,"policy":r.try_get::<serde_json::Value>("", "policy")?}))
+    }).collect::<Result<Vec<_>>>()?;
+    snapshot.endpoints.retain(|e| e.region.as_deref() == Some(region));
+    let response = json!({"protocolVersion":1,"serviceId":service,"environment":environment,
+        "region":region,"gatewayId":gateway,"bootId":boot,"version":snapshot.version,
+        "operationId":latest.try_get::<String>("", "operation_id")?,"phase":latest.try_get::<String>("", "phase")?,
+        "proposalGeneration":latest.try_get::<i64>("", "generation")?,"activeGeneration":active,
+        "drainTarget":target,"closedThroughGeneration":fence,"policies":policies,"endpoints":snapshot.endpoints});
+    tx.commit().await?;
+    Ok(response)
+}
+
 /// Compensation must save individual drain intent, not materialize temporary
 /// region exclusions as permanent replica drains.
 pub(super) async fn read_stored_snapshot(service_id: &str) -> Result<Option<ServiceDiscoverySnapshot>> {
@@ -77,10 +160,18 @@ async fn read_snapshot_with_region_drains(service_id: &str, effective: bool) -> 
     let transaction = db.begin_with_config(
         Some(IsolationLevel::RepeatableRead), Some(AccessMode::ReadOnly),
     ).await?;
+    let snapshot = read_snapshot_in(&transaction, service_id, effective).await?;
+    transaction.commit().await?;
+    Ok(snapshot)
+}
+
+pub(super) async fn read_snapshot_in(
+    transaction: &impl ConnectionTrait, service_id: &str, effective: bool,
+) -> Result<Option<ServiceDiscoverySnapshot>> {
     let set = transaction
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT version, updated_at FROM service_discovery_sets WHERE service_id = $1",
+            "SELECT version, updated_at, regional_policy FROM service_discovery_sets WHERE service_id = $1",
             [service_id.into()],
         ))
         .await
@@ -90,6 +181,9 @@ async fn read_snapshot_with_region_drains(service_id: &str, effective: bool) -> 
     };
 
     let version: i64 = set.try_get("", "version")?;
+    let regional_policy: Option<serde_json::Value> = set.try_get("", "regional_policy")?;
+    let regional_policy = regional_policy.map(serde_json::from_value).transpose()
+        .context("invalid stored regional routing policy")?;
     let updated_at: DateTime<chrono::FixedOffset> = set.try_get("", "updated_at")?;
     let rows = transaction
         .query_all(Statement::from_sql_and_values(
@@ -120,11 +214,11 @@ async fn read_snapshot_with_region_drains(service_id: &str, effective: bool) -> 
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    transaction.commit().await?;
 
     Ok(Some(ServiceDiscoverySnapshot {
         service_id: service_id.to_string(),
         version: u64::try_from(version).context("service discovery version was negative")?,
+        regional_policy,
         endpoints,
         updated_at: updated_at.with_timezone(&Utc),
     }))
@@ -271,21 +365,7 @@ pub async fn mark_endpoint_draining(service_id: &str, deployment_id: &str) -> Re
 pub async fn mark_endpoint_active(service_id: &str, deployment_id: &str) -> Result<()> {
     let db = db::get_db()?;
     let transaction = db.begin().await?;
-    // Membership is authoritative for multi-replica rollback. Reactivating a
-    // non-scalar replica must revoke historical retirement authority too.
-    transaction.execute(Statement::from_sql_and_values(DbBackend::Postgres,
-        "INSERT INTO service_deployment_events(deployment_id,service_id,phase,status,message,metadata)
-         SELECT DISTINCT intent.deployment_id,intent.service_id,'previous-retire-cancelled','passed',
-             'Retirement cancelled by discovery reactivation.',
-             jsonb_build_object('response',jsonb_build_object('previousDeploymentId',$2::TEXT))
-         FROM service_deployment_events intent
-         WHERE intent.service_id=$1 AND intent.phase='previous-retire-wait'
-             AND intent.metadata->'response'->>'previousDeploymentId'=$2
-             AND NOT EXISTS (SELECT 1 FROM service_deployment_events cancelled
-                 WHERE cancelled.deployment_id=intent.deployment_id
-                     AND cancelled.phase='previous-retire-cancelled'
-                     AND cancelled.metadata->'response'->>'previousDeploymentId'=$2)",
-        [service_id.into(),deployment_id.into()])).await?;
+    cancel_endpoint_retirement(&transaction,service_id,deployment_id).await?;
     let result = transaction
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -299,6 +379,25 @@ pub async fn mark_endpoint_active(service_id: &str, deployment_id: &str) -> Resu
         bump_version(&transaction, service_id).await?;
     }
     transaction.commit().await?;
+    Ok(())
+}
+
+pub(super) async fn cancel_endpoint_retirement(db: &impl ConnectionTrait, service_id: &str, deployment_id: &str) -> Result<()> {
+    // Membership is authoritative for multi-replica rollback. Reactivating a
+    // non-scalar replica must revoke historical retirement authority too.
+    db.execute(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO service_deployment_events(deployment_id,service_id,phase,status,message,metadata)
+         SELECT DISTINCT intent.deployment_id,intent.service_id,'previous-retire-cancelled','passed',
+             'Retirement cancelled to protect retained or active discovery capacity.',
+             jsonb_build_object('response',jsonb_build_object('previousDeploymentId',$2::TEXT))
+         FROM service_deployment_events intent
+         WHERE intent.service_id=$1 AND intent.phase='previous-retire-wait'
+             AND intent.metadata->'response'->>'previousDeploymentId'=$2
+             AND NOT EXISTS (SELECT 1 FROM service_deployment_events cancelled
+                 WHERE cancelled.deployment_id=intent.deployment_id
+                     AND cancelled.phase='previous-retire-cancelled'
+                     AND cancelled.metadata->'response'->>'previousDeploymentId'=$2)",
+        [service_id.into(),deployment_id.into()])).await?;
     Ok(())
 }
 
@@ -423,6 +522,37 @@ pub(crate) fn validate_endpoint_url(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regional_response_preserves_generation_and_excludes_other_or_unplaced_endpoints() {
+        let snapshot: ServiceDiscoverySnapshot = serde_json::from_value(json!({
+            "serviceId":"svc", "version":17, "updatedAt":"2026-09-22T00:00:00Z",
+            "regionalPolicy":{"version":1,"regions":[
+                {"region":"us3","weight":2,"gateways":[{"id":"us-a","backendServerId":"host-us","url":"https://us.example"}]},
+                {"region":"eu1","weight":1,"gateways":[{"id":"eu-a","backendServerId":"host-eu","url":"https://eu.example"}]}
+            ]},
+            "endpoints":[
+                {"deploymentId":"us-a","region":"us3","url":"http://us:24001","healthStatus":"healthy","draining":false},
+                {"deploymentId":"eu-a","region":"eu1","url":"http://eu:24002","healthStatus":"healthy","draining":false},
+                {"deploymentId":"eu-b","region":"eu1","url":"http://eu:24003","healthStatus":"unhealthy","draining":true},
+                {"deploymentId":"unknown","url":"http://old:24004","healthStatus":"healthy","draining":false}
+            ]
+        })).unwrap();
+        let eu = scoped_response(snapshot.clone(), Some("eu1"));
+        let us = scoped_response(snapshot.clone(), Some("us3"));
+        assert_eq!(eu["regionalPolicy"], us["regionalPolicy"]);
+        assert_eq!(eu["regionalPolicy"]["regions"].as_array().unwrap().len(), 2);
+        assert_eq!(eu["region"], "eu1");
+        assert_eq!(eu["version"], 17);
+        assert_eq!(eu["endpoints"].as_array().unwrap().len(), 2);
+        assert_eq!(eu["endpoints"][0]["deploymentId"], "eu-a");
+        assert_eq!(eu["endpoints"][1]["draining"], true);
+        let empty = scoped_response(snapshot.clone(), Some("absent"));
+        assert_eq!(empty["region"], "absent");
+        assert_eq!(empty["version"], 17);
+        assert_eq!(empty["endpoints"], json!([]));
+        assert_eq!(scoped_response(snapshot, None)["endpoints"].as_array().unwrap().len(), 4);
+    }
 
     #[test]
     fn discovery_endpoint_requires_cross_host_proxy_shape() {

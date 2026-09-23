@@ -3543,7 +3543,9 @@ async fn list(
         .map(|d| status_of(&state, d))
         .collect();
     out.sort_by(|a, b| a.spec.id.cmp(&b.spec.id));
-    ([("x-app-lb-create-only", "1"), ("x-app-lb-discovery-source", "1")], Json(out))
+    ([("x-app-lb-create-only", "1"), ("x-app-lb-discovery-source", "1"),
+        ("x-app-lb-discovery-region", "1"), ("x-app-lb-gateway", "1"),
+        ("x-app-lb-regional-admission", "1")], Json(out))
 }
 
 async fn get_one(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
@@ -3575,6 +3577,8 @@ struct DiscoveryStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     source_url: Option<String>,
     version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regional: Option<serde_json::Value>,
     upstreams: Vec<DiscoveryUpstreamStatus>,
 }
 
@@ -3612,6 +3616,18 @@ fn discovery_status_locked(
         service_id: discovery.service_id.clone(),
         source_url: deployment.state().discovery_source_url.clone(),
         version: deployment.state().discovery_version,
+        regional: deployment.regional.as_ref().zip(discovery.regional.as_ref())
+            .map(|(router, spec)| {
+                let mut status = router.status(spec, !deployment.spec.maintenance);
+                let host = deployment.spec.routes.first().and_then(|r| r.host.as_deref()).unwrap_or("");
+                let conflict = registry.deployments().values().any(|other| other.spec.id != id
+                    && other.spec.routes.iter().any(|r| r.matches(Some(host), r.path_prefix.as_deref().unwrap_or("/"))));
+                status["admission"] = serde_json::json!({"protocolVersion":1,"environment":spec.environment,
+                    "region":discovery.region,"backendServerId":spec.backend_server_id,"namespace":deployment.spec.namespace,
+                    "routes":deployment.spec.routes,"sourceUrl":discovery.source.as_ref().map(|s| &s.url),
+                    "routeConflict":conflict,"maintenance":deployment.spec.maintenance,"credentialsReady":false});
+                status
+            }),
         upstreams: upstreams
             .into_iter()
             .map(|(peer, (draining, in_flight))| DiscoveryUpstreamStatus {
@@ -3628,8 +3644,70 @@ fn discovery_status_locked(
 async fn discovery_status(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
     let _change = state.registry.change_guard().await;
     match discovery_status_locked(&state.registry, &id) {
-        Ok(status) => Json(status).into_response(),
+        Ok(mut status) => {
+            if let Some(deployment) = state.registry.get(&id) {
+                if let Some(spec) = deployment.spec.discovery.as_ref().and_then(|d| d.regional.as_ref()) {
+                    let ready = state.secrets.resolve(&spec.auth).is_ok_and(|token|
+                        !token.is_empty() && http::HeaderValue::from_str(&token).is_ok())
+                        && deployment.spec.discovery.as_ref().and_then(|d| d.source.as_ref()).is_some_and(|source|
+                            state.secrets.resolve(&source.auth).is_ok_and(|token| !token.trim().is_empty()
+                                && http::HeaderValue::from_str(&token).is_ok()));
+                    if let Some(regional) = &mut status.regional {
+                        regional["admission"]["credentialsReady"] = serde_json::json!(ready);
+                    }
+                    if !ready {
+                        if let Some(report) = status.regional.as_mut().and_then(|r| r.get_mut("report")).filter(|r| r.is_object()) {
+                            report["prepared"] = serde_json::json!(false);
+                        }
+                    }
+                }
+            }
+            ([(header::CACHE_CONTROL, "no-store")], Json(status)).into_response()
+        }
         Err(response) => response,
+    }
+}
+
+/// An authenticated control-plane request makes this gateway exercise the
+/// destination's HTTPS peer path. Peer credentials never leave the gateway.
+async fn regional_probe(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path(id): Path<String>, Json(request): Json<crate::regional::ProbeRequest>) -> Response {
+    let Some(deployment) = state.registry.get(&id) else {
+        return err(StatusCode::NOT_FOUND,"deployment not found").into_response();
+    };
+    if !recovery_authorized(&caller,&deployment.spec) {
+        return forbidden("authenticated namespace admin required");
+    }
+    if deployment.spec.maintenance { return err(StatusCode::CONFLICT,"gateway is in maintenance").into_response(); }
+    let (Some(router),Some(discovery)) = (&deployment.regional,&deployment.spec.discovery) else {
+        return err(StatusCode::CONFLICT,"regional gateway required").into_response();
+    };
+    let host = deployment.spec.routes.first().and_then(|r| r.host.as_deref()).unwrap_or("");
+    match router.probe_remote(discovery.regional.as_ref().unwrap(),&discovery.service_id,&request,
+        host,&deployment.spec.health,&state.secrets).await {
+        Ok(()) => ([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"request":request,"sourceBootId":router.boot_id}))).into_response(),
+        Err(code) => err(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),"candidate probe refused or unhealthy").into_response(),
+    }
+}
+
+/// Read-only readiness of currently eligible capacity, independent of a pending
+/// proposal's owner. Namespace admin authorization does not authorize a rollout.
+async fn regional_active_probe(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path(id): Path<String>, Json(request): Json<crate::regional::ActiveProbeRequest>) -> Response {
+    let Some(deployment) = state.registry.get(&id) else {
+        return err(StatusCode::NOT_FOUND,"deployment not found").into_response();
+    };
+    if !recovery_authorized(&caller,&deployment.spec) {return forbidden("authenticated namespace admin required");}
+    if deployment.spec.maintenance {return err(StatusCode::CONFLICT,"gateway is in maintenance").into_response();}
+    let (Some(router),Some(discovery)) = (&deployment.regional,&deployment.spec.discovery) else {
+        return err(StatusCode::CONFLICT,"regional gateway required").into_response();
+    };
+    let spec = discovery.regional.as_ref().unwrap();
+    let host = deployment.spec.routes.first().and_then(|r| r.host.as_deref()).unwrap_or("");
+    match router.active_probe_remote(spec,&discovery.service_id,&request,host,&deployment.spec.health,&state.secrets).await {
+        Ok(receipt) => ([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"request":request,
+            "sourceGatewayId":spec.gateway_id,"sourceBootId":router.boot_id,"destination":receipt}))).into_response(),
+        Err(code) => err(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),"active capacity probe refused or unhealthy").into_response(),
     }
 }
 
@@ -5296,8 +5374,14 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/workspace/recoveries/:operation_id", get(get_workspace_recovery))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
 
+    let regional = Router::new()
+        .route("/deployments/:id/regional-probe",post(regional_probe))
+        .route("/deployments/:id/regional-active-probe",post(regional_active_probe))
+        .route_layer(middleware::from_fn_with_state(state.clone(),require_crud_auth));
+
     Router::new()
         .route("/healthz", get(healthz))
+        .merge(regional)
         .merge(recovery)
         .merge(view)
         .merge(whoami)

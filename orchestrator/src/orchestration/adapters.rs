@@ -3250,6 +3250,7 @@ async fn execute_heyo_deploy(
                 deployment_environment: None,
                 placement_pool: None,
                 excluded_backend_server_ids: Vec::new(),
+                allowed_backend_server_ids: None,
                 metadata: None,
             };
             (sandbox.clone(), deployment_id, request)

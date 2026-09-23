@@ -13,7 +13,7 @@ pub(super) fn enabled(state: &AppState, service: &str) -> bool {
         && (o.ingress_url.is_some() || o.discovery_url.is_some()))
 }
 
-fn http_url(value: &str) -> Result<reqwest::Url> {
+pub(super) fn http_url(value: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(value)?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none()
         || !url.username().is_empty() || url.password().is_some()
@@ -61,16 +61,26 @@ fn matches_spec(actual: &Value, expected: &Value) -> bool {
     actual["id"] == expected["id"] && actual["discovery"] == expected["discovery"]
         && actual["routes"] == expected["routes"]
         && actual["vm"].is_null() && actual["site"].is_null()
+        && (expected["discovery"]["regional"].is_null()
+            || (actual["namespace"].as_str().unwrap_or("default") == expected["namespace"].as_str().unwrap_or("default")
+                && actual["health"] == expected["health"]))
 }
 
 async fn ensure_route(client: &reqwest::Client, observer: &DiscoveryObserver, route: &ServiceRouteRequest, token: &str) -> Result<()> {
+    ensure_spec(client, observer, &spec(observer, route), token).await
+}
+
+pub(super) async fn ensure_spec(client: &reqwest::Client, observer: &DiscoveryObserver, expected: &Value, token: &str) -> Result<()> {
     let mut collection = http_url(&observer.base_url)?;
     collection.path_segments_mut().unwrap().pop_if_empty().push("deployments");
     let mut resource = collection.clone();
     resource.path_segments_mut().unwrap().push(&observer.deployment_id);
-    let expected = spec(observer, route);
     let response = client.get(resource.clone()).bearer_auth(token).send().await?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+    // Namespace-scoped app-lb tokens receive 403 for absent IDs because no
+    // namespace can yet be established. Create-only registration is safe in
+    // either case: it cannot replace an existing deployment, and both create
+    // permission and the authenticated matching read-back remain mandatory.
+    if matches!(response.status(), reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::FORBIDDEN) {
         let capability = client.get(collection.clone()).bearer_auth(token).send().await?.error_for_status()?;
         if capability.headers().get("x-app-lb-create-only").is_none_or(|v| v != "1") {
             bail!("app-lb does not support safe create-only registration; upgrade it first");
@@ -79,21 +89,25 @@ async fn ensure_route(client: &reqwest::Client, observer: &DiscoveryObserver, ro
             && capability.headers().get("x-app-lb-discovery-source").is_none_or(|v| v != "1") {
             bail!("app-lb does not support managed discovery sources; upgrade it first");
         }
+        if !expected["discovery"]["regional"].is_null()
+            && capability.headers().get("x-app-lb-regional-admission").is_none_or(|v| v != "1") {
+            bail!("app-lb does not support cold regional admission; upgrade it first");
+        }
         let created = client.post(collection).bearer_auth(token)
-            .header("If-None-Match", "*").json(&expected).send().await?;
+            .header("If-None-Match", "*").json(expected).send().await?;
         // A concurrent creator is acceptable only if read-back matches exactly.
         if created.status() != reqwest::StatusCode::PRECONDITION_FAILED {
             created.error_for_status()?;
         }
     } else {
         let actual: Value = response.error_for_status()?.json().await?;
-        if !matches_spec(&actual["spec"], &expected) {
+        if !matches_spec(&actual["spec"], expected) {
             bail!("existing ingress deployment {} differs; refusing replacement", observer.deployment_id);
         }
     }
     let actual: Value = client.get(resource).bearer_auth(token).send().await?
         .error_for_status()?.json().await?;
-    if !matches_spec(&actual["spec"], &expected) {
+    if !matches_spec(&actual["spec"], expected) {
         bail!("ingress registration read-back differs from the requested discovery route");
     }
     Ok(())
@@ -177,19 +191,25 @@ mod tests {
             .route("/orchestration/services/smoke/discovery", get(|State(s): State<Mock>| async move { Json(s.snapshot) }))
             .route("/deployments", get(|State(s): State<Mock>| async move {
                 ([("x-app-lb-create-only", if s.mode.load(Ordering::SeqCst) == 4 { "0" } else { "1" }),
-                    ("x-app-lb-discovery-source", if s.mode.load(Ordering::SeqCst) == 6 { "0" } else { "1" })], Json(json!([])))
+                    ("x-app-lb-discovery-source", if s.mode.load(Ordering::SeqCst) == 6 { "0" } else { "1" }),
+                    ("x-app-lb-regional-admission", if s.mode.load(Ordering::SeqCst) == 10 { "0" } else { "1" })], Json(json!([])))
             }).post(|State(s): State<Mock>, headers: HeaderMap, Json(spec): Json<Value>| async move {
                 assert_eq!(headers["if-none-match"], "*");
                 assert_eq!(headers["authorization"], "Bearer test");
                 s.creates.fetch_add(1, Ordering::SeqCst);
+                if s.mode.load(Ordering::SeqCst) == 9 { return StatusCode::FORBIDDEN; }
                 let mut stored = s.stored.lock().unwrap();
                 if stored.is_some() { return StatusCode::PRECONDITION_FAILED; }
                 *stored = Some(spec);
                 StatusCode::CREATED
             }))
             .route("/deployments/{id}", get(|State(s): State<Mock>, Path(_id): Path<String>| async move {
+                if s.mode.load(Ordering::SeqCst) == 8 {
+                    return (StatusCode::FORBIDDEN, Json(json!({})));
+                }
                 match s.stored.lock().unwrap().clone() {
                     Some(spec) => (StatusCode::OK, Json(json!({"spec":spec}))),
+                    None if matches!(s.mode.load(Ordering::SeqCst), 7 | 9) => (StatusCode::FORBIDDEN, Json(json!({}))),
                     None => (StatusCode::NOT_FOUND, Json(json!({}))),
                 }
             }))
@@ -222,7 +242,7 @@ mod tests {
         mock.mode.store(6, Ordering::SeqCst);
         assert!(ensure_route(&client, &observer, &route, "test").await.unwrap_err().to_string().contains("managed discovery sources"));
         assert_eq!(mock.creates.load(Ordering::SeqCst), 0);
-        mock.mode.store(0, Ordering::SeqCst);
+        mock.mode.store(7, Ordering::SeqCst);
         ensure_route(&client, &observer, &route, "test").await.unwrap();
         ensure_route(&client, &observer, &route, "test").await.unwrap();
         assert_eq!(mock.creates.load(Ordering::SeqCst), 1);
@@ -231,6 +251,45 @@ mod tests {
         mock.stored.lock().unwrap().as_mut().unwrap()["discovery"]["source"]["auth"]["secret"] = json!("other");
         assert!(ensure_route(&client, &observer, &route, "test").await.unwrap_err().to_string().contains("refusing replacement"));
         assert_eq!(mock.creates.load(Ordering::SeqCst), 1);
+
+        // A real forbidden read is not permission to replace the resource.
+        let protected = mock.stored.lock().unwrap().clone();
+        mock.mode.store(8, Ordering::SeqCst);
+        assert!(ensure_route(&client, &observer, &route, "test").await.is_err());
+        assert_eq!(*mock.stored.lock().unwrap(), protected);
+        assert_eq!(mock.creates.load(Ordering::SeqCst), 2);
+
+        // A token unable to create also remains a hard failure.
+        *mock.stored.lock().unwrap() = None;
+        mock.mode.store(9, Ordering::SeqCst);
+        assert!(ensure_route(&client, &observer, &route, "test").await.is_err());
+        assert!(mock.stored.lock().unwrap().is_none());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn cold_registration_requires_capability_and_preserves_namespace_and_identity() {
+        let (base, mock, task) = mock().await;
+        let observer: DiscoveryObserver = serde_json::from_value(json!({
+            "service_id":"smoke","region":"eu1","deployment_id":"smoke","base_url":base,
+            "token_secret_path":"test/observer","discovery_token_secret":"reader"
+        })).unwrap();
+        let expected = json!({"id":"smoke","namespace":"team-a","routes":[{"host":"smoke.example"}],
+            "discovery":{"service_id":"smoke","regional":{"gateway_id":"eu","backend_server_id":"host-eu"}}});
+        let client = reqwest::Client::new();
+        mock.mode.store(10,Ordering::SeqCst);
+        assert!(ensure_spec(&client,&observer,&expected,"test").await.unwrap_err().to_string().contains("cold regional admission"));
+        assert_eq!(mock.creates.load(Ordering::SeqCst),0);
+        mock.mode.store(0,Ordering::SeqCst);
+        ensure_spec(&client,&observer,&expected,"test").await.unwrap();
+        ensure_spec(&client,&observer,&expected,"test").await.unwrap();
+        for field in ["namespace","discovery"] {
+            let mut changed = expected.clone();
+            changed[field] = json!("different");
+            assert!(ensure_spec(&client,&observer,&changed,"test").await.is_err());
+        }
+        assert_eq!(*mock.stored.lock().unwrap(),Some(expected));
+        assert_eq!(mock.creates.load(Ordering::SeqCst),1);
         task.abort();
     }
 

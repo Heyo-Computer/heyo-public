@@ -154,6 +154,7 @@ fn vm_spec() -> DeploymentSpec {
         },
         upstreams: vec![],
         discovery: None,
+        gateway: None,
         build: Some(crate::config::BuildSpec {
             repo: Some("https://github.com/example/agent".into()),
             store: None,
@@ -244,6 +245,7 @@ fn site_spec() -> DeploymentSpec {
         health: crate::config::HealthCheck::default(),
         upstreams: vec![],
         discovery: None,
+        gateway: None,
         build: None,
         artifact: None,
         site: Some(crate::config::SiteSpec {
@@ -301,8 +303,11 @@ fn static_spec() -> DeploymentSpec {
         upstreams: vec!["10.0.0.4:8080".into(), "10.0.0.5:8080".into()],
         discovery: Some(crate::config::DiscoverySpec {
             service_id: "cloud".into(),
+            region: None,
             source: None,
+            regional: None,
         }),
+        gateway: None,
         build: None,
         artifact: None,
         site: None,

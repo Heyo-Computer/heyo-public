@@ -72,7 +72,175 @@ deployments. Regional rollout is deliberately stricter: traffic leaves a region
 before its new revision is created, observer and bake gates are mandatory, and
 rollback capacity is retained.
 
+### V3 application execution remains gated
+
+The hierarchical application program has an internal dispatcher for preflight,
+policy barriers, correlated candidate creation/recovery, membership staging,
+restoration, bake and final verification. Public v3 admission and background
+execution remain closed pending complete lifecycle/failure integration; local
+fixture results do not authorize activation or establish live acceptance.
+
+Internal application admission requires the expected active generation and
+discovery version, an explicit placement pool, immutable archive, runtime revision
+and exposed guest port. It pins every retained healthy endpoint and authenticates
+all configured gateway participants against the predecessor's boot identities.
+Application regions must match the positive-weight baseline regions, and each
+region must have enough distinct pinned hosts for its candidate slots. Mutable
+draft policy does not authorize application traffic changes.
+
+Archive retrieval and gateway inspection happen outside the service lifecycle
+lock. Admission rechecks the complete baseline under that lock and requires fleet
+observations no older than five seconds before atomically saving the v3 plan.
+An identical operation retry returns its persisted identity even if the archive
+or gateways are unavailable; changed intent and concurrent lifecycle owners are
+rejected. These are internal integration contracts, not a newly exposed endpoint.
+Requests containing the legacy `revisionGuard` are rejected until its cutover
+freshness check is integrated; it must not be silently treated as satisfied by
+the archive digest or the application's runtime-revision health response.
+
+For an existing v3 operation, rollback enters the persisted current region's
+`rollback_entry`, not the legacy region-zero rollback cursor. Repeated rollback
+requests do not rewind an entered rollback or resume it if blocked. Explicit
+resume preserves its cursor and invalidates outstanding probe work. Late health
+responses cannot stage membership across block/resume, even when discovery and
+the active policy have not changed.
+
+The internal dispatcher persists an attempt start time independently of health
+samples. Each step has `drainTimeoutSeconds` to progress; bake additionally gets
+`bakeSeconds`. Expiry blocks the operation without restoring traffic or dropping
+its service ownership. A controller restart does not reset this budget. Explicit
+resume or advancement to the next step begins a fresh attempt; elapsed downtime
+never counts as a healthy bake interval. These additive fields are in migration
+`041_add_application_probe_claims.sql`, which is tested locally, not applied to
+shared infrastructure by this implementation.
+
+## Regional routing intent (not activated routing)
+
+`PUT /orchestration/services/{id}/regional-policy` stores explicit regional weights
+and gateway inventory in the same PostgreSQL discovery set. It uses the existing
+internal API-key role and service lifecycle lock; there are no regional credentials.
+Apply migrations `037_add_regional_routing_policy.sql` and
+`038_add_regional_policy_proposals.sql` through the normal managed upgrade before
+using this capability.
+
+```json
+{"expectedVersion":17,"policy":{"version":1,"regions":[{"region":"us3","weight":2,"gateways":[{"id":"us-a","backendServerId":"host-us","url":"https://us.example"}]},{"region":"eu1","weight":1,"gateways":[{"id":"eu-a","backendServerId":"host-eu","url":"https://eu.example"}]}]}}
+```
+
+`expectedVersion` compares against the current discovery generation (0 for a new
+set). An accepted write increments that generation atomically with policy storage.
+A stale generation, held lifecycle lock, running ordinary rollout, or running/blocked
+regional rollout returns 409 without changing intent. On an ambiguous response,
+read discovery and compare policy; do not blindly retry with a newer generation.
+Explicit `policy: null` clears intent under the same gates and advances, never resets,
+the generation. Omitting `policy` is rejected. Regional snapshots return the same
+complete `regionalPolicy` alongside their scoped VM membership.
+
+This stores desired topology only. It does not attest gateway health, policy
+adoption, capacity, or drain. **Do not configure it on a live service yet:** the
+current flat app-lb consumer refuses policy-bearing snapshots rather than falsely
+acknowledging hierarchical routing, and legacy deployment/rollout executors reject
+services with regional policy before starting deployment effects. The hierarchical
+consumer and staged rollout gates must be integrated before activation. Clearing
+unused intent restores the legacy path without erasing its generation history.
+
+### Immutable proposal storage (executor integration pending)
+
+Migration 038 separates policy generation allocation from discovery revision.
+An immutable proposal belongs to a service, operation and publication plan item,
+and pins its expected active predecessor. PostgreSQL rejects proposal updates and
+deletes. One active reference selects a proposal; there are no mutable prepared and
+active copies. Schema version remains `RegionalPolicy.version`.
+
+The version-2 routing-only plan separates publication, preparation, activation,
+source adoption, outgoing-assignment drain, peer-admission closure and destination
+drain. Weight-only changes without withdrawal finish after source adoption;
+withdrawing a serving region requires its drain plan and zero target weight while
+retaining target inventory. Neither variant creates VMs or reinterprets version-1 plans.
+Internal storage primitives commit publication/activation and their cursor/item
+journal together under the service lifecycle lock. Exact retries return the
+existing generation/receipt; changed intent and stale predecessors fail. Endpoint
+membership revision changes do not invalidate the pinned policy predecessor.
+Clearing draft intent is refused while an active policy exists, and active policy
+also fences legacy executors independently of the draft.
+
+Transition admission/publication is not exposed through HTTP. The reconciler
+dispatches already-published version-2 operations to the hierarchical report/gate
+executor; version-1 operations retain their legacy path and safety fences.
+Internal routing-only admission authenticates every configured participant, checks
+its cold/active-predecessor state, environment, placement, exact whole-host route,
+namespace and shared discovery authority, and pins boot IDs and observer bindings.
+The lifecycle lock protects the final draft/predecessor/conflict recheck and atomic
+operation/proposal publication. Exact operation retries return the durable receipt
+without polling unavailable gateways; changed intent is rejected. Reconciliation
+rejects observer/configuration drift. Routing-only transitions cannot change the
+gateway inventory or boots; those require a separately fenced fleet handoff.
+Cold route enrollment is also internal. It uses existing host-managed app-lb admin
+APIs with `If-None-Match: *`, requires `x-app-lb-regional-admission: 1`, and never
+updates an existing deployment. All observer bindings and secret references are
+validated before writes. The service lifecycle lock excludes admission/deployment
+while routes are registered; partial registrations remain cold and retry reads
+them back without changing their boot identity. Enrollment itself publishes no
+proposal and cannot be used after an active policy exists.
+
+For enrollment, each observer supplies `discovery_token_secret` and
+`regional_peer_token_secret`: distinct existing app-lb secret IDs in the requested
+namespace, not raw credentials. The source URL has exactly `?region=<region>`;
+the registered source omits that query because app-lb supplies its runtime scope.
+The application health path is explicit and must match on retries. Successful
+enrollment verifies authenticated cold status and credential readiness, not serving
+health. Fresh admission remains a separate step. Provisioning hosts/secrets and
+replacing active processes are not part of this route-registration primitive.
+
+Publication validates the union of predecessor and proposed gateway participants
+against the operation's immutable boot/region inventory. Report storage retains
+per-service/gateway/boot sequence high-water marks across operations. Duplicates do
+not refresh evidence; observing a different boot permanently invalidates the old
+boot's reports, including delayed higher-sequence responses. This invalidation is
+not proof of network fencing and cannot authorize a replacement process to serve.
+
+Gate evaluation uses server timestamps and a five-second maximum sample age,
+including poll duration. Activation rechecks fresh preparation within its ownership
+transaction. Source-adoption samples must follow activation, and destination
+admission ACKs must follow the close command. Source assignment totals cover all
+retained generations; zero outgoing assignments does not substitute for closed
+destination admission and zero local work. Each successful gate advances one
+persisted dependency and its item journal atomically.
+
+Hierarchical discovery (`protocol=regional-v1`) reads policy history, active reference,
+regional endpoints and admission fence in one repeatable-read transaction. Each
+discovery observer must explicitly bind `gateway_id`, region, deployment and the exact
+applied `discovery_url` (including its region query). Observer credentials come from
+HeyoSecret; redirects and cached reports are rejected. Scope is checked before report
+storage. An authenticated observation of a cold boot that has no routing authorization
+still invalidates its predecessor's evidence; it never proves predecessor drain.
+
+The local end-to-end fixture uses actual app-lb processes and authenticated polls
+against disposable PostgreSQL; storage tests also inject reports to discriminate
+stale/replayed/foreign evidence. Run the integrated fixture after building app-lb
+with `reqwest/rustls-tls-native-roots`, setting its absolute path in
+`APP_LB_TEST_BINARY` and the disposable database in `ORCHESTRATOR_TEST_DATABASE_URL`:
+
+```sh
+cargo test --locked --manifest-path orchestrator/Cargo.toml --bin orchestrator two_real_gateways -- --include-ignored --nocapture
+```
+
+This verifies local integration, not live drain or safe candidate/host replacement.
+Keep public admission/activation APIs and legacy flat-consumer fences closed until
+managed fleet lifecycle, external ingress inventory/fencing, replacement handoff
+and live acceptance gates are explicitly satisfied. The configured observer list
+alone cannot prove that no external legacy ingress still admits work.
+
 ## Ingress observers
+
+Discovery reads support `GET /orchestration/services/{id}/discovery?region=eu1`.
+The response contains only that region's endpoints, retains the shared version,
+and echoes `region`, including for empty sets. Omitting the parameter preserves
+the complete endpoint set. app-lb can opt in with `discovery.region`; it rejects
+responses that omit or contradict the scope. This does not change the current
+rollout executor into a hierarchical gateway coordinator: regional weights,
+gateway inventory and staged source-assignment/destination-drain gates are still
+required before using that topology for coordinated upgrades.
 
 Configure **every** app-lb instance that can admit traffic for the service in the
 orchestrator TOML file (`HEYO_ORCHESTRATOR_CONFIG_PATH`). At least one observer
@@ -129,6 +297,11 @@ API, using HeyoSecret as the source of truth. This is the discovery reader token
 not the observer's app-lb admin token. Bootstrap checks support and persists only
 the reference. No host environment edit is required. If the field is omitted,
 the legacy `APP_LB_DISCOVERY_URL/TOKEN` host configuration remains required.
+Namespace-scoped app-lb tokens can return 403 rather than 404 for an absent
+deployment. Bootstrap handles either response with capability-checked,
+create-only registration (`If-None-Match: *`), followed by an authenticated
+exact-spec read-back. It does not widen the token or replace an existing route;
+denied creation or denied read-back still fails the rollout.
 Controllers executing the same rollout must share the same PostgreSQL state;
 this feature does not replicate independent regional databases.
 

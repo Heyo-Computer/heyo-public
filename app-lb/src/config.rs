@@ -3281,6 +3281,9 @@ pub struct DeploymentSpec {
     /// deployment's upstream membership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery: Option<DiscoverySpec>,
+    /// Opt-in one-hop regional gateway transport over explicit static upstreams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<crate::gateway::GatewaySpec>,
     /// Where `vm.image` is built from: a git repo and a Dockerfile. Optional —
     /// a deployment can go on naming a prebuilt image — and only valid on a
     /// managed deployment, since a static one has no image to build.
@@ -3365,6 +3368,11 @@ impl IngressSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct DiscoverySpec {
     pub service_id: String,
+    /// Opt into region-scoped membership; the authority must echo this scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regional: Option<crate::regional::RegionalSpec>,
     /// Managed per-deployment authority; absent preserves the host env default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<DiscoverySource>,
@@ -3742,6 +3750,7 @@ pub enum SpecError {
     EmptyDiscoveryServiceId,
     DiscoveryWithOtherBackend,
     InvalidDiscoverySource(String),
+    InvalidGateway(String),
     /// A static upstream address is not a valid plaintext `host:port` or HTTPS URL.
     BadUpstream(String),
     /// A static deployment declared a `build` block; there is no image to build.
@@ -4079,6 +4088,7 @@ impl std::fmt::Display for SpecError {
             ),
             Self::EmptyDiscoveryServiceId => write!(f, "discovery.service_id must not be empty"),
             Self::InvalidDiscoverySource(error) => write!(f, "invalid discovery source: {error}"),
+            Self::InvalidGateway(error) => write!(f, "invalid gateway: {error}"),
             Self::DiscoveryWithOtherBackend => write!(
                 f,
                 "discovery supplies a static upstream set and cannot be combined with `vm` or `site`"
@@ -4593,8 +4603,12 @@ impl DeploymentSpec {
     /// refs and are handled beside this in [`normalize`](Self::normalize).
     fn secret_refs_mut(&mut self) -> Vec<&mut SecretRef> {
         let mut out: Vec<&mut SecretRef> = Vec::new();
-        if let Some(source) = self.discovery.as_mut().and_then(|d| d.source.as_mut()) {
-            out.push(&mut source.auth);
+        if let Some(gateway) = &mut self.gateway {
+            out.push(&mut gateway.auth);
+        }
+        if let Some(discovery) = &mut self.discovery {
+            if let Some(source) = &mut discovery.source { out.push(&mut source.auth); }
+            if let Some(regional) = &mut discovery.regional { out.push(&mut regional.auth); }
         }
         if let Some(b) = &mut self.build {
             out.extend(b.auth.as_mut());
@@ -4626,7 +4640,9 @@ impl DeploymentSpec {
     /// a delete checks before refusing.
     pub fn secret_ids(&self) -> Vec<String> {
         let mut refs: Vec<Option<&SecretRef>> = vec![
+            self.gateway.as_ref().map(|g| &g.auth),
             self.discovery.as_ref().and_then(|d| d.source.as_ref()).map(|s| &s.auth),
+            self.discovery.as_ref().and_then(|d| d.regional.as_ref()).map(|s| &s.auth),
             self.build.as_ref().and_then(|b| b.auth.as_ref()),
             self.artifact.as_ref().and_then(|a| a.auth.as_ref()),
             self.update.as_ref().and_then(|u| u.auth.as_ref()),
@@ -4769,6 +4785,14 @@ impl DeploymentSpec {
         if self.id.trim().is_empty() {
             return Err(SpecError::EmptyId);
         }
+        if let Some(gateway) = &self.gateway {
+            if self.vm.is_some() || self.discovery.is_some() || self.site.is_some()
+                || self.routes.len() != 1 || self.routes[0].host.is_none()
+                || self.routes[0].strip_prefix || self.routes[0].host_suffix.is_some() {
+                return Err(SpecError::InvalidGateway("gateway transport requires static upstreams and one exact-host route with preserved path".into()));
+            }
+            gateway.validate(&self.upstreams).map_err(SpecError::InvalidGateway)?;
+        }
         if !is_valid_namespace(&self.namespace) {
             return Err(SpecError::BadNamespace(self.namespace.clone()));
         }
@@ -4848,9 +4872,26 @@ impl DeploymentSpec {
             if discovery.service_id.trim().is_empty() {
                 return Err(SpecError::EmptyDiscoveryServiceId);
             }
+            if discovery.region.as_ref().is_some_and(|r| r.is_empty() || r.len() > 128
+                || !r.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))) {
+                return Err(SpecError::InvalidDiscoverySource("region must be a bounded identifier".into()));
+            }
             if let Some(source) = &discovery.source {
                 crate::discovery::validate_source_url(&source.url).map_err(SpecError::InvalidDiscoverySource)?;
                 source.auth.validate().map_err(|e| SpecError::InvalidDiscoverySource(e.to_string()))?;
+            }
+            if let Some(regional) = &discovery.regional {
+                if discovery.region.is_none() || discovery.source.is_none() || self.gateway.is_some()
+                    || self.routes.len() != 1 || self.routes[0].host.is_none()
+                    || self.routes[0].strip_prefix || self.routes[0].host_suffix.is_some() {
+                    return Err(SpecError::InvalidDiscoverySource("regional routing requires region, explicit authority and one exact-host route with preserved path".into()));
+                }
+                for value in [&regional.gateway_id, &regional.backend_server_id, &regional.environment, &discovery.service_id] {
+                    if value.is_empty() || value.len() > 128 || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+                        return Err(SpecError::InvalidDiscoverySource("regional identity must be a bounded identifier".into()));
+                    }
+                }
+                regional.auth.validate().map_err(|e| SpecError::InvalidDiscoverySource(e.to_string()))?;
             }
             if self.vm.is_some() || self.site.is_some() {
                 return Err(SpecError::DiscoveryWithOtherBackend);
@@ -5563,6 +5604,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,
@@ -5619,6 +5661,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,

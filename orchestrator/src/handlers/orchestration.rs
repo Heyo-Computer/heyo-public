@@ -671,6 +671,7 @@ pub async fn create_resource_deployment(
         deployment_environment: None,
         placement_pool: None,
         excluded_backend_server_ids: Vec::new(),
+        allowed_backend_server_ids: None,
         metadata: req.metadata,
     };
 

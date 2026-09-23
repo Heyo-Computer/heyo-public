@@ -250,6 +250,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(handlers::service_discovery::get_service_discovery),
         )
         .route(
+            "/orchestration/services/{service_id}/regional-policy",
+            axum::routing::put(handlers::regional_policy::put),
+        )
+        .route(
             "/orchestration/threads/{thread_id}",
             get(handlers::orchestration::get_thread),
         )

@@ -343,6 +343,7 @@ mod tests {
             health: Default::default(),
             upstreams: vec![],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,

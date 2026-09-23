@@ -85,6 +85,7 @@ pub(crate) struct CreateDeploymentRequest {
     pub deployment_environment: Option<String>,
     pub placement_pool: Option<String>,
     pub excluded_backend_server_ids: Vec<String>,
+    pub allowed_backend_server_ids: Option<Vec<String>>,
     pub metadata: Option<Value>,
 }
 
@@ -190,6 +191,8 @@ struct CreateDeploymentHttpRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     placement_pool: Option<String>,
     excluded_backend_server_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_backend_server_ids: Option<Vec<String>>,
     metadata: Option<Value>,
 }
 
@@ -328,22 +331,12 @@ struct ReconcileDeploymentHostsRequest {
     deployment_ids: Vec<String>,
 }
 
-pub(crate) async fn create_deployment(
-    state: &AppState,
-    request: &CreateDeploymentRequest,
-) -> Result<CreateDeploymentResponse> {
+fn deployment_http_request(request: &CreateDeploymentRequest) -> CreateDeploymentHttpRequest {
     let archive_id = request
         .archive_id
         .clone()
         .filter(|_| request.archive_bytes.is_empty());
-    let response = authorized_request(
-        state,
-        state.http_client.post(format!(
-            "{}/internal/orchestration/deployments",
-            state.config.cloud_internal_url.trim_end_matches('/'),
-        )),
-    )
-    .json(&CreateDeploymentHttpRequest {
+    CreateDeploymentHttpRequest {
         deployment_id: request.deployment_id.clone(),
         user_id: request.user_id.clone(),
         account_id: request.account_id.clone(),
@@ -373,8 +366,35 @@ pub(crate) async fn create_deployment(
         deployment_environment: request.deployment_environment.clone(),
         placement_pool: request.placement_pool.clone(),
         excluded_backend_server_ids: request.excluded_backend_server_ids.clone(),
+        allowed_backend_server_ids: request.allowed_backend_server_ids.clone(),
         metadata: request.metadata.clone(),
-    })
+    }
+}
+
+/// Persist this fingerprint before sending create; it contains no secret values.
+pub(crate) fn deployment_request_digest(request: &CreateDeploymentRequest) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut value = serde_json::to_value(deployment_http_request(request))?;
+    // Cloud hashes its parsed request, including absent optional fields as null.
+    for key in ["slug", "archiveId", "deploymentEnvironment", "placementPool"] {
+        value.as_object_mut().unwrap().entry(key).or_insert(Value::Null);
+    }
+    value.sort_all_objects();
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&value)?)))
+}
+
+pub(crate) async fn create_deployment(
+    state: &AppState,
+    request: &CreateDeploymentRequest,
+) -> Result<CreateDeploymentResponse> {
+    let response = authorized_request(
+        state,
+        state.http_client.post(format!(
+            "{}/internal/orchestration/deployments",
+            state.config.cloud_internal_url.trim_end_matches('/'),
+        )),
+    )
+    .json(&deployment_http_request(request))
     .send()
     .await
     .context("Failed to call cloud deploy API")?;
@@ -389,6 +409,50 @@ pub(crate) async fn create_deployment(
         .json::<CreateDeploymentResponse>()
         .await
         .context("Failed to parse cloud deploy API response")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeploymentCreationReceipt {
+    #[serde(flatten)]
+    pub deployment: CreateDeploymentResponse,
+    pub request_digest: String,
+    pub host_local_url: Option<String>,
+    pub guest_port: Option<u16>,
+}
+
+/// Read-only after an uncertain create; never retry creation with a fresh identity.
+pub(crate) async fn recover_deployment(
+    state: &AppState,
+    deployment_id: &str,
+    request_digest: &str,
+    guest_port: Option<u16>,
+) -> Result<DeploymentCreationReceipt> {
+    let mut url = reqwest::Url::parse(&format!("{}/internal/orchestration/deployments/",
+        state.config.cloud_internal_url.trim_end_matches('/')))?;
+    url.path_segments_mut().map_err(|_| anyhow::anyhow!("Invalid Cloud URL"))?
+        .pop_if_empty().push(deployment_id);
+    if let Some(port) = guest_port {
+        url.query_pairs_mut().append_pair("port", &port.to_string());
+    }
+    let response = authorized_request(state, state.http_client.get(url)).send().await?
+        .error_for_status()?;
+    let receipt: DeploymentCreationReceipt = response.json().await?;
+    anyhow::ensure!(receipt.deployment.deployment_id == deployment_id
+        && receipt.request_digest == request_digest, "Cloud creation receipt identity mismatch");
+    if let Some(port) = guest_port {
+        anyhow::ensure!(receipt.guest_port == Some(port)
+            && receipt.deployment.status == "running"
+            && receipt.deployment.backend_server_id.is_some()
+            && receipt.deployment.backend_sandbox_id.is_some(), "Cloud runtime binding unavailable");
+        let local = reqwest::Url::parse(receipt.host_local_url.as_deref()
+            .context("Cloud did not attest a host-local mapping")?)?;
+        anyhow::ensure!(local.scheme() == "http" && local.host_str() == Some("127.0.0.1")
+            && local.path() == "/" && local.query().is_none() && local.fragment().is_none()
+            && local.username().is_empty() && local.password().is_none()
+            && local.port_or_known_default() != Some(0), "Invalid host-local mapping");
+    }
+    Ok(receipt)
 }
 
 pub(crate) async fn create_archive(
@@ -887,6 +951,64 @@ mod tests {
     use super::{create_deployment, CreateDeploymentRequest, DeploymentHealthcheckUrls};
     use crate::AppState;
 
+    #[test]
+    fn creation_digest_matches_cloud_wire_contract() -> Result<()> {
+        let request = CreateDeploymentRequest {
+            deployment_id: "dep-candidate".into(), user_id: "operator".into(), account_id: "account".into(),
+            name: "candidate".into(), slug: None, target: "service".into(), archive_id: Some("archive-a".into()),
+            archive_name: None, archive_bytes: vec![], region: "eu1".into(), backend_type: "libvirt".into(),
+            image: "ubuntu".into(), ports: vec![], port_mappings: vec![], mounts: vec![],
+            env: Some(HashMap::from([("Z".into(), "last".into()), ("A".into(), "first".into())])),
+            env_refs: vec![], start_command: None, working_directory: None, setup_hooks: None,
+            size_class: "small".into(), ttl_seconds: None, deployment_environment: None,
+            placement_pool: None, excluded_backend_server_ids: vec![], metadata: Some(json!({"operationId": "operation-a"})),
+            allowed_backend_server_ids: None,
+        };
+        // Independently derived SHA-256 of sorted, compact JSON with explicit defaults;
+        // the private Cloud request test uses the same wire fixture.
+        assert_eq!(super::deployment_request_digest(&request)?,
+            "cd2a152a5d5f791413cc10c4d8073cd8d2317428c1dfde1cdc5214efe6aa84cf");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_is_read_only_and_rejects_wrong_identity_or_mapping() -> Result<()> {
+        let payload = Arc::new(tokio::sync::Mutex::new(json!({
+            "deploymentId":"dep-a", "requestDigest":"digest-a", "status":"provisioning"
+        })));
+        let app = Router::new().route("/internal/orchestration/deployments/{id}",
+            axum::routing::get(|State(payload): State<Arc<tokio::sync::Mutex<Value>>>, headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer test");
+                Json(payload.lock().await.clone())
+            })).with_state(payload.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = serde_json::from_value(json!({
+            "server_port":0,"database_url":"postgres://unused","agent_provider":"test",
+            "agent_model":"test","agent_api_key":"","agent_timeout_seconds":1,
+            "agent_max_iterations":1,"jwt_secret":"test","cloud_internal_url":base_url,
+            "internal_api_key":"test"
+        }))?;
+        let state = AppState { config: Arc::new(config), http_client: reqwest::Client::new(),
+            worker_id: Arc::new("test".into()), ci_workspace_cache: Default::default() };
+        let receipt = super::recover_deployment(&state, "dep-a", "digest-a", None).await?;
+        assert_eq!(receipt.deployment.status, "provisioning");
+        assert!(super::recover_deployment(&state, "dep-a", "digest-other", None).await.is_err());
+        assert!(super::recover_deployment(&state, "dep-other", "digest-a", None).await.is_err());
+        assert!(super::recover_deployment(&state, "dep-a", "digest-a", Some(8080)).await.is_err());
+        *payload.lock().await = json!({"deploymentId":"dep-a", "requestDigest":"digest-a", "status":"running",
+            "backendServerId":"eu1-host", "backendSandboxId":"sb-exact", "guestPort":8080,
+            "hostLocalUrl":"http://127.0.0.1:18081"});
+        assert_eq!(super::recover_deployment(&state, "dep-a", "digest-a", Some(8080)).await?
+            .deployment.backend_sandbox_id.as_deref(), Some("sb-exact"));
+        assert!(super::recover_deployment(&state, "dep-a", "digest-a", Some(9090)).await.is_err());
+        payload.lock().await["hostLocalUrl"] = json!("http://10.0.0.2:18081");
+        assert!(super::recover_deployment(&state, "dep-a", "digest-a", Some(8080)).await.is_err());
+        server.abort();
+        Ok(())
+    }
+
     #[tokio::test]
     async fn create_deployment_sends_environment_without_placement_pool() -> Result<()> {
         let (body_tx, body_rx) = tokio::sync::oneshot::channel();
@@ -917,8 +1039,10 @@ mod tests {
             setup_hooks: None, size_class: "small".into(), ttl_seconds: None,
             deployment_environment: Some("production".into()), placement_pool: None,
             excluded_backend_server_ids: vec![], metadata: None,
+            allowed_backend_server_ids: Some(vec!["pinned-host".into()]),
         }).await?;
         let body = body_rx.await?;
+        assert_eq!(body["allowedBackendServerIds"], json!(["pinned-host"]));
         assert_eq!(body["deploymentEnvironment"], "production");
         assert!(body.get("placementPool").is_none());
         assert_eq!(response.placement.unwrap().deployment_environment, "production");

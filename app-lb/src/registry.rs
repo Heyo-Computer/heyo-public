@@ -283,8 +283,16 @@ impl Registry {
     /// operator drains are carried for upstream addresses still present in the
     /// replacement: replaying a deployment must not silently put a maintenance
     /// target back into service.
-    pub fn upsert(&self, spec: DeploymentSpec) -> Arc<Deployment> {
+    pub fn upsert(&self, mut spec: DeploymentSpec) -> Arc<Deployment> {
         let previous = self.get(&spec.id);
+        if previous.as_ref().is_some_and(|old|
+            old.spec.discovery.as_ref().and_then(|d| d.region.as_ref())
+                != spec.discovery.as_ref().and_then(|d| d.region.as_ref()))
+            && spec.discovery.is_some() {
+            // A regional scope change cannot relabel cached endpoints from
+            // another region. Wait for a validated snapshot of the new scope.
+            spec.upstreams.clear();
+        }
         if let Some(previous) = previous.as_ref().filter(|d| d.spec.discovery.is_some()) {
             self.fence_discovery_removals(previous, &spec.upstreams);
         }
@@ -295,8 +303,8 @@ impl Registry {
                     .spec
                     .discovery
                     .as_ref()
-                    .map(|value| &value.service_id)
-                    == spec.discovery.as_ref().map(|value| &value.service_id);
+                    .map(|value| (&value.service_id, &value.region))
+                    == spec.discovery.as_ref().map(|value| (&value.service_id, &value.region));
                 if !same_discovery_service {
                     state.discovery_version = None;
                     state.discovery_source_url = None;
@@ -313,7 +321,15 @@ impl Registry {
                 state
             })
         });
-        let deployment = Arc::new(Deployment::new(spec));
+        let mut deployment = Deployment::new(spec);
+        if let Some(previous) = &previous {
+            if previous.spec.namespace == deployment.spec.namespace && previous.spec.discovery == deployment.spec.discovery {
+                deployment.regional = previous.regional.clone();
+            } else if let Some(router) = &previous.regional {
+                router.fence();
+            }
+        }
+        let deployment = Arc::new(deployment);
         if let Some(state) = previous_state {
             deployment.set_state(state);
         }
@@ -799,6 +815,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,
@@ -822,6 +839,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,
@@ -1377,7 +1395,9 @@ mod tests {
         let mut cloud = static_spec("stage", vec![host("stage.example.com")], &[]);
         cloud.discovery = Some(DiscoverySpec {
             service_id: "cloud".into(),
+            region: None,
             source: None,
+            regional: None,
         });
         let deployment = r.upsert(cloud);
         deployment.mutate_state(|state| state.discovery_version = Some(7));
@@ -1385,11 +1405,37 @@ mod tests {
         let mut auth = static_spec("stage", vec![host("stage.example.com")], &[]);
         auth.discovery = Some(DiscoverySpec {
             service_id: "auth".into(),
+            region: None,
             source: None,
+            regional: None,
         });
         let deployment = r.upsert(auth);
 
         assert_eq!(deployment.state().discovery_version, None);
+    }
+
+    #[test]
+    fn changing_discovery_region_fences_cached_membership_without_losing_in_flight_work() {
+        let registry = Registry::new("unused.json");
+        let mut spec = static_spec("stage", vec![host("stage.example.com")], &["eu.example:8081"]);
+        spec.discovery = Some(DiscoverySpec { service_id: "stage".into(), region: Some("eu1".into()), source: None, regional: None });
+        let original = registry.upsert(spec.clone());
+        original.mutate_state(|state| {
+            state.discovery_version = Some(17);
+            state.discovery_source_url = Some("https://authority/discovery?region=eu1".into());
+        });
+        let backend = original.backends()[0].clone();
+        assert!(backend.try_acquire());
+        spec.discovery.as_mut().unwrap().region = Some("us3".into());
+        let replacement = registry.upsert(spec);
+        assert!(replacement.spec.upstreams.is_empty());
+        assert_eq!(replacement.state().discovery_version, None);
+        assert_eq!(replacement.state().discovery_source_url, None);
+        assert!(!backend.try_acquire());
+        assert_eq!(backend.in_flight(), 1);
+        assert_eq!(registry.discovery_backends("stage").len(), 1);
+        backend.release();
+        assert!(registry.discovery_backends("stage").is_empty());
     }
 
     #[tokio::test]
@@ -1400,7 +1446,7 @@ mod tests {
             vec![host("stage.example.com")],
             &["a.example:80", "b.example:80"],
         );
-        first.discovery = Some(DiscoverySpec { service_id: "stage".into(), source: None });
+        first.discovery = Some(DiscoverySpec { service_id: "stage".into(), region: None, source: None, regional: None });
         let deployment = r.upsert(first);
         deployment.mutate_state(|state| {
             state.discovery_version = Some(1);

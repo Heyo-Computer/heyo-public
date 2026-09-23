@@ -27,6 +27,100 @@ process. A deployment is one of three kinds:
 
 A deployment sets exactly one of `vm`, `upstreams` or `site`.
 
+### Opt-in regional gateway transport
+
+The `gateway` block adds explicit one-hop forwarding to a static deployment.
+This is the transport building block, not automatic regional selection or fleet
+management. Existing deployments remain unchanged. Both sides use one exact-host
+route, preserve paths, and resolve a namespace-scoped secret through `auth`.
+Before provisioning, require `X-App-Lb-Gateway: 1` from `GET /deployments`;
+older binaries can silently ignore unknown spec fields.
+
+Source example (normal application Host is preserved; upstream hostname supplies TLS SNI):
+
+```json
+{"id":"smoke-peer","routes":[{"host":"smoke.example"}],"upstreams":["https://eu1.example:443"],"health":{"path":"/health"},"gateway":{"mode":"forward","service":"smoke","region":"eu1","auth":{"secret":"gateway-forwarding"}}}
+```
+
+Destination example (the existing host ingress must deliver this Host to this route):
+
+```json
+{"id":"smoke-local","routes":[{"host":"smoke.example"}],"upstreams":["127.0.0.1:2227"],"health":{"path":"/health"},"gateway":{"mode":"local","service":"smoke","region":"eu1","auth":{"secret":"gateway-forwarding"}}}
+```
+
+`forward` requires HTTPS upstreams. `local` is peer-only and permits only plaintext
+loopback host-port upstreams; it never chooses another region. Supply the same
+gateway-role token through the existing secrets API on both hosts, backed by the
+canonical HeyoSecret role configuration. Never put the value in a deployment spec.
+Peer headers are validated and consumed before forwarding to the application;
+application Authorization is independent. A second hop is refused with 508,
+invalid/missing peer credentials with 403, and unresolved secrets with 503.
+Forward health probes carry peer authentication and the application Host, require
+2xx, and honor configured revision-header checks. In-flight accounting uses the
+existing backend admission guards on each hop.
+
+Do not point this peer-only destination route at a public local-serving route or
+enable it on existing flattened discovery. Hierarchical discovery uses the separate
+`discovery.regional` opt-in below. Fleet registration, coordinated gateway upgrades
+and live two-region acceptance remain separate work.
+
+Run the isolated two-process regression with Python 3 and OpenSSL installed:
+
+```sh
+cargo build --locked --manifest-path app-lb/Cargo.toml --features reqwest/rustls-tls-native-roots
+python3 app-lb/testdata/gateway_smoke.py
+```
+
+The extra build feature lets Rustls health checks read the disposable test CA
+from `SSL_CERT_FILE`, like the OpenSSL proxy. Normal public-CA builds need no
+extra feature. The test never disables TLS verification or touches deployed
+services. It checks request preservation, single POST delivery, peer admission,
+WebSocket echo, and a held response body draining across spec replay while new
+traffic uses another local backend.
+
+### Hierarchical discovery (local integration; not live acceptance)
+
+`discovery.regional` contains `gateway_id`, `backend_server_id`, `environment` and
+an `auth` secret reference for the peer role. The backend identity must match the
+policy's gateway placement. It requires `discovery.region`, an explicit managed
+`discovery.source`, and one exact-host route with preserved path; it cannot be
+combined with the legacy `gateway` block. Both secret references are confined to
+the deployment namespace. The authority is queried with `protocol=regional-v1`,
+region, gateway ID and this runtime's boot UUID.
+
+Cold starts return 503 until the authority authorizes that exact boot. One coherent
+snapshot supplies immutable policy history, active generation, local membership and
+a monotonic admission fence. Requests select a weighted region before a local backend
+or a single HTTPS peer hop. Generation/environment/peer credentials are consumed at
+the destination; application Host and Authorization are preserved. Regional requests
+are never replayed against another assignment after a connect failure.
+
+Assignments remain counted across snapshot/spec replay until the whole request or
+stream finishes. The authenticated `discovery-status` response includes a `regional`
+boot/operation envelope and sequenced preparation/adoption/drain report, with
+`Cache-Control: no-store`. Operator maintenance or missing peer credentials prevents
+preparation evidence. A changed runtime identity fences its predecessor rather than
+resetting the predecessor's outstanding counters.
+
+Even a cold gateway reports authenticated admission metadata: protocol, environment,
+host placement, namespace, routes and discovery authority, plus route conflicts,
+maintenance and credential readiness. This lets the controller pin a configured
+fleet without accepting caller-supplied boot identities. It does not establish the
+absence of unregistered external ingress or authorize a gateway replacement.
+
+The authenticated deployments collection advertises
+`x-app-lb-regional-admission: 1`. Controllers must check this capability before
+create-only cold enrollment; older gateways must not interpret a regional spec as
+a legacy route. Enrollment does not grant traffic admission or replace an existing
+route. Discovery and peer credentials remain separate namespace-local secret refs.
+
+The Orchestrator `two_real_gateways_drain_through_authenticated_durable_barriers`
+test combines real app-lb processes, verified peer TLS, authenticated reports and
+disposable PostgreSQL. Set `APP_LB_TEST_BINARY` to the absolute path of the binary
+built above and `ORCHESTRATOR_TEST_DATABASE_URL` to a disposable test database.
+Public transition-admission APIs remain gated; do not edit shared DB rows to enable
+this feature. These local checks do not establish live multi-region acceptance.
+
 Only Firecracker and KVM are supported. This is not a limitation of taste: app-lb routes
 directly to `SandboxInfo.guest_ip`, which the daemon only populates for tap-networked
 Firecracker/KVM backends on a local daemon. A Libvirt VM would boot fine and then be
@@ -657,6 +751,18 @@ Orchestrator endpoints and persists the last good set. Failed or stale snapshots
 The same deployment can be registered with
 `heyctl create deployment cloud --host cloud.example.com --discovery-service cloud`.
 
+To request regional membership, set `discovery.region`, for example
+`{"service_id":"cloud","region":"eu1"}`. Require
+`X-App-Lb-Discovery-Region: 1` from `GET /deployments` before provisioning it.
+The watcher adds `?region=eu1` to the authority URL and requires an exact `region`
+echo plus matching region on every endpoint. An old server ignoring the query,
+a foreign endpoint, or an unplaced endpoint rejects the entire snapshot; the
+last valid set remains. Empty regional sets retain the shared authority's version.
+Changing region clears and fences cached membership before polling the new scope;
+in-flight requests stay counted until completion. This is regional membership,
+not regional traffic weights, per-host VM mapping, or the staged peer-drain protocol.
+Legacy specs without `region` continue requesting the full endpoint set.
+
 For managed configuration without host environment changes, include a source in the
 deployment registered through the admin API:
 
@@ -694,6 +800,30 @@ the durably applied snapshot. It is persisted with `version`, not inferred from 
 current environment. Legacy state acquires it after a successful poll. Once stamped,
 a different discovery authority is rejected rather than mixing its version sequence
 with the old one. Discovery redirects are not followed.
+
+#### Active regional capacity probes
+
+For hierarchical deployments, namespace administrators can POST to
+`/deployments/:id/regional-active-probe`. The request binds `operationId`, `stepId`,
+`epoch`, a fresh `challenge`, active policy `generation`, exact discovery `version`,
+and the destination's `region`, `gatewayId`, `gatewayBootId`, `backendServerId`,
+`deploymentId` and `revision`. The receipt echoes that request, source gateway/boot,
+and the destination's gateway/boot and exact backend URL.
+
+This probes the **active** policy even when a newer proposal is pending. Execution
+identity correlates the result; it does not authorize using an inactive proposal.
+The destination must have positive regional weight, open peer admission, eligible
+discovery membership and an eligible local backend. The authenticated HTTPS peer
+path issues a fresh configured health GET to the exact host-local mapping, checks
+revision and the complete bounded response, and retains both regional and backend
+request guards until completion. Both gateways revalidate the snapshot afterward.
+Public requests cannot inject the internal probe header.
+
+These receipts neither activate policy nor prove withdrawal/drain. Orchestrator
+must verify every pinned source/destination pair within its durable probe epoch,
+then recheck discovery, policy and gateway boots before publishing. A restarted
+gateway or stale/partial receipt set cannot authorize publication. The separate
+withdrawn-member probe contract retains its stricter drain barriers.
 
 #### Cordoning and draining a static upstream
 

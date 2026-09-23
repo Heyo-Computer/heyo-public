@@ -65,6 +65,17 @@
         }
       ]
     },
+    "gateway": {
+      "description": "Opt-in one-hop regional gateway transport over explicit static upstreams.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewaySpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "health": {
       "description": "How app-lb decides a replica is ready to take traffic. Defaults to an\nHTTP GET of `/` on the deployment's own port.",
       "$ref": "#/$defs/HealthCheck",
@@ -464,6 +475,23 @@
     "DiscoverySpec": {
       "type": "object",
       "properties": {
+        "region": {
+          "description": "Opt into region-scoped membership; the authority must echo this scope.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "regional": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegionalSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "service_id": {
           "type": "string"
         },
@@ -540,6 +568,37 @@
           "default": false
         }
       }
+    },
+    "GatewayMode": {
+      "type": "string",
+      "enum": [
+        "forward",
+        "local"
+      ]
+    },
+    "GatewaySpec": {
+      "type": "object",
+      "properties": {
+        "auth": {
+          "$ref": "#/$defs/SecretRef"
+        },
+        "mode": {
+          "$ref": "#/$defs/GatewayMode"
+        },
+        "region": {
+          "description": "Destination region for forward mode; this instance's region for local mode.",
+          "type": "string"
+        },
+        "service": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "service",
+        "region",
+        "auth",
+        "mode"
+      ]
     },
     "HealthCheck": {
       "description": "How a freshly-booted VM is proven ready before it joins the pool.\n\nThis exists because the SDK's readiness signal is not trustworthy on its own\n(see `vm::wait_until_running`), so we always probe the guest ourselves.",
@@ -838,6 +897,29 @@
             "path"
           ]
         }
+      ]
+    },
+    "RegionalSpec": {
+      "type": "object",
+      "properties": {
+        "auth": {
+          "$ref": "#/$defs/SecretRef"
+        },
+        "backend_server_id": {
+          "type": "string"
+        },
+        "environment": {
+          "type": "string"
+        },
+        "gateway_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gateway_id",
+        "backend_server_id",
+        "environment",
+        "auth"
       ]
     },
     "RouteRule": {

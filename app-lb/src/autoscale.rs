@@ -769,7 +769,12 @@ impl Autoscaler {
     /// each tick, so a name that fails to resolve reads as unhealthy.
     async fn reconcile_static(&self, d: &Arc<Deployment>) {
         for b in d.backends().iter() {
-            let healthy = if b.tls {
+            let healthy = if let Some(gateway) = d.spec.gateway.as_ref()
+                .filter(|g| g.mode == crate::gateway::GatewayMode::Forward) {
+                crate::gateway::probe(gateway, &b.peer,
+                    d.spec.routes[0].host.as_deref().expect("validated gateway host"),
+                    &d.spec.health, &self.secrets).await
+            } else if b.tls {
                 health::probe_https(&b.address, &b.sni, &d.spec.health).await
             } else {
                 match tokio::net::lookup_host(&b.address).await {
@@ -2290,6 +2295,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,
@@ -2319,6 +2325,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec!["127.0.0.1:9".into()],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,

@@ -377,6 +377,7 @@ pub struct DeploymentState {
 #[derive(Debug)]
 pub struct Deployment {
     pub spec: DeploymentSpec,
+    pub regional: Option<Arc<crate::regional::Router>>,
     /// Runtime state, persisted with the spec. Copy-on-write like the pools.
     state: ArcSwap<DeploymentState>,
     /// Ready, routable VMs. Copy-on-write: the autoscaler is the only writer.
@@ -419,6 +420,7 @@ impl Deployment {
             .map(|addr| Arc::new(VmBackend::for_upstream(addr.clone())))
             .collect();
         Self {
+            regional: spec.discovery.as_ref().and_then(|d| d.regional.as_ref()).map(|_| Arc::new(crate::regional::Router::new())),
             spec,
             state: ArcSwap::from_pointee(DeploymentState { rollout_revision: crate::rollout::revision(), ..Default::default() }),
             backends: ArcSwap::from_pointee(backends),
@@ -731,6 +733,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,
@@ -760,6 +763,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,

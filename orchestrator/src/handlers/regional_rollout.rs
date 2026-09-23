@@ -279,6 +279,10 @@ pub async fn rollback(
     let result = async {
         let db = db::get_db()?;
         let r = load(Some(db), &operation_id).await?.context("rollout not found")?;
+        if r.plan.version == 3 {
+            return super::regional_application::begin_rollback(db,&r.service_id,&operation_id).await;
+        }
+        anyhow::ensure!(r.plan.version == 1, "routing-only transitions require a new policy operation");
         let _lock = service_deploy::try_service_lifecycle_lock(db, &r.service_id)
             .await?.context("service lifecycle is busy")?;
         let changed = db.execute(Statement::from_sql_and_values(DbBackend::Postgres,
@@ -288,10 +292,10 @@ pub async fn rollback(
              WHERE operation_id=$1 AND status IN ('running','blocked')",
             [operation_id.clone().into()])).await?;
         if changed.rows_affected() != 1 { bail!("only an active or blocked rollout can be rolled back"); }
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, anyhow::Error>("rollback_restore".to_owned())
     }.await;
     match result {
-        Ok(()) => response(StatusCode::ACCEPTED, json!({"operationId":operation_id,"phase":"rollback_restore"})),
+        Ok(phase) => response(StatusCode::ACCEPTED, json!({"operationId":operation_id,"phase":phase})),
         Err(error) => response(StatusCode::CONFLICT, json!({"error":error.to_string()})),
     }
 }
@@ -320,7 +324,7 @@ async fn validate_admission(
     Ok(())
 }
 
-fn validate_policy(r: &RegionalRolloutRequest) -> std::result::Result<(), String> {
+pub(super) fn validate_policy(r: &RegionalRolloutRequest) -> std::result::Result<(), String> {
     let d = &r.deployment;
     // Admission, lifecycle locks, and candidate creation must use the same key.
     // Ordinary deployment trims service IDs; durable regional plans reject them.
@@ -384,7 +388,7 @@ fn validate_policy(r: &RegionalRolloutRequest) -> std::result::Result<(), String
     Ok(())
 }
 
-fn ordered_regions(slots: &[String]) -> Vec<String> {
+pub(super) fn ordered_regions(slots: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     slots
         .iter()
@@ -432,6 +436,7 @@ async fn admit(state: &AppState, request: RegionalRolloutRequest) -> Result<(Rol
         return Ok((existing, false));
     }
     ensure_no_regional_rollout(db, &request.deployment.service_id).await?;
+    super::regional_policy::require_legacy_topology(db, &request.deployment.service_id).await?;
     if db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
         "SELECT 1 FROM service_rollouts WHERE service_id=$1 AND status='running'",
         [request.deployment.service_id.clone().into()])).await?.is_some() {
@@ -492,7 +497,7 @@ async fn admit(state: &AppState, request: RegionalRolloutRequest) -> Result<(Rol
     Ok((row, created))
 }
 
-fn candidate_id(operation: &str, index: usize) -> String {
+pub(super) fn candidate_id(operation: &str, index: usize) -> String {
     let digest = Sha256::digest(operation.as_bytes());
     format!("regional-{}-{index}", hex_prefix(&digest, 20))
 }
@@ -549,6 +554,19 @@ async fn reconcile(state: &AppState) -> Result<()> {
 
 async fn tick(state: &AppState, operation: &str) -> Result<()> {
     let db = db::get_db()?;
+    tick_in(state, db, operation).await
+}
+
+pub(super) async fn tick_in(state: &AppState, db: &sea_orm::DatabaseConnection, operation: &str) -> Result<()> {
+    let Some(header) = db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT service_id,status,plan FROM regional_service_rollouts WHERE operation_id=$1", [operation.into()])).await? else { return Ok(()); };
+    if header.try_get::<String>("", "status")? != "running" { return Ok(()); }
+    let plan: Plan = serde_json::from_value(header.try_get("", "plan")?)?;
+    if plan.version == 2 {
+        // A routing-only request must never be deserialized as a VM deployment.
+        return super::regional_reports::reconcile(state, db, &header.try_get::<String>("", "service_id")?, operation).await;
+    }
+    anyhow::ensure!(plan.version == 1, "application-plan execution is not enabled; refusing legacy fallback");
     let Some(r) = load(Some(db), operation).await? else {
         return Ok(());
     };
