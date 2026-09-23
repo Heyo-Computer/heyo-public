@@ -584,8 +584,9 @@ you bind the dashboard elsewhere. app-lb and the pooler must be on the same host
   curl -H 'Host: pg-dashboard.local' localhost:6188/
   ```
 
-- **Health check is a bare TCP connect** (`"path": null`). The dashboard has no
-  dedicated health endpoint, and `GET /` sits behind Basic auth — a TCP connect
+- **Health check is a bare TCP connect** (`"path": null`). The dashboard's
+  `GET /api/health` sits behind Basic auth like every other route, and so does
+  `GET /` — a TCP connect
   cleanly proves the HTTP listener is up without depending on auth. (app-lb also
   treats a `401` as healthy, so `"path": "/"` would work too.) app-lb re-probes
   static upstreams each tick, so if the pooler restarts the dashboard rejoins

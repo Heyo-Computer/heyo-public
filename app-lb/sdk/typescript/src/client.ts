@@ -15,6 +15,7 @@ import type {
   JobRecord,
   MetricsResponse,
   MintedToken,
+  PluginView,
   Ingress,
   SecretSummary,
   TokenSummary,
@@ -503,6 +504,26 @@ export class Heyctl {
       name: req.name,
       signal,
     });
+  }
+
+  // -- plugins ---------------------------------------------------------------
+
+  plugins(signal?: AbortSignal): Promise<PluginView[]> {
+    return this.request("GET", "/api/plugins", { kind: "plugin", signal });
+  }
+
+  plugin(id: string, signal?: AbortSignal): Promise<PluginView> {
+    return this.request("GET", `/api/plugins/${seg(id)}`, { kind: "plugin", name: id, signal });
+  }
+
+  /**
+   * Write a plugin's record. Omit `config` to keep the stored one. Resolves
+   * when the record is saved even if applying it failed — check `last_error`.
+   */
+  setPlugin(id: string, enabled: boolean, config?: unknown, signal?: AbortSignal): Promise<PluginView> {
+    const body: Record<string, unknown> = { enabled };
+    if (config !== undefined) body.config = config;
+    return this.request("PUT", `/api/plugins/${seg(id)}`, { body, kind: "plugin", name: id, signal });
   }
 
   tokens(signal?: AbortSignal): Promise<TokenSummary[]> {

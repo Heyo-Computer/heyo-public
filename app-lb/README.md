@@ -2773,6 +2773,71 @@ owns any more.
 store, it is small (single-digit MB across a whole host), and deleting a daemon's persistence
 records to reclaim 23 KB is not a trade worth making.
 
+## Plugins
+
+Plugins are optional capabilities compiled into app-lb that you switch on at
+runtime from the **Plugins** page (`/plugins`) or with `heyctl plugins`. Each
+one's `{enabled, config}` record lives in `app-lb-plugins.d/<id>.json` beside
+the state file.
+
+A plugin's routes live under `/api/plugins/<id>/…`. Reads are on the view tier
+and actions on the CRUD tier, and every route answers 409 while the plugin is
+disabled. If a plugin fails to start, it stays enabled and the failure shows
+as `last_error` on its card.
+
+Plugin configs never contain credentials. A config names a secret in app-lb's
+secret store (`POST /secrets`) instead, and the plugin reads it at the moment
+it uses it, so rotating the secret needs no re-apply.
+
+```sh
+heyctl plugins ls
+heyctl plugins set pgfc -f pgfc.json --enable
+heyctl plugins disable pgfc
+```
+
+### pg-fc databases (`pgfc`)
+
+This plugin monitors and configures [pg-fc](../pg-fc) pools through their
+JSON admin API. It shows:
+
+- host health and schema counts by tier
+- every schema, with start/stop/reboot/restore/reap actions
+- dedicated databases: create one (the password is shown once, as a
+  connection string) or revoke one
+- the pooler's runtime settings
+- maintenance passes, recent events and log tails
+
+app-lb holds the pg-fc dashboard credential and calls pg-fc on the page's
+behalf, so the browser never sees it. A 401 from pg-fc becomes a 502 naming
+the misconfigured node, rather than looking like your session failed.
+
+Store the password, then configure one entry per pooler:
+
+```sh
+heyctl create secret pg-fc --from-stdin password < pg-fc-password.txt
+```
+
+```json
+{
+  "nodes": [
+    {
+      "name": "local",
+      "url": "http://127.0.0.1:34199",
+      "user": "admin",
+      "password": {"secret": "pg-fc", "key": "password"},
+      "pg_host": "db.example.com"
+    }
+  ],
+  "poll_secs": 15
+}
+```
+
+- `url` is `PG_VM_POOL_DASHBOARD_LISTEN`.
+- `pg_host` and `pg_port` (default 6432) only feed the connection strings
+  the page shows; `pg_host` defaults to the host in `url`.
+- A schema's Postgres log is read by running a command inside its VM, so that
+  route sits on the CRUD tier with the actions.
+
 ## Clients
 
 | | |

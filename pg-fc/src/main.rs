@@ -25,6 +25,7 @@ mod proxy;
 mod reclaim;
 mod registry;
 mod replication;
+mod runtime_config;
 mod s3;
 mod spares;
 mod startup;

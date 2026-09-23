@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en" {{HTML_ATTRS}}>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{APP_NAME}} plugins</title>
+<link rel="stylesheet" href="/__ui/heyo.css">
+<script defer src="/__ui/theme.js"></script>
+<style>
+  /* Same aliases and tokens as disks.html; copied because each page is
+     `include_str!`d and there is no build step to share them through. */
+  :root {
+    --plane: var(--bg-dark);
+    --surface: var(--bg-panel);
+    --text: var(--text-primary);
+    --text-2: var(--text-secondary);
+    --muted: var(--text-muted);
+    --border: var(--border-color);
+    --good: var(--success);
+    --success-text: var(--success);
+  }
+  .section-title, thead th, table th, .k {
+    font-family: var(--font-display);
+    font-size: 9px;
+    font-weight: 400;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+  * { box-sizing: border-box; }
+  body { padding: 28px 24px 72px; }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  .lede { color: var(--text-2); margin: 0 0 22px; }
+  .section-title { margin: 30px 0 10px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 0; padding: 16px 18px; margin-bottom: 12px;
+  }
+  .plugin-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .plugin-head h2 { font-size: 15px; font-weight: 650; margin: 0; }
+  .plugin-head .spacer { margin-left: auto; }
+  .desc { color: var(--text-2); font-size: 13px; margin: 6px 0 0; }
+
+  button.act {
+    font: inherit; font-size: 12.5px; padding: 5px 11px; border-radius: 0; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  }
+  button.act:hover { border-color: var(--accent); }
+  button.act.danger { color: var(--critical); }
+  button.act.danger:hover { border-color: var(--critical); }
+  button.act:disabled { opacity: .5; cursor: not-allowed; }
+
+  .tag { font-size: 10px; padding: 1px 6px; border-radius: 0; flex: none; white-space: nowrap; }
+  .tag.on   { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--success-text); }
+  .tag.off  { background: color-mix(in srgb, var(--muted) 20%, transparent); color: var(--text-2); }
+  .tag.fail { background: color-mix(in srgb, var(--critical) 20%, transparent); color: var(--critical); }
+
+  details.cfg { margin-top: 12px; }
+  details.cfg > summary { cursor: pointer; font-size: 12px; color: var(--accent); }
+  textarea {
+    width: 100%; min-height: 160px; margin-top: 8px; padding: 9px 11px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    background: var(--plane); color: var(--text); border: 1px solid var(--border); border-radius: 0;
+  }
+  pre.status {
+    margin: 10px 0 0; padding: 9px 11px; overflow: auto; max-height: 260px;
+    background: var(--plane); border: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-2);
+  }
+  .row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .panel { margin-top: 14px; }
+  .empty { color: var(--text-2); padding: 20px 0; text-align: center; }
+  .caveat {
+    font-size: 12.5px; color: var(--text-2); margin-top: 10px; padding: 9px 11px;
+    border-left: 3px solid var(--critical); border-radius: 0;
+    background: color-mix(in srgb, var(--critical) 9%, transparent);
+  }
+  .flash {
+    position: sticky; top: 0; z-index: 5; margin: 0 0 14px;
+    padding: 10px 14px; border-radius: 0; font-size: 13px; display: none;
+  }
+  .flash.on { display: block; }
+  .flash.ok { background: color-mix(in srgb, var(--good) 14%, var(--surface)); color: var(--success-text); }
+  .flash.bad { background: color-mix(in srgb, var(--critical) 14%, var(--surface)); color: var(--critical); }
+  /* ---- pg-fc panel ---- */
+  .sub-title { font-family: var(--font-display); font-size: 9px; letter-spacing: .8px;
+    text-transform: uppercase; color: var(--text-muted); margin: 18px 0 8px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+  .tile { border: 1px solid var(--border); padding: 10px 12px; }
+  .tile .k { display: block; }
+  .tile .v { font-size: 18px; font-weight: 650; margin-top: 3px; font-variant-numeric: tabular-nums; }
+  .tile .s { font-size: 11.5px; color: var(--text-2); margin-top: 2px; }
+  .scroll { overflow-x: auto; }
+  table.grid { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.grid th { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  table.grid td { padding: 6px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  table.grid td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  table.grid td.actions { text-align: right; white-space: nowrap; }
+  table.grid td.actions button { margin-left: 4px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+  .dim { color: var(--muted); }
+  .tag.live { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--success-text); }
+  .tag.warm { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+  .tag.cold { background: color-mix(in srgb, var(--muted) 20%, transparent); color: var(--text-2); }
+  select, input[type=text], input[type=number] {
+    font: inherit; font-size: 12.5px; padding: 4px 7px; border-radius: 0;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  }
+  .secret { margin-top: 10px; padding: 9px 11px; border-left: 3px solid var(--warning);
+    background: color-mix(in srgb, var(--warning) 9%, transparent); font-size: 12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="topbar">
+    <a class="topbar-brand" href="/"><span>heyo</span><span class="topbar-app">{{APP_NAME}}</span></a>
+    <nav class="topbar-nav">
+      <a href="/">Directory</a>
+      <a href="/dashboard">Dashboard</a>
+      <a href="/siem">Security</a>
+      <a href="/storage">Disks</a>
+      <a href="/plugins" aria-current="page">Plugins</a>
+      <a href="/metrics">Metrics</a>
+    </nav>
+    <div class="topbar-right">
+      <span class="topbar-user">{{WHO}}</span>
+      <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-label>theme</span></button>
+    </div>
+  </header>
+  <p class="lede">Built-in capabilities you can switch on for this host. Switching one on or
+    changing its configuration needs admin credentials.</p>
+
+  <div class="flash" id="flash"></div>
+  <div id="plugins"><div class="empty">Loading…</div></div>
+</div>
+
+<script>
+"use strict";
+
+function esc(v) {
+  return String(v == null ? "" : v).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+const $ = id => document.getElementById(id);
+
+async function api(method, path, body) {
+  const opts = { method, headers: { accept: "application/json" } };
+  if (body !== undefined) {
+    opts.headers["content-type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  try {
+    const r = await fetch(path, opts);
+    if (r.status === 204) return { ok: true, status: 204, data: null };
+    const text = await r.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) { data = { message: text }; }
+    return { ok: r.ok, status: r.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { message: String(e) } };
+  }
+}
+
+function flash(kind, message) {
+  const el = $("flash");
+  el.className = "flash on " + kind;
+  el.textContent = message;
+  if (flash.timer) clearTimeout(flash.timer);
+  flash.timer = setTimeout(() => { el.className = "flash"; }, 12000);
+}
+
+function failure(r, what) {
+  const d = r.data || {};
+  if (r.status === 401 || r.status === 403)
+    return `${what} needs admin credentials; this session can only view.`;
+  return `${what} failed: ${d.error || d.message || ("HTTP " + r.status)}`;
+}
+
+// Plugin-specific panels register here: PANELS[id] = { render(view, el), refresh?(view, el) }.
+// A plugin without one gets the generic status view below.
+const PANELS = {};
+
+// Cards are built once and then only their volatile parts are refreshed, so a
+// poll never throws away a half-edited configuration.
+const cards = new Map();
+
+function card(view) {
+  const el = document.createElement("div");
+  el.className = "card";
+  el.innerHTML = `
+    <div class="plugin-head">
+      <h2>${esc(view.name)}</h2>
+      <span class="tag" data-state></span>
+      <span class="spacer"></span>
+      <button class="act" type="button" data-toggle></button>
+    </div>
+    <p class="desc">${esc(view.description)}</p>
+    <div data-error></div>
+    <div class="panel" data-panel></div>
+    <details class="cfg">
+      <summary>Configuration</summary>
+      <textarea spellcheck="false" data-config></textarea>
+      <div class="row">
+        <button class="act" type="button" data-save>Save</button>
+        <button class="act" type="button" data-reset>Revert</button>
+      </div>
+    </details>`;
+  el.querySelector("[data-config]").value = JSON.stringify(view.config ?? {}, null, 2);
+  el.querySelector("[data-toggle]").addEventListener("click", async ev => {
+    const cur = cards.get(view.id).view;
+    ev.target.disabled = true;
+    const r = await api("POST", `/api/plugins/${encodeURIComponent(view.id)}/${cur.enabled ? "disable" : "enable"}`);
+    ev.target.disabled = false;
+    if (!r.ok) { flash("bad", failure(r, cur.enabled ? "Disabling" : "Enabling")); return; }
+    flash(r.data.last_error ? "bad" : "ok", r.data.last_error
+      ? `${view.name} is ${r.data.enabled ? "enabled" : "disabled"}, but applying it failed: ${r.data.last_error}`
+      : `${view.name} ${r.data.enabled ? "enabled" : "disabled"}.`);
+    update(r.data);
+  });
+  el.querySelector("[data-save]").addEventListener("click", async ev => {
+    const cur = cards.get(view.id).view;
+    let config;
+    try { config = JSON.parse(el.querySelector("[data-config]").value || "{}"); }
+    catch (e) { flash("bad", "The configuration is not valid JSON: " + e.message); return; }
+    ev.target.disabled = true;
+    const r = await api("PUT", `/api/plugins/${encodeURIComponent(view.id)}`, { enabled: cur.enabled, config });
+    ev.target.disabled = false;
+    if (!r.ok) { flash("bad", failure(r, "Saving")); return; }
+    flash(r.data.last_error ? "bad" : "ok", r.data.last_error
+      ? `Saved, but applying it failed: ${r.data.last_error}` : `${view.name} configuration saved.`);
+    el.querySelector("[data-config]").value = JSON.stringify(r.data.config ?? {}, null, 2);
+    update(r.data);
+  });
+  el.querySelector("[data-reset]").addEventListener("click", () => {
+    el.querySelector("[data-config]").value = JSON.stringify(cards.get(view.id).view.config ?? {}, null, 2);
+  });
+  const panel = PANELS[view.id];
+  if (panel) panel.render(view, el.querySelector("[data-panel]"));
+  return el;
+}
+
+function update(view) {
+  const entry = cards.get(view.id);
+  entry.view = view;
+  const el = entry.el;
+  const state = el.querySelector("[data-state]");
+  const failed = view.enabled && view.last_error;
+  state.className = "tag " + (failed ? "fail" : view.enabled ? "on" : "off");
+  state.textContent = failed ? "error" : view.enabled ? "enabled" : "disabled";
+  el.querySelector("[data-toggle]").textContent = view.enabled ? "Disable" : "Enable";
+  el.querySelector("[data-error]").innerHTML = view.last_error
+    ? `<div class="caveat">${esc(view.last_error)}</div>` : "";
+  const panel = PANELS[view.id];
+  const target = el.querySelector("[data-panel]");
+  if (panel && panel.refresh) panel.refresh(view, target);
+  else if (!panel) target.innerHTML = view.enabled
+    ? `<pre class="status">${esc(JSON.stringify(view.status, null, 2))}</pre>` : "";
+}
+
+// ---- pg-fc -------------------------------------------------------------------
+//
+// Every call goes through app-lb (`/api/plugins/pgfc/…`), which holds the
+// pg-fc credential; the browser never sees it. Reads need view credentials,
+// every button needs admin ones — a view-only session gets the 403 flash.
+PANELS.pgfc = (() => {
+  const base = "/api/plugins/pgfc";
+  let el = null, node = null, nodes = [], lastNodeKey = "";
+
+  const n = v => (v == null ? "—" : Number(v).toLocaleString());
+  function bytes(v) {
+    if (v == null) return "—";
+    const u = ["B", "KiB", "MiB", "GiB", "TiB"]; let i = 0;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return (v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)) + " " + u[i];
+  }
+  function secs(v) {
+    if (v == null) return "—";
+    if (v < 120) return v + "s";
+    if (v < 7200) return Math.round(v / 60) + "m";
+    if (v < 172800) return Math.round(v / 3600) + "h";
+    return Math.round(v / 86400) + "d";
+  }
+  const nodeUrl = p => `${base}/nodes/${encodeURIComponent(node)}${p}`;
+
+  function skeleton() {
+    el.innerHTML = `
+      <div class="row" style="align-items:center">
+        <label class="k" for="pgfc-node">Node</label>
+        <select id="pgfc-node"></select>
+        <span class="dim" id="pgfc-node-note"></span>
+      </div>
+      <div class="sub-title">Host</div>
+      <div class="tiles" id="pgfc-tiles"></div>
+      <div class="sub-title">Schemas</div>
+      <div class="row">
+        <select id="pgfc-tier">
+          <option value="">Any tier</option><option value="warm">Warm</option>
+          <option value="live">Live</option><option value="compacted">Compacted</option>
+          <option value="frozen">Frozen</option><option value="archived">Archived</option>
+          <option value="pending">Pending</option>
+        </select>
+        <input type="text" id="pgfc-q" placeholder="schema" size="18">
+      </div>
+      <div class="scroll" id="pgfc-schemas"><div class="empty">Loading…</div></div>
+      <div class="sub-title">Dedicated databases</div>
+      <div class="row">
+        <input type="text" id="pgfc-db" placeholder="database" size="16">
+        <input type="text" id="pgfc-user" placeholder="username (default: database)" size="24">
+        <button class="act" type="button" id="pgfc-create">Create</button>
+      </div>
+      <div id="pgfc-created"></div>
+      <div class="scroll" id="pgfc-dbs"></div>
+      <div class="sub-title">Runtime settings</div>
+      <div class="scroll" id="pgfc-config"></div>
+      <div class="sub-title">Maintenance</div>
+      <div class="row">
+        <button class="act" type="button" data-op="sweep">S3 sweep</button>
+        <button class="act" type="button" data-op="reclaim">Reclaim disk</button>
+        <button class="act" type="button" data-op="stop-idle">Stop idle VMs</button>
+      </div>
+      <div class="sub-title">Recent events</div>
+      <div class="scroll" id="pgfc-events"></div>
+      <div class="sub-title">Logs</div>
+      <div class="row">
+        <select id="pgfc-log"><option value="pooler">pooler</option><option value="heyvmd">heyvmd</option></select>
+        <button class="act" type="button" id="pgfc-log-load">Load</button>
+      </div>
+      <pre class="status" id="pgfc-log-out" hidden></pre>`;
+    el.querySelector("#pgfc-node").addEventListener("change", ev => { node = ev.target.value; loadAll(); });
+    el.querySelector("#pgfc-tier").addEventListener("change", loadSchemas);
+    el.querySelector("#pgfc-q").addEventListener("input", loadSchemas);
+    el.querySelector("#pgfc-create").addEventListener("click", createDb);
+    el.querySelector("#pgfc-log-load").addEventListener("click", loadLog);
+    el.querySelectorAll("[data-op]").forEach(b => b.addEventListener("click", () => maintenance(b.dataset.op)));
+  }
+
+  function renderNodes() {
+    const sel = el.querySelector("#pgfc-node");
+    const key = nodes.map(x => x.name).join(",");
+    if (key !== lastNodeKey) {
+      sel.innerHTML = nodes.map(x => `<option value="${esc(x.name)}">${esc(x.name)}</option>`).join("");
+      lastNodeKey = key;
+      if (!nodes.some(x => x.name === node)) node = nodes.length ? nodes[0].name : null;
+    }
+    sel.value = node || "";
+    const cur = nodes.find(x => x.name === node);
+    el.querySelector("#pgfc-node-note").innerHTML = !cur ? "" : cur.up
+      ? `<span class="tag on">up</span> <span class="mono">${esc(cur.url)}</span> · clients connect to <span class="mono">${esc(cur.pg_host)}:${esc(cur.pg_port)}</span>`
+      : `<span class="tag fail">down</span> ${esc(cur.error || "")}`;
+    renderTiles(cur);
+  }
+
+  function renderTiles(cur) {
+    const t = el.querySelector("#pgfc-tiles");
+    if (!cur || !cur.up) { t.innerHTML = `<div class="dim">No data from this node.</div>`; return; }
+    const h = cur.health || {}, host = cur.host || {}, tiers = host.tiers || {};
+    const mem = host.memory_total_bytes ? `${bytes(host.memory_used_bytes)} / ${bytes(host.memory_total_bytes)}` : "—";
+    const disk = (host.disks || []).map(d => `${esc(d.mount)} ${Math.round(100 * d.used / Math.max(1, d.used + d.avail))}%`).join(" · ");
+    const tile = (k, v, sub) => `<div class="tile"><span class="k">${k}</span><div class="v">${v}</div>${sub ? `<div class="s">${sub}</div>` : ""}</div>`;
+    t.innerHTML =
+      tile("pg-vm-pool", esc(h.version || "—"), `up ${secs(h.uptime_secs)}`) +
+      tile("Schemas", n(h.known_schemas), `${n(h.warm_schemas)} warm`) +
+      tile("Tiers", `${n(tiers.live)} live`, `${n(tiers.compacted)} compacted · ${n(tiers.frozen)} frozen · ${n(tiers.archived)} archived`) +
+      tile("CPU", host.cpu_percent == null ? "—" : host.cpu_percent.toFixed(0) + "%", host.cpu_count ? `${host.cpu_count} cores` : "") +
+      tile("Memory", mem, "") +
+      tile("Spares", host.spares_target == null ? "off" : `${n(host.spares_ready)}/${n(host.spares_target)}`, "ready / target") +
+      (disk ? tile("Disks", "", disk) : "");
+  }
+
+  async function loadSchemas() {
+    if (!node) return;
+    const tier = el.querySelector("#pgfc-tier").value, q = el.querySelector("#pgfc-q").value.trim();
+    const qs = new URLSearchParams(); if (tier) qs.set("tier", tier); if (q) qs.set("q", q);
+    const r = await api("GET", nodeUrl(`/schemas?${qs}`));
+    const box = el.querySelector("#pgfc-schemas");
+    if (!r.ok) { box.innerHTML = `<div class="dim">${esc(failure(r, "Loading schemas"))}</div>`; return; }
+    if (!r.data.length) { box.innerHTML = `<div class="empty">No schemas match.</div>`; return; }
+    box.innerHTML = `<table class="grid"><thead><tr><th>Schema</th><th>Tier</th><th>Sessions</th><th>Idle</th><th>Disk</th><th>VM</th><th></th></tr></thead><tbody>${
+      r.data.map(s => {
+        const offloaded = s.tier !== "live" && s.tier !== "pending";
+        const tag = s.warm ? `<span class="tag warm">warm</span>` : `<span class="tag ${s.tier === "live" ? "live" : "cold"}">${esc(s.tier)}</span>`;
+        const flags = [s.dedicated && "dedicated", s.keepalive && "keepalive", s.pinned && "pinned", s.offloading && "offloading"].filter(Boolean).join(", ");
+        const act = (a, label, cls = "") => `<button class="act ${cls}" type="button" data-schema="${esc(s.schema)}" data-action="${a}">${label}</button>`;
+        const actions = s.tier === "pending" ? "" : offloaded
+          ? act("restore", "Restore")
+          : act("start", "Start") + act("stop", "Stop") + act("reboot", "Reboot") + act("reap", "Reap to S3", "danger");
+        return `<tr><td class="mono">${esc(s.schema)}${flags ? `<div class="dim">${esc(flags)}</div>` : ""}${s.pinned ? `<div class="dim">${esc(s.pinned)}</div>` : ""}</td>
+          <td>${tag}</td>
+          <td class="num">${s.sessions == null ? "—" : `${n(s.sessions)}${s.slot_limit ? ` <span class="dim">(${n(s.free_slots)}/${n(s.slot_limit)} free)</span>` : ""}`}</td>
+          <td class="num">${s.idle_secs == null ? "—" : secs(s.idle_secs)}${s.idle_budget_secs ? ` <span class="dim">/ ${secs(s.idle_budget_secs)}</span>` : ""}</td>
+          <td class="num">${s.disk_gb ? s.disk_gb + " GiB" : "—"}</td>
+          <td class="mono dim">${esc(s.sandbox_id || "—")}</td>
+          <td class="actions">${actions}</td></tr>`;
+      }).join("")}</tbody></table>`;
+    box.querySelectorAll("[data-action]").forEach(b => b.addEventListener("click", () => schemaAction(b.dataset.schema, b.dataset.action, b)));
+  }
+
+  async function schemaAction(schema, action, button) {
+    if (action === "reap" && !confirm(`Dump ${schema} to S3 and delete its VM? The next connection restores it.`)) return;
+    if (action === "stop" && !confirm(`Stop ${schema}'s VM? Connected clients are dropped.`)) return;
+    button.disabled = true;
+    const r = await api("POST", nodeUrl(`/schemas/${encodeURIComponent(schema)}/${action}`));
+    button.disabled = false;
+    if (!r.ok) { flash("bad", failure(r, `${action} ${schema}`)); return; }
+    flash("ok", `${schema}: ${r.data.message}${r.data.done ? "" : " (running in the background — see events)"}`);
+    loadSchemas(); loadEvents();
+  }
+
+  async function loadDbs() {
+    if (!node) return;
+    const r = await api("GET", nodeUrl("/databases"));
+    const box = el.querySelector("#pgfc-dbs");
+    if (!r.ok) { box.innerHTML = `<div class="dim">${esc(failure(r, "Loading databases"))}</div>`; return; }
+    if (!r.data.length) { box.innerHTML = `<div class="dim">None provisioned.</div>`; return; }
+    box.innerHTML = `<table class="grid"><thead><tr><th>Database</th><th>User</th><th>Tier</th><th></th></tr></thead><tbody>${
+      r.data.map(d => `<tr><td class="mono">${esc(d.database)}</td><td class="mono">${esc(d.username)}</td>
+        <td>${esc(d.tier || "pending")}</td>
+        <td class="actions"><button class="act danger" type="button" data-revoke="${esc(d.database)}">Revoke</button></td></tr>`).join("")}</tbody></table>`;
+    box.querySelectorAll("[data-revoke]").forEach(b => b.addEventListener("click", async () => {
+      const db = b.dataset.revoke;
+      if (!confirm(`Revoke ${db}'s credential? Its VM and data are left untouched.`)) return;
+      const r = await api("DELETE", nodeUrl(`/databases/${encodeURIComponent(db)}`));
+      if (!r.ok) { flash("bad", failure(r, `Revoking ${db}`)); return; }
+      flash("ok", `${db}'s credential was revoked.`); loadDbs();
+    }));
+  }
+
+  async function createDb() {
+    const database = el.querySelector("#pgfc-db").value.trim();
+    const username = el.querySelector("#pgfc-user").value.trim();
+    if (!database) { flash("bad", "Name the database."); return; }
+    const body = { database }; if (username) body.username = username;
+    const r = await api("POST", nodeUrl("/databases"), body);
+    if (!r.ok) { flash("bad", failure(r, "Creating the database")); return; }
+    const cur = nodes.find(x => x.name === node) || {};
+    const url = `postgres://${encodeURIComponent(r.data.username)}:${encodeURIComponent(r.data.password)}@${cur.pg_host}:${cur.pg_port}/${encodeURIComponent(r.data.database)}`;
+    // Shown once: pg-fc never returns the password again, and this page
+    // keeps it only in the DOM until the next reload.
+    el.querySelector("#pgfc-created").innerHTML = `<div class="secret">
+      <b>${esc(r.data.database)}</b> is provisioning. Copy the password now — it is not shown again.
+      <div class="mono" style="margin-top:6px">${esc(url)}</div></div>`;
+    el.querySelector("#pgfc-db").value = ""; el.querySelector("#pgfc-user").value = "";
+    loadDbs(); loadSchemas();
+  }
+
+  async function loadConfig() {
+    if (!node) return;
+    const r = await api("GET", nodeUrl("/config"));
+    const box = el.querySelector("#pgfc-config");
+    if (!r.ok) { box.innerHTML = `<div class="dim">${esc(failure(r, "Loading settings"))}</div>`; return; }
+    box.innerHTML = `<table class="grid"><thead><tr><th>Setting</th><th>Value</th><th>Source</th><th></th></tr></thead><tbody>${
+      r.data.knobs.map(k => `<tr><td class="mono">${esc(k.key)}<div class="dim">${esc(k.env)}</div></td>
+        <td>${k.mutable
+          ? `<input type="number" min="0" data-knob="${esc(k.key)}" value="${esc(k.value ?? "")}" style="width:120px">`
+          : `<span class="mono">${esc(k.value ?? "off")}</span>`}</td>
+        <td>${esc(k.source)}</td><td class="dim">${esc(k.note || "")}</td></tr>`).join("")}</tbody></table>
+      <div class="row"><button class="act" type="button" id="pgfc-config-save">Save settings</button></div>`;
+    box.querySelector("#pgfc-config-save").addEventListener("click", async () => {
+      const patch = {};
+      box.querySelectorAll("[data-knob]").forEach(i => {
+        const orig = r.data.knobs.find(k => k.key === i.dataset.knob);
+        if (i.value !== "" && i.value !== (orig.value ?? "")) patch[i.dataset.knob] = Number(i.value);
+      });
+      if (!Object.keys(patch).length) { flash("ok", "Nothing changed."); return; }
+      const w = await api("PUT", nodeUrl("/config"), patch);
+      if (!w.ok) { flash("bad", failure(w, "Saving settings")); return; }
+      flash("ok", `Saved: ${Object.keys(patch).join(", ")}. The pooler applies them on its next pass.`);
+      loadConfig();
+    });
+  }
+
+  async function maintenance(op) {
+    if (!confirm(`Run "${op}" on ${node} now?`)) return;
+    const r = await api("POST", nodeUrl(`/maintenance/${op}`));
+    if (!r.ok) { flash("bad", failure(r, op)); return; }
+    flash("ok", r.data.message); loadEvents();
+  }
+
+  async function loadEvents() {
+    if (!node) return;
+    const r = await api("GET", nodeUrl("/events?limit=15"));
+    const box = el.querySelector("#pgfc-events");
+    if (!r.ok) { box.innerHTML = `<div class="dim">${esc(failure(r, "Loading events"))}</div>`; return; }
+    if (!r.data.length) { box.innerHTML = `<div class="dim">No events yet.</div>`; return; }
+    box.innerHTML = `<table class="grid"><tbody>${r.data.map(e => `<tr>
+      <td class="dim" style="white-space:nowrap">${esc(new Date(e.t * 1000).toLocaleString())}</td>
+      <td>${e.level === "error" ? `<span class="tag fail">error</span>` : `<span class="tag off">${esc(e.kind)}</span>`}</td>
+      <td>${esc(e.msg)}</td></tr>`).join("")}</tbody></table>`;
+  }
+
+  async function loadLog() {
+    const which = el.querySelector("#pgfc-log").value;
+    const r = await api("GET", nodeUrl(`/logs/${which}?lines=200`));
+    const out = el.querySelector("#pgfc-log-out");
+    out.hidden = false;
+    out.textContent = r.ok ? `# ${r.data.source}\n${r.data.lines.join("\n")}` : failure(r, "Loading the log");
+    out.scrollTop = out.scrollHeight;
+  }
+
+  function loadAll() { renderNodes(); loadSchemas(); loadDbs(); loadConfig(); loadEvents(); }
+
+  async function refresh(view, target) {
+    if (!view.enabled) {
+      el = null; lastNodeKey = "";
+      target.innerHTML = `<p class="desc">Point this at a pg-vm-pool dashboard listener. Store its password as an
+        app-lb secret first, then configure, for example:</p>
+        <pre class="status">${esc(JSON.stringify({ nodes: [{ name: "local", url: "http://127.0.0.1:34199", user: "admin",
+          password: { secret: "pg-fc", key: "password" }, pg_host: "db.example.com" }] }, null, 2))}</pre>`;
+      return;
+    }
+    const first = el !== target;
+    if (first) { el = target; skeleton(); }
+    const r = await api("GET", `${base}/nodes`);
+    if (!r.ok) return;
+    nodes = r.data;
+    if (first) loadAll(); else { renderNodes(); loadSchemas(); }
+  }
+
+  return { render: refresh, refresh };
+})();
+
+async function load() {
+  const r = await api("GET", "/api/plugins");
+  const root = $("plugins");
+  if (!r.ok) { root.innerHTML = `<div class="empty">${esc(failure(r, "Loading plugins"))}</div>`; return; }
+  if (!r.data.length) {
+    root.innerHTML = `<div class="empty">This build of app-lb has no plugins.</div>`;
+    return;
+  }
+  if (!cards.size) root.innerHTML = "";
+  for (const view of r.data) {
+    if (!cards.has(view.id)) {
+      const el = card(view);
+      cards.set(view.id, { el, view });
+      root.appendChild(el);
+    }
+    update(view);
+  }
+}
+
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>
