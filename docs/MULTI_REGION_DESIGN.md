@@ -7,6 +7,21 @@ work. This document does not itself change running infrastructure.
 
 ## Unified control-plane checkpoint — 2026-09-23
 
+- Live follow-through at 12:34 UTC: [release 3d](https://ci.eu1.heyo.work/runs/01a0ce2b02c1-0000003d)
+  validated and published `4b06bf0107821f1a28cea03e3f11703d3389215e` and verified
+  both regional app-lb replacements. Both public admin APIs now serve
+  `/control-plane/config`, revision 0 with empty bindings: installed, not configured.
+  The CI controller operation
+  `ci-controller-016fe500b525de0986cecb3dac6adfa343372a75a48389d84dc9906ae8736e93`
+  remains draining, waiting for verified cleanup of its job VM `sb-109738e8`.
+  Internal read-only inspection found CI PID 421 holding 1018 descriptors with
+  soft/hard limits 1024/4096, while its log reports `Too many open files` and
+  failing Iroh connections. No cleanup record or maintenance fence was cleared.
+  No approved us3 cache has been deleted. Orchestrator replacements remain pending.
+  The subsequent 20 GiB CI-cache workflow change is pushed in PR108 but its
+  [release 41](https://ci.eu1.heyo.work/runs/01a0ce33a204-00000041) failed validation
+  while polling an exec operation (`Missing API key`); it was not published.
+  Earlier validation evidence was not substituted for that failed revision.
 - Gary's chosen model is one logical control plane accessible through either
   region, with a generic DNS name that can switch regions. App-lb is the UI/API
   entry point; Retail is not the implementation surface. Regional entry points
