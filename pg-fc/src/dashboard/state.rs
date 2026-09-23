@@ -21,4 +21,6 @@ pub struct DashState {
     pub alerts: Arc<AlertStore>,
     pub history: Arc<VmHistory>,
     pub inventory: Arc<InventoryCache>,
+    /// When the dashboard started, for `/api/health`'s uptime.
+    pub started_at: std::time::Instant,
 }
