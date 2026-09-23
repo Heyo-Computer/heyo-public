@@ -5229,16 +5229,25 @@ async fn get_workspace_recovery(State(state): State<AdminState>, axum::Extension
     }
 }
 
-async fn fleet_snapshot(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>) -> Response {
+fn fleet_credential(caller: &Caller, headers: &axum::http::HeaderMap) -> Option<String> {
+    if !matches!(caller, Caller::Federated(_)) { return None; }
+    let session = browser_login::session(headers, &axum::http::Method::GET).ok().flatten();
+    bearer(headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()).or(session.as_deref())).map(str::to_owned)
+}
+
+async fn fleet_snapshot(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>, headers: axum::http::HeaderMap) -> Response {
     // Never inherit dashboard_auth=false: remote credentials must not turn an
     // open local dashboard into an unauthenticated cross-region inventory.
     if matches!(caller, Caller::Ungated) || !caller.covers_fleet() {
         return forbidden("authenticated fleet view required");
     }
+    // Only forward an already-authenticated Heyo identity. Never delegate a
+    // gateway-local app-token or Basic password to another gateway.
+    let credential = fleet_credential(&caller, &headers);
     let snapshot = state.views.as_ref().map(|views| views.snapshot());
     let fleet = snapshot.as_ref().and_then(|s| s.fleet.as_ref());
     let observations = match fleet {
-        Some(fleet) => fleet.observe().await,
+        Some(fleet) => fleet.observe(credential.as_deref()).await,
         None => Vec::new(),
     };
     ([(header::CACHE_CONTROL, "no-store")], Json(serde_json::json!({
@@ -7066,6 +7075,20 @@ mod tests {
                     .collect(),
                 fleet,
             })
+        }
+
+        #[test]
+        fn only_authenticated_federated_credentials_can_be_delegated() {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::COOKIE, "__Host-heyo-admin=session.token".parse().unwrap());
+            let federated = Caller::Federated(grant(&[], true));
+            assert_eq!(fleet_credential(&federated, &headers).as_deref(), Some("session.token"));
+            assert!(fleet_credential(&Caller::Operator, &headers).is_none());
+            assert!(fleet_credential(&Caller::Ungated, &headers).is_none());
+            headers.insert(header::AUTHORIZATION, "Bearer explicit-token".parse().unwrap());
+            assert_eq!(fleet_credential(&federated, &headers).as_deref(), Some("explicit-token"));
+            headers.insert(header::AUTHORIZATION, "Basic operator".parse().unwrap());
+            assert!(fleet_credential(&federated, &headers).is_none());
         }
 
         fn spec_in(ns: &str, body_account: Option<&str>) -> DeploymentSpec {

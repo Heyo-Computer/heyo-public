@@ -10,7 +10,10 @@ pub struct Gateway {
     id: String,
     region: String,
     url: String,
-    auth: SecretRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth: Option<SecretRef>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    use_caller_auth: bool,
 }
 
 pub struct Fleet {
@@ -75,6 +78,9 @@ impl ViewStore {
     }
 
     fn prepare(revision: u64, mut config: ViewConfig, externally_managed: bool, secrets: Arc<SecretStore>) -> Result<ViewSnapshot, String> {
+        if config.control_plane.iter().any(|g| g.use_caller_auth) {
+            return Err("Orchestrator bindings require service credentials".into());
+        }
         let mut clients = Vec::new();
         for targets in [&mut config.gateways, &mut config.control_plane] {
             if targets.is_empty() { clients.push(None); continue; }
@@ -99,7 +105,7 @@ impl ViewStore {
         // Reject unresolved credentials before acknowledging activation. Values
         // stay in SecretStore; neither persistence nor the response contains them.
         for gateway in next.config.gateways.iter().chain(&next.config.control_plane) {
-            if self.secrets.resolve(&gateway.auth).map_or(true, |value| value.trim().is_empty()) {
+            if gateway.auth.as_ref().is_some_and(|auth| self.secrets.resolve(auth).map_or(true, |value| value.trim().is_empty())) {
                 return Err((StatusCode::BAD_REQUEST, "view credential unavailable".into()));
             }
         }
@@ -223,7 +229,12 @@ fn parse(text: &str) -> Result<Vec<Gateway>, String> {
         if !ids.insert(gateway.id.clone()) || !urls.insert(url) {
             return Err("duplicate gateway id or origin".into());
         }
-        gateway.auth.validate().map_err(|_| "invalid fleet secret reference")?;
+        if gateway.use_caller_auth == gateway.auth.is_some() {
+            return Err("choose exactly one gateway credential: auth or use_caller_auth".into());
+        }
+        if let Some(auth) = &gateway.auth {
+            auth.validate().map_err(|_| "invalid fleet secret reference")?;
+        }
     }
     Ok(gateways)
 }
@@ -237,13 +248,18 @@ impl Fleet {
         Ok(Self { gateways, client, secrets })
     }
 
-    async fn fetch<T: serde::de::DeserializeOwned>(&self, gateway: &Gateway, path: &str) -> Result<T, &'static str> {
-        let credential = self.secrets.resolve(&gateway.auth).map_err(|_| "credential unavailable")?;
-        if credential.trim().is_empty() { return Err("credential unavailable") }
+    async fn fetch<T: serde::de::DeserializeOwned>(&self, gateway: &Gateway, path: &str, caller: Option<&str>) -> Result<T, &'static str> {
         let request = self.client.get(format!("{}{path}", gateway.url.trim_end_matches('/')));
-        let request = match &gateway.auth.username {
-            Some(user) => request.basic_auth(user, Some(credential)),
-            None => request.bearer_auth(credential),
+        let request = if gateway.use_caller_auth {
+            request.bearer_auth(caller.filter(|s| !s.is_empty()).ok_or("Heyo sign-in required for regional observations")?)
+        } else {
+            let auth = gateway.auth.as_ref().ok_or("credential unavailable")?;
+            let credential = self.secrets.resolve(auth).map_err(|_| "credential unavailable")?;
+            if credential.trim().is_empty() { return Err("credential unavailable") }
+            match &auth.username {
+                Some(user) => request.basic_auth(user, Some(credential)),
+                None => request.bearer_auth(credential),
+            }
         };
         let mut response = request.send().await.map_err(|_| "gateway unreachable")?;
         if response.status().is_server_error() { return Err("gateway unavailable") }
@@ -267,7 +283,7 @@ impl Fleet {
         }
         let mut last = "control plane unavailable";
         for gateway in &self.gateways {
-            match self.fetch(gateway, &path).await {
+            match self.fetch(gateway, &path, None).await {
                 Ok(inventory) => return Ok(inventory),
                 Err(error @ ("gateway unreachable" | "gateway unavailable" | "gateway response interrupted")) => last = error,
                 Err(error) => return Err(error),
@@ -276,12 +292,12 @@ impl Fleet {
         Err(last)
     }
 
-    pub async fn observe(&self) -> Vec<Observation> {
+    pub async fn observe(&self, caller: Option<&str>) -> Vec<Observation> {
         futures::future::join_all(self.gateways.iter().map(|gateway| async move {
-            let result = self.fetch(gateway, "/metrics?summary=true&limit=0").await;
+            let result = self.fetch(gateway, "/metrics?summary=true&limit=0", caller).await;
             Observation {
                 id: gateway.id.clone(), region: gateway.region.clone(),
-                dashboard_url: format!("{}/dashboard", gateway.url.trim_end_matches('/')),
+                dashboard_url: format!("{}/dashboard?view=local", gateway.url.trim_end_matches('/')),
                 observed_at: crate::deployment::now_secs(),
                 error: result.as_ref().err().copied(), metrics: result.ok(),
             }
@@ -326,7 +342,7 @@ mod tests {
         invalid.control_plane[0].url = "http://untrusted.example".into();
         assert_eq!(restarted.configure(ConfigureViews { expected_revision:1,config:invalid }).err().unwrap().0,http::StatusCode::BAD_REQUEST);
         let mut missing = config;
-        missing.gateways[0].auth.key = "missing".into();
+        missing.gateways[0].auth.as_mut().unwrap().key = "missing".into();
         assert_eq!(restarted.configure(ConfigureViews { expected_revision:1,config:missing }).err().unwrap().0,http::StatusCode::BAD_REQUEST);
         assert_eq!(restarted.snapshot().revision,1);
         let override_path = dir.path().join("override.json");
@@ -383,6 +399,27 @@ mod tests {
     }
 
     #[test]
+    fn caller_auth_is_explicit_and_cannot_replace_control_plane_credentials() {
+        let mut g = gateway("https://admin.example");
+        let legacy = parse(&serde_json::json!([g.clone()]).to_string()).unwrap();
+        assert!(serde_json::to_value(&legacy).unwrap()[0].get("use_caller_auth").is_none());
+        g["use_caller_auth"] = true.into();
+        assert!(parse(&serde_json::json!([g.clone()]).to_string()).is_err());
+        g.as_object_mut().unwrap().remove("auth");
+        let gateways = parse(&serde_json::json!([g.clone()]).to_string()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(SecretStore::new(dir.path().join("secrets"), None));
+        let store = ViewStore::open(dir.path().join("views"), secrets, [None,None]).unwrap();
+        let config = ViewConfig { gateways:gateways.clone(), control_plane:vec![] };
+        assert_eq!(store.configure(ConfigureViews {expected_revision:0,config}).unwrap().revision,1);
+        let config = ViewConfig { gateways:vec![], control_plane:gateways };
+        assert_eq!(store.configure(ConfigureViews {expected_revision:1,config}).err().unwrap().0,http::StatusCode::BAD_REQUEST);
+        assert_eq!(store.snapshot().revision,1);
+        g["use_caller_auth"] = false.into();
+        assert!(parse(&serde_json::json!([g]).to_string()).is_err());
+    }
+
+    #[test]
     fn remote_fields_are_allowlisted() {
         let metrics: GatewayMetrics = serde_json::from_value(serde_json::json!({
             "generated_at":42,"uptime_secs":7,"secret":"never-forward",
@@ -427,9 +464,12 @@ mod tests {
             serde_json::from_value(value).unwrap()
         }).collect();
         gateways[1].region = "eu1".into();
+        gateways.push(serde_json::from_value(serde_json::json!({
+            "id":"signed-in","region":"eu1","url":format!("http://{address}"),"use_caller_auth":true
+        })).unwrap());
         let fleet = Fleet { gateways, secrets, client: reqwest::Client::builder()
             .timeout(Duration::from_secs(5)).redirect(reqwest::redirect::Policy::none()).build().unwrap() };
-        let observed = fleet.observe().await;
+        let observed = fleet.observe(None).await;
         assert_eq!(observed[0].metrics.as_ref().unwrap().fleet.total_in_flight, 17);
         assert_eq!(observed[1].region, "eu1");
         assert!(observed[1].metrics.is_none());
@@ -437,6 +477,13 @@ mod tests {
         assert!(observed[2].metrics.is_none());
         assert_eq!(observed[2].error, Some("credential unavailable"));
         assert!(!serde_json::to_string(&observed).unwrap().contains("test-observer"));
+        assert_eq!(observed[3].error,Some("Heyo sign-in required for regional observations"));
+        let signed_in = fleet.observe(Some("test-observer")).await;
+        assert_eq!(signed_in[3].metrics.as_ref().unwrap().fleet.total_in_flight,17);
+        assert!(signed_in[3].dashboard_url.ends_with("/dashboard?view=local"));
+        assert_eq!(signed_in[1].error,Some("gateway rejected observation"));
+        assert_eq!(signed_in[2].error,Some("credential unavailable"));
+        assert!(!serde_json::to_string(&signed_in).unwrap().contains("test-observer"));
         server.abort();
     }
 

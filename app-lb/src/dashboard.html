@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="/__ui/heyo.css">
 <script defer src="/__ui/theme.js"></script>
 <style>
+  [hidden] { display: none !important; }
   /* ------------------------------------------------------------------------
      app-lb, layered on ui/heyo.css — the same sheet ci, app-obs, heyosecret and
      artifacts serve, so the five read as one product.
@@ -53,6 +54,13 @@
      of chart series 1, which put a data colour on a control and made the
      one peach thing on the page compete with it. */
   .wrap { max-width: 1200px; margin: 0 auto; padding: 24px 20px 64px; }
+
+  @media (max-width: 720px) {
+    .topbar { flex-wrap: wrap; height: auto; padding: 12px; gap: 8px; }
+    .topbar-brand { white-space: normal; overflow-wrap: anywhere; }
+    .topbar-nav { order: 3; flex-basis: 100%; }
+    .topbar-right { flex-wrap: wrap; white-space: normal; }
+  }
 
   header.top {
     display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px 20px;
@@ -314,11 +322,11 @@
 <header class="topbar">
     <a class="topbar-brand" href="/"><span>heyo</span><span class="topbar-app">{{APP_NAME}}</span></a>
     <nav class="topbar-nav">
-      <a href="/">Directory</a>
+      <a href="/" data-local-nav>Directory</a>
       <a href="/dashboard" aria-current="page">Dashboard</a>
-      <a href="/siem">Security</a>
-      <a href="/storage">Disks</a>
-      <a href="/metrics">Metrics</a>
+      <a href="/siem" data-local-nav>Security</a>
+      <a href="/storage" data-local-nav>Disks</a>
+      <a href="/metrics" data-local-nav>Metrics</a>
     </nav>
     <div class="topbar-right">
       <!-- `uptime`, `livedot` and `updated` keep their ids: the poll loop
@@ -344,7 +352,8 @@
     <div class="card" id="regional-fleet" aria-live="polite">Loading regional observations…</div>
   </section>
 
-  <div class="section-title">This gateway · host &amp; pools</div>
+  <section id="local-view" hidden aria-label="Selected gateway details">
+  <div class="section-title" id="local-title">Selected gateway · host &amp; pools</div>
   <div class="tiles" id="fleet-tiles"></div>
 
   <div class="section-title">Request latency &amp; throughput</div>
@@ -451,6 +460,7 @@
     Deploy jobs <span class="count" id="jobs-count"></span>
   </div>
   <div class="card" id="jobs"></div>
+  </section>
 </div>
 
 <div class="modal-overlay" id="modal-overlay">
@@ -469,6 +479,16 @@
 
 <script>
 "use strict";
+// The entry region must not silently select the fleet dashboard's data.
+// Gateway cards link to an explicit local view on that gateway's own origin.
+const localView = new URLSearchParams(location.search).get("view") === "local";
+document.getElementById("local-view").hidden = !localView;
+document.querySelectorAll("[data-local-nav]").forEach(el => el.hidden = !localView);
+document.querySelector(".topbar-brand").href = "/dashboard";
+document.querySelector(".topbar-app").textContent = localView ? location.host : "Control plane";
+document.title = localView ? location.host + " · Heyo" : "Heyo control plane";
+document.getElementById("local-title").textContent = "Selected gateway: " + location.host + " · host & pools";
+document.getElementById("uptime").hidden = !localView;
 const REFRESH_MS = 2000;
 // Certs, secrets and jobs move on human timescales; see `pollSlow`.
 const SLOW_REFRESH_MS = 10000;
@@ -2365,6 +2385,7 @@ function metricsUrl() {
 }
 
 async function poll() {
+  if (!localView) return;
   try {
     const r = await fetch(metricsUrl(), { headers: { accept: "application/json" }, cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
@@ -2434,17 +2455,18 @@ function renderFleet(result) {
     return;
   }
   if (!result.data.configured) {
-    target.textContent = "Regional inventory is not configured. Local gateway metrics below do not describe other regions.";
+    target.textContent = "Regional observations are not configured. No region is assumed from this page's hostname.";
     return;
   }
   target.innerHTML = `<div class="sub">Independent gateway observations, not a shared rollout snapshot. Counts may include the same application on several gateways; do not sum them as unique capacity.</div>
     <div>${result.data.gateways.map(g => {
       const m = g.metrics, p = m?.fleet;
-      return `<article style="margin-top:16px;overflow-wrap:anywhere"><strong>${esc(g.region)}</strong> · <a href="${esc(g.dashboard_url)}">${esc(g.id)}</a>
+      return `<article style="margin-top:16px;overflow-wrap:anywhere"><strong>${esc(g.region)}</strong> · ${esc(g.id)}
         <div>${m ? "Observed" : `<strong>Unavailable</strong> · ${esc(g.error)}`}</div>
         <div>Deployments: ${p ? fmt(p.deployments) : "—"} · In-flight: ${p ? fmt(p.total_in_flight) : "—"}</div>
         <div>Backends: ${p ? `${fmt(p.ready)} tracked · ${fmt(p.draining)} draining · ${fmt(p.pending)} pending` : "—"}</div>
-        <div>Sample time: ${m ? esc(new Date(m.generated_at * 1000).toLocaleTimeString()) : "—"}</div></article>`;
+        <div>Sample time: ${m ? esc(new Date(m.generated_at * 1000).toLocaleTimeString()) : "—"}</div>
+        <a href="${esc(g.dashboard_url)}">Open ${esc(g.region)} gateway details</a></article>`;
     }).join("")}</div>`;
 }
 
@@ -2458,6 +2480,11 @@ async function pollSlow() {
       api("GET", "fleet").then(renderFleet).catch(() => renderFleet({ ok: false })),
       pollServices(),
     ]);
+    if (!localView) {
+      $("updated").textContent = "checked " + new Date().toLocaleTimeString();
+      $("livedot").hidden = true;
+      return;
+    }
     const [certs, secrets, tokens, jobs, security, namespaces] = await Promise.all([
       api("GET", "certs"),
       api("GET", "secrets"),

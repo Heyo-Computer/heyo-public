@@ -7,17 +7,65 @@ work. This document does not itself change running infrastructure.
 
 ## Unified control-plane checkpoint — 2026-09-23
 
+- Post-login continuation: both live `/control-plane/config` responses remain
+  revision 1 with identical Orchestrator bindings but empty `gateways`; both
+  `/fleet` responses report `configured=false`. The legacy dashboard sections
+  read their serving gateway's local registry/metrics, so a common hostname
+  does not make those sections fleet-wide. PR108 is merged; further dashboard
+  implementation requires a new release, not another restart/config replay.
+  Both live Orchestrators report `acceptance-v1k-20260922` terminally failed
+  during eu1 readiness, and region-scoped eu1 discovery remains empty. Current
+  receipt `job-9f9ceb904c21` finds no port-2227 listener or retained candidate
+  domain. Fresh us3 probe `job-cad99034046f` times out; simultaneous eu1 capture
+  `job-8a00910fdd54` reports no captured packets. No candidate was recreated.
+  Regional HTTPS candidate probes exist internally, but public application
+  admission/background execution are still fenced in the current source.
+  Do not treat those internal primitives as an enabled deployment API, reopen
+  ephemeral ports as a substitute, or replay the failed flat-path deployment.
+- Gary authorized the common URL: `https://admin.heyo.work` now points to eu1.
+  Authoritative Route 53 zone `Z07907081HGPDGJ740C8L` matches the public NS
+  delegation; change `C100007612LV056I6LCK6` created a 60-second CNAME to
+  `admin.eu1.heyo.work`. The other same-named hosted zone was not changed.
+  Managed receipt `job-ba8f0ebc61de` created an additive Traefik hostname route
+  in `heyo-unified-admin.yml`, reusing the existing control-panel service and
+  certificate resolver. Existing regional routes were preserved; no restart.
+  Public-origin check `job-94ec7950958a` from us3 resolved the new hostname
+  normally and verified login HTTP 200, TLS validation success and healthy
+  `/healthz`. Public DNS also resolved through 1.1.1.1. The Mac retained an
+  earlier NXDOMAIN: its browser check used the publicly resolved address while
+  still validating the hostname certificate, login redirect, Gary's existing
+  session, shared inventory and logout. The login screenshot was inspected.
+  This is a common entry point, not automatic failover: the generic hostname's
+  us3 route/certificate readiness and renewal have not been established. Region-local
+  dashboard sections still differ; missing eu1 smoke-app placement remains open.
 - Administrator identity decision: the dashboard inherits Heyo's platform admin
   role; no regional user accounts or per-email allowlist. Auth already derives
-  `fleet:admin` from the active user's stored role. Live authenticated checks
-  confirmed Gary's account receives that grant from both regional Auth origins
-  (`https://cloud.{region}.heyo.work/__auth`), while the existing dashboard
-  deployments still reject his bearer. The app-lb browser-login integration is
-  implemented locally, with current-scope checks, host-only HttpOnly sessions,
-  same-origin mutation/WebSocket protection and logout. Local two-gateway browser
-  checks cover separate administrators, non-admin denial and role removal. Linux
-  publication and enabling each gateway's `APP_LB_AUTH_URL` remain delivery gates;
-  no live user role has been modified, and Sam's role has not yet been verified.
+  `fleet:admin` from the active user's stored role. Browser admin login is now
+  deployed and enabled at both regional dashboards using
+  `APP_LB_AUTH_URL=https://cloud.{region}.heyo.work/__auth`.
+  [Admin-login release](https://ci.eu1.heyo.work/runs/01a0cebd9afa-00000002)
+  succeeded, including Linux validations and both app-lb replacements. Its initial
+  build-capacity retry recovered without manual cleanup or fence reset.
+  Gary explicitly approved regional Auth configuration and sequential restarts.
+  Managed host-command jobs preserved owner-only config backups and checked
+  BEFORE hashes before atomic writes; provisioning bootstrap was not replayed.
+  us3 receipts: `job-8f635ea4e8fe` (Auth URL), `job-01d0227a9629` (restart),
+  `job-bb04fb01de59` (enable its previously disabled dashboard-page auth gate).
+  eu1 receipt: `job-d85be47a0bf2` (Auth URL and restart); an earlier command
+  `job-673719f4706c` failed Python parsing before executing or changing files.
+  Restarts briefly interrupted the affected regional endpoint; the other region
+  was checked healthy. This was not a continuous zero-interruption acceptance test.
+- Live desktop/mobile browser checks verified anonymous login redirects, rendered
+  login forms, Gary's existing Heyo session and identity, authenticated `/services`
+  reads, cross-origin write rejection and logout on both regional dashboards.
+  Both public `/healthz` endpoints and emergency Basic-auth reads subsequently
+  returned HTTP 200. eu1 restart receipt `job-3a6e48783bf4` confirms systemd
+  success and active service. Screenshots were inspected for both desktop and
+  mobile layouts. No real user password sign-in or Sam session was exercised;
+  local two-gateway tests cover password login, non-admin denial and role removal.
+  Read-only Auth database receipts `job-19e21b5de037` and `job-b58238a6197d`,
+  using canonical `auth/database-url`, confirm Gary and Sam are active admins
+  with password credentials configured. No account, password or role was changed.
 - Live follow-through after 13:30 UTC: both
   [us3](https://admin.us3.heyo.work/dashboard) and
   [eu1](https://admin.eu1.heyo.work/dashboard) now render the same **Global

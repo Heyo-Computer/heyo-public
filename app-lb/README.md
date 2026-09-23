@@ -2345,13 +2345,20 @@ which appear only when there is more than one page.
 
 ### Shared control-plane view
 
+`/dashboard` defaults to the fleet overview on every gateway: shared applications
+and the same explicitly configured regional observations. It does not poll or show
+the entry gateway's local metrics, secrets, tokens, jobs or host inventory.
+Each regional card links to that gateway's `/dashboard?view=local`, where existing
+local controls remain available and the hostname identifies the selected gateway.
+The overview does not sum regional pool counts as unique application capacity.
+
 Configure an already-running gateway with fleet-admin GET and PUT at
 `/control-plane/config`; these routes require authentication even when the admin
 or dashboard gates are disabled. GET returns `revision`, `config`, and
 `externally_managed`. PUT takes `{"expected_revision":0,"config":{"gateways":[],"control_plane":[]}}`,
 using the revision from GET and the origin/secret-reference arrays described
-below. Empty arrays explicitly disable that view. Credentials must already
-resolve in the gateway's secret store. Values are never part of this document.
+below. Empty arrays explicitly disable that view. Secret-reference credentials
+must already resolve in the gateway's secret store. Values are never part of this document.
 Only unconfined fleet admins may read or replace the bindings; view-only,
 deployment-scoped, and namespace-scoped tokens cannot change them.
 
@@ -2393,6 +2400,22 @@ requires surviving auth, secrets, storage, and ingress dependencies.
 
 ### Regional gateway view
 
+For gateways sharing Heyo Auth, set `use_caller_auth:true` instead of `auth`:
+
+```json
+{"id":"us3-edge","region":"US","url":"https://admin.us3.example.com","use_caller_auth":true}
+```
+
+This explicitly trusts that HTTPS origin to receive the authenticated Heyo user's
+bearer for read-only metrics requests. The token lives only in the request, never
+the saved bindings or observation response. Only already-validated federated
+callers are forwarded; local app-tokens and Basic passwords are not. Without a
+Heyo session the observation reports sign-in required. The destination independently
+checks current permissions. Choose exactly one credential mode per gateway; caller
+credentials are forbidden for Orchestrator bindings, which retain their service key.
+Install identical gateway bindings on both regions. Regional links may require
+sign-in on that origin because session cookies remain host-only.
+
 The dashboard's **Regional gateways** section reads `GET /fleet`. Configure
 `APP_LB_FLEET_FILE` with the path to a JSON array of explicitly trusted gateways:
 
@@ -2423,6 +2446,14 @@ snapshot, unique fleet capacity, admission membership, or proof of failover.
 The same application can appear at several gateways. Local controls remain on
 each gateway's linked dashboard; this view does not move lifecycle ownership
 from Orchestrator or alter routing/maintenance gates.
+
+After building the debug binary, `node app-lb/testdata/unified_dashboard.cjs`
+checks real dashboard rendering with asymmetric observation/inventory fixtures,
+default-versus-local polling, explicit drill-downs and unavailable-region display.
+It requires Playwright and its Chromium browser; `PLAYWRIGHT_MODULE` may point to
+an existing installation. `SCREENSHOT_DIR` optionally saves desktop, mobile, local
+and unavailable captures. Rust fleet/authorization tests cover credential selection
+and transport; the browser fixtures are not live multi-region acceptance.
 
 ### Sandboxes app-lb does not own
 
