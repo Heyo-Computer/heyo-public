@@ -421,6 +421,46 @@ pub(crate) struct DeploymentCreationReceipt {
     pub guest_port: Option<u16>,
 }
 
+/// Current retained-runtime observation, never proof that a create was executed.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RetainedDeploymentBinding {
+    pub deployment_id: String,
+    pub archive_id: String,
+    pub backend_server_id: String,
+    pub backend_sandbox_id: String,
+    pub node_id: String,
+    pub region: String,
+    pub deployment_environment: String,
+    pub placement_pool: String,
+    pub guest_port: u16,
+    pub host_local_url: String,
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub(crate) async fn observe_retained_deployment(
+    state: &AppState, deployment_id: &str, guest_port: u16,
+) -> Result<RetainedDeploymentBinding> {
+    anyhow::ensure!(guest_port > 0, "A nonzero guest port is required");
+    let mut url = reqwest::Url::parse(&format!("{}/internal/orchestration/deployments/",
+        state.config.cloud_internal_url.trim_end_matches('/')))?;
+    url.path_segments_mut().map_err(|_| anyhow::anyhow!("Invalid Cloud URL"))?
+        .pop_if_empty().push(deployment_id).push("binding");
+    url.query_pairs_mut().append_pair("port", &guest_port.to_string());
+    let binding: RetainedDeploymentBinding = authorized_request(state, state.http_client.get(url))
+        .send().await?.error_for_status()?.json().await?;
+    anyhow::ensure!(binding.deployment_id == deployment_id && binding.guest_port == guest_port
+        && [&binding.archive_id, &binding.backend_server_id, &binding.backend_sandbox_id,
+            &binding.node_id, &binding.region, &binding.deployment_environment, &binding.placement_pool]
+            .into_iter().all(|value| !value.trim().is_empty()), "Cloud retained binding identity mismatch");
+    let local = reqwest::Url::parse(&binding.host_local_url)?;
+    anyhow::ensure!(local.scheme() == "http" && local.host_str() == Some("127.0.0.1")
+        && local.path() == "/" && local.query().is_none() && local.fragment().is_none()
+        && local.username().is_empty() && local.password().is_none()
+        && local.port_or_known_default() != Some(0), "Invalid retained host-local mapping");
+    Ok(binding)
+}
+
 /// Read-only after an uncertain create; never retry creation with a fresh identity.
 pub(crate) async fn recover_deployment(
     state: &AppState,
@@ -980,6 +1020,12 @@ mod tests {
             axum::routing::get(|State(payload): State<Arc<tokio::sync::Mutex<Value>>>, headers: axum::http::HeaderMap| async move {
                 assert_eq!(headers.get("authorization").unwrap(), "Bearer test");
                 Json(payload.lock().await.clone())
+            })).route("/internal/orchestration/deployments/{id}/binding",
+            axum::routing::get(|State(payload): State<Arc<tokio::sync::Mutex<Value>>>, headers: axum::http::HeaderMap,
+                axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String,String>>| async move {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer test");
+                assert!(query.contains_key("port"));
+                Json(payload.lock().await.clone())
             })).with_state(payload.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base_url = format!("http://{}", listener.local_addr()?);
@@ -1005,6 +1051,25 @@ mod tests {
         assert!(super::recover_deployment(&state, "dep-a", "digest-a", Some(9090)).await.is_err());
         payload.lock().await["hostLocalUrl"] = json!("http://10.0.0.2:18081");
         assert!(super::recover_deployment(&state, "dep-a", "digest-a", Some(8080)).await.is_err());
+        assert!(super::observe_retained_deployment(&state, "dep-a", 8080).await.is_err());
+        let retained = json!({"deploymentId":"dep-a","archiveId":"archive-old",
+            "backendServerId":"us-host","backendSandboxId":"sb-retained","nodeId":"node-us",
+            "region":"US","deploymentEnvironment":"production","placementPool":"platform",
+            "guestPort":8080,"hostLocalUrl":"http://127.0.0.1:18081","observedAt":"2026-09-23T00:00:00Z"});
+        *payload.lock().await = retained.clone();
+        assert_eq!(super::observe_retained_deployment(&state, "dep-a", 8080).await?.archive_id, "archive-old");
+        assert!(super::recover_deployment(&state, "dep-a", "digest-a", None).await.is_err(),
+            "a retained observation is not creation evidence");
+        assert!(super::observe_retained_deployment(&state, "dep-other", 8080).await.is_err());
+        assert!(super::observe_retained_deployment(&state, "dep-a", 9090).await.is_err());
+        assert!(super::observe_retained_deployment(&state, "dep-a", 0).await.is_err());
+        for (key,value) in [("nodeId",json!("")), ("region",Value::Null),
+            ("hostLocalUrl",json!("http://remote.example:18081")),
+            ("hostLocalUrl",json!("http://127.0.0.1:18081/other"))] {
+            let mut bad = retained.clone(); bad[key] = value;
+            *payload.lock().await = bad;
+            assert!(super::observe_retained_deployment(&state, "dep-a", 8080).await.is_err(), "{key}");
+        }
         server.abort();
         Ok(())
     }

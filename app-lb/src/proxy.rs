@@ -28,6 +28,17 @@ use std::time::{Duration, Instant};
 /// How many upstreams one request may try before giving up.
 const MAX_ATTEMPTS: usize = 3;
 
+/// Flat selection can refresh membership, but cannot acquire a different
+/// gateway admission policy or bypass the regional generation reservation.
+fn check_flat_admission_refresh(previous: &Deployment, current: &Deployment) -> Result<()> {
+    if current.spec.gateway != previous.spec.gateway
+        || current.regional.is_some() || previous.regional.is_some() {
+        return Err(Error::explain(ErrorType::ConnectProxyFailure,
+            "gateway policy changed after admission"));
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct Ctx {
     /// The backend currently serving, if we've incremented its counter.
@@ -654,11 +665,25 @@ impl ProxyHttp for LbProxy {
             return Ok(true);
         }
 
-        let Some(deployment) = routed else {
+        let Some(mut deployment) = routed else {
             tracing::debug!(?host, %path, "no deployment matches request");
             write_plain(session, 404, "no deployment matches this request\n").await?;
             return Ok(true); // response already written; stop proxying
         };
+
+        // A staged regional runtime is invisible to ordinary public requests.
+        // Peer/probe headers merely nominate it; the regional admission below
+        // still authenticates the complete signed peer header set before any
+        // backend is selected or contacted.
+        let nominates_regional = crate::gateway::HEADERS.iter().chain([
+            crate::regional::GENERATION, crate::regional::ENVIRONMENT,
+            crate::regional::PROBE, crate::regional::ACTIVE_PROBE,
+        ].iter()).any(|name| session.req_header().headers.contains_key(*name));
+        if nominates_regional
+            && let Some(staged) = self.registry.staged(&deployment.spec.id)
+        {
+            deployment = staged;
+        }
 
         if session.req_header().headers.contains_key(crate::regional::PROBE)
             || session.req_header().headers.contains_key(crate::regional::ACTIVE_PROBE) {
@@ -995,12 +1020,7 @@ impl ProxyHttp for LbProxy {
                     // forwarding credential against the original gateway.
                     // Never apply that decision to a different gateway policy
                     // (including changing an ordinary route into a peer route).
-                    if current.spec.gateway != deployment.spec.gateway {
-                        return Err(Error::explain(
-                            ErrorType::ConnectProxyFailure,
-                            "gateway policy changed after admission",
-                        ));
-                    }
+                    check_flat_admission_refresh(&deployment, &current)?;
                     drop(changed);
                     deployment = current;
                     ctx.deployment = Some(deployment.clone());
@@ -1447,6 +1467,27 @@ mod tests {
 
     fn backend(addr: &str) -> Arc<VmBackend> {
         Arc::new(VmBackend::new("sb-1".into(), addr.parse().unwrap()))
+    }
+
+    #[test]
+    fn stale_flat_request_cannot_enter_regional_route_without_admission() {
+        let flat: DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id":"app", "routes":[{"host":"app.example"}],
+            "discovery":{"service_id":"svc"}, "upstreams":["127.0.0.1:8000"]
+        })).unwrap();
+        let previous = Deployment::new(flat.clone());
+        let mut refreshed = flat.clone();
+        refreshed.upstreams = vec!["127.0.0.1:8001".into()];
+        assert!(check_flat_admission_refresh(&previous, &Deployment::new(refreshed)).is_ok());
+        let mut regional = flat;
+        regional.discovery.as_mut().unwrap().region = Some("us3".into());
+        regional.discovery.as_mut().unwrap().regional = Some(serde_json::from_value(serde_json::json!({
+            "gateway_id":"us", "backend_server_id":"host-us", "environment":"prod", "auth":{"secret":"peer"}
+        })).unwrap());
+        let current = Deployment::new(regional);
+        assert_eq!(previous.spec.gateway, current.spec.gateway, "both are None; the legacy gateway check misses this transition");
+        assert!(check_flat_admission_refresh(&previous, &current).is_err());
+        assert!(check_flat_admission_refresh(&current, &previous).is_err());
     }
 
     #[test]

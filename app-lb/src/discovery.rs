@@ -96,17 +96,15 @@ impl DiscoveryWatcher {
     }
 
     async fn tick(&self) {
-        let targets: Vec<(String, String)> = self.registry.deployments().values()
-            .filter_map(|d| d.spec.discovery.as_ref().map(|x| (d.spec.id.clone(), x.service_id.clone())))
-            .collect();
+        let targets = self.registry.discovery_targets();
         let refreshes = targets
             .iter()
-            .map(|(deployment_id, service_id)| self.refresh(deployment_id, service_id));
+            .map(|(deployment_id, service_id, staged)| self.refresh_target(deployment_id, service_id, *staged));
         let results = join_all(refreshes).await;
         let mut failed = self.failed.lock().await;
-        let target_keys: HashSet<_> = targets.iter().cloned().collect();
+        let target_keys: HashSet<_> = targets.iter().map(|(d,s,_)| (d.clone(),s.clone())).collect();
         failed.retain(|key| target_keys.contains(key));
-        for ((deployment_id, service_id), result) in targets.iter().zip(results) {
+        for ((deployment_id, service_id, _), result) in targets.iter().zip(results) {
             let key = (deployment_id.clone(), service_id.clone());
             match result {
                 Err(error) if failed.insert(key.clone()) => {
@@ -120,8 +118,13 @@ impl DiscoveryWatcher {
         }
     }
 
+    #[cfg(test)]
     async fn refresh(&self, deployment_id: &str, service_id: &str) -> Result<bool, String> {
-        let Some(before) = self.registry.get(deployment_id) else { return Ok(false) };
+        self.refresh_target(deployment_id, service_id, false).await
+    }
+
+    async fn refresh_target(&self, deployment_id: &str, service_id: &str, staged: bool) -> Result<bool, String> {
+        let Some(before) = (if staged { self.registry.staged(deployment_id) } else { self.registry.get(deployment_id) }) else { return Ok(false) };
         let Some(discovery) = &before.spec.discovery else { return Ok(false) };
         if discovery.service_id != service_id { return Ok(false); }
         let (source, token) = if let Some(source) = &discovery.source {
@@ -167,17 +170,19 @@ impl DiscoveryWatcher {
                 if endpoint.health_status == "healthy" && !endpoint.draining { upstreams.insert(peer); }
             }
             let _guard = self.registry.change_guard().await;
-            let Some(current) = self.registry.get(deployment_id) else { return Ok(false); };
+            let Some(current) = (if staged { self.registry.staged(deployment_id) } else { self.registry.get(deployment_id) }) else { return Ok(false); };
             if !Arc::ptr_eq(&current, &before) { return Ok(false); }
             if current.state().discovery_version.is_some_and(|v| snapshot.version < v) { return Ok(false); }
             let version = snapshot.version;
             let local: Vec<_> = upstreams.iter().map(|peer| current.backends().iter().find(|b| b.peer == *peer)
                 .cloned().unwrap_or_else(|| Arc::new(crate::deployment::VmBackend::for_upstream(peer.clone())))).collect();
             if !router.apply(snapshot, regional, service_id, region, local.clone())? { return Ok(false); }
-            let deployment = self.registry.apply_discovery_upstreams(&current, upstreams.into_iter().collect());
+            let deployment = if staged {
+                self.registry.apply_staged_discovery(&current, upstreams.into_iter().collect()).ok_or("staged runtime changed")?
+            } else { self.registry.apply_discovery_upstreams(&current, upstreams.into_iter().collect()) };
             deployment.set_backends(local);
             deployment.mutate_state(|s| { s.discovery_version = Some(version); s.discovery_source_url = Some(source); });
-            self.registry.persist_one(deployment_id).map_err(|e| e.to_string())?;
+            if !staged { self.registry.persist_one(deployment_id).map_err(|e| e.to_string())?; }
             return Ok(true);
         }
         let snapshot: Snapshot = self.client.get(&source)
@@ -189,7 +194,7 @@ impl DiscoveryWatcher {
         }
         let upstreams = snapshot_upstreams(&snapshot, discovery.region.as_deref())?;
         let _guard = self.registry.change_guard().await;
-        let Some(current) = self.registry.get(deployment_id) else { return Ok(false) };
+        let Some(current) = (if staged { self.registry.staged(deployment_id) } else { self.registry.get(deployment_id) }) else { return Ok(false) };
         // Do not apply an in-flight response after its deployment was replaced,
         // even when the replacement has the same service ID and source URL.
         if !Arc::ptr_eq(&before, &current) {
@@ -208,12 +213,14 @@ impl DiscoveryWatcher {
         )) {
             return Ok(false);
         }
-        let deployment = self.registry.apply_discovery_upstreams(&current, upstreams);
+        let deployment = if staged {
+            self.registry.apply_staged_discovery(&current, upstreams).ok_or("staged runtime changed")?
+        } else { self.registry.apply_discovery_upstreams(&current, upstreams) };
         deployment.mutate_state(|state| {
             state.discovery_version = Some(snapshot.version);
             state.discovery_source_url = Some(source);
         });
-        if let Err(error) = self.registry.persist_one(deployment_id) {
+        if !staged && let Err(error) = self.registry.persist_one(deployment_id) {
             // Keep the previous version eligible for retry. The in-memory
             // upstream set is already safe to route, but it is not durable yet.
             deployment.mutate_state(|state| {

@@ -14,6 +14,28 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RouteHandoffRecord {
+    pub operation_id: String,
+    pub predecessor_fingerprint: String,
+    pub staged_fingerprint: String,
+    pub staged_spec: DeploymentSpec,
+    pub phase: RouteHandoffPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteHandoffPhase { Preparing, Prepared, Committed }
+
+#[derive(Debug)]
+pub enum HandoffError { NotFound, Conflict(String), Io(std::io::Error) }
 
 /// Route rules pre-sorted most-specific-first, so the first match wins.
 ///
@@ -227,6 +249,7 @@ pub struct Registry {
     /// requests admitted before the withdrawal hold their Arcs. Runtime-only:
     /// a restart terminates those connections, so there is nothing to restore.
     retired_discovery: std::sync::Mutex<HashMap<String, Vec<Arc<crate::deployment::VmBackend>>>>,
+    staged: std::sync::Mutex<HashMap<String, Arc<Deployment>>>,
     #[cfg(test)]
     pub(crate) fail_after_rename: std::sync::atomic::AtomicBool,
     /// Whether the last [`load`](Registry::load) left a file on disk that it
@@ -245,6 +268,7 @@ impl Registry {
             change_lock: tokio::sync::Mutex::new(()),
             persist_lock: std::sync::Mutex::new(()),
             retired_discovery: std::sync::Mutex::new(HashMap::new()),
+            staged: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             load_skipped: std::sync::atomic::AtomicBool::new(false),
@@ -264,6 +288,117 @@ impl Registry {
 
     pub fn get(&self, id: &str) -> Option<Arc<Deployment>> {
         self.deployments().get(id).cloned()
+    }
+
+    pub fn staged(&self, id: &str) -> Option<Arc<Deployment>> {
+        self.staged.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
+    }
+
+    pub fn discovery_targets(&self) -> Vec<(String, String, bool)> {
+        let mut out: Vec<_> = self.deployments().values().filter_map(|d| d.spec.discovery.as_ref()
+            .map(|x| (d.spec.id.clone(), x.service_id.clone(), false))).collect();
+        out.extend(self.staged.lock().unwrap_or_else(|e| e.into_inner()).values().filter_map(|d|
+            d.spec.discovery.as_ref().map(|x| (d.spec.id.clone(), x.service_id.clone(), true))));
+        out
+    }
+
+    pub fn prepare_handoff(&self, operation_id: &str, expected: &str, staged_spec: DeploymentSpec)
+        -> Result<RouteHandoffRecord, HandoffError> {
+        let current = self.get(&staged_spec.id).ok_or(HandoffError::NotFound)?;
+        let current_fp = spec_fingerprint(&current.spec).map_err(HandoffError::Io)?;
+        let staged_fp = spec_fingerprint(&staged_spec).map_err(HandoffError::Io)?;
+        if let Some(existing) = current.state().route_handoff.clone() {
+            if existing.operation_id == operation_id && existing.predecessor_fingerprint == expected
+                && existing.staged_fingerprint == staged_fp { return Ok(existing); }
+            return Err(HandoffError::Conflict("deployment already has a different route handoff intent".into()));
+        }
+        if current_fp != expected { return Err(HandoffError::Conflict("expected predecessor fingerprint does not match".into())); }
+        validate_handoff(&current.spec, &staged_spec).map_err(HandoffError::Conflict)?;
+        let record = RouteHandoffRecord { operation_id: operation_id.into(), predecessor_fingerprint: expected.into(),
+            staged_fingerprint: staged_fp, staged_spec: staged_spec.clone(), phase: RouteHandoffPhase::Preparing,
+            prepared_boot_id: None, prepared_version: None };
+        let mut next = (*current.state()).clone();
+        next.route_handoff = Some(record.clone());
+        self.persist_snapshot(&current, &next).map_err(HandoffError::Io)?;
+        current.set_state(next);
+        self.staged.lock().unwrap_or_else(|e| e.into_inner()).insert(staged_spec.id.clone(), Arc::new(Deployment::new(staged_spec)));
+        Ok(record)
+    }
+
+    pub fn inspect_handoff(&self, id: &str) -> Option<RouteHandoffRecord> {
+        self.get(id)?.state().route_handoff.clone()
+    }
+
+    pub fn mark_handoff_prepared(&self, id: &str) -> Result<RouteHandoffRecord, HandoffError> {
+        let current = self.get(id).ok_or(HandoffError::NotFound)?;
+        let staged = self.staged(id).ok_or_else(|| HandoffError::Conflict("staged runtime unavailable".into()))?;
+        let evidence = staged.regional.as_ref().and_then(|r| r.preparation(!staged.spec.maintenance))
+            .filter(|p| p.prepared && p.adopted).ok_or_else(|| HandoffError::Conflict("regional runtime must be healthy and have adopted the active policy".into()))?;
+        let mut record = current.state().route_handoff.clone().ok_or_else(|| HandoffError::Conflict("no route handoff".into()))?;
+        if evidence.operation_id != record.operation_id {
+            return Err(HandoffError::Conflict("regional snapshot operation does not match route handoff".into()));
+        }
+        record.phase = RouteHandoffPhase::Prepared;
+        record.prepared_boot_id = Some(evidence.boot_id);
+        record.prepared_version = Some(evidence.version);
+        let mut next = (*current.state()).clone();
+        next.route_handoff = Some(record.clone());
+        self.persist_snapshot(&current, &next).map_err(HandoffError::Io)?;
+        current.set_state(next);
+        Ok(record)
+    }
+
+    pub fn commit_handoff(&self, id: &str, operation_id: &str) -> Result<RouteHandoffRecord, HandoffError> {
+        let predecessor = self.get(id).ok_or(HandoffError::NotFound)?;
+        let mut record = predecessor.state().route_handoff.clone().ok_or_else(|| HandoffError::Conflict("no route handoff".into()))?;
+        if record.operation_id != operation_id { return Err(HandoffError::Conflict("operation identity does not match".into())); }
+        if record.phase == RouteHandoffPhase::Committed { return Ok(record); }
+        if record.phase != RouteHandoffPhase::Prepared { return Err(HandoffError::Conflict("route handoff is not prepared".into())); }
+        if spec_fingerprint(&predecessor.spec).map_err(HandoffError::Io)? != record.predecessor_fingerprint {
+            return Err(HandoffError::Conflict("predecessor spec changed after preparation".into()));
+        }
+        if self.deployments().values().any(|other| other.spec.id != id && record.staged_spec.routes.iter().any(|new| {
+            let host = new.host.as_deref();
+            let path = new.path_prefix.as_deref().unwrap_or("/");
+            other.spec.routes.iter().any(|old| old.matches(host, path) || new.matches(old.host.as_deref(), old.path_prefix.as_deref().unwrap_or("/")))
+        })) {
+            return Err(HandoffError::Conflict("a competing deployment now overlaps the staged route".into()));
+        }
+        let staged = self.staged(id).ok_or_else(|| HandoffError::Conflict("staged runtime unavailable".into()))?;
+        let evidence = staged.regional.as_ref().and_then(|r| r.preparation(!staged.spec.maintenance))
+            .filter(|p| p.prepared && p.adopted).ok_or_else(|| HandoffError::Conflict("prepared evidence is stale or the active policy is not healthy".into()))?;
+        if evidence.operation_id != record.operation_id {
+            return Err(HandoffError::Conflict("regional snapshot operation does not match route handoff".into()));
+        }
+        if record.prepared_boot_id.as_deref() != Some(&evidence.boot_id) || record.prepared_version != Some(evidence.version) {
+            return Err(HandoffError::Conflict("prepared evidence changed; inspect and prepare again".into()));
+        }
+        record.phase = RouteHandoffPhase::Committed;
+        let mut next = (*staged.state()).clone();
+        next.route_handoff = Some(record.clone());
+        next.discovery_version = Some(evidence.version);
+        // Persist switch intent before publishing. A crash after this point
+        // reloads the regional spec (closed until a fresh matching snapshot).
+        self.persist_snapshot(&staged, &next).map_err(HandoffError::Io)?;
+        staged.set_state(next);
+        // Fence even requests holding a predecessor Arc. Already-admitted
+        // streams finish normally and remain visible in discovery status.
+        self.fence_discovery_removals(&predecessor, &[]);
+        self.install(Some(staged.clone()), id);
+        self.staged.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        Ok(record)
+    }
+
+    pub fn apply_staged_discovery(&self, old: &Arc<Deployment>, upstreams: Vec<String>) -> Option<Arc<Deployment>> {
+        let mut stages = self.staged.lock().unwrap_or_else(|e| e.into_inner());
+        if !stages.get(&old.spec.id).is_some_and(|d| Arc::ptr_eq(d, old)) { return None; }
+        let mut spec = old.spec.clone(); spec.upstreams = upstreams;
+        let mut next = Deployment::new(spec);
+        next.regional = old.regional.clone();
+        let next = Arc::new(next);
+        next.set_state((*old.state()).clone());
+        stages.insert(old.spec.id.clone(), next.clone());
+        Some(next)
     }
 
     /// Resolve a request to a deployment.
@@ -698,6 +833,14 @@ impl Registry {
             }
             let d = self.upsert(record.spec);
             d.set_state(record.state);
+            if let Some(handoff) = d.state().route_handoff.clone()
+                && handoff.phase != RouteHandoffPhase::Committed
+            {
+                // Preparation survives restart as intent only. The fresh Router
+                // has a new boot id and must obtain a coherent fresh snapshot.
+                self.staged.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                    d.spec.id.clone(), Arc::new(Deployment::new(handoff.staged_spec)));
+            }
             loaded += 1;
         }
         self.load_skipped
@@ -743,6 +886,37 @@ impl Registry {
         );
         Ok(())
     }
+}
+
+pub fn spec_fingerprint(spec: &DeploymentSpec) -> std::io::Result<String> {
+    let mut intent = spec.clone();
+    intent.normalize();
+    // Discovery refreshes membership independently of the operator's route
+    // intent. They must not invalidate an otherwise identical handoff retry.
+    if intent.discovery.is_some() { intent.upstreams.clear(); }
+    let bytes = serde_json::to_vec(&intent).map_err(std::io::Error::other)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn validate_handoff(flat: &DeploymentSpec, regional: &DeploymentSpec) -> Result<(), String> {
+    if regional.validate().is_err() { return Err("staged regional spec is invalid".into()); }
+    let Some(predecessor) = flat.discovery.as_ref() else { return Err("predecessor must be discovery-backed".into()); };
+    if predecessor.regional.is_some() || flat.gateway.is_some() {
+        return Err("predecessor must use flat discovery routing".into());
+    }
+    let Some(discovery) = regional.discovery.as_ref() else { return Err("staged spec requires discovery".into()); };
+    if discovery.region.is_none() || discovery.regional.is_none() || discovery.source.is_none() {
+        return Err("staged spec requires explicit regional scope, authority and peer authentication".into());
+    }
+    let mut expected = flat.clone();
+    expected.upstreams = regional.upstreams.clone();
+    let allowed = expected.discovery.as_mut().unwrap();
+    allowed.region = discovery.region.clone();
+    allowed.regional = discovery.regional.clone();
+    if expected != *regional {
+        return Err("handoff must preserve authority, credentials, service identity and non-routing configuration".into());
+    }
+    Ok(())
 }
 
 /// One deployment's on-disk record: its spec, plus the runtime state that has
@@ -846,6 +1020,174 @@ mod tests {
             update: None,
             auth: None,
         }
+    }
+
+    fn regional_spec(flat: &DeploymentSpec, boot_id: &str) -> (DeploymentSpec, crate::regional::Snapshot) {
+        let mut staged = flat.clone();
+        staged.upstreams.clear();
+        staged.discovery = Some(serde_json::from_value(serde_json::json!({
+            "service_id":"svc", "region":"eu1",
+            "source":{"url":"https://control.example/discovery","auth":{"secret":"discovery"}},
+            "regional":{"gateway_id":"eu","backend_server_id":"host-eu","environment":"prod","auth":{"secret":"peer"}}
+        })).unwrap());
+        let snapshot = serde_json::from_value(serde_json::json!({
+            "protocolVersion":1,"serviceId":"svc","environment":"prod","region":"eu1","gatewayId":"eu",
+            "bootId":boot_id,"version":7,"operationId":"handoff-1","phase":"bake","proposalGeneration":1,
+            "activeGeneration":1,"drainTarget":null,"closedThroughGeneration":0,
+            "policies":[{"generation":1,"policy":{"version":1,"regions":[{"region":"eu1","weight":1,
+                "gateways":[{"id":"eu","backendServerId":"host-eu","url":"https://eu.example"}]}]}}],
+            "endpoints":[]
+        })).unwrap();
+        (staged, snapshot)
+    }
+
+    fn handoff_flat_spec() -> DeploymentSpec {
+        let mut flat = static_spec("app", vec![host("app.example")], &["127.0.0.1:8000"]);
+        let (regional, _) = regional_spec(&flat, "unused");
+        flat.discovery = regional.discovery;
+        let discovery = flat.discovery.as_mut().unwrap();
+        discovery.region = None;
+        discovery.regional = None;
+        flat
+    }
+
+    #[test]
+    fn staged_handoff_keeps_flat_selection_then_commits_without_invalidating_held_requests() {
+        let state_file = scratch("route-handoff");
+        let registry = Registry::new(&state_file);
+        let flat = registry.upsert(handoff_flat_spec());
+        let held = flat.backends()[0].try_hold().unwrap();
+        let fingerprint = spec_fingerprint(&flat.spec).unwrap();
+        let temporary = crate::regional::Router::new();
+        let (staged_spec, _) = regional_spec(&flat.spec, &temporary.boot_id);
+        let first = registry.prepare_handoff("handoff-1", &fingerprint, staged_spec.clone()).unwrap();
+        assert_eq!(first.phase, RouteHandoffPhase::Preparing);
+        assert!(Arc::ptr_eq(&registry.route(Some("app.example"), "/").unwrap(), &flat));
+        assert_eq!(registry.prepare_handoff("handoff-1", &fingerprint, staged_spec.clone()).unwrap(), first);
+        let mut conflict = staged_spec.clone(); conflict.maintenance = true;
+        assert!(matches!(registry.prepare_handoff("handoff-1", &fingerprint, conflict), Err(HandoffError::Conflict(_))));
+
+        let staged = registry.staged("app").unwrap();
+        let router = staged.regional.as_ref().unwrap();
+        let (_, snapshot) = regional_spec(&flat.spec, &router.boot_id);
+        router.apply(snapshot, staged.spec.discovery.as_ref().unwrap().regional.as_ref().unwrap(), "svc", "eu1",
+            vec![Arc::new(crate::deployment::VmBackend::for_upstream("127.0.0.1:9000".into()))]).unwrap();
+        registry.mark_handoff_prepared("app").unwrap();
+        registry.commit_handoff("app", "handoff-1").unwrap();
+        let selected = registry.route(Some("app.example"), "/").unwrap();
+        assert!(selected.regional.is_some());
+        assert_eq!(flat.backends()[0].in_flight(), 1, "held predecessor keeps its own Arc and counter");
+        assert!(!flat.backends()[0].try_acquire(), "a request holding the old route cannot start new work");
+        assert!(registry.discovery_backends("app").iter().any(|b| b.peer == "127.0.0.1:8000" && b.in_flight() == 1));
+        drop(held);
+        assert_eq!(flat.backends()[0].in_flight(), 0);
+        assert!(!registry.discovery_backends("app").iter().any(|b| b.peer == "127.0.0.1:8000"));
+
+        let restarted = Registry::new(&state_file);
+        assert_eq!(restarted.load().unwrap(), 1);
+        let recovered = restarted.route(Some("app.example"), "/").unwrap();
+        assert!(recovered.regional.is_some());
+        assert!(recovered.regional.as_ref().unwrap().preparation(true).is_none(),
+            "restart must not fabricate the old boot's preparation evidence");
+        std::fs::remove_dir_all(state_file.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn handoff_requires_healthy_active_policy_and_current_boot() {
+        let path = scratch("handoff-policy");
+        let registry = Registry::new(&path);
+        let flat = registry.upsert(handoff_flat_spec());
+        let (spec, _) = regional_spec(&flat.spec, "unused");
+        registry.prepare_handoff("handoff-1", &spec_fingerprint(&flat.spec).unwrap(), spec).unwrap();
+        let staged = registry.staged("app").unwrap();
+        let router = staged.regional.as_ref().unwrap();
+        let (_, mut snapshot) = regional_spec(&flat.spec, &router.boot_id);
+        let regional = staged.spec.discovery.as_ref().unwrap().regional.as_ref().unwrap();
+        let backend = Arc::new(crate::deployment::VmBackend::for_upstream("127.0.0.1:9000".into()));
+        snapshot.active_generation = None;
+        router.apply(snapshot.clone(), regional, "svc", "eu1", vec![backend.clone()]).unwrap();
+        assert!(registry.mark_handoff_prepared("app").is_err(), "prepared alone does not permit cutover");
+        snapshot.active_generation = Some(1);
+        snapshot.version += 1;
+        backend.set_healthy(false);
+        router.apply(snapshot, regional, "svc", "eu1", vec![backend.clone()]).unwrap();
+        assert!(registry.mark_handoff_prepared("app").is_err(), "adopted alone does not permit cutover");
+        backend.set_healthy(true);
+        registry.mark_handoff_prepared("app").unwrap();
+        backend.set_healthy(false);
+        assert!(registry.commit_handoff("app", "handoff-1").is_err(), "commit rechecks readiness");
+        let restarted = Registry::new(&path);
+        assert_eq!(restarted.load().unwrap(), 1);
+        assert!(restarted.commit_handoff("app", "handoff-1").is_err());
+        let recovered = restarted.staged("app").unwrap();
+        let new_router = recovered.regional.as_ref().unwrap();
+        assert_ne!(new_router.boot_id, router.boot_id);
+        let (_, snapshot) = regional_spec(&flat.spec, &new_router.boot_id);
+        backend.set_healthy(true);
+        new_router.apply(snapshot, regional, "svc", "eu1", vec![backend]).unwrap();
+        assert!(restarted.commit_handoff("app", "handoff-1").is_err(), "fresh snapshot cannot reuse an old boot receipt");
+        restarted.mark_handoff_prepared("app").unwrap();
+        restarted.commit_handoff("app", "handoff-1").unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn handoff_failed_persistence_is_not_acknowledged_by_retry() {
+        let path = scratch("handoff-write-failure");
+        let registry = Registry::new(&path);
+        let flat = registry.upsert(handoff_flat_spec());
+        let fingerprint = spec_fingerprint(&flat.spec).unwrap();
+        let (spec, _) = regional_spec(&flat.spec, "unused");
+        registry.fail_after_rename.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(registry.prepare_handoff("handoff-1", &fingerprint, spec.clone()), Err(HandoffError::Io(_))));
+        assert!(registry.inspect_handoff("app").is_none());
+        assert!(registry.staged("app").is_none());
+        registry.prepare_handoff("handoff-1", &fingerprint, spec).unwrap();
+        let staged = registry.staged("app").unwrap();
+        let router = staged.regional.as_ref().unwrap();
+        let (_, snapshot) = regional_spec(&flat.spec, &router.boot_id);
+        router.apply(snapshot, staged.spec.discovery.as_ref().unwrap().regional.as_ref().unwrap(), "svc", "eu1",
+            vec![Arc::new(crate::deployment::VmBackend::for_upstream("127.0.0.1:9000".into()))]).unwrap();
+        registry.fail_after_rename.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(registry.mark_handoff_prepared("app"), Err(HandoffError::Io(_))));
+        assert_eq!(registry.inspect_handoff("app").unwrap().phase, RouteHandoffPhase::Preparing);
+        registry.mark_handoff_prepared("app").unwrap();
+        registry.fail_after_rename.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(registry.commit_handoff("app", "handoff-1"), Err(HandoffError::Io(_))));
+        assert!(Arc::ptr_eq(&registry.get("app").unwrap(), &flat));
+        assert!(staged.state().route_handoff.is_none());
+        assert_eq!(registry.inspect_handoff("app").unwrap().phase, RouteHandoffPhase::Prepared);
+        // Rename may have happened before the I/O error. Restart recovers the
+        // selected intent but cannot route from a prior boot's cached policy.
+        let restarted = Registry::new(&path);
+        restarted.load().unwrap();
+        assert!(restarted.get("app").unwrap().regional.as_ref().unwrap().preparation(true).is_none());
+        registry.commit_handoff("app", "handoff-1").unwrap();
+        assert_eq!(registry.commit_handoff("app", "handoff-1").unwrap().phase, RouteHandoffPhase::Committed);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn handoff_preserves_authority_and_non_routing_intent_but_not_cached_membership() {
+        let flat = handoff_flat_spec();
+        let (regional, _) = regional_spec(&flat, "unused");
+        validate_handoff(&flat, &regional).unwrap();
+        let mut refreshed = flat.clone();
+        refreshed.upstreams = vec!["127.0.0.1:8001".into()];
+        assert_eq!(spec_fingerprint(&flat).unwrap(), spec_fingerprint(&refreshed).unwrap());
+        for edit in 0..4 {
+            let mut wrong = regional.clone();
+            match edit {
+                0 => wrong.discovery.as_mut().unwrap().source.as_mut().unwrap().url = "https://other.example/discovery".into(),
+                1 => wrong.discovery.as_mut().unwrap().service_id = "other".into(),
+                2 => wrong.maintenance = true,
+                _ => wrong.user_id = Some("other-owner".into()),
+            }
+            assert!(validate_handoff(&flat, &wrong).is_err());
+        }
+        refreshed.discovery = None;
+        assert!(validate_handoff(&refreshed, &regional).is_err());
+        assert!(validate_handoff(&regional, &regional).is_err());
     }
 
     #[test]

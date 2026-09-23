@@ -3,7 +3,8 @@
 Build with --features reqwest/rustls-tls-native-roots so both TLS stacks trust
 the disposable SSL_CERT_FILE. Certificate and hostname verification stay enabled.
 """
-import base64, concurrent.futures, hashlib, http.server, json, os, pathlib, socket, subprocess, tempfile, threading, time, urllib.request, urllib.error
+import base64, concurrent.futures, hashlib, json, os, pathlib, socket, subprocess, tempfile, threading, time, urllib.request, urllib.error
+from regional_app import RegionalApp, server
 
 BINARY = str(pathlib.Path(__file__).resolve().parents[1] / 'target/debug/app-lb')
 
@@ -12,15 +13,16 @@ def port():
         s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
 
-seen = []
 held_started, held_release = threading.Event(), threading.Event()
 held_port = None
-class App(http.server.BaseHTTPRequestHandler):
-    protocol_version = 'HTTP/1.1'
-    def do_GET(self): self.respond()
-    def do_POST(self): self.respond()
-    def respond(self):
+class App(RegionalApp):
+    def hold(self, seconds):
         global held_port
+        held_port = self.server.server_port
+        held_started.set()
+        assert held_release.wait(10), 'held request was not released'
+
+    def respond(self):
         if self.path == '/socket':
             assert not any(k.lower().startswith('x-heyo-peer') for k in self.headers)
             accept = base64.b64encode(hashlib.sha1((self.headers['Sec-WebSocket-Key']+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
@@ -39,23 +41,7 @@ class App(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
             self.close_connection=True
             return
-        body = self.rfile.read(int(self.headers.get('Content-Length', 0))).decode()
-        if self.path.startswith('/held'):
-            held_port = self.server.server_port
-        record = {'port': self.server.server_port, 'method': self.command, 'path': self.path, 'host': self.headers.get('Host'), 'authorization': self.headers.get('Authorization'), 'body': body, 'peerHeaders': [k for k in self.headers if k.lower().startswith('x-heyo-peer')]}
-        seen.append(record)
-        data = json.dumps(record).encode()
-        self.send_response(200)
-        self.send_header('Content-Length', str(len(data)))
-        self.send_header('X-Revision', 'fixture-v1')
-        self.end_headers()
-        self.wfile.write(data[:1])
-        self.wfile.flush()
-        if self.path.startswith('/held'):
-            held_started.set()
-            assert held_release.wait(10), 'held request was not released'
-        self.wfile.write(data[1:])
-    def log_message(self, *args): pass
+        super().respond()
 
 def request(url, data=None, headers=None, method=None):
     r = urllib.request.Request(url, data=None if data is None else json.dumps(data).encode(), headers=headers or {}, method=method)
@@ -73,9 +59,9 @@ with tempfile.TemporaryDirectory(prefix='heyo-gateway-smoke-') as tmp:
     openssl('req','-x509','-newkey','rsa:2048','-nodes','-keyout',ca_key,'-out',ca,'-days','1','-subj','/CN=Disposable gateway test CA','-addext','basicConstraints=critical,CA:TRUE')
     openssl('req','-new','-newkey','rsa:2048','-nodes','-keyout',key,'-out',csr,'-subj','/CN=localhost')
     openssl('x509','-req','-in',csr,'-CA',ca,'-CAkey',ca_key,'-CAcreateserial','-out',cert,'-days','1','-extfile',extensions)
-    backend = http.server.ThreadingHTTPServer(('127.0.0.1',0),App)
+    backend = server('eu1', 'fixture-v1', handler=App)
     threading.Thread(target=backend.serve_forever,daemon=True).start()
-    alternate = http.server.ThreadingHTTPServer(('127.0.0.1',0),App)
+    alternate = server('eu1', 'fixture-v1', handler=App)
     threading.Thread(target=alternate.serve_forever,daemon=True).start()
     processes=[]
     def start(name, tls=False):
@@ -103,7 +89,7 @@ with tempfile.TemporaryDirectory(prefix='heyo-gateway-smoke-') as tmp:
         dest,da,dt=start('destination',True)
         source,sa,_=start('source')
         def register(admin,mode,*upstreams):
-            spec={'id':'smoke','routes':[{'host':'smoke.example'}],'upstreams':list(upstreams),'health':{'path':'/health','expected_header':{'name':'x-revision','value':'fixture-v1'}},'gateway':{'mode':mode,'service':'smoke','region':'eu1','auth':{'secret':'peer'}}}
+            spec={'id':'smoke','routes':[{'host':'smoke.example'}],'upstreams':list(upstreams),'health':{'path':'/health','expected_header':{'name':'x-heyo-revision','value':'fixture-v1'}},'gateway':{'mode':mode,'service':'smoke','region':'eu1','auth':{'secret':'peer'}}}
             status,body=request(f'http://127.0.0.1:{admin}/deployments',spec,{'Content-Type':'application/json'})
             assert status in (200,201),(status,body)
         register(da,'local',f'127.0.0.1:{backend.server_port}',f'127.0.0.1:{alternate.server_port}')
@@ -117,9 +103,11 @@ with tempfile.TemporaryDirectory(prefix='heyo-gateway-smoke-') as tmp:
         status,body=request(f'http://127.0.0.1:{source}/action?q=a%2Fb',{'asymmetric':17},h)
         result=json.loads(body)
         assert status==200 and result['method']=='POST' and result['path']=='/action?q=a%2Fb',result
-        assert result['host']=='smoke.example' and result['authorization']=='Bearer application-value' and not result['peerHeaders'],result
+        assert result['region']=='eu1' and result['revision']=='fixture-v1',result
+        assert result['host']=='smoke.example' and result['authorizationSha256']==hashlib.sha256(h['Authorization'].encode()).hexdigest() and not result['peerHeaders'],result
+        assert b'Bearer application-value' not in body
         assert json.loads(result['body'])=={'asymmetric':17}
-        assert len([r for r in seen if r['method']=='POST'])==1
+        assert len([r for r in [*backend.admissions,*alternate.admissions] if r['method']=='POST'])==1
         assert request(f'http://127.0.0.1:{dest}/private',headers=h)[0]==403
         assert request(f'http://127.0.0.1:{source}/loop',headers={**h,'x-heyo-peer-region':'eu1'})[0]==508
         with socket.create_connection(('127.0.0.1',source),timeout=5) as ws:

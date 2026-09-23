@@ -63,7 +63,9 @@ impl Operation {
 }
 
 pub fn reserved(d: &Deployment) -> bool {
-    d.state().rollouts.iter().any(|o| matches!(o.status.as_str(), "running" | "reconciliation_required"))
+    let state = d.state();
+    state.rollouts.iter().any(|o| matches!(o.status.as_str(), "running" | "reconciliation_required"))
+        || state.route_handoff.as_ref().is_some_and(|h| h.phase != crate::registry::RouteHandoffPhase::Committed)
 }
 
 pub fn protected_ids(state: &DeploymentState) -> impl Iterator<Item = &String> {

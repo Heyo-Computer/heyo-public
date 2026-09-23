@@ -7,7 +7,95 @@ work. This document does not itself change running infrastructure.
 
 ## Unified control-plane checkpoint — 2026-09-23
 
-- Post-login continuation: both live `/control-plane/config` responses remain
+- Live stale-request check after Gary requested safe cleanup: authenticated
+  public dashboard reads in both regions reported `regional-rollout-smoke`
+  total in-flight zero. Three successive `discovery-status` reads per region
+  also reported version 1, one backend, zero draining backends and zero
+  in-flight requests. No lingering requests were observed to cancel; no route,
+  VM or service data was deleted. The earlier stale-route discussion described
+  a local code race, not an observed backlog on the Linux deployment.
+- Local route-handoff correction: cutover fences the predecessor's backend
+  admission locks before acknowledgement. Requests holding stale route/backend
+  references cannot start new work; already-admitted streams retain their slots
+  until completion and remain visible in discovery drain counts. Flat requests
+  must also fail rather than switch to a regional runtime without generation
+  admission. This is a local fix, not an executed Linux cutover.
+  Handoff preparation now requires both readiness and active-policy adoption,
+  pins the boot/version, expires after 30 seconds without a valid snapshot, and
+  persists before publishing each phase. GET inspection no longer mutates the
+  durable phase. Intent fingerprints exclude discovery membership and normalize
+  secret references so refresh/restart does not invalidate unchanged intent.
+  The app-lb suite passed with 876 tests and six existing ignored tests before
+  the additional flat-to-regional proxy guard; all 18 proxy tests then passed,
+  including the stale-request regression. Enrollment controller integration, authenticated process-level
+  handoff verification, publication and live two-region acceptance remain open.
+- Retained-baseline migration check: the live Cloud receipt read for
+  `acceptance-v1c-20260922-r1?port=8080` returned 409, "Deployment has no
+  recoverable creation receipt". Added a separate authenticated, read-only
+  `/internal/orchestration/deployments/{id}/binding?port=` implementation in
+  private Cloud and a typed Orchestrator client. It observes existing runtime
+  placement and exact daemon mapping without inventing a create digest or
+  sending create. Cloud deployment-handler tests passed (20, one existing
+  ignored); client transport/identity tests passed. Handler success against
+  a database and live use remain unverified. These changes are local only and
+  do not enable bootstrap admission, route handoff or v3 execution. A Mac link
+  failure from disk exhaustion was resolved by removing inactive mvm-ctrl Rust
+  incremental artifacts; available space increased from 1.1 to 6.6 GiB. No
+  database volumes, service data or active compilation cache were removed.
+- Current direction: use authenticated regional HTTPS gateways, not opening
+  public VM ports. The replacement workload now lives in
+  `app-lb/testdata/regional_app.py`: explicit region/revision response headers,
+  health separate from admission history, held response bodies and an unhealthy
+  mode. The actual workload runs in the existing two-Pingora HTTPS regression;
+  request preservation, single POST execution, WebSocket transport and held-body
+  drain with 12 successful alternate-backend requests passed. Three workload
+  tests passed. These are local transport/workload checks, not hierarchical
+  enrollment or Linux VM lifecycle acceptance. The rewrite is not deployed.
+  Managed first-replica enrollment and flat-to-regional route handoff remain
+  implementation work; provider credentials are not the sole path forward.
+- Earlier direct-port diagnosis: eu1 placement through the old flat path was
+  blocked on the cross-region workload network. Both live Orchestrators reported failed
+  `acceptance-v1k-20260922` and identical version-1 discovery with only the US
+  endpoint. Managed eu1 inventory `job-99a68b785519` confirmed listeners on
+  2222, 2223 and 8080; us3 probe `job-6126fdbc35d7` connected to eu1 port 443
+  but timed out on all three workload ports. These TCP-only checks created no
+  candidate or application traffic. Earlier simultaneous captures below located
+  the missing candidate-port SYNs upstream of eu1's host interface; the new
+  probe alone does not identify the filtering device. Current HeyoSecret listing
+  contained 86 metadata entries, none identifying provider/network/firewall
+  credentials. Provider/network-admin access is required to investigate that
+  path; no firewall rules, discovery rows or health claims were changed.
+  Internal v3 regional HTTPS probes are not a deployable alternative yet:
+  admission and background execution remain closed, and application admission
+  requires retained healthy endpoints in every region. Do not bypass those
+  fences or manufacture an eu1 baseline to make a retry appear successful.
+- Unified overview delivered through [PR109](https://github.com/Heyo-Computer/heyo-public/pull/109)
+  and [regional release](https://ci.eu1.heyo.work/runs/01a0cf2817cf-00000001).
+  Linux validation, merge, us3 and eu1 replacements succeeded. Both gateways now
+  have revision 2 view configuration with identical `us3-edge` and `eu1-edge`
+  caller-auth bindings; existing Orchestrator service-key bindings were preserved.
+  Live Heyo-session `/fleet` requests through `admin.heyo.work`,
+  `admin.us3.heyo.work` and `admin.eu1.heyo.work` each returned both observations
+  without errors. Sample registry counts were US 30 deployments/22 tracked
+  backends and eu1 22/20; these are not unique application capacity totals.
+- Live browser checks on all three public origins used normal DNS and verified
+  TLS, with no response fixtures. Shared application content matched; default
+  overviews did not poll local metrics/secrets/tokens/jobs. Both regional local
+  drill-downs identified their selected hostname. Desktop, mobile and local
+  screenshots were inspected. Anonymous login redirect, emergency Basic reads,
+  Basic non-delegation and all three public health endpoints passed. A first
+  label assertion incorrectly compared CSS-uppercase rendered text to a lowercase
+  hostname; inspecting DOM text confirmed the correct label, and the corrected
+  check passed. Local verification: 871 tests passed/6 existing ignored; final
+  fleet compatibility regressions 8 passed; browser fixture checks passed.
+- eu1's replacement briefly produced public 502s at its dashboard, the common
+  hostname and CI; all recovered, and us3 remained reachable during that check.
+  This was not zero-interruption acceptance. The unified dashboard is deployed,
+  but the smoke application still has only its US endpoint. eu1 placement,
+  withdrawal/rollback/restart acceptance, generic-hostname us3 failover readiness
+  and shared-authority/database resilience remain open. No lifecycle fence was
+  removed and no new application candidate was created by this dashboard release.
+- Earlier post-login checkpoint: both `/control-plane/config` responses were
   revision 1 with identical Orchestrator bindings but empty `gateways`; both
   `/fleet` responses report `configured=false`. The legacy dashboard sections
   read their serving gateway's local registry/metrics, so a common hostname

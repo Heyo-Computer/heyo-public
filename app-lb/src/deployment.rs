@@ -372,6 +372,10 @@ pub struct DeploymentState {
     /// the current environment setting. Prevents falsely attesting a new source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_source_url: Option<String>,
+    /// Durable public-selector transition. A committed record makes restart
+    /// fail closed on the regional spec until fresh discovery is observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_handoff: Option<crate::registry::RouteHandoffRecord>,
 }
 
 #[derive(Debug)]

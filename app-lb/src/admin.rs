@@ -3624,7 +3624,15 @@ fn discovery_status_locked(
     registry: &Registry,
     id: &str,
 ) -> Result<DiscoveryStatusResponse, Response> {
-    let Some(deployment) = registry.get(id) else {
+    discovery_target_status_locked(registry, id, false)
+}
+
+fn discovery_target_status_locked(
+    registry: &Registry,
+    id: &str,
+    staged: bool,
+) -> Result<DiscoveryStatusResponse, Response> {
+    let Some(deployment) = (if staged { registry.staged(id) } else { registry.get(id) }) else {
         return Err(
             err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response(),
         );
@@ -3637,7 +3645,8 @@ fn discovery_status_locked(
         .into_response());
     };
     let mut upstreams: BTreeMap<String, (bool, usize)> = BTreeMap::new();
-    for backend in registry.discovery_backends(id) {
+    let backends = if staged { deployment.backends().iter().cloned().collect() } else { registry.discovery_backends(id) };
+    for backend in backends {
         let value = upstreams.entry(backend.peer.clone()).or_insert((true, 0));
         value.0 &= backend.is_draining();
         value.1 += backend.in_flight();
@@ -3671,11 +3680,19 @@ fn discovery_status_locked(
 
 /// Observed discovery state. The registry mutation gate makes the durable
 /// version and all live/retired generation counters one coherent observation.
-async fn discovery_status(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+#[derive(Default, Deserialize)]
+struct DiscoveryTarget {
+    #[serde(default)]
+    staged: bool,
+}
+
+async fn discovery_status(State(state): State<AdminState>, Path(id): Path<String>, Query(target): Query<DiscoveryTarget>) -> Response {
     let _change = state.registry.change_guard().await;
-    match discovery_status_locked(&state.registry, &id) {
+    let status = if target.staged { discovery_target_status_locked(&state.registry, &id, true) }
+        else { discovery_status_locked(&state.registry, &id) };
+    match status {
         Ok(mut status) => {
-            if let Some(deployment) = state.registry.get(&id) {
+            if let Some(deployment) = (if target.staged { state.registry.staged(&id) } else { state.registry.get(&id) }) {
                 if let Some(spec) = deployment.spec.discovery.as_ref().and_then(|d| d.regional.as_ref()) {
                     let ready = state.secrets.resolve(&spec.auth).is_ok_and(|token|
                         !token.is_empty() && http::HeaderValue::from_str(&token).is_ok())
@@ -3739,6 +3756,74 @@ async fn regional_active_probe(State(state): State<AdminState>, axum::Extension(
             "sourceGatewayId":spec.gateway_id,"sourceBootId":router.boot_id,"destination":receipt}))).into_response(),
         Err(code) => err(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),"active capacity probe refused or unhealthy").into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PrepareRouteHandoff {
+    operation_id: String,
+    expected_predecessor_fingerprint: String,
+    staged_spec: DeploymentSpec,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommitRouteHandoff { operation_id: String }
+
+fn handoff_response(result: Result<crate::registry::RouteHandoffRecord, crate::registry::HandoffError>) -> Response {
+    match result {
+        Ok(receipt) => ([(header::CACHE_CONTROL,"no-store")], Json(receipt)).into_response(),
+        Err(crate::registry::HandoffError::NotFound) => err(StatusCode::NOT_FOUND,"deployment not found").into_response(),
+        Err(crate::registry::HandoffError::Conflict(message)) => err(StatusCode::CONFLICT,message).into_response(),
+        Err(crate::registry::HandoffError::Io(error)) => {
+            tracing::error!(%error,"failed to persist route handoff");
+            err(StatusCode::SERVICE_UNAVAILABLE,"could not durably record route handoff").into_response()
+        }
+    }
+}
+
+fn fleet_handoff_authorized(caller: &Caller) -> bool {
+    !matches!(caller, Caller::Ungated) && caller.covers_fleet()
+        && caller.satisfies_in(crate::tokens::AdminScope::Admin, None)
+}
+
+async fn prepare_route_handoff(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path(id): Path<String>, Json(mut request): Json<PrepareRouteHandoff>) -> Response {
+    if !fleet_handoff_authorized(&caller) { return forbidden("authenticated fleet admin required"); }
+    if request.operation_id.is_empty() || request.operation_id.len() > 256 {
+        return err(StatusCode::BAD_REQUEST,"operationId must be a bounded non-empty identity").into_response();
+    }
+    request.staged_spec.id = id.clone();
+    request.staged_spec.normalize();
+    let _change = state.registry.change_guard().await;
+    let result = state.registry.prepare_handoff(&request.operation_id,
+        &request.expected_predecessor_fingerprint, request.staged_spec);
+    if result.is_ok() {
+        // A retry after discovery has prepared the hidden runtime upgrades the
+        // durable receipt. Failure means it remains safely in preparing.
+        if state.registry.staged(&id).and_then(|d| d.regional.as_ref()
+            .and_then(|r| r.preparation(!d.spec.maintenance))).is_some_and(|p| p.prepared && p.adopted) {
+            return handoff_response(state.registry.mark_handoff_prepared(&id));
+        }
+    }
+    handoff_response(result)
+}
+
+async fn inspect_route_handoff(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path(id): Path<String>) -> Response {
+    if !fleet_handoff_authorized(&caller) { return forbidden("authenticated fleet admin required"); }
+    let _change = state.registry.change_guard().await;
+    match state.registry.inspect_handoff(&id) {
+        Some(receipt) => ([(header::CACHE_CONTROL,"no-store")],Json(receipt)).into_response(),
+        None => err(StatusCode::NOT_FOUND,"route handoff not found").into_response(),
+    }
+}
+
+async fn commit_route_handoff(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path(id): Path<String>, Json(request): Json<CommitRouteHandoff>) -> Response {
+    if !fleet_handoff_authorized(&caller) { return forbidden("authenticated fleet admin required"); }
+    let _change = state.registry.change_guard().await;
+    handoff_response(state.registry.commit_handoff(&id,&request.operation_id))
 }
 
 const MAX_DRAIN_REASON_LEN: usize = 512;
@@ -5470,6 +5555,8 @@ fn router(state: AdminState) -> Router {
     let regional = Router::new()
         .route("/deployments/:id/regional-probe",post(regional_probe))
         .route("/deployments/:id/regional-active-probe",post(regional_active_probe))
+        .route("/deployments/:id/route-handoff",post(prepare_route_handoff).get(inspect_route_handoff))
+        .route("/deployments/:id/route-handoff/commit",post(commit_route_handoff))
         .route_layer(middleware::from_fn_with_state(state.clone(),require_crud_auth));
 
     let fleet = Router::new()

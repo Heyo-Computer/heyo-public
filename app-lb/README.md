@@ -78,6 +78,28 @@ services. It checks request preservation, single POST delivery, peer admission,
 WebSocket echo, and a held response body draining across spec replay while new
 traffic uses another local backend.
 
+The workload is checked in as `testdata/regional_app.py`, rather than depending
+on a temporary app archive. Its region and immutable runtime revision are explicit
+startup arguments; both are returned in JSON and `X-Heyo-Region` /
+`X-Heyo-Revision` headers. `/health` is excluded from admission history,
+`/admissions` returns the last 4096 requests, and `/held?hold=10&id=drain-1`
+starts a response then holds its body for ten seconds. `--unhealthy` returns
+503 for negative readiness checks. Only use disposable request data: the app
+records paths and bodies; Authorization is hashed, never reflected verbatim.
+
+```sh
+python3 app-lb/testdata/regional_app.py --region eu1 --revision regional-gateway-v2 --port 8080
+python3 -B -m unittest discover -s app-lb/testdata -p test_regional_app.py
+```
+
+The default bind is loopback for host-local tests. A managed VM must explicitly
+bind its guest interface (for example `--bind 0.0.0.0`); only its owning gateway
+uses the host-bound mapping. Cross-region traffic and readiness use authenticated
+HTTPS gateways, not public VM ports. Use the same app artifact/revision in both
+regions and inject the region at startup. This app does not register routes,
+publish discovery, or grant itself serving weight. Rewriting the workload does
+not enable the currently gated managed first-replica enrollment path below.
+
 ### Hierarchical discovery (local integration; not live acceptance)
 
 `discovery.regional` contains `gateway_id`, `backend_server_id`, `environment` and
