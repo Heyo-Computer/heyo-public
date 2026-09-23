@@ -574,6 +574,17 @@ impl Pool {
         sandbox_id: &str,
         runners: &[String],
     ) -> Result<Option<PooledVm>, PoolError> {
+        self.take_run_cache_for_sweep(sandbox_id, runners, None).await
+    }
+
+    /// A machine caller may reclaim only a cache last used by its authorized
+    /// run. Check ownership in the same UPDATE that excludes concurrent claims.
+    pub async fn take_run_cache_for_sweep(
+        &self,
+        sandbox_id: &str,
+        runners: &[String],
+        run_id: Option<&str>,
+    ) -> Result<Option<PooledVm>, PoolError> {
         if runners.is_empty() {
             return Ok(None);
         }
@@ -583,10 +594,15 @@ impl Pool {
               WHERE sandbox_id = $1
                 AND runner_hd_id = ANY($2)
                 AND (status = 'idle' OR (status = 'draining' AND eviction_requested))
+                AND ($3::text IS NULL OR EXISTS (
+                    SELECT 1 FROM ci_job j WHERE j.id = ci_vm_pool.last_job
+                    AND j.run_id = $3 AND j.status IN ('success','failure','cancelled','skipped')
+                ))
              RETURNING *",
         )
         .bind(sandbox_id)
         .bind(runners)
+        .bind(run_id)
         .fetch_optional(&self.db)
         .await
         .map_err(PoolError::sql)?;
@@ -1482,6 +1498,47 @@ mod tests {
             0,
             "an instance must never reclaim a VM it is holding"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn run_cache_eviction_checks_last_use_inside_the_claim_exclusion() {
+        let (pool, store) = test_pool().await;
+        let runner = runner_id();
+        let ours = std::slice::from_ref(&runner);
+        let wf = crate::workflow::Workflow::parse("wf.yml", "name: t\njobs:\n  build:\n    vm: { driver: firecracker }\n    steps: [{run: 'true'}]\n").unwrap();
+        let plan = crate::plan::Plan::build(&wf).unwrap();
+        let runs = [crate::vm::new_id(), crate::vm::new_id()];
+        let jobs = runs.each_ref().map(|run| crate::store::job_id(run, "build"));
+        for (run, job) in runs.iter().zip(&jobs) {
+            store.create_run(run, &crate::store::RunRequest::default(), &plan).await.unwrap();
+            store.set_job_status(job, crate::store::JobStatus::Success, None).await.unwrap();
+        }
+        let id = sb(&runner, "owned-cache");
+        pool.register(&id, &runner, "fp-owned", "wf", None, &jobs[0], held()).await.unwrap();
+        assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[0])).await.unwrap().is_none(), "claimed caches cannot be evicted");
+        pool.release(&id).await.unwrap();
+        assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[1])).await.unwrap().is_none(), "another run cannot evict this cache");
+        assert!(pool.take_run_cache_for_sweep(&id, &[runner_id()], Some(&runs[0])).await.unwrap().is_none(), "another host is outside authority");
+        assert_eq!(pool.claim(&runner, "fp-owned", &jobs[1], held()).await.unwrap(),Some(id.clone()));
+        pool.release(&id).await.unwrap();
+        assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[0])).await.unwrap().is_none(), "an earlier owner loses authority after reuse");
+        store.set_job_status(&jobs[1], crate::store::JobStatus::Running, None).await.unwrap();
+        assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[1])).await.unwrap().is_none(), "idle status alone is not a terminal job");
+        store.set_job_status(&jobs[1], crate::store::JobStatus::Success, None).await.unwrap();
+        let (eviction, claim) = tokio::join!(
+            pool.take_run_cache_for_sweep(&id, ours, Some(&runs[1])),
+            pool.claim(&runner, "fp-owned", &jobs[0], held()),
+        );
+        let eviction = eviction.unwrap(); let claim = claim.unwrap();
+        assert_ne!(eviction.is_some(),claim.is_some(), "claim and eviction must not both win");
+        if eviction.is_some() {
+            assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[1])).await.unwrap().is_some(), "same-owner retry retains durable intent");
+        } else {
+            pool.release(&id).await.unwrap();
+            assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[1])).await.unwrap().is_none());
+            assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[0])).await.unwrap().is_some());
+        }
     }
 
     /// The two selections the cleanup page offers, and the guard that matters:

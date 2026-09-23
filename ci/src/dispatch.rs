@@ -4043,8 +4043,12 @@ impl Dispatcher {
 
     /// Destroy one pooled VM by id.
     pub async fn destroy_pooled_vm(&self, sandbox_id: &str) -> Result<String, DispatchError> {
+        self.destroy_run_cache(sandbox_id, None).await
+    }
+
+    pub async fn destroy_run_cache(&self, sandbox_id: &str, run_id: Option<&str>) -> Result<String, DispatchError> {
         let ours = self.served_runner_ids();
-        let Some(taken) = self.pool.take_one_for_sweep(sandbox_id, &ours).await? else {
+        let Some(taken) = self.pool.take_run_cache_for_sweep(sandbox_id, &ours, run_id).await? else {
             return Err(DispatchError::VmNotSweepable(sandbox_id.to_string()));
         };
         let (destroyed, failed) = self.destroy_swept(vec![taken]).await;

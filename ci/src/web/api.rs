@@ -83,11 +83,42 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/runs/{run_id}", get(run_status))
         .route("/api/runs/{run_id}/rerun-failed", post(rerun_failed))
+        .route("/api/runs/{run_id}/cache/{sandbox_id}/destroy", post(destroy_run_cache))
         .route("/api/runs/{run_id}/bootstrap/{operation_id}/recover", post(recover_bootstrap))
         .route("/api/runs/{run_id}/logs", get(run_logs))
         .route("/api/runs/{run_id}/events", get(run_events))
         .route("/api/runs/{run_id}/deployments", get(run_deployments))
         .route("/api/runs/{run_id}/release", get(run_release))
+}
+
+/// A submit credential can retire its own run's idle build cache, not a host's
+/// entire pool. Read signatures never authorize this mutation. Last-use and
+/// idle status are rechecked atomically when the durable eviction is admitted.
+async fn destroy_run_cache(
+    State(state): State<AppState>,
+    Path((run_id, sandbox_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if bearer(&headers).is_none() {
+        return error(StatusCode::UNAUTHORIZED, "a repository submit bearer token is required");
+    }
+    let reader = match authenticate(&state, &headers, "").await {
+        Ok(reader) => reader,
+        Err(response) => return response,
+    };
+    if let Err(response) = readable_run(&state, &reader, &run_id).await { return response; }
+    match state.dispatcher.destroy_run_cache(&sandbox_id, Some(&run_id)).await {
+        Ok(message) => {
+            tracing::info!(run = %run_id, sandbox = %sandbox_id, "repository caller reclaimed its idle cache");
+            axum::Json(serde_json::json!({"sandbox_id":sandbox_id,"status":"destroyed","message":message})).into_response()
+        }
+        Err(crate::dispatch::DispatchError::VmNotSweepable(_)) =>
+            error(StatusCode::CONFLICT, "no idle cache last used by this run on a served runner"),
+        Err(e) => {
+            tracing::error!(run = %run_id, sandbox = %sandbox_id, "cache cleanup not confirmed: {e}");
+            error(StatusCode::SERVICE_UNAVAILABLE, "cache cleanup not confirmed; durable eviction remains available for reconciliation")
+        }
+    }
 }
 
 /// A submit credential can retry its own repository without a browser session.

@@ -937,6 +937,18 @@ behind, sitting beside the one that replaced it. Claimed VMs are refused in the
 query; `draining` keeps a taken VM out of circulation until the daemon confirms
 it is gone.
 
+Machine callers can reclaim one cache with
+`POST /api/runs/{run_id}/cache/{sandbox_id}/destroy`, authenticated with that
+repository's submit bearer token. Read-only HMAC signatures are not accepted.
+The pool atomically checks that the VM is idle (or already eviction-requested),
+belongs to a served runner, and was last used by a terminal job of this exact
+run. Reuse by another run removes the old caller's authority. A conflict returns
+409 without eviction; transport failure preserves the durable eviction intent.
+Success is returned only after the daemon confirms removal and CI removes the
+pool row. This does not authorize deleting service VMs or clearing maintenance
+fences. Stopped caches also retain network allocations, not just disk space;
+disk-pressure eviction alone does not guarantee room for service rollouts.
+
 Disk pressure overrides this retention window during VM admission. Before
 comparing compatible hosts (and for a pinned host), CI evicts that host's oldest
 idle caches one at a time until measured free space meets the incoming job's

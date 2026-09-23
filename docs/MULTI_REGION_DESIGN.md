@@ -30,6 +30,20 @@ work. This document does not itself change running infrastructure.
   deleted. A new release alone cannot fix capacity. Changing the global network
   also changes allocation behavior for stopped VMs on restart, so blindly
   enlarging/replacing the existing network is not a verified safe remedy.
+- Cleanup unblocker, not deployed: CI now has a local repository-bearer route
+  `POST /api/runs/{run_id}/cache/{sandbox_id}/destroy`. Its atomic pool update
+  checks idle status, served runner and latest terminal owning job before
+  recording durable eviction; it reuses daemon-confirmed deletion. Targeted
+  PostgreSQL and HTTP tests passed for claim exclusion, reuse revoking an old
+  owner's authority, wrong repository/token and read-HMAC denial. The existing
+  rerun integration test still fails before dispatch because its legacy tar.gz
+  fixture is rejected; cleanup auth is tested separately without relaxing that
+  source-format fence.
+  A fresh CI inventory read still shows `sb-0ef175a4` idle on us3, last used by
+  successful run `01a0cbf90bfe-0000000d`; that run is readable with this
+  checkout's repository bearer. No cache was deleted and no capacity reclaimed.
+  Publishing this additional CI change and obtaining a deployed authenticated
+  cleanup path remain delivery gates; local test results do not clear them.
 - Shared inventory implementation (not yet deployed in Orchestrator):
   Orchestrator now exposes a paginated, internal-key-gated
   shared-database inventory. App-lb's global application view consumes it using

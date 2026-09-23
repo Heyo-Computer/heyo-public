@@ -1843,6 +1843,41 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_NATS_URL"]
+    async fn machine_cache_cleanup_requires_own_repository_bearer() {
+        use hmac::Mac;
+        let root = tempfile::tempdir().unwrap();
+        let app = test_router().await;
+        let store = Store::connect(&std::env::var("CI_TEST_DATABASE_URL").unwrap(),
+            root.path().into(), std::time::Duration::from_secs(30)).await.unwrap();
+        let run = crate::vm::new_id();
+        let url = format!("https://example.test/{run}.git");
+        let repo = store.register_repo(&url, "cleanup", None, None, None).await.unwrap();
+        let other = store.register_repo(&format!("{url}-other"), "other", None, None, None).await.unwrap();
+        let (_, token) = store.create_repo_token(&repo.id, "cleanup", None).await.unwrap();
+        let (_, wrong_token) = store.create_repo_token(&other.id, "other", None).await.unwrap();
+        let plan = crate::plan::Plan::build(&crate::workflow::Workflow::parse("cleanup.yml",
+            "jobs:\n  build:\n    steps: [{run: 'true'}]\n").unwrap()).unwrap();
+        store.create_run(&run, &crate::store::RunRequest {repo_id: Some(repo.id),
+            repo_url: url, ..Default::default()}, &plan).await.unwrap();
+        let path = format!("/api/runs/{run}/cache/sb-missing/destroy");
+        for (credential, expected) in [(None, StatusCode::UNAUTHORIZED),
+            (Some("invalid"), StatusCode::UNAUTHORIZED), (Some(wrong_token.as_str()), StatusCode::NOT_FOUND),
+            (Some(token.as_str()), StatusCode::CONFLICT)] {
+            let mut request = Request::builder().method("POST").uri(&path);
+            if let Some(token) = credential { request = request.header("Authorization", format!("Bearer {token}")); }
+            let response = app.clone().oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"0123456789abcdef").unwrap();
+        mac.update(path.as_bytes());
+        let response = app.oneshot(Request::builder().method("POST").uri(&path)
+            .header(trigger::SIGNATURE_HEADER, format!("sha256={}", hex::encode(mac.finalize().into_bytes())))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "read HMACs cannot delete caches");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_NATS_URL"]
     async fn machine_rerun_is_repo_scoped_and_carries_successes() {
         use base64::Engine;
         let root = tempfile::tempdir().unwrap();
