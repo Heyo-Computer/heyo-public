@@ -22,6 +22,16 @@ work. This document does not itself change running infrastructure.
   [release 41](https://ci.eu1.heyo.work/runs/01a0ce33a204-00000041) failed validation
   while polling an exec operation (`Missing API key`); it was not published.
   Earlier validation evidence was not substituted for that failed revision.
+- Approved runtime recovery: raised only CI PID 421's soft descriptor limit
+  from 1024 to its existing hard limit 4096, without restart or persistent
+  configuration changes. Inspection counted 1015 sockets, including 919 TCP
+  CLOSE-WAIT sockets clustered on old loopback tunnel ports. Exact published
+  heyo-sdk 0.1.9 source retains detached forwarding tasks and sends QUIC FIN only
+  after joining both copy directions; this is a concrete half-close retention
+  path consistent with the live sockets, not normal capacity demand. No SDK
+  fix or package release has been made. The count subsequently reached 1034;
+  the controller still reported the same cleanup wait after the outstanding
+  validation's scheduled retry time. Headroom alone has not completed recovery.
 - Gary's chosen model is one logical control plane accessible through either
   region, with a generic DNS name that can switch regions. App-lb is the UI/API
   entry point; Retail is not the implementation surface. Regional entry points
