@@ -122,13 +122,12 @@ jobs:
       # wipes on every checkout. This disk is what makes reusing a warm VM worth
       # anything.
       #
-      # 40 GB, carried over from the standalone repository, and the one number
-      # in this file that is inherited rather than measured: nothing records a
-      # release `target/` size for this crate. The margin is not generosity —
-      # cargo never garbage-collects a `target/`, so what it buys is how many
-      # reuses fit before init.sh's 85% guard wipes it. The build step prints
-      # `df`; shrink this once a few real runs have said what the number is.
-      disk_size_gb: 40
+      # The successful Linux CI run 01a0c6d80869-0000000d recorded about
+      # 1.2 GiB used on this cache disk. Keep 20 GiB for compilation and reuse,
+      # rather than the inherited, unmeasured 40 GiB reservation. Host disk
+      # admission still includes both image copies and 5 GiB of headroom;
+      # the 85% cache guard below remains in force.
+      disk_size_gb: 20
       # 4 hours, comfortably past this job's 75-minute timeout.
       #
       # Explicit because the default (`CI_VM_TTL_SECONDS`, 3600) is *shorter*
