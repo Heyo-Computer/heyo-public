@@ -2343,6 +2343,64 @@ deployments passed the filter before paging, so a client can page without
 guessing. The dashboard's deployment table has a matching filter box and pager,
 which appear only when there is more than one page.
 
+### Shared control-plane view
+
+**Global applications** reads `GET /services`, which queries Orchestrator's
+shared PostgreSQL inventory rather than any gateway's local registry. Configure
+`APP_LB_CONTROL_PLANE_FILE` on each regional app-lb with a JSON array using the
+same `id`, `region`, `url`, and `auth` fields shown below, but pointing to the
+regional **Orchestrator HTTPS origins**. Use the same HeyoSecret-backed
+`orchestrator/internal-api-key` service credential at both sources. Never expose
+that credential to the browser. These origins must use the same authoritative
+database; this setting does not replicate or reconcile separate databases.
+
+Reads try origins in order and fail over on transport errors or HTTP 5xx.
+Authentication errors, redirects, and invalid responses stop the read rather than
+masking configuration errors. No mutations are replayed. Each page contains at
+most 100 services, with `after` / `nextCursor` pagination; each page is a committed
+database snapshot, not one snapshot across multiple pages. The dashboard shows
+desired regions, recorded revisions/health/drain state, and latest regional
+rollout phase. Missing discovery is unknown, not zero healthy capacity.
+
+Both `/services` and `/fleet` require an authenticated fleet-wide view regardless
+of whether the local dashboard is public. Database failure stays visible; there
+is no fallback to local files or gateway metrics. This provides a common read
+surface, not database HA or a global mutation API. Generic DNS failover still
+requires surviving auth, secrets, storage, and ingress dependencies.
+
+### Regional gateway view
+
+The dashboard's **Regional gateways** section reads `GET /fleet`. Configure
+`APP_LB_FLEET_FILE` with the path to a JSON array of explicitly trusted gateways:
+
+```json
+[
+  {"id":"us3-edge","region":"US","url":"https://admin.us3.example.com","auth":{"secret":"fleet-observer","key":"token"}},
+  {"id":"eu1-edge","region":"eu1","url":"https://admin.eu1.example.com","auth":{"secret":"fleet-observer","key":"token"}}
+]
+```
+
+Use a fleet-wide **view-only** observer token at each gateway, stored through
+the existing secret API. For Heyo-managed installations, provision that observer
+role through HeyoSecret-backed service configuration. References resolve in the
+`default` namespace unless `auth.namespace` is explicit. A reference with
+`auth.username` uses HTTP Basic authentication instead of bearer authentication.
+Secret values never appear in the fleet file, browser, or observation response.
+The file is read at startup; malformed or duplicate gateway definitions fail
+startup rather than silently dropping a region. Only HTTPS origins are accepted.
+
+This route always requires an authenticated fleet-wide view credential, even
+with `APP_LB_DASHBOARD_AUTH=0`. Deployment/namespace-scoped callers cannot use it.
+The configured gateways are queried concurrently with a five-second timeout,
+no redirects, and bounded responses. Failed observations have `metrics: null`
+and an explicit error, never zero capacity or retained healthy-looking counts.
+
+These are independent gateway-local observations, **not** an atomic Orchestrator
+snapshot, unique fleet capacity, admission membership, or proof of failover.
+The same application can appear at several gateways. Local controls remain on
+each gateway's linked dashboard; this view does not move lifecycle ownership
+from Orchestrator or alter routing/maintenance gates.
+
 ### Sandboxes app-lb does not own
 
 The host is one machine, and not everything on it is a pool. Sandboxes created

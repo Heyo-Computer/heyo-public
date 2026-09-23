@@ -150,6 +150,8 @@ fn html_escape(s: &str) -> String {
 
 #[derive(Clone)]
 struct AdminState {
+    fleet: Option<Arc<crate::fleet::Fleet>>,
+    control_plane: Option<Arc<crate::fleet::Fleet>>,
     rollouts: Arc<crate::rollout::Rollouts>,
     registry: Arc<Registry>,
     autoscaler: Arc<Autoscaler>,
@@ -319,6 +321,8 @@ impl AdminApi {
         Self {
             addr,
             state: AdminState {
+                fleet: None,
+                control_plane: None,
                 rollouts: Arc::new(crate::rollout::Rollouts::new(registry.clone(), autoscaler.clone(), jobs.clone())),
                 registry,
                 autoscaler,
@@ -356,6 +360,12 @@ impl AdminApi {
                     .map(Arc::from),
             },
         }
+    }
+
+    pub fn with_fleet(mut self, fleet: Option<Arc<crate::fleet::Fleet>>, control_plane: Option<Arc<crate::fleet::Fleet>>) -> Self {
+        self.state.fleet = fleet;
+        self.state.control_plane = control_plane;
+        self
     }
 }
 
@@ -5199,6 +5209,44 @@ async fn get_workspace_recovery(State(state): State<AdminState>, axum::Extension
     }
 }
 
+async fn fleet_snapshot(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>) -> Response {
+    // Never inherit dashboard_auth=false: remote credentials must not turn an
+    // open local dashboard into an unauthenticated cross-region inventory.
+    if matches!(caller, Caller::Ungated) || !caller.covers_fleet() {
+        return forbidden("authenticated fleet view required");
+    }
+    let observations = match &state.fleet {
+        Some(fleet) => fleet.observe().await,
+        None => Vec::new(),
+    };
+    ([(header::CACHE_CONTROL, "no-store")], Json(serde_json::json!({
+        "configured": state.fleet.is_some(), "gateways": observations,
+    }))).into_response()
+}
+
+async fn require_fleet_view(State(state): State<AdminState>, req: Request, next: Next) -> Response {
+    authorize(state, req, next, crate::tokens::AdminScope::View).await
+}
+
+#[derive(Default, Deserialize)]
+struct ServicesQuery { after: Option<String> }
+
+async fn services_snapshot(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Query(query): Query<ServicesQuery>) -> Response {
+    if matches!(caller, Caller::Ungated) || !caller.covers_fleet() {
+        return forbidden("authenticated fleet view required");
+    }
+    let Some(control) = &state.control_plane else {
+        return ([(header::CACHE_CONTROL, "no-store")], Json(serde_json::json!({"configured":false}))).into_response();
+    };
+    match control.inventory(query.after.as_deref()).await {
+        Ok(inventory) => ([(header::CACHE_CONTROL, "no-store")], Json(serde_json::json!({
+            "configured":true,"inventory":inventory,
+        }))).into_response(),
+        Err(error) => err(StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    }
+}
+
 fn router(state: AdminState) -> Router {
     // The dashboard view + its data source are always behind the optional gate.
     let view = Router::new()
@@ -5379,8 +5427,14 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/regional-active-probe",post(regional_active_probe))
         .route_layer(middleware::from_fn_with_state(state.clone(),require_crud_auth));
 
+    let fleet = Router::new()
+        .route("/fleet", get(fleet_snapshot))
+        .route("/services", get(services_snapshot))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_fleet_view));
+
     Router::new()
         .route("/healthz", get(healthz))
+        .merge(fleet)
         .merge(regional)
         .merge(recovery)
         .merge(view)
@@ -6905,6 +6959,8 @@ mod tests {
             // would be an escalation, the job history is fleet state.
             assert!(matches!(at("/tokens", "/tokens"), Verdict::Forbidden(_)));
             assert!(matches!(at("/jobs", "/jobs"), Verdict::Forbidden(_)));
+            assert!(matches!(at("/services", "/services"), Verdict::Forbidden(_)));
+            assert!(matches!(at("/fleet", "/fleet"), Verdict::Forbidden(_)));
             // Secrets are walled in the handler, per namespace, so the gate
             // lets a confined caller through to be measured there.
             assert!(matches!(at("/secrets", "/secrets"), Verdict::Allow(_)));
@@ -7558,6 +7614,8 @@ mod tests {
             // Creating deployments, reading the secret store and listing every job
             // are not about the one deployment this token was given.
             for route in [
+                "/fleet",
+                "/services",
                 "/deployments",
                 "/secrets",
                 "/secrets/:id",

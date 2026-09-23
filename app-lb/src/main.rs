@@ -24,6 +24,7 @@ mod discovery;
 mod disks;
 mod dns;
 mod federated;
+mod fleet;
 mod feed;
 mod gateway;
 mod regional;
@@ -958,6 +959,11 @@ fn main() {
             event_feed.clone(),
             &cfg.public_ips,
             cfg.deploy_host_base().map(str::to_string),
+        ).with_fleet(
+            fleet::Fleet::from_env("APP_LB_FLEET_FILE", secrets.clone())
+                .unwrap_or_else(|error| panic!("invalid fleet configuration: {error}")),
+            fleet::Fleet::from_env("APP_LB_CONTROL_PLANE_FILE", secrets.clone())
+                .unwrap_or_else(|error| panic!("invalid control plane configuration: {error}")),
         ),
     );
 

@@ -332,7 +332,18 @@
     </div>
   </header>
 
-  <div class="section-title">Host &amp; fleet</div>
+  <section aria-labelledby="services-title">
+    <div class="section-title" id="services-title">Global applications</div>
+    <div class="card" id="global-services" aria-live="polite">Loading shared application state…</div>
+    <div><button class="btn btn-sm" id="services-first" hidden>First page</button> <button class="btn btn-sm" id="services-next" hidden>Next page</button></div>
+  </section>
+
+  <section aria-labelledby="regions-title">
+    <div class="section-title" id="regions-title">Regional gateways</div>
+    <div class="card" id="regional-fleet" aria-live="polite">Loading regional observations…</div>
+  </section>
+
+  <div class="section-title">This gateway · host &amp; pools</div>
   <div class="tiles" id="fleet-tiles"></div>
 
   <div class="section-title">Request latency &amp; throughput</div>
@@ -2370,10 +2381,82 @@ async function poll() {
 // two seconds would be three requests wasted. The exception is a job in flight:
 // while one is running its record is the only progress there is, so the loop
 // tightens to the metrics cadence until it finishes.
+let servicesCursor = null, servicesNext = null;
+$("services-first").onclick = () => { servicesCursor = null; pollServices(); };
+$("services-next").onclick = () => { servicesCursor = servicesNext; pollServices(); };
+
+async function pollServices() {
+  const cursor = servicesCursor;
+  let result;
+  try { result = await api("GET", "services" + (cursor ? "?after=" + encodeURIComponent(cursor) : "")); }
+  catch (_) { result = { ok: false }; }
+  if (cursor === servicesCursor) renderServices(result);
+}
+
+function renderServices(result) {
+  const target = $("global-services");
+  servicesNext = result.ok ? result.data.inventory?.nextCursor : null;
+  $("services-first").hidden = !servicesCursor;
+  $("services-next").hidden = !servicesNext;
+  if (!result.ok) {
+    target.textContent = result.status === 401 || result.status === 403
+      ? "Global applications require an authenticated fleet-wide view."
+      : "Shared control plane unavailable. Application state is unknown; local gateway counts are not a substitute.";
+    return;
+  }
+  if (!result.data.configured) {
+    target.textContent = "Shared control plane is not configured on this gateway.";
+    return;
+  }
+  const services = result.data.inventory.services;
+  target.innerHTML = `<div class="sub">Shared Orchestrator state · recorded health, not a live reachability test.</div>` +
+    (services.length ? services.map(s => {
+      const endpoints = s.endpoints;
+      const regions = [...new Set([...(s.replicaRegions || []), ...(endpoints || []).map(e => e.region || "unplaced")])];
+      const ready = endpoints?.filter(e => e.healthStatus === "healthy" && !e.draining).length;
+      return `<article style="margin-top:16px;overflow-wrap:anywhere"><h3>${esc(s.serviceId)}</h3>
+        <div>Desired replicas: ${s.desiredReplicas ?? "unknown"} · Recorded eligible: ${ready ?? "unknown"} · Discovery version: ${s.discoveryVersion ?? "unknown"}</div>
+        ${regions.map(region => {
+          const members = (endpoints || []).filter(e => (e.region || "unplaced") === region);
+          return `<div><strong>${esc(region)}</strong>: ${members.length ? members.map(e => `${esc(e.revision || "revision unknown")} · ${esc(e.healthStatus)}${e.draining ? " · draining" : ""}`).join("; ") : "no recorded endpoint"}</div>`;
+        }).join("")}
+        <div>Regional rollout: ${s.rollout ? `${esc(s.rollout.status)} · ${esc(s.rollout.phase)} · ${esc(s.rollout.operationId)}` : "none recorded"}</div></article>`;
+    }).join("") : `<div>No applications on this page.</div>`);
+}
+
+function renderFleet(result) {
+  const target = $("regional-fleet");
+  if (!result.ok) {
+    target.textContent = result.status === 401 || result.status === 403
+      ? "Regional inventory requires an authenticated fleet-wide view."
+      : "Regional observations unavailable — retrying. No current regional capacity is known.";
+    return;
+  }
+  if (!result.data.configured) {
+    target.textContent = "Regional inventory is not configured. Local gateway metrics below do not describe other regions.";
+    return;
+  }
+  target.innerHTML = `<div class="sub">Independent gateway observations, not a shared rollout snapshot. Counts may include the same application on several gateways; do not sum them as unique capacity.</div>
+    <div>${result.data.gateways.map(g => {
+      const m = g.metrics, p = m?.fleet;
+      return `<article style="margin-top:16px;overflow-wrap:anywhere"><strong>${esc(g.region)}</strong> · <a href="${esc(g.dashboard_url)}">${esc(g.id)}</a>
+        <div>${m ? "Observed" : `<strong>Unavailable</strong> · ${esc(g.error)}`}</div>
+        <div>Deployments: ${p ? fmt(p.deployments) : "—"} · In-flight: ${p ? fmt(p.total_in_flight) : "—"}</div>
+        <div>Backends: ${p ? `${fmt(p.ready)} tracked · ${fmt(p.draining)} draining · ${fmt(p.pending)} pending` : "—"}</div>
+        <div>Sample time: ${m ? esc(new Date(m.generated_at * 1000).toLocaleTimeString()) : "—"}</div></article>`;
+    }).join("")}</div>`;
+}
+
 async function pollSlow() {
   clearTimeout(slowTimer);
   let interval = SLOW_REFRESH_MS;
   try {
+    // Independent of the local CRUD reads, which can fail for a view token.
+    // Clear old values on failure instead of leaving a disconnected region green.
+    await Promise.all([
+      api("GET", "fleet").then(renderFleet).catch(() => renderFleet({ ok: false })),
+      pollServices(),
+    ]);
     const [certs, secrets, tokens, jobs, security, namespaces] = await Promise.all([
       api("GET", "certs"),
       api("GET", "secrets"),

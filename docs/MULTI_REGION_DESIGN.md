@@ -5,6 +5,111 @@ decisions and checklist below supersede conflicting next-step statements in the
 historical checkpoints. Existing capabilities are identified separately from new
 work. This document does not itself change running infrastructure.
 
+## Unified control-plane checkpoint — 2026-09-23
+
+- Gary's chosen model is one logical control plane accessible through either
+  region, with a generic DNS name that can switch regions. App-lb is the UI/API
+  entry point; Retail is not the implementation surface. Regional entry points
+  must show shared application state, not reinterpret their local registries as
+  separate global inventories.
+- Local, not deployed: Orchestrator now exposes a paginated, internal-key-gated
+  shared-database inventory. App-lb's global application view consumes it using
+  server-side secret references and read-only regional API fallback. It does not
+  replay mutations, merge independent databases, or fall back to local files.
+  Independent regional gateway counters remain separately labelled observations.
+- Verification: the new PostgreSQL inventory test ran against an isolated schema
+  on disposable `heyo-policy-proposals-test`, using two independent connections.
+  It covered identical reads, 100-row pagination, region drains, revision identity,
+  missing discovery and exclusion of secret-bearing metadata. App-lb fleet tests
+  passed, including failed-region fallback versus denied credentials; all 40
+  existing admin gate tests passed with the new routes included in scope checks.
+- A compiled disposable local app-lb successfully queried both installed public
+  HTTPS gateway metrics endpoints. Anonymous `/fleet` and `/services` requests
+  returned 401 even with the local dashboard configured public. No remote writes
+  were used for this check. Browser checks rendered and inspected desktop/mobile
+  views, desired-versus-recorded replica mismatch, and unavailable states that
+  clear old values. Application inventory in the browser check was fixture data;
+  gateway observations were live. This is not deployed control-plane acceptance.
+- Delivery path: the existing `.ci/workflows/regional-release.yml`
+  merges the public release before replacing us3/eu1 app-lb and Orchestrator.
+  `ci/rollout-host-app-lb` requires the exact confirmed merged revision. Gary
+  explicitly approved a new branch push, PR, and merge through that CICD release
+  workflow for this change. Release completion still requires deployed evidence;
+  approval and local verification are not deployment receipts.
+- Remaining platform gates: configure the same authority and canonical operator
+  identity in both entry points, install a generic hostname/certificate path,
+  verify auth/HeyoSecret/database dependency survival, and run regional-loss and
+  writer-recovery checks. pg-fc has replication and fenced-promotion primitives,
+  but these are not evidence of a configured automatic regional writer handoff.
+  The CI maintenance fence remains intact. Global mutations and full two-region
+  application routing/drain acceptance are still incomplete.
+
+## Live deployment checkpoint — 2026-09-23
+
+- Public [release](https://ci.eu1.heyo.work/runs/01a0cc3e2c91-00000021)
+  completed; [PR 106](https://github.com/Heyo-Computer/heyo-public/pull/106)
+  merged. Both regional Orchestrator `/health` and app-lb admin `/healthz`
+  endpoints return HTTP 200 and revision `c2b3f55e923c95070ede7d606960be960f336c39`.
+- Private [release](https://ci.eu1.heyo.work/runs/01a0cc4c8eac-0000002c)
+  passed its required validations and merged
+  [PR 617](https://github.com/Heyo-Computer/heyo/pull/617). Both Cloud deployment
+  receipts confirm the exact candidate healthy and predecessor stopped. Both
+  `https://cloud.{us3,eu1}.heyo.work/health` endpoints return HTTP 200 and revision
+  `87786b295ccb0561ad5dee85d17af08048b2e71c`.
+- Host runtime deployment uses us3 CI maintenance operation
+  `36fce8c5ce851b3276aec416ec0b745fdcf2d0324526d20b18b0b52ee3ee494c`,
+  now in CI phase `failed` after its deadline. Read-only database receipts `job-152eaa7dd82a` and
+  `job-b9cc3a8be671` identify five retained attempt-1 `ci_host_work` rows:
+  `01a0cbf90bf3-0000000b.release`, `01a0cc3e0737-0000001b.build`,
+  `01a0cc3e0739-0000001c.build`, `01a0cc3e2c8b-0000001f.release`, and
+  `01a0cc48ece7-00000028.build`. All corresponding jobs finished attempt 2;
+  their current VM pool entries were idle with no claimant or lease. Historical
+  events (`job-bc04275e6784`) identify four first-attempt start timeouts for the
+  same stopped VMs and one credential-resolution failure before VM acquisition.
+  After Gary's explicit approval, `job-5f5346ae013d` removed exactly those five
+  attempt-1 claims under the runner lock with terminal-job, attempt, pool-lease,
+  and host-process guards. No VM or application data was deleted. The existing
+  release advanced automatically from CI drain to the Cloud host upgrade.
+- us3 host upgrade completed at 04:14 UTC, but Cloud lost the POST response during
+  restart and retained `status=maintenance` with an unknown-outcome error.
+  `job-05aaebcb84cc` confirms the helper exited successfully and the service
+  restarted. Authenticated host status (`job-486205ed299e`) confirms target `us3`,
+  `systemdActive=true`, version `0.50.4`, and both installed/running executable
+  hashes equal the admitted artifact hash
+  `b4522bf593e7065005de63cb805714c9b970ccc65006a887c073cf6344ad18b1`.
+  After Gary approved Cloud reconciliation, `job-e57606606bc7` rechecked those
+  hashes and atomically completed the exact operation and restored us3 scheduling.
+  The live database binding is `orchestrator-us3/database-url`, not the legacy
+  `cloud/database-url` or `orchestrator/database-url`. Identity preflight receipt:
+  `job-229a1e9f2cee`. Completion committed at 04:37:52 UTC, after CI's 04:35:02
+  deadline. CI still retains its independent failed-maintenance runner fence;
+  its worker excludes failed operations and has no reconciliation endpoint.
+  Gary directed investigation rather than clearing this fence; it remains intact.
+  eu1 heyvm and both heyvmd jobs were skipped, not deployed. No second
+  host upgrade request was sent, and the original failed run remains unchanged.
+- Root-cause investigation: CI `claim_job` inserts attempt-scoped host work before
+  source preparation and VM acquisition. Early errors return without reaching VM
+  cleanup; a subsequent attempt's cleanup does not reconcile its predecessor.
+  Historical events identify four VM-start timeouts and one pre-VM credential
+  failure. This explains the retained claims, but not the original start timeouts.
+  Host journal receipt `job-8be2e58c1c8c` records helper start at 04:14:15.321555,
+  API stop at 04:14:15.333598, new listener at 04:14:17.410330, and helper success
+  at 04:14:18.401658 UTC. The handler launches `systemd-run` before returning JSON;
+  the helper immediately restarts the same API service. This permits response
+  loss during self-restart and matches the observed transport failure; no packet
+  capture establishes the precise response-byte boundary. Cloud's error path
+  skips `verify_host_heyvm`, and its worker excludes `status=maintenance`, leaving
+  no read-only recovery after uncertain delivery. CI excludes `phase=failed`
+  after its deadline, while runner admission blocks every phase except `passed`.
+  Recovery needs operation-bound host receipts and verification without replay,
+  plus explicit late-outcome reconciliation preserving failed-run history—not
+  unconditional claim deletion, a longer timeout, or a second upgrade POST.
+- The eu1 app-lb update briefly caused CI/HeyoSecret 502s before recovery.
+  These releases prove installed code, not zero-downtime maintenance, activated
+  hierarchical routing, a unified control panel, or any unchecked live acceptance
+  gate below. The authenticated CI Networks page does list both regional runners;
+  it is a CI view, not proof of a unified platform control plane.
+
 ## Implementation contract — 2026-09-22
 
 Build one platform across us3 and eu1, then deploy CI as an application on it.

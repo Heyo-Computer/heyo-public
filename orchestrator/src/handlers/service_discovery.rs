@@ -46,6 +46,59 @@ pub struct DiscoveryQuery {
     pub boot_id: Option<String>,
 }
 
+#[derive(Default, Deserialize)]
+pub struct InventoryQuery {
+    pub after: Option<String>,
+}
+
+/// Global inventory comes only from shared durable state, never this API
+/// instance's local deployment files. Each page is one committed snapshot.
+pub async fn list_services(
+    headers: HeaderMap, State(state): State<AppState>, Query(query): Query<InventoryQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(status) = auth::require_internal_api_key(&headers, &state.config.internal_api_key) {
+        return (status, Json(json!({"error":"Unauthorized"})));
+    }
+    let result = async { read_inventory(db::get_db()?, query.after.as_deref()).await }.await;
+    match result {
+        Ok(inventory) => (StatusCode::OK, Json(inventory)),
+        Err(error) => {
+            tracing::warn!(%error, "shared service inventory unavailable");
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"Shared service inventory unavailable"})))
+        }
+    }
+}
+
+pub(super) async fn read_inventory(db: &sea_orm::DatabaseConnection, after: Option<&str>) -> Result<serde_json::Value> {
+    let tx = db.begin_with_config(Some(IsolationLevel::RepeatableRead), Some(AccessMode::ReadOnly)).await?;
+    let rows = tx.query_all(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT ids.service_id,s.desired_replicas,s.replica_regions
+         FROM (SELECT service_id FROM service_discovery_sets UNION SELECT service_id FROM service_deployment_states) ids
+         LEFT JOIN service_deployment_states s USING(service_id)
+         WHERE ($1::text IS NULL OR ids.service_id > $1) ORDER BY ids.service_id LIMIT 101",
+        [after.map(str::to_owned).into()])).await?;
+    let mut services = Vec::new();
+    for row in rows.iter().take(100) {
+        let id: String = row.try_get("", "service_id")?;
+        let snapshot = read_snapshot_in(&tx, &id, true).await?;
+        let operation = tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT operation_id,status,phase,target_revision FROM regional_service_rollouts
+             WHERE service_id=$1 ORDER BY created_at DESC,operation_id DESC LIMIT 1", [id.clone().into()])).await?;
+        let rollout = operation.map(|r| -> Result<_> { Ok(json!({
+            "operationId":r.try_get::<String>("","operation_id")?,"status":r.try_get::<String>("","status")?,
+            "phase":r.try_get::<String>("","phase")?,"targetRevision":r.try_get::<String>("","target_revision")?
+        })) }).transpose()?;
+        services.push(json!({"serviceId":id,
+            "desiredReplicas":row.try_get::<Option<i32>>("","desired_replicas")?,
+            "replicaRegions":row.try_get::<Option<serde_json::Value>>("","replica_regions")?,
+            "discoveryVersion":snapshot.as_ref().map(|s|s.version),
+            "endpoints":snapshot.as_ref().map(|s| &s.endpoints), "rollout":rollout}));
+    }
+    let next = if rows.len() > 100 { services.last().map(|s| s["serviceId"].clone()) } else { None };
+    tx.commit().await?;
+    Ok(json!({"services":services,"nextCursor":next}))
+}
+
 fn scoped_response(mut snapshot: ServiceDiscoverySnapshot, region: Option<&str>) -> serde_json::Value {
     if let Some(region) = region {
         snapshot.endpoints.retain(|endpoint| endpoint.region.as_deref() == Some(region));
@@ -522,6 +575,57 @@ pub(crate) fn validate_endpoint_url(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires ORCHESTRATOR_TEST_DATABASE_URL (disposable PostgreSQL)"]
+    async fn global_inventory_is_shared_paginated_and_preserves_missing_discovery() -> Result<()> {
+        let url = std::env::var("ORCHESTRATOR_TEST_DATABASE_URL")?;
+        let root = sea_orm::Database::connect(url.clone()).await?;
+        let schema = format!("inventory_{}", uuid::Uuid::new_v4().simple());
+        root.execute_unprepared(&format!("CREATE SCHEMA {schema}")).await?;
+        let mut options = sea_orm::ConnectOptions::new(url);
+        options.set_schema_search_path(schema.clone());
+        let first = sea_orm::Database::connect(options.clone()).await?;
+        let second = sea_orm::Database::connect(options).await?;
+        for migration in [include_str!("../../migrations/028_add_service_deployment_state.sql"),
+            include_str!("../../migrations/031_add_service_discovery.sql"),
+            include_str!("../../migrations/032_add_service_rollout_state.sql"),
+            include_str!("../../migrations/033_add_service_replica_placement.sql"),
+            include_str!("../../migrations/035_add_regional_service_rollouts.sql"),
+            include_str!("../../migrations/037_add_regional_routing_policy.sql")] {
+            first.execute_unprepared(migration).await?;
+        }
+        first.execute_unprepared("INSERT INTO service_deployment_states(service_id,desired_replicas,replica_regions,active_metadata)
+            VALUES('a-service',2,'[\"US\",\"eu1\"]','{\"secret\":\"never-forward\"}');
+            INSERT INTO service_discovery_sets(service_id,version) VALUES('a-service',9),('b-discovery-only',3);
+            INSERT INTO service_discovery_endpoints(service_id,deployment_id,region,revision,backend_url,health_status)
+            VALUES('a-service','one','US','rev-a','http://us:2222','healthy'),
+                  ('a-service','two','eu1','rev-b','http://eu:3333','healthy');
+            INSERT INTO service_region_drains(service_id,region) VALUES('a-service','eu1');
+            INSERT INTO service_deployment_states(service_id)
+            SELECT 'z-' || lpad(i::text,3,'0') FROM generate_series(1,100) i;").await?;
+        let page = read_inventory(&first, None).await?;
+        assert_eq!(page, read_inventory(&second, None).await?);
+        assert_eq!(page["services"].as_array().unwrap().len(),100);
+        assert_eq!(page["nextCursor"],"z-098");
+        let service = &page["services"][0];
+        assert_eq!(service["desiredReplicas"],2);
+        assert_eq!(service["discoveryVersion"],9);
+        assert_eq!(service["endpoints"][0]["draining"],false);
+        assert_eq!(service["endpoints"][1]["draining"],true);
+        assert_eq!(service["endpoints"][1]["revision"],"rev-b");
+        assert!(page["services"][1]["desiredReplicas"].is_null());
+        assert!(page["services"][2]["endpoints"].is_null());
+        assert!(!page.to_string().contains("never-forward"));
+        let tail = read_inventory(&second, Some("z-098")).await?;
+        assert_eq!(tail["services"].as_array().unwrap().len(),2);
+        assert_eq!(tail["services"][0]["serviceId"],"z-099");
+        assert!(tail["nextCursor"].is_null());
+        first.close().await?;
+        second.close().await?;
+        root.execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE")).await?;
+        Ok(())
+    }
 
     #[test]
     fn regional_response_preserves_generation_and_excludes_other_or_unplaced_endpoints() {

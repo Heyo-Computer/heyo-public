@@ -209,6 +209,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::routing::delete(handlers::orchestration::delete_resource_deployment),
         )
         .route(
+            "/orchestration/services",
+            get(handlers::service_discovery::list_services),
+        )
+        .route(
             "/orchestration/services/deployments",
             post(handlers::service_deploy::deploy_service)
                 .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)),
