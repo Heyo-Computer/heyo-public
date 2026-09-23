@@ -7,7 +7,44 @@ work. This document does not itself change running infrastructure.
 
 ## Unified control-plane checkpoint — 2026-09-23
 
-- Live follow-through at 12:34 UTC: [release 3d](https://ci.eu1.heyo.work/runs/01a0ce2b02c1-0000003d)
+- Live follow-through after 13:30 UTC: both
+  [us3](https://admin.us3.heyo.work/dashboard) and
+  [eu1](https://admin.eu1.heyo.work/dashboard) now render the same **Global
+  applications** inventory. Both `/control-plane/config` bindings are revision 1,
+  using the same two public Orchestrator origins and existing HeyoSecret-backed
+  `regional-rollout-discovery/token` reference. Both `/services` responses matched;
+  real public-browser desktop/mobile checks verified desired replicas 2, recorded
+  eligible 1, US healthy and **eu1: no recorded endpoint**. This accurately exposes
+  the incomplete application placement; it is not two-region serving acceptance.
+  Gateway observation bindings remain empty; local pools are labelled separately.
+- Read-only database identity receipts `job-299d2721558e` (us3) and
+  `job-831be8a5408c` (eu1) reached the same writable `orchestrator_us3` database,
+  server `10.88.0.50:5432`, PostgreSQL system identifier `7684717664390689069`.
+  This establishes a common writer, not writer HA: both control-panel entry points
+  still depend on the us3 writer. No database writes, promotions or fence resets
+  were used for these checks.
+- Durable Orchestrator operations `platform-inventory-us3-41b9d329-20260923` and
+  `platform-inventory-eu1-41b9d329-20260923` both succeeded sequentially, with
+  `readiness_verified=true` and `previous_stopped=true`. Both public `/health`
+  endpoints report revision `41b9d3293f04f75b68f8f01f738735ff9f690305`; both
+  authenticated inventory endpoints return HTTP 200. These rollouts reused the
+  successful [Linux validation artifact](https://ci.eu1.heyo.work/runs/01a0cce793b7-00000036),
+  SHA-256 `bd39bfbfb731234fd867f7f691d38d3e5ebc1e063f0a079e39d40b8f9c02d6c4`.
+  The old release was not rerun, avoiding rollback of the newer app-lbs.
+- [Release 3d](https://ci.eu1.heyo.work/runs/01a0ce2b02c1-0000003d) succeeded.
+  CI's controller operation completed at 13:22:11 UTC and reopened submissions;
+  public CI health now identifies healthy replacement `sb-96b5efe8` at revision
+  `4b06bf0107821f1a28cea03e3f11703d3389215e`. The approved manual restart of its
+  predecessor was unnecessary and was not performed. This controller recovery
+  does not resolve CI's separate failed us3 host-maintenance fence.
+- Approved cleanup of **only** idle CI cache `sb-0ef175a4` completed through the
+  repository-authenticated cleanup API for run `01a0cbf90bfe-0000000d`. Fresh
+  host-reference and Cloud/Orchestrator database checks found no protected service
+  reference. The API confirmed destruction/removal from the pool; postcheck
+  `job-177d39e747b3` confirmed its directory and network allocation absent. us3
+  allocations fell 63→62; available disk increased by about 20 GiB during cleanup.
+  No other VM or allocation was manually deleted.
+- Earlier checkpoint at 12:34 UTC: [release 3d](https://ci.eu1.heyo.work/runs/01a0ce2b02c1-0000003d)
   validated and published `4b06bf0107821f1a28cea03e3f11703d3389215e` and verified
   both regional app-lb replacements. Both public admin APIs now serve
   `/control-plane/config`, revision 0 with empty bindings: installed, not configured.
@@ -17,7 +54,8 @@ work. This document does not itself change running infrastructure.
   Internal read-only inspection found CI PID 421 holding 1018 descriptors with
   soft/hard limits 1024/4096, while its log reports `Too many open files` and
   failing Iroh connections. No cleanup record or maintenance fence was cleared.
-  No approved us3 cache has been deleted. Orchestrator replacements remain pending.
+  At that checkpoint, the approved cache deletion and Orchestrator replacements
+  were still pending; the completed results above supersede those blockers.
   The subsequent 20 GiB CI-cache workflow change is pushed in PR108 but its
   [release 41](https://ci.eu1.heyo.work/runs/01a0ce33a204-00000041) failed validation
   while polling an exec operation (`Missing API key`); it was not published.
@@ -31,20 +69,20 @@ work. This document does not itself change running infrastructure.
   path consistent with the live sockets, not normal capacity demand. No SDK
   fix or package release has been made. The count subsequently reached 1034;
   the controller still reported the same cleanup wait after the outstanding
-  validation's scheduled retry time. Headroom alone has not completed recovery.
+  validation's scheduled retry time, before its subsequent automatic recovery.
 - Gary's chosen model is one logical control plane accessible through either
   region, with a generic DNS name that can switch regions. App-lb is the UI/API
   entry point; Retail is not the implementation surface. Regional entry points
   must show shared application state, not reinterpret their local registries as
   separate global inventories.
-- Delivery status at 06:36 UTC: [PR 107](https://github.com/Heyo-Computer/heyo-public/pull/107)
+- Historical delivery status at 06:36 UTC: [PR 107](https://github.com/Heyo-Computer/heyo-public/pull/107)
   merged through [release 37](https://ci.eu1.heyo.work/runs/01a0cce793b9-00000037).
   Both Linux validations passed. us3 app-lb is publicly healthy at the new
   revision, but us3 Orchestrator replacement failed; eu1 was skipped. Both
   Orchestrators and eu1 app-lb still serve the previous revision. The first
   submission failed during a CI daemon-tunnel timeout before merge; no failed
   validation evidence was substituted into the fresh submission.
-- Concrete deployment blocker: operation
+- Initial deployment blocker (subsequently recovered above): operation
   `ci-service-9e027fc01defe58b9324fb6be666d1d1a79021c67ff008b37e475afe63424171`
   allocated `sb-eb09681b`, but us3 heyvm rejected its creation because `heyo-net`
   has no usable `/30` TAP subnet in `10.88.0.0/24`. Read-only host receipts
@@ -55,7 +93,7 @@ work. This document does not itself change running infrastructure.
   deleted. A new release alone cannot fix capacity. Changing the global network
   also changes allocation behavior for stopped VMs on restart, so blindly
   enlarging/replacing the existing network is not a verified safe remedy.
-- Cleanup unblocker, not deployed: CI now has a local repository-bearer route
+- Cleanup API, now deployed and exercised above: CI has a repository-bearer route
   `POST /api/runs/{run_id}/cache/{sandbox_id}/destroy`. Its atomic pool update
   checks idle status, served runner and latest terminal owning job before
   recording durable eviction; it reuses daemon-confirmed deletion. Targeted
@@ -64,12 +102,9 @@ work. This document does not itself change running infrastructure.
   rerun integration test still fails before dispatch because its legacy tar.gz
   fixture is rejected; cleanup auth is tested separately without relaxing that
   source-format fence.
-  A fresh CI inventory read still shows `sb-0ef175a4` idle on us3, last used by
-  successful run `01a0cbf90bfe-0000000d`; that run is readable with this
-  checkout's repository bearer. No cache was deleted and no capacity reclaimed.
-  Publishing this additional CI change and obtaining a deployed authenticated
-  cleanup path remain delivery gates; local test results do not clear them.
-- Shared inventory implementation (not yet deployed in Orchestrator):
+  Its live deletion evidence is recorded above; the old inventory showing that
+  cache idle is no longer current.
+- Shared inventory implementation (now deployed in both Orchestrators):
   Orchestrator now exposes a paginated, internal-key-gated
   shared-database inventory. App-lb's global application view consumes it using
   server-side secret references and read-only regional API fallback. It does not
@@ -84,7 +119,7 @@ work. This document does not itself change running infrastructure.
   credentials, failed writes and scoped authorization. A compiled local HTTP
   check exercised anonymous denial with both optional gates disabled, successful
   configuration, stale/invalid rejection and restart persistence. This API is
-  not yet deployed or configured on either regional gateway.
+  now deployed and configured on both regional gateways as recorded above.
 - Verification: the new PostgreSQL inventory test ran against an isolated schema
   on disposable `heyo-policy-proposals-test`, using two independent connections.
   It covered identical reads, 100-row pagination, region drains, revision identity,
@@ -104,8 +139,8 @@ work. This document does not itself change running infrastructure.
   explicitly approved a new branch push, PR, and merge through that CICD release
   workflow for this change. Release completion still requires deployed evidence;
   approval and local verification are not deployment receipts.
-- Remaining platform gates: configure the same authority and canonical operator
-  identity in both entry points, install a generic hostname/certificate path,
+- Remaining platform gates: establish canonical operator and read-only gateway
+  observer identities in both entry points, install a generic hostname/certificate path,
   verify auth/HeyoSecret/database dependency survival, and run regional-loss and
   writer-recovery checks. pg-fc has replication and fenced-promotion primitives,
   but these are not evidence of a configured automatic regional writer handoff.
