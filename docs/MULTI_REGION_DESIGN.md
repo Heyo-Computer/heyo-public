@@ -7,6 +7,32 @@ work. This document does not itself change running infrastructure.
 
 ## Unified control-plane checkpoint — 2026-09-23
 
+- Live NATS recovery: host memory admission evicted `sb-055d2cfb` at
+  19:22:31 UTC while admitting an 8192 MiB build VM. The empty replacement
+  `sb-f1b3942a` did not contain the original JetStream queues; CI still used
+  the original address. Both disks were explicitly retained through the admin
+  API. With Gary's approval, eu1 app-lb was stopped, the empty replacement was
+  stopped without deletion, and the exact original VM was resumed. The first
+  recovery job timed out waiting for controller shutdown before changing either
+  VM; after confirming the controller had stopped, the same operation completed.
+  App-lb adopted the original healthy backend at `10.120.179.238:8222`, verified
+  through the public authenticated dashboard API. Recovery receipt
+  `job-ffdd135dc4c9` records both original streams (`CI_US3_EVENTS`,
+  `CI_US3_JOBS`), five consumers and 1385 messages at recovery; subsequent
+  monitoring showed a reconnected client and new messages. No queue, consumer,
+  database or disk was cleared. This involved public eu1 interruption, not
+  zero-downtime acceptance. Idle-eviction prevention and replacement-aware NATS
+  client binding remain unresolved; disk retention alone prevents neither.
+- Gateway handoff changes are published in
+  [PR114](https://github.com/Heyo-Computer/heyo-public/pull/114).
+  Linux app-lb validation `01a0cfb7d5f6-00000003` and Orchestrator validation
+  `01a0cfb7d5fa-00000004` succeeded with artifacts. Regional release
+  `01a0cfb7d5fd-00000005` resumed automatically after NATS recovery, then its
+  merge job failed: PR115 had advanced trunk beyond the submitted base. CI
+  records a generic unknown-publication error, but the remote inspection and
+  exact-base publication guard establish that this candidate cannot replace
+  that newer trunk. A new validated candidate must include current trunk;
+  do not retry the old candidate or treat validation as deployed capability.
 - Live stale-request check after Gary requested safe cleanup: authenticated
   public dashboard reads in both regions reported `regional-rollout-smoke`
   total in-flight zero. Three successive `discovery-status` reads per region
