@@ -93,6 +93,7 @@ const KNOWN = {
     FeedSpec: ["announce", "issues", "expose"],
     FeedIndexEntry: ["namespace", "events"],
     FeedEvent: ["id", "ts", "last_ts", "count", "namespace", "deployment", "kind", "title", "detail"],
+    PluginView: ["id", "name", "description", "config_schema", "enabled", "config", "updated_at", "last_error", "status"],
   },
 };
 
@@ -130,6 +131,7 @@ const FIXTURES = {
   "upstream-traffic-status": "UpstreamTrafficStatus",
   "feed-event": "FeedEvent",
   "feed-index": "FeedIndexEntry",
+  "plugins": "PluginView",
 };
 
 /** Which declaration governs a nested object, by the key that holds it. */

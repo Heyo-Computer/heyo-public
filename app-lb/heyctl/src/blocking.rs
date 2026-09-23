@@ -482,6 +482,20 @@ impl Client {
     pub fn disks(&self) -> Result<DiskInventory> {
         run!(self, self.inner.disks())
     }
+
+    // -- plugins ------------------------------------------------------------
+
+    pub fn plugins(&self) -> Result<Vec<PluginView>> {
+        run!(self, self.inner.plugins())
+    }
+
+    pub fn plugin(&self, id: &str) -> Result<PluginView> {
+        run!(self, self.inner.plugin(id))
+    }
+
+    pub fn set_plugin(&self, id: &str, enabled: bool, config: Option<&Value>) -> Result<PluginView> {
+        run!(self, self.inner.set_plugin(id, enabled, config))
+    }
 }
 
 pub struct ClientBuilder {
@@ -658,7 +672,7 @@ macro_rules! raw_blocking_id {
 }
 
 impl Raw<'_> {
-    raw_blocking!(deployments, secrets, tokens, jobs, certs, workflows, feeds, disks, namespaces);
+    raw_blocking!(deployments, secrets, tokens, jobs, certs, workflows, feeds, disks, namespaces, plugins);
 
     /// Deployments in one namespace. See [`crate::api::Raw::deployments_in`].
     pub fn deployments_in(&self, namespace: &str) -> Result<Value> {
