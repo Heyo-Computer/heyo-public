@@ -7,6 +7,17 @@ work. This document does not itself change running infrastructure.
 
 ## Unified control-plane checkpoint — 2026-09-23
 
+- Administrator identity decision: the dashboard inherits Heyo's platform admin
+  role; no regional user accounts or per-email allowlist. Auth already derives
+  `fleet:admin` from the active user's stored role. Live authenticated checks
+  confirmed Gary's account receives that grant from both regional Auth origins
+  (`https://cloud.{region}.heyo.work/__auth`), while the existing dashboard
+  deployments still reject his bearer. The app-lb browser-login integration is
+  implemented locally, with current-scope checks, host-only HttpOnly sessions,
+  same-origin mutation/WebSocket protection and logout. Local two-gateway browser
+  checks cover separate administrators, non-admin denial and role removal. Linux
+  publication and enabling each gateway's `APP_LB_AUTH_URL` remain delivery gates;
+  no live user role has been modified, and Sam's role has not yet been verified.
 - Live follow-through after 13:30 UTC: both
   [us3](https://admin.us3.heyo.work/dashboard) and
   [eu1](https://admin.eu1.heyo.work/dashboard) now render the same **Global

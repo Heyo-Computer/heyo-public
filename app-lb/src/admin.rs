@@ -31,6 +31,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+#[path = "admin_login.rs"]
+mod browser_login;
+
 /// The live dashboard page. Self-contained (no external fetches beyond the
 /// same-origin `/metrics` poll) so it works over an SSH tunnel with no assets.
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
@@ -806,11 +809,20 @@ async fn authorize(
         .extensions()
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_string());
+    let browser_auth = if state.gate_admin && state.federated.is_some() && state.auth.is_some() {
+        match browser_login::session(req.headers(), req.method()) {
+            Ok(value) => value,
+            Err(()) => return forbidden("invalid session or cross-origin session request"),
+        }
+    } else { None };
+    let browser_navigation = req.method() == axum::http::Method::GET
+        && !req.headers().contains_key(header::AUTHORIZATION)
+        && req.headers().get(header::ACCEPT).and_then(|h| h.to_str().ok()).is_some_and(|h| h.contains("text/html"));
     let header = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+        .map(str::to_owned).or(browser_auth);
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(str::to_owned);
     // Requires `into_make_service_with_connect_info` on the listener; without it
@@ -892,6 +904,9 @@ async fn authorize(
                 "admin API request rejected: no usable credential",
             );
             observe_auth_failure(&state, peer, &path, AuthAction::AdminRejected, scheme);
+            if browser_navigation && state.gate_admin && state.federated.is_some() {
+                return axum::response::Redirect::to("/login").into_response();
+            }
             unauthorized()
         }
         Verdict::Forbidden(detail) => {
@@ -2972,8 +2987,16 @@ async fn directory(
 async fn dashboard(
     State(state): State<AdminState>,
     headers: axum::http::HeaderMap,
+    caller: Option<axum::Extension<Caller>>,
 ) -> impl IntoResponse {
-    Html(render_page(&state, &state.dashboard_html, &headers))
+    let page = if let Some(axum::Extension(Caller::Federated(grant))) = caller {
+        let name = crate::heyo_ui::escape(grant.subject.email.as_deref().unwrap_or(&grant.subject.user_id));
+        render_page(&state, &state.dashboard_html.replace("{{WHO}}", &name), &headers)
+    } else { render_page(&state, &state.dashboard_html, &headers) };
+    let sign_out = if browser_login::session(&headers, &axum::http::Method::GET).ok().flatten().is_some() {
+        "<form method=\"post\" action=\"/logout\"><button class=\"btn btn-sm\">Sign out</button></form>"
+    } else { "" };
+    ([(header::CACHE_CONTROL, "no-store")], Html(page.replace("{{SESSION_ACTION}}", sign_out)))
 }
 
 /// Fill the per-request half of a page: the theme, and who is signed in.
@@ -5271,9 +5294,6 @@ fn router(state: AdminState) -> Router {
         .route("/", get(directory))
         .route("/metrics", get(metrics_snapshot))
         .route("/dashboard", get(dashboard))
-        // Outside the gate with the other static assets: a sign-in page that
-        // cannot fetch its own stylesheet is a sign-in page nobody can read.
-        .route("/__ui/*path", get(ui_asset))
         // View tier, not CRUD: the dashboard is its consumer, so the browser's
         // cached view credentials have to work. It must never be ungated — it
         // enumerates attacker addresses and the probes that reached the fleet —
@@ -5454,6 +5474,12 @@ fn router(state: AdminState) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        // Embedded static assets contain no fleet state. Sign-in needs them
+        // before the browser has a credential; inventory stays behind its gate.
+        .route("/__ui/*path", get(ui_asset))
+        .route("/login", get(browser_login::page).post(browser_login::login)
+            .layer(axum::extract::DefaultBodyLimit::max(8192)))
+        .route("/logout", post(browser_login::logout))
         .merge(views)
         .merge(fleet)
         .merge(regional)
@@ -6349,6 +6375,7 @@ mod tests {
                     .replace("{{APP_NAME}}", "app-lb")
                     .replace("{{HTML_ATTRS}}", r#"data-theme="light""#)
                     .replace("{{WHO}}", "ops@example.com")
+                    .replace("{{SESSION_ACTION}}", "")
                     .replace("{{LEDE}}", "")
                     .replace("{{CARDS}}", "");
                 assert!(!rendered.contains("{{"), "{name} left a placeholder unfilled");

@@ -3455,6 +3455,26 @@ it) and the admin API accepts a third credential:
 That is also the order of precedence: a local token is never sent upstream,
 and the auth service is only asked about a bearer the store does not know.
 
+With federation and the admin gate enabled, unauthenticated browser navigation
+opens `/login`. Sign in using an existing Heyo email/password; Auth must return
+`fleet:admin`. Heyo's platform administrator role is the authority across all
+regional gateways, not an email allowlist or separate dashboard user database.
+Configure each regional Auth origin against the same authoritative user store.
+
+Browser sessions use a host-only `Secure`, `HttpOnly`, `SameSite=Strict` cookie.
+Tokens are not stored in JavaScript/local storage, and passwords are sent only to
+the configured HTTPS Auth service (HTTP loopback is supported for a colocated
+issuer). Redirects are not followed with credentials. Serve the dashboard through
+HTTPS, preserving its public `Host` header. Cookie-authenticated writes and
+WebSocket upgrades require an exact same-origin HTTPS `Origin`; explicit Basic
+or bearer API credentials retain their existing behavior. The dashboard provides
+sign-out. Session expiry requires sign-in again; permission removal takes effect
+within the existing bounded `APP_LB_AUTH_CACHE_SECS` cache lifetime.
+
+Regional hostnames have independent browser cookies, but the same Heyo account
+and role. A common dashboard hostname avoids separate regional sign-ins. Keep
+Basic credentials as emergency operator access; they are not per-user accounts.
+
 ### What the auth service says
 
 The scopes endpoint answers with a list of strings, and the grammar is the
