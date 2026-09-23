@@ -29,6 +29,8 @@
 //! [`crate::secrets::SecretRef`] and resolve it through the secret store when
 //! they use it — the same indirection a deployment's git credential uses.
 
+pub mod pgfc;
+
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use axum::Router;

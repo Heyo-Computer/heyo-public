@@ -94,6 +94,9 @@ reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 # classic source of bugs.
 form_urlencoded = "1"
 url = "2"
+# Wire types for pg-vm-pool's JSON admin API, shared with pg-fc itself, for
+# the pg-fc plugin. serde-only.
+pg-fc-api = { path = "../pg-fc/api" }
 
 async-trait = "0.1"
 futures.workspace = true

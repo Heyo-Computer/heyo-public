@@ -500,8 +500,8 @@ fn main() {
         ),
     }
     // Plugins: which built-in plugins run, and with what configuration, is an
-    // object per plugin beside the other stores. None are compiled in yet; the
-    // host, its routes and the Plugins page are the frame they slot into.
+    // object per plugin beside the other stores. The host is built once the
+    // secret store exists, which plugins resolve their credentials through.
     let plugin_store = plugins::PluginStore::new(plugins::plugin_dir(&cfg.state_path));
     match plugin_store.load() {
         (0, 0) => tracing::debug!(dir = %plugin_store.dir().display(), "no plugin records"),
@@ -513,7 +513,6 @@ fn main() {
             "restored plugin records; some were unreadable and were left on disk"
         ),
     }
-    let plugin_host = Arc::new(plugins::PluginHost::new(Vec::new(), plugin_store));
     let auth_providers = Arc::new(crate::auth_providers::AuthProviderStore::new(
         crate::auth_providers::auth_provider_dir(&cfg.state_path),
     ));
@@ -560,6 +559,10 @@ fn main() {
             std::path::Path::new(&cfg.secrets_path).display()
         ),
     }
+    let plugin_host = Arc::new(plugins::PluginHost::new(
+        vec![plugins::pgfc::PgFcPlugin::new(secrets.clone())],
+        plugin_store,
+    ));
     let tokens = Arc::new(tokens::TokenStore::new(&cfg.tokens_path));
     match tokens.load() {
         Ok(0) => tracing::info!(path = %tokens.path().display(), "no app-tokens"),
