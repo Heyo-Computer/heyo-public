@@ -3681,9 +3681,16 @@ fn discovery_target_status_locked(
 /// Observed discovery state. The registry mutation gate makes the durable
 /// version and all live/retired generation counters one coherent observation.
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DiscoveryTarget {
     #[serde(default)]
     staged: bool,
+}
+
+impl DiscoveryTarget {
+    fn deployment(&self, registry: &Registry, id: &str) -> Option<Arc<crate::deployment::Deployment>> {
+        if self.staged { registry.staged(id) } else { registry.get(id) }
+    }
 }
 
 async fn discovery_status(State(state): State<AdminState>, Path(id): Path<String>, Query(target): Query<DiscoveryTarget>) -> Response {
@@ -3692,7 +3699,7 @@ async fn discovery_status(State(state): State<AdminState>, Path(id): Path<String
         else { discovery_status_locked(&state.registry, &id) };
     match status {
         Ok(mut status) => {
-            if let Some(deployment) = (if target.staged { state.registry.staged(&id) } else { state.registry.get(&id) }) {
+            if let Some(deployment) = target.deployment(&state.registry, &id) {
                 if let Some(spec) = deployment.spec.discovery.as_ref().and_then(|d| d.regional.as_ref()) {
                     let ready = state.secrets.resolve(&spec.auth).is_ok_and(|token|
                         !token.is_empty() && http::HeaderValue::from_str(&token).is_ok())
@@ -3718,8 +3725,8 @@ async fn discovery_status(State(state): State<AdminState>, Path(id): Path<String
 /// An authenticated control-plane request makes this gateway exercise the
 /// destination's HTTPS peer path. Peer credentials never leave the gateway.
 async fn regional_probe(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
-    Path(id): Path<String>, Json(request): Json<crate::regional::ProbeRequest>) -> Response {
-    let Some(deployment) = state.registry.get(&id) else {
+    Path(id): Path<String>, Query(target): Query<DiscoveryTarget>, Json(request): Json<crate::regional::ProbeRequest>) -> Response {
+    let Some(deployment) = target.deployment(&state.registry, &id) else {
         return err(StatusCode::NOT_FOUND,"deployment not found").into_response();
     };
     if !recovery_authorized(&caller,&deployment.spec) {
@@ -3740,8 +3747,8 @@ async fn regional_probe(State(state): State<AdminState>, axum::Extension(caller)
 /// Read-only readiness of currently eligible capacity, independent of a pending
 /// proposal's owner. Namespace admin authorization does not authorize a rollout.
 async fn regional_active_probe(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
-    Path(id): Path<String>, Json(request): Json<crate::regional::ActiveProbeRequest>) -> Response {
-    let Some(deployment) = state.registry.get(&id) else {
+    Path(id): Path<String>, Query(target): Query<DiscoveryTarget>, Json(request): Json<crate::regional::ActiveProbeRequest>) -> Response {
+    let Some(deployment) = target.deployment(&state.registry, &id) else {
         return err(StatusCode::NOT_FOUND,"deployment not found").into_response();
     };
     if !recovery_authorized(&caller,&deployment.spec) {return forbidden("authenticated namespace admin required");}
@@ -5885,6 +5892,43 @@ async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_probe_target_never_falls_back_or_changes_the_live_route() {
+        let directory = std::env::temp_dir().join(format!("probe-target-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let registry = Registry::new(directory.join("state.json"));
+        let flat: DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id":"app", "routes":[{"host":"app.example"}], "upstreams":["127.0.0.1:8000"],
+            "discovery":{"service_id":"svc", "source":{"url":"https://control.example/discovery","auth":{"secret":"discovery"}}}
+        })).unwrap();
+        let live = registry.upsert(flat.clone());
+        let staged_target = DiscoveryTarget { staged: true };
+        assert!(staged_target.deployment(&registry, "app").is_none(), "never probe the live predecessor as a staged successor");
+        let mut successor = flat;
+        successor.upstreams.clear();
+        successor.discovery = Some(serde_json::from_value(serde_json::json!({
+            "service_id":"svc", "region":"eu1",
+            "source":{"url":"https://control.example/discovery","auth":{"secret":"discovery"}},
+            "regional":{"gateway_id":"eu","backend_server_id":"host-eu","environment":"prod","auth":{"secret":"peer"}}
+        })).unwrap());
+        registry.prepare_handoff("enrollment-1", &crate::registry::spec_fingerprint(&live.spec).unwrap(), successor).unwrap();
+        let staged = staged_target.deployment(&registry, "app").unwrap();
+        assert!(staged.regional.is_some());
+        assert!(!Arc::ptr_eq(&staged, &live));
+        assert!(Arc::ptr_eq(&DiscoveryTarget::default().deployment(&registry, "app").unwrap(), &live));
+        assert!(Arc::ptr_eq(&registry.route(Some("app.example"), "/").unwrap(), &live));
+        assert!(staged_target.deployment(&registry, "missing").is_none());
+        for (query, staged) in [("", false), ("?staged=false", false), ("?staged=true", true)] {
+            let uri = format!("/deployments/app/regional-active-probe{query}").parse().unwrap();
+            assert_eq!(Query::<DiscoveryTarget>::try_from_uri(&uri).unwrap().staged, staged);
+        }
+        for query in ["?stage=true", "?staged=1", "?staged=true&staged=false"] {
+            let uri = format!("/deployments/app/regional-active-probe{query}").parse().unwrap();
+            assert!(Query::<DiscoveryTarget>::try_from_uri(&uri).is_err());
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn discovery_bootstrap_cannot_shadow_another_route() {

@@ -7,6 +7,110 @@ work. This document does not itself change running infrastructure.
 
 ## Unified control-plane checkpoint — 2026-09-23
 
+- Fresh-smoke replacement, 2026-09-24: Gary explicitly requested removing the
+  old smoke app completely and replacing it with a gateway-based live test,
+  without further local test runs. Both obsolete `regional-rollout-smoke`
+  app-lb registrations were deleted through the public admin API (204), and
+  both authenticated read-backs returned 404. The exact saved specs had no
+  managed VM pool, so this operation removed only flat routes, not VM storage.
+  Cloud inventory identifies old smoke deployments
+  `acceptance-v1c-20260922-r1` (US, running) and
+  `acceptance-v1k-20260922-r1` (eu1, stopped), both explicitly named
+  `service-regional-rollout-smoke`; their reference checks and deletion are
+  still in progress. The new packaging workflow and public HTTPS verifier
+  target fresh disposable gateway resources rather than migration of the old
+  serving route. The replacement is not yet deployed. This narrow transport
+  smoke does not claim the still-incomplete hierarchical rollout acceptance.
+- Enrollment continuation, 2026-09-24: fresh authenticated public
+  `discovery-status` reads from both regional admin APIs still returned version
+  one and the same sole US upstream, `161.129.71.178:2223`, with zero in-flight
+  requests. Both named the same us3 Orchestrator discovery authority. This is
+  shared observed membership, not an eu1 application endpoint or failover proof.
+  Local app-lb changes add explicit `?staged=true` source selection to both
+  authenticated regional probe APIs, allowing successor-path checks before
+  committing a route handoff. Missing staged sources never fall back to the
+  predecessor; ordinary public selection remains unchanged. The targeted
+  selector regression, eight regional tests and five handoff tests passed.
+  The complete app-lb binary suite also passed: 881 passed, six ignored;
+  the existing unused `ForceParams` warning remains. No Linux or live
+  successor-path verification is claimed from these macOS checks.
+  These edits are uncommitted and undeployed. Durable first-enrollment
+  journaling/controller integration, private Cloud binding delivery, the
+  rewritten workload deployment and live two-region acceptance remain open.
+  Existing v3 application execution and lifecycle fences remain closed. An
+  additive shared Orchestrator database migration for enrollment recovery
+  needs explicit operational authorization before it is applied; no shared
+  database migration or deployment was performed in this continuation.
+- Approved BBR recovery, 2026-09-24: `job-73ad3b6bed5c` loaded eu1's installed
+  `tcp_bbr` module and changed runtime TCP congestion control from CUBIC to BBR;
+  qdisc remained `fq_codel`. No persistent sysctl/module configuration was
+  written, so this is not yet a reboot-persistent network configuration.
+  Matched twelve-second authenticated probes `job-19049b4c270b` measured
+  20.95 MB/s over HTTP/1.1 and 19.08 MB/s over HTTP/2, versus 0.36 and
+  0.14 MB/s before. BBR was retained because throughput materially improved.
+  Managed recovery reused the already validated/published PR116 artifacts:
+  `bbr-recovery-us3-8f94eed-20260924` used the exact failed target-spec hash
+  and completed candidate readiness, cutover and predecessor stop. Eu1 host
+  operation `bbr-release-eu1-app-lb-8f94eed-20260924` then verified the same
+  app-lb bundle/binary with eu1's own source binary/config fingerprints.
+  The eu1 admin endpoint briefly returned 502 during its restart; this was
+  not zero-interruption maintenance. Service operation
+  `bbr-release-eu1-orchestrator-8f94eed-20260924` subsequently completed with
+  readiness and predecessor stop verified. New healthy Orchestrator VMs are
+  `sb-d2aa51f5` (us3) and `sb-bf11e733` (eu1), with no pending candidates.
+  Public admin `/healthz` and Orchestrator `/health` in both regions, plus
+  `https://admin.heyo.work/healthz`, all returned HTTP 200 with exact revision
+  [8f94eed](https://github.com/Heyo-Computer/heyo-public/commit/8f94eed1e50cb0403a5418f2e6b71a00ef18f57c).
+  Authenticated `/services` responses in both regions matched exactly, but
+  `regional-rollout-smoke` still records only its US endpoint, desired replicas
+  two, discovery version one, and no rollout. Updating the control-plane
+  binaries did not itself enroll or activate the missing eu1 application route.
+  The original CI run remains failed; these are separate managed recovery
+  receipts, not a rewritten green CI result. CI's existing rerun path does
+  not admit `on: release` workflows; no controller/DB changes were used to
+  bypass that restriction. Broader two-region acceptance and the private
+  allocator rollout/network expansion remain incomplete.
+- Preparation-fix release, 2026-09-24: Gary authorized publication/deployment
+  through [PR116](https://github.com/Heyo-Computer/heyo-public/pull/116).
+  Linux app-lb validation `01a0d0efaa6d-0000000e` and Orchestrator validation
+  `01a0d0efaa70-0000000f` passed and uploaded artifacts. The app-lb job's first
+  eu1 admission failed on disk headroom; automatic attempt 2 acquired
+  `sb-12d8afc8` and completed without manual storage deletion. Coordinated
+  release `01a0d0efaa72-00000010` published
+  [the candidate](https://github.com/Heyo-Computer/heyo-public/commit/8f94eed1e50cb0403a5418f2e6b71a00ef18f57c)
+  and verified the us3 app-lb host executable/public build. The us3 Orchestrator
+  operation `ci-service-3a1654474f9a31161d866c66b8a9f79efff6b135194a2182e8b2dd9fded77500`
+  failed at 01:51 UTC: `candidate artifact preparation deadline expired during
+  blob_download; source retained`. Readiness and predecessor stop remain false;
+  candidate creation and cutover did not run. CI recorded failure with its own
+  stopped-waiting/reconciliation message; the authenticated operation read
+  confirms the terminal preparation failure. Eu1 and controller stages were
+  skipped. PR116 is merged and `origin/main` matches the published candidate.
+  Before release, pool-preserving
+  scaling PATCHes raised both Orchestrator boot budgets to 1800 seconds;
+  rereads verified only that field changed and original healthy VMs remained
+  `sb-a4dbf6b3` (us3) and `sb-c5e900a3` (eu1). This is deployment progress,
+  not completed two-region acceptance. Private allocator publication and live
+  network-pool expansion remain separate, unapproved operations.
+- Live transfer diagnosis: `job-23ee72ca419c` measured the active us3 image
+  growing from 162045536 to 163880544 bytes in ten seconds. At 01:41 UTC,
+  `job-dcaacfa498ad` found only 250404448 of 805306368 bytes downloaded after
+  approximately twenty minutes; the healthy us3 artifact store returned 404
+  for the pinned blob. Bounded authenticated protocol probes
+  `job-7095845d0328` received HTTP 200 but only about 359 kB/s over HTTP/1.1
+  and 143 kB/s over HTTP/2, so HTTP/2 alone does not explain the slowdown.
+  Sender receipt `job-05fd6ec4cca0` observed the exact eu1 Traefik socket with
+  a 3.2 MB send queue, 106 ms RTT, congestion window 18, 1398 retransmissions
+  in approximately 179000 sent segments, and 1.7 Mbps delivery rate. Both
+  hosts had low load and no configured traffic shaper in their qdisc inventory
+  (`job-3e5003973b6d` also covers us3). This establishes a slow, retransmitting
+  network transfer, not the location or cause of the network fault. The old
+  short-sample ten-minute extrapolation was not representative of this run.
+  Before the approved trial, read-only `job-4549cd6c14e4` confirmed eu1's BBR
+  module was installed while TCP used CUBIC. No module loading, sysctl, route,
+  or qdisc change occurred during that diagnosis; the approved trial is above.
+  Every temporary diagnostic deployment spec was restored. No service data,
+  failed operation history, or NATS state was removed.
 - Preparation investigation, 2026-09-24: authenticated HEAD reads confirmed
   the pinned rootfs blob exists (805306368 bytes) and the validated Orchestrator
   bundle exists (8040047 bytes). Read-only host diagnostic `job-3f3c87335dd2`
@@ -25,27 +129,25 @@ work. This document does not itself change running infrastructure.
   Completion receipt `job-c171646e3aef` found no remaining probe processes;
   subsequent authenticated regional reads showed one healthy Orchestrator
   backend in each region and both rollout budgets still at 300 seconds.
-- App-lb preparation fix is local, not published: preparation shares the
+- App-lb preparation fix (pre-publication verification): preparation shares the
   remaining persisted rollout deadline rather than an independent two-minute
   cap; latest safe stage/status codes are persisted during preparation and
   survive failure/reload. Deadline expiry is distinct from preparation error,
   with remote bodies and credentials excluded. The complete app-lb binary
   test suite passed on macOS (880 passed, 6 ignored), including slow successful
   preparation, remaining-budget expiry, durable error stages, and HTTP/digest
-  failure classification. Linux CI/release and live verification remain due.
-  PR114 is merged; publishing this additional fix requires a new public PR/CI
-  release authorization. Deployment should also raise the Orchestrator rollout
-  budget to 1800 seconds through the pool-preserving scaling PATCH API before
-  retrying the validated candidate. No such publication or policy write occurred.
-- Latest release supersedes the older publication failure below: Linux
+  failure classification. Publication, Linux CI and approved live budget changes
+  are now recorded above; completed regional deployment and acceptance must
+  still be verified independently.
+- Earlier PR114 release superseded the publication failure below: Linux
   validations `01a0d0633d65-00000008` (app-lb) and
   `01a0d0633d69-00000009` (Orchestrator) passed. Release
   `01a0d0633d6a-0000000a` published
   [the candidate](https://github.com/Heyo-Computer/heyo-public/commit/edbe5eae73c890b5a9dc44b6a6dd82b651639c1d)
   and replaced us3 app-lb, then failed us3 Orchestrator creation on subnet
   exhaustion. Eu1 and controller stages did not run. Public `/healthz` checks
-  still show that candidate on us3 and revision
-  `5089a900e2f4312c252b9e2d43c6705acd72036b` on eu1; both return HTTP 200.
+  at that checkpoint showed that candidate on us3 and revision
+  `5089a900e2f4312c252b9e2d43c6705acd72036b` on eu1; both returned HTTP 200.
 - Subnet incident: receipt `job-156325a6e4f1` records the daemon refusing
   candidate `sb-8368d453`; inventory `job-f2cc8b1ef5e5` found 63 reservations
   and 18 live sockets. After service/reference checks, the repository-owned

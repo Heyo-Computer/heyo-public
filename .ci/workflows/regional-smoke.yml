@@ -1,0 +1,42 @@
+name: regional-smoke
+on:
+  submit:
+    paths:
+      - 'app-lb/testdata/regional_app.py'
+      - 'app-lb/testdata/regional_live_smoke.py'
+      - '.ci/workflows/regional-smoke.yml'
+
+jobs:
+  package:
+    vm:
+      driver: firecracker
+      build:
+        dockerfile: .ci/image/ci/Dockerfile
+        context: .ci/image/ci
+        size_mb: 6144
+      size_class: small
+      disk_size_gb: 10
+      ttl_seconds: 1800
+    timeout-minutes: 15
+    steps:
+      - name: Package one immutable regional workload
+        run: |
+          set -eu
+          mkdir -p dist
+          cp app-lb/testdata/regional_app.py dist/app.py
+          cp app-lb/testdata/regional_live_smoke.py dist/verify.py
+          printf '%s\n' '${{ ci.sha }}' > dist/REVISION
+          cat > dist/start.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          CDPATH= cd -- "$(dirname -- "$0")"
+          : "${HEYO_REGION:?region must be supplied by the deployment}"
+          exec python3 ./app.py --bind 0.0.0.0 --port 8080 --region "$HEYO_REGION" --revision "$(cat REVISION)"
+          SH
+          chmod +x dist/start.sh
+          (cd dist && sha256sum app.py verify.py start.sh REVISION > SHA256SUMS)
+      - uses: ci/upload-artifact
+        with:
+          name: regional-smoke
+          description: Immutable disposable workload for authenticated cross-region app-lb verification.
+          path: dist
