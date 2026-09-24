@@ -1472,6 +1472,12 @@ pub(super) async fn prepare_cloud_candidate(
         request.ports.clone()
     };
     let resolved_secrets = resolve_env_refs(state, request).await?;
+    if super::instance_http::Contract::from_metadata(request.metadata.as_ref().unwrap_or(&serde_json::Value::Null))?.is_some() {
+        let env = request.env.get_or_insert_with(HashMap::new);
+        env.insert("HEYO_SERVICE_ID".into(), service_id.clone());
+        env.insert("HEYO_DEPLOYMENT_ID".into(), deployment_id.into());
+        env.insert("HEYO_REGION".into(), request.region.clone());
+    }
     let cloud_request = CreateDeploymentRequest {
         deployment_id: deployment_id.into(),
         user_id: request.user_id.clone(),
@@ -1511,6 +1517,9 @@ async fn deploy_service_candidate(
 ) -> Result<ServiceDeployResponse> {
     let service_id = sanitize_service_id(&request.service_id)?;
     let mut current_state = read_service_state(&state, &service_id).await?;
+    anyhow::ensure!(!request.retire_previous
+        || super::instance_http::Contract::from_metadata(&current_state.active_metadata["source"])?.is_none(),
+        "application lifecycle retirement requires the regional rollout barrier");
     let previous_discovery = service_discovery::read_stored_snapshot(&service_id).await?;
     let excluded_backend_server_ids = match placement_exclusions {
         Some(exclusions) => exclusions,

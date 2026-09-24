@@ -21,6 +21,7 @@
 
 pub mod api;
 pub mod identity;
+mod owner_http;
 pub mod pages;
 pub mod stream;
 
@@ -133,6 +134,7 @@ pub fn router(
         .route("/api/native/jobs/{lease}/release-source/{index}", get(native_release_source))
         .route("/api/native/jobs/{lease}/artifacts/{index}", post(native_artifact).layer(DefaultBodyLimit::max(512 * 1024 * 1024)))
         .route("/api/lifecycle", get(application_lifecycle))
+        .route("/api/lifecycle/retirements/{id}", get(retirement_status).post(retire_application))
         .route("/api/lifecycle/updates/{id}", get(application_update_status).post(activate_application_update))
         .route(
             "/api/submit",
@@ -143,6 +145,7 @@ pub fn router(
         // above, for the reason this module's header gives — a machine route
         // behind the gate answers 401 whatever it carries. See [`api`].
         .merge(api::router())
+        .layer(axum::middleware::from_fn_with_state(state.clone(), owner_http::route))
         .with_state(state)
 }
 
@@ -160,12 +163,44 @@ fn application_lifecycle_auth(state: &AppState, headers: &HeaderMap) -> Result<(
 
 async fn application_lifecycle(State(state): State<AppState>, headers: HeaderMap) -> axum::response::Response {
     if let Err(response) = application_lifecycle_auth(&state, &headers) { return response; }
+    if let Some(deployment) = &state.config.managed_deployment {
+        return Json(serde_json::json!({"applicationId":state.config.application_id,
+            "deploymentId":deployment,"bootId":state.dispatcher.executor.boot_id(),
+            "revision":state.config.expected_sha,"capabilities":["managed-retirement-v1"]})).into_response();
+    }
     if state.config.application_id.is_none() || state.config.application_orchestrator_url.is_none()
         || state.config.controller_deployment.is_none() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "application lifecycle is not configured");
     }
     Json(serde_json::json!({"applicationId":state.config.application_id,
         "deploymentId":state.config.controller_deployment,"capabilities":["release-update"]})).into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetirementEnvelope { request_hash: String, request: crate::application_lifecycle::Retirement }
+
+async fn retire_application(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap,
+    Json(envelope): Json<RetirementEnvelope>) -> axum::response::Response {
+    if let Err(response) = application_lifecycle_auth(&state, &headers) { return response; }
+    if id != envelope.request.command_id { return error(StatusCode::CONFLICT,"retirement identity mismatch"); }
+    match crate::application_lifecycle::accept(&state.dispatcher,envelope.request,&envelope.request_hash).await {
+        Ok(status) => (StatusCode::ACCEPTED,Json(status)).into_response(),
+        Err(_) => error(StatusCode::CONFLICT,"retirement was not accepted"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetirementQuery { request_hash: String }
+
+async fn retirement_status(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap,
+    Query(query): Query<RetirementQuery>) -> axum::response::Response {
+    if let Err(response) = application_lifecycle_auth(&state, &headers) { return response; }
+    match crate::application_lifecycle::status(state.store.pool(),&id,&query.request_hash).await {
+        Ok(status) => Json(status).into_response(),
+        Err(_) => error(StatusCode::NOT_FOUND,"retirement receipt unavailable"),
+    }
 }
 
 async fn application_update_status(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> axum::response::Response {
@@ -1775,7 +1810,8 @@ mod tests {
         let runners = test_runners(config.clone());
         let dispatcher = Arc::new(Dispatcher {
             lifecycle: Arc::new(crate::lifecycle::Lifecycle::default()),
-            executor: Arc::new(crate::executor::ExecutorOwner::register(store.pool().clone(), &format!("web-test-{}", uuid::Uuid::new_v4())).await.expect("executor")),
+            executor: Arc::new(crate::executor::ExecutorOwner::register(store.pool().clone(),
+                config.managed_deployment.as_deref().unwrap_or(&format!("web-test-{}", uuid::Uuid::new_v4()))).await.expect("executor")),
             config: config.clone(),
             store: store.clone(),
             pool: crate::pool::Pool::new(store.pool().clone()),
@@ -1795,6 +1831,80 @@ mod tests {
             objects: Arc::new(crate::objects::Workflows::new(&config)),
         });
         router(config, runners, store, dispatcher)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_NATS_URL; run alone"]
+    async fn managed_frontends_preserve_auth_and_reject_wrong_boot_without_retry() {
+        use base64::Engine;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let base = std::env::var("CI_TEST_DATABASE_URL").unwrap();
+        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        let schema = format!("routing_{}",uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&admin).await.unwrap();
+        let mut url = reqwest::Url::parse(&base).unwrap();
+        url.query_pairs_mut().append_pair("options",&format!("-c search_path={schema}"));
+        unsafe { std::env::set_var("CI_TEST_DATABASE_URL",url.as_str()); }
+        let mut config = Arc::try_unwrap(test_config()).unwrap();
+        config.managed_deployment=Some("managed-owner".into());
+        config.native_runner_secret=Some("original-native-token".into());
+        let owner = test_router_with_config(Arc::new(config)).await;
+        let pool = sqlx::PgPool::connect(url.as_str()).await.unwrap();
+        let boot: uuid::Uuid = sqlx::query_scalar("SELECT boot_id FROM ci_executor_owner").fetch_one(&pool).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let proxy_owner=owner.clone(); let proxy_calls=calls.clone();
+        let proxy=Router::new().route("/orchestration/services/ci/instances/{deployment}/http-request",post(
+            move |headers:HeaderMap,body:Body| {let owner=proxy_owner.clone(); let calls=proxy_calls.clone(); async move {
+                calls.fetch_add(1,Ordering::SeqCst);
+                assert_eq!(headers["authorization"],"Bearer app-role-token");
+                let meta:serde_json::Value=serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(headers["x-heyo-instance-request"].as_bytes()).unwrap()).unwrap();
+                assert_eq!(meta["bootId"],boot.to_string());
+                let mut request=Request::builder().method(meta["method"].as_str().unwrap()).uri(meta["path"].as_str().unwrap())
+                    .header("x-ci-target-boot",boot.to_string()).header("x-ci-forwarded","1");
+                for pair in meta["headers"].as_array().unwrap() {
+                    request=request.header(pair[0].as_str().unwrap(),pair[1].as_str().unwrap());
+                }
+                owner.oneshot(request.body(body).unwrap()).await.unwrap()
+            }}));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {axum::serve(listener,proxy).await.unwrap()});
+        let mut config=Arc::try_unwrap(test_config()).unwrap();
+        config.managed_deployment=Some("managed-standby".into());
+        config.application_id=Some("ci".into()); config.application_orchestrator_url=Some(address);
+        config.application_lifecycle_token=Some("app-role-token".into());
+        let standby=test_router_with_config(Arc::new(config)).await;
+        for (app,name,credential,status) in [(&owner,"direct","original-native-token",StatusCode::OK),
+            (&standby,"forwarded","original-native-token",StatusCode::OK),
+            (&standby,"unauthorized","wrong-token",StatusCode::UNAUTHORIZED)] {
+            let body=serde_json::json!({"runnerId":name,"name":name,"labels":["macos","x86_64"],"platform":"macos","arch":"x86_64","protocolVersion":1});
+            let response=app.clone().oneshot(Request::builder().method("POST").uri("/api/native/register")
+                .header("content-type","application/json").header("authorization",format!("Bearer {credential}"))
+                .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(),status);
+        }
+        let names:Vec<String>=sqlx::query_scalar("SELECT id FROM ci_native_runner ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(names,vec!["direct","forwarded"]);
+        // Registration is a shared write; polling additionally requires the
+        // owner's effect permit, so this checks an actually owner-only route.
+        for (app,runner) in [(&owner,"direct"),(&standby,"forwarded")] {
+            let response=app.clone().oneshot(Request::builder().method("POST").uri("/api/native/poll")
+                .header("content-type","application/json").header("authorization","Bearer original-native-token")
+                .body(Body::from(serde_json::json!({"runnerId":runner,"protocolVersion":1}).to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::OK);
+            let body=to_bytes(response.into_body(),1024).await.unwrap();
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(),serde_json::json!({"job":null}));
+        }
+        for (app,target,marker) in [(&owner,uuid::Uuid::new_v4(),"1"),(&standby,boot,"1"),(&owner,boot,"2")] {
+            let response=app.clone().oneshot(Request::builder().method("POST").uri("/api/native/register")
+                .header("x-ci-target-boot",target.to_string()).header("x-ci-forwarded",marker)
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::CONFLICT);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst),3,"wrong boots and loops must not dispatch another request");
+        server.abort();
+        unsafe {std::env::set_var("CI_TEST_DATABASE_URL",base);}
     }
 
     #[tokio::test]

@@ -634,6 +634,10 @@ async fn step(state: &AppState, db: &impl ConnectionTrait, mut r: Rollout) -> Re
         "exclude_region" => {
             let before = snapshot(&r.service_id).await?;
             probe_survivors(state, &r, &before, &region).await?;
+            if !super::regional_lifecycle::before_withdrawal(state, db, &r.operation_id, &item.id,
+                &r.service_id, &region, &r.baseline.active_metadata["source"], &before).await? {
+                return Ok(());
+            }
             service_discovery::set_region_draining(&r.service_id, &region, true).await?;
             let s = snapshot(&r.service_id).await?;
             update(
@@ -896,6 +900,8 @@ async fn verify_complete(state: &AppState, db: &impl ConnectionTrait, r: &Rollou
 }
 
 async fn rollback_step(state: &AppState, db: &impl ConnectionTrait, r: &Rollout) -> Result<()> {
+    anyhow::ensure!(super::instance_http::Contract::from_metadata(&r.baseline.active_metadata["source"])?.is_none(),
+        "lifecycle-managed rollback requires fresh baseline candidates; retained boot reactivation is forbidden");
     let Some(region) = r.regions.get(r.region_index) else {
         service_deploy::restore_regional_baseline(state, &r.baseline).await?;
         db.execute(Statement::from_sql_and_values(DbBackend::Postgres,

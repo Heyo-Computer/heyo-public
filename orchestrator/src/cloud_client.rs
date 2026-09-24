@@ -438,6 +438,82 @@ pub(crate) struct RetainedDeploymentBinding {
     pub observed_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Non-starting exact-runtime HTTP transport. Ordinary Cloud exec/proxy is not
+/// a fallback: those APIs may wake a retained VM and do not pin its runtime.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ExactRuntimeHttpRequest {
+    pub expected_backend_server_id: String,
+    pub expected_backend_sandbox_id: String,
+    pub port: u16,
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExactRuntimeHttpResponse {
+    pub backend_server_id: String,
+    pub backend_sandbox_id: String,
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
+impl ExactRuntimeHttpRequest {
+    pub(crate) fn validate(&self) -> Result<()> {
+        anyhow::ensure!(!self.expected_backend_server_id.is_empty()
+            && !self.expected_backend_sandbox_id.is_empty() && self.port > 0,
+            "exact-runtime HTTP target is incomplete");
+        anyhow::ensure!(matches!(self.method.as_str(), "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE"), "unsupported exact-runtime HTTP method");
+        anyhow::ensure!(self.path.starts_with('/') && !self.path.starts_with("//")
+            && !self.path.contains(['#', '\\', '\r', '\n']), "exact-runtime HTTP path must be origin-form");
+        for (name, value) in &self.headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())?;
+            reqwest::header::HeaderValue::from_str(value)?;
+            anyhow::ensure!(!matches!(name.as_str(), "host" | "connection" | "keep-alive"
+                | "proxy-authenticate" | "proxy-authorization" | "te" | "trailer"
+                | "transfer-encoding" | "upgrade" | "content-length"), "invalid exact-runtime HTTP header");
+        }
+        Ok(())
+    }
+}
+
+pub(crate) async fn exact_runtime_http(
+    state: &AppState, deployment: &str, request: &ExactRuntimeHttpRequest,
+    body: reqwest::Body,
+) -> Result<(ExactRuntimeHttpResponse, reqwest::Response)> {
+    request.validate()?;
+    let metadata = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(request)?);
+    anyhow::ensure!(metadata.len() <= 16 * 1024, "exact-runtime HTTP request metadata too large");
+    anyhow::ensure!(!deployment.is_empty(), "exact-runtime deployment identity missing");
+    let mut url = reqwest::Url::parse(&format!("{}/internal/orchestration/deployments/",
+        state.config.cloud_internal_url.trim_end_matches('/')))?;
+    url.path_segments_mut().map_err(|_| anyhow::anyhow!("Invalid Cloud URL"))?
+        .pop_if_empty().push(deployment).push("http-request");
+    // Never follow a redirect with the inner application's credentials or
+    // replay an ambiguous mutation against another runtime.
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(30)).build()?;
+    let response = authorized_request(state, client.post(url))
+        .header("content-type", "application/octet-stream")
+        .header("x-heyo-runtime-request", metadata).body(body).send().await?;
+    anyhow::ensure!(response.status() == reqwest::StatusCode::OK, "exact-runtime HTTP transport unavailable ({})", response.status());
+    let metadata = response.headers().get("x-heyo-runtime-response")
+        .context("exact-runtime HTTP response metadata missing")?.as_bytes();
+    anyhow::ensure!(metadata.len() <= 16 * 1024, "exact-runtime HTTP response metadata too large");
+    let metadata: ExactRuntimeHttpResponse = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(metadata)?)?;
+    anyhow::ensure!(metadata.backend_server_id == request.expected_backend_server_id
+        && metadata.backend_sandbox_id == request.expected_backend_sandbox_id,
+        "exact-runtime HTTP response identity mismatch");
+    let status = reqwest::StatusCode::from_u16(metadata.status)?;
+    anyhow::ensure!(!status.is_informational(), "exact-runtime HTTP upgrade is unsupported");
+    Ok((metadata, response))
+}
+
 pub(crate) async fn observe_retained_deployment(
     state: &AppState, deployment_id: &str, guest_port: u16,
 ) -> Result<RetainedDeploymentBinding> {
@@ -990,6 +1066,73 @@ mod tests {
 
     use super::{create_deployment, CreateDeploymentRequest, DeploymentHealthcheckUrls};
     use crate::AppState;
+
+    #[tokio::test]
+    async fn exact_runtime_http_streams_and_never_falls_back_or_follows_redirects() -> Result<()> {
+        use base64::Engine;
+        use axum::{body::{Body, Bytes}, http::{HeaderMap, StatusCode}, response::IntoResponse};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mode = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route("/internal/orchestration/deployments/dep-a/http-request", post({
+            let calls = calls.clone(); let mode = mode.clone();
+            move |headers: HeaderMap, body: Bytes| {
+                let calls = calls.clone(); let mode = mode.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(headers["authorization"], "Bearer test");
+                    let request: Value = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(headers["x-heyo-runtime-request"].as_bytes()).unwrap()).unwrap();
+                    assert_eq!(request["headers"][0], json!(["authorization","Bearer original-caller"]));
+                    assert_eq!(request["expectedBackendSandboxId"], "sb-original");
+                    assert_eq!(body.as_ref(), b"\0binary\xffbody");
+                    match mode.load(Ordering::SeqCst) {
+                        1 => StatusCode::NOT_FOUND.into_response(),
+                        2 => (StatusCode::TEMPORARY_REDIRECT, [("location", "/ordinary-exec")]).into_response(),
+                        value => {
+                            let metadata = json!({"backendServerId":"host-a",
+                                "backendSandboxId": if value == 3 {"sb-other"} else {"sb-original"},
+                                "status":409,"headers":[["content-type","application/octet-stream"]]});
+                            axum::response::Response::builder().status(200)
+                                .header("x-heyo-runtime-response", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&metadata).unwrap()))
+                                .body(Body::from(body)).unwrap()
+                        }
+                    }
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = serde_json::from_value(json!({"server_port":0,"database_url":"postgres://unused",
+            "agent_provider":"test","agent_model":"test","agent_api_key":"","agent_timeout_seconds":1,
+            "agent_max_iterations":1,"jwt_secret":"test","cloud_internal_url":base,"internal_api_key":"test"}))?;
+        let state = AppState { config: Arc::new(config), http_client: reqwest::Client::new(),
+            worker_id: Arc::new("test".into()), ci_workspace_cache: Default::default() };
+        let mut request = super::ExactRuntimeHttpRequest { expected_backend_server_id:"host-a".into(),
+            expected_backend_sandbox_id:"sb-original".into(), port:8080, method:"POST".into(),
+            path:"/api/mutate?x=1".into(), headers:vec![("authorization".into(),"Bearer original-caller".into())] };
+        let (metadata, response) = super::exact_runtime_http(&state,"dep-a",&request,b"\0binary\xffbody".to_vec().into()).await?;
+        assert_eq!(metadata.status,409);
+        assert_eq!(response.bytes().await?.as_ref(),b"\0binary\xffbody");
+        for value in 1..=3 {
+            mode.store(value,Ordering::SeqCst);
+            assert!(super::exact_runtime_http(&state,"dep-a",&request,b"\0binary\xffbody".to_vec().into()).await.is_err());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst),4);
+        for path in ["https://elsewhere/", "//elsewhere/path", "/bad#fragment", "/bad\\path", "/bad\r\nheader"] {
+            request.path=path.into(); assert!(request.validate().is_err());
+        }
+        request.path="/valid?x=1".into();
+        for method in ["GET","HEAD","POST","PUT","PATCH","DELETE"] { request.method=method.into(); request.validate()?; }
+        for method in ["CONNECT","TRACE"] { request.method=method.into(); assert!(request.validate().is_err()); }
+        request.method="GET".into();
+        for header in ["Host","Content-Length","Connection","Transfer-Encoding","Upgrade"] {
+            request.headers=vec![(header.into(),"value".into())]; assert!(request.validate().is_err());
+        }
+        server.abort();
+        Ok(())
+    }
 
     #[test]
     fn creation_digest_matches_cloud_wire_contract() -> Result<()> {

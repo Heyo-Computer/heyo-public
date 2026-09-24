@@ -7,7 +7,8 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 // Shared by final admission/grant transactions and exclusive drain transitions.
 // A process-local permit alone cannot fence a request on another HTTP replica.
-const DRAIN_LOCK: i64 = 0x0c19_6472;
+pub(crate) const DRAIN_LOCK: i64 = 0x0c19_6472;
+const PHASE_QUERY: &str = "SELECT phase FROM (SELECT phase,created_at FROM ci_controller_rollout WHERE phase<>'complete' UNION ALL SELECT phase,created_at FROM ci_application_retirement WHERE phase='draining') phases ORDER BY CASE WHEN phase IN ('prepared','pending') THEN 2 WHEN phase='draining' THEN 1 ELSE 0 END,created_at LIMIT 1";
 
 #[derive(Clone, Default)]
 pub struct Lifecycle {
@@ -43,7 +44,7 @@ impl Lifecycle {
     async fn transaction_phase(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<Option<String>, String> {
         sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(DRAIN_LOCK)
             .execute(&mut **tx).await.map_err(|e| e.to_string())?;
-        sqlx::query_scalar("SELECT phase FROM ci_controller_rollout WHERE phase <> 'complete' ORDER BY created_at LIMIT 1")
+        sqlx::query_scalar(PHASE_QUERY)
             .fetch_optional(&mut **tx).await.map_err(|e| e.to_string())
     }
 
@@ -66,9 +67,7 @@ impl Lifecycle {
     }
 
     async fn phase(store: &Store) -> Result<Option<String>, String> {
-        sqlx::query_scalar(
-            "SELECT phase FROM ci_controller_rollout WHERE phase <> 'complete' ORDER BY created_at LIMIT 1",
-        )
+        sqlx::query_scalar(PHASE_QUERY)
         .fetch_optional(store.pool())
         .await
         .map_err(|e| format!("could not read controller rollout phase: {e}"))

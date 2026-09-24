@@ -149,6 +149,9 @@ async fn snapshot_at(base: &str, id: &str, token: &str) -> Result<Value, String>
 /// Persist intent, not credentials or a running deploy job. Publication and
 /// merge must already have succeeded; the run remains running after this job.
 pub async fn request(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &str, workflow: Option<&str>) -> Result<String, String> {
+    if d.config.managed_deployment.is_some() {
+        return Err("managed CI requires a regional platform update; direct app-lb self-replacement is forbidden".into());
+    }
     let (deployment, base, _) = target(d)?;
     let (application, _, _) = application_target(d)?;
     let run = d.store.get_run(&msg.run_id).await.map_err(|e| e.to_string())?.ok_or("missing run")?;

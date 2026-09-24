@@ -312,6 +312,8 @@ pub struct Config {
     pub controller_app_lb_token: Option<String>,
     /// Shared app identity and its authenticated lifecycle authority.
     pub application_id: Option<String>,
+    /// Platform-injected exact managed deployment identity, not an app-lb ID.
+    pub managed_deployment: Option<String>,
     pub application_orchestrator_url: Option<String>,
     pub application_lifecycle_token: Option<String>,
     pub expected_sha: Option<String>,
@@ -656,7 +658,8 @@ impl Config {
             controller_repository: opt("CI_CONTROLLER_REPOSITORY"),
             controller_app_lb_url: opt("CI_CONTROLLER_APP_LB_URL").map(|u| u.trim_end_matches('/').to_string()),
             controller_app_lb_token: opt("CI_CONTROLLER_APP_LB_TOKEN"),
-            application_id: opt("CI_APPLICATION_ID"),
+            application_id: opt("HEYO_SERVICE_ID").or_else(|| opt("CI_APPLICATION_ID")),
+            managed_deployment: opt("HEYO_DEPLOYMENT_ID"),
             application_orchestrator_url: opt("CI_APPLICATION_ORCHESTRATOR_URL").map(|u| u.trim_end_matches('/').to_string()),
             application_lifecycle_token: opt("CI_APPLICATION_LIFECYCLE_TOKEN"),
             expected_sha: opt("CI_EXPECTED_SHA"),

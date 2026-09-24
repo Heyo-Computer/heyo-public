@@ -1360,15 +1360,18 @@ CI replicas sharing PostgreSQL register distinct process boots. One boot owns
 external effects; the others can serve shared run/source/log reads, submission,
 rerun and transactional completion writes. Queue execution, native grants,
 artifact uploads, VM changes and infrastructure reconcilers require the owner's
-permit. Owner-only HTTP operations return 503 on a standby; deployment routing
-must account for this before exposing both replicas as interchangeable endpoints.
+permit. Managed replicas forward mutations once to the exact owner's boot through
+the per-application authenticated Orchestrator instance transport. The original
+caller authentication is preserved; wrong boots, forwarding loops and unavailable
+transport fail closed. Existing handler effect permits remain required. Unmanaged
+replicas still return 503 for owner-only operations on a standby.
 
 The owner is **non-expiring**. A timeout, cancelled run or lost heartbeat never
 proves that a worker or VM command stopped. An unplanned owner restart therefore
 does not recover execution automatically. There is no force-takeover API; runtime
 fencing and reconciliation must be implemented before claiming crash failover.
 
-Planned controller replacement closes shared admission and grants, waits for
+Legacy direct controller replacement closes shared admission and grants, waits for
 local effect permits, then verifies durable jobs, leases, VM cleanup and remote
 operation fences. It transfers to a named, recently ready boot at a different
 deployment authority before replacing itself. The successor may perform only
@@ -1377,10 +1380,43 @@ completion commit release normal execution. Both regions use the same canonical
 HeyoSecret service-role credential for that recorded authority. Readiness refresh
 only filters handoff candidates; it never revokes or grants ownership.
 
-These are CI-side prerequisites, not a completed managed two-region application.
-The existing external-service adoption binding still represents one deployment;
-it must not be used to label a singleton as a two-region CI service. The platform's
-managed regional application lifecycle and live acceptance remain required.
+Managed retirement uses a separate job-independent command and receipt ledger.
+The running target boot validates the immutable request and obtains its own local
+effect fence. Owner retirement closes shared admission, drains admitted work and
+durable remote obligations, and transfers only to a ready boot in the platform's
+pinned surviving set outside the retiring region. Standby retirement serializes
+with the same owner-row lock as successor selection. Receipt, retirement and owner
+generation commit together; replay cannot transfer twice. Normal admission resumes
+on the successor before the platform continues HTTP withdrawal and replacement.
+Retained old boots cannot issue effects. No timeout grants ownership.
+
+Configure `source.applicationLifecycle` in managed service metadata with `port`
+and `tokenSecretPath`; resolve `CI_APPLICATION_LIFECYCLE_TOKEN` from that same
+per-app HeyoSecret and configure `CI_APPLICATION_ORCHESTRATOR_URL`. Orchestrator
+injects `HEYO_SERVICE_ID`, `HEYO_DEPLOYMENT_ID` and `HEYO_REGION`. CI exposes
+authenticated `/api/lifecycle` identity and asynchronous
+`/api/lifecycle/retirements/{commandId}` command/status endpoints. Transport uses
+raw streaming bodies and base64url-no-pad metadata capped at 16KiB; this is not a
+16MiB body envelope. The native artifact endpoint retains its separate 512MiB
+limit. Full large-artifact transport parity has not been tested.
+
+**This is not a completed or deployed managed two-region application.** The
+legacy managed regional controller has the pre-withdrawal barrier; hierarchical
+application plans reject lifecycle contracts until integrated. Lifecycle rollback
+is blocked: it must create a fresh baseline-revision boot from a proven exact
+recipe, not reactivate retained retired boots. Scalar previous metadata and
+`envRefCount` are not that recipe. Managed self-release currently refuses direct
+app-lb replacement; asynchronous platform submission and verification of both
+regional target identities remain unimplemented. The old external-service
+adoption binding still represents one deployment and must not label a singleton
+as a two-region CI service.
+
+The exact-runtime Cloud transport must never wake stopped instances, retry, follow
+redirects or silently substitute another backend. The public client checks echoed
+backend identities and CI checks the target boot; existing Cloud exec/proxy is not
+a fallback. Private backend safety verification and composed real-process/live
+acceptance remain required. See the single acceptance checklist in
+`docs/MULTI_REGION_DESIGN.md` for local evidence and remaining gates.
 
 ### Migrations
 

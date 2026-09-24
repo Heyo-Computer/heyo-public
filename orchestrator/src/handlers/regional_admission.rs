@@ -421,6 +421,9 @@ pub(super) fn admit_application<'a>(state: &'a crate::AppState, db: &'a sea_orm:
     super::service_adoption::ensure_managed(&tx,&scope.service_id).await?;
     if application_exists(&tx,request,&hash).await? { return Ok(false); }
     let mut baseline = application_baseline(&tx,&scope,&regions,rollout.minimum_serving_replicas.into()).await?;
+    anyhow::ensure!(super::instance_http::Contract::from_metadata(&baseline["activeMetadata"]["source"])?.is_none()
+        && super::instance_http::Contract::from_metadata(deployment.metadata.as_ref().unwrap_or(&Value::Null))?.is_none(),
+        "hierarchical application lifecycle retirement is not integrated; refusing an unbarriered rollout");
     tx.commit().await?;
     let active: RegionalPolicy = serde_json::from_value(baseline["regionalPolicy"].clone())?;
     for region in &regions {

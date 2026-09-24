@@ -11,6 +11,7 @@
 //! with a message naming the variable — not a process that supervisord reports
 //! as `RUNNING` while every job fails.
 
+mod application_lifecycle;
 mod artifacts;
 mod bus;
 mod cd;
@@ -312,10 +313,10 @@ async fn main() {
     };
     // Deployment IDs are scoped to their regional authority; both regions may
     // legitimately use the same ID for instances of the one CI application.
-    let executor_identity = match (&config.controller_deployment, &config.controller_app_lb_url) {
+    let executor_identity = config.managed_deployment.clone().unwrap_or_else(|| match (&config.controller_deployment, &config.controller_app_lb_url) {
         (Some(id), Some(base)) => format!("{}/deployments/{id}", base.trim_end_matches('/')),
         _ => config.instance_id.clone(),
-    };
+    });
     let dispatcher = Arc::new(Dispatcher {
         lifecycle: Arc::new(lifecycle::Lifecycle::default()),
         executor: Arc::new(match executor::ExecutorOwner::register(
@@ -363,6 +364,7 @@ async fn main() {
     }
     dispatcher.clone().spawn_lease_loop();
     dispatcher.clone().spawn_consumers();
+    application_lifecycle::spawn(dispatcher.clone());
     controller_rollout::spawn(dispatcher.clone());
     host_maintenance::spawn(dispatcher.clone());
     host_heyvm_bootstrap_coordinator::spawn(dispatcher.clone());

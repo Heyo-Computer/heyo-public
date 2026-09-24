@@ -140,6 +140,61 @@ impl ExecutorOwner {
         }
         Ok(HandoffFence { pool: self.pool.clone(), boot_id: self.boot_id, local })
     }
+
+    /// Called by the process-local lifecycle worker, never while holding an
+    /// effect permit. Receipt, owner generation and retirement commit together.
+    pub async fn retire_application(&self, request: &crate::application_lifecycle::Retirement) -> anyhow::Result<()> {
+        anyhow::ensure!(request.target.boot_id == self.boot_id && request.target.deployment_id == self.deployment_id,
+            "retirement target is not this process");
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(crate::lifecycle::DRAIN_LOCK).execute(&mut *tx).await?;
+        let (owner, mut generation): (Uuid, i64) = sqlx::query_as(
+            "SELECT boot_id,generation FROM ci_executor_owner WHERE singleton=TRUE FOR UPDATE",
+        ).fetch_one(&mut *tx).await?;
+        let (phase, hash): (String, String) = sqlx::query_as(
+            "SELECT phase,request_hash FROM ci_application_retirement WHERE command_id=$1 AND target_boot=$2 FOR UPDATE",
+        ).bind(&request.command_id).bind(self.boot_id).fetch_one(&mut *tx).await?;
+        anyhow::ensure!(hash == request.hash()?, "retirement payload changed");
+        if phase == "safe" { return Ok(()); }
+        if owner == self.boot_id && phase == "pending" {
+            sqlx::query("UPDATE ci_application_retirement SET phase='draining' WHERE command_id=$1")
+                .bind(&request.command_id).execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+        // Never wait for a local effect while holding the shared admission
+        // transaction. That effect may itself need the database drain lock.
+        let Ok(mut local) = self.local.clone().try_write_owned() else { return Ok(()); };
+        anyhow::ensure!(!local.retired, "retired process cannot produce another acknowledgment");
+        let mut successor = None;
+        if owner == self.boot_id {
+            let obligations: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM ci_job j JOIN ci_run r ON r.id=j.run_id WHERE j.status='running' OR (j.status IN ('pending','queued') AND r.status NOT IN ('success','failure','cancelled'))) OR EXISTS(SELECT 1 FROM ci_native_job WHERE state='leased') OR EXISTS(SELECT 1 FROM ci_host_work) OR EXISTS(SELECT 1 FROM ci_vm_cleanup) OR EXISTS(SELECT 1 FROM ci_vm_pool WHERE status IN ('claimed','building','draining')) OR EXISTS(SELECT 1 FROM ci_service_deployment WHERE status NOT IN ('passed','failed')) OR EXISTS(SELECT 1 FROM ci_host_maintenance WHERE phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE phase NOT IN ('passed','superseded')) OR EXISTS(SELECT 1 FROM ci_service_deployment s WHERE s.status<>'passed' AND (EXISTS(SELECT 1 FROM ci_service_rollout r WHERE r.id=s.id) OR EXISTS(SELECT 1 FROM ci_host_app_lb h WHERE h.id=s.id))) OR EXISTS(SELECT 1 FROM ci_controller_rollout WHERE phase<>'complete')"
+            ).fetch_one(&mut *tx).await?;
+            if obligations { return Ok(()); }
+            for candidate in &request.survivors {
+                anyhow::ensure!(candidate.region != request.target.region && candidate.deployment_id != self.deployment_id,
+                    "successor belongs to the retiring region or deployment");
+                let ready: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM ci_executor_boot WHERE boot_id=$1 AND deployment_id=$2 AND NOT retired AND ready_at>now()-interval '30 seconds')",
+                ).bind(candidate.boot_id).bind(&candidate.deployment_id).fetch_one(&mut *tx).await?;
+                if ready { successor = Some(candidate.boot_id); break; }
+            }
+            let next = successor.ok_or_else(|| anyhow::anyhow!("no platform-approved surviving boot is ready; ownership retained"))?;
+            generation = sqlx::query_scalar("UPDATE ci_executor_owner SET boot_id=$1,generation=generation+1,continuation_operation_id=NULL,transferred_at=now() WHERE singleton=TRUE RETURNING generation")
+                .bind(next).fetch_one(&mut *tx).await?;
+        }
+        sqlx::query("UPDATE ci_executor_boot SET retired=TRUE WHERE boot_id=$1")
+            .bind(self.boot_id).execute(&mut *tx).await?;
+        let receipt = serde_json::json!({"commandId":request.command_id,"operationId":request.operation_id,
+            "stepId":request.step_id,"serviceId":request.service_id,"target":request.target,
+            "requestHash":hash,"successorBootId":successor,"ownerGeneration":generation});
+        sqlx::query("UPDATE ci_application_retirement SET phase='safe',receipt=$2 WHERE command_id=$1 AND receipt IS NULL")
+            .bind(&request.command_id).bind(receipt).execute(&mut *tx).await?;
+        tx.commit().await?;
+        local.retired = true;
+        Ok(())
+    }
 }
 
 impl HandoffFence {
@@ -162,9 +217,18 @@ impl HandoffFence {
             }
         };
         let mut tx = self.pool.begin().await.map_err(db)?;
+        // Lock before inspecting successor eligibility. An UPDATE's statement
+        // snapshot can predate a wait on this row and otherwise miss retirement
+        // committed by the lock holder. Retirement takes this same lock first.
+        let owner: Uuid = sqlx::query_scalar(
+            "SELECT boot_id FROM ci_executor_owner WHERE singleton=TRUE FOR UPDATE",
+        ).fetch_one(&mut *tx).await.map_err(db)?;
+        if owner != self.boot_id {
+            return Err("executor ownership changed".into());
+        }
         let row = sqlx::query(
             "UPDATE ci_executor_owner o SET boot_id=$2,generation=generation+1,continuation_operation_id=$3,transferred_at=now() \
-             WHERE singleton=TRUE AND boot_id=$1 AND EXISTS (SELECT 1 FROM ci_executor_boot b WHERE b.boot_id=$2 AND b.ready_at>now()-interval '30 seconds' AND NOT b.retired) \
+             WHERE singleton=TRUE AND boot_id=$1 AND EXISTS (SELECT 1 FROM ci_executor_boot b JOIN ci_executor_boot source ON source.boot_id=$1 WHERE b.boot_id=$2 AND b.deployment_id<>source.deployment_id AND b.ready_at>now()-interval '30 seconds' AND NOT b.retired) \
              RETURNING generation",
         )
         .bind(self.boot_id).bind(successor).bind(operation)
@@ -221,12 +285,179 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
+    async fn managed_retirement_receipt_replays_once_and_keeps_failed_effects_fenced() {
+        use crate::application_lifecycle::{Instance, Retirement, status};
+        let pool=fixture().await;
+        for migration in crate::store::embedded_migrations() {
+            sqlx::raw_sql(&migration.sql).execute(&pool).await.unwrap();
+        }
+        let us=ExecutorOwner::register(pool.clone(),"dep-us-old").await.unwrap();
+        let eu=ExecutorOwner::register(pool.clone(),"dep-eu-old").await.unwrap();
+        let unapproved=ExecutorOwner::register(pool.clone(),"dep-unapproved").await.unwrap();
+        eu.mark_ready().await.unwrap(); unapproved.mark_ready().await.unwrap();
+        let instance=|owner:&ExecutorOwner,region:&str| Instance {deployment_id:owner.deployment_id.clone(),
+            backend_server_id:format!("host-{region}"),backend_sandbox_id:format!("sb-{}",owner.boot_id()),
+            region:region.into(),boot_id:owner.boot_id()};
+        let first=Retirement {command_id:"op-us".into(),operation_id:"op".into(),step_id:"us-retire".into(),service_id:"ci".into(),
+            target:instance(&us,"us3"),survivors:vec![instance(&eu,"eu1")]};
+        async fn record(pool:&PgPool,request:&Retirement) {
+            sqlx::query("INSERT INTO ci_application_retirement(command_id,target_boot,request_hash,request,phase) VALUES($1,$2,$3,$4,'pending')")
+                .bind(&request.command_id).bind(request.target.boot_id).bind(request.hash().unwrap())
+                .bind(serde_json::to_value(request).unwrap()).execute(pool).await.unwrap();
+        }
+        record(&pool,&first).await;
+        assert!(eu.retire_application(&first).await.is_err(),"a peer cannot fabricate the target's local acknowledgment");
+        let plan=crate::plan::Plan::build(&crate::workflow::Workflow::parse("test.yml","jobs:\n  build:\n    steps: [{run: 'true'}]\n").unwrap()).unwrap();
+        let mut tx=pool.begin().await.unwrap();
+        crate::store::Store::create_run_in(&mut tx,"failed-run",&crate::store::RunRequest::default(),&plan).await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id='failed-run'").execute(&mut *tx).await.unwrap();
+        sqlx::query("UPDATE ci_job SET status='failure' WHERE run_id='failed-run'").execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO ci_host_work SELECT id,'host-unresolved',1 FROM ci_job WHERE run_id='failed-run'").execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        us.retire_application(&first).await.unwrap(); // closes admission
+        let mut tx=pool.begin().await.unwrap();
+        assert!(crate::lifecycle::Lifecycle::admit_in(&mut tx).await.is_err());
+        assert!(crate::lifecycle::Lifecycle::grant_in(&mut tx).await.is_ok(),"admitted work can still drain");
+        tx.rollback().await.unwrap();
+        us.retire_application(&first).await.unwrap();
+        assert!(us.is_owner().await.unwrap(),"a failed parent does not resolve remote effects");
+        assert_eq!(status(&pool,&first.command_id,&first.hash().unwrap()).await.unwrap()["status"],"pending");
+        // This fixture now supplies positive completion of the retained effect.
+        sqlx::query("DELETE FROM ci_host_work WHERE runner_hd_id='host-unresolved'").execute(&pool).await.unwrap();
+        let permit=us.effect_permit().await.unwrap();
+        us.retire_application(&first).await.unwrap();
+        assert!(us.is_owner().await.unwrap());
+        drop(permit);
+        us.retire_application(&first).await.unwrap();
+        let receipt=status(&pool,&first.command_id,&first.hash().unwrap()).await.unwrap();
+        assert_eq!(receipt["receipt"]["successorBootId"],eu.boot_id().to_string());
+        assert_eq!(receipt["receipt"]["ownerGeneration"],2);
+        for _ in 0..3 {us.retire_application(&first).await.unwrap();}
+        assert_eq!(status(&pool,&first.command_id,&first.hash().unwrap()).await.unwrap(),receipt);
+        assert!(us.effect_permit().await.is_err()); assert!(unapproved.effect_permit().await.is_err());
+        let mut tx=pool.begin().await.unwrap();
+        crate::lifecycle::Lifecycle::admit_in(&mut tx).await.unwrap(); tx.rollback().await.unwrap();
+        let candidate=ExecutorOwner::register(pool.clone(),"dep-us-candidate").await.unwrap();
+        candidate.mark_ready().await.unwrap();
+        let second=Retirement {command_id:"op-eu".into(),step_id:"eu-retire".into(),target:instance(&eu,"eu1"),
+            survivors:vec![instance(&candidate,"us3")],..first.clone()};
+        record(&pool,&second).await;
+        eu.retire_application(&second).await.unwrap(); eu.retire_application(&second).await.unwrap();
+        assert_eq!(status(&pool,&second.command_id,&second.hash().unwrap()).await.unwrap()["receipt"]["ownerGeneration"],3);
+        candidate.effect_permit().await.unwrap(); assert!(eu.effect_permit().await.is_err());
+        let mut changed=second.clone(); changed.operation_id="different".into();
+        assert!(eu.retire_application(&changed).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
     async fn standby_cannot_produce_effects() {
         let pool = fixture().await;
         let owner = ExecutorOwner::register(pool.clone(), "us3").await.unwrap();
         let standby = ExecutorOwner::register(pool, "eu1").await.unwrap();
         let _permit = owner.effect_permit().await.unwrap();
         assert!(standby.effect_permit().await.unwrap_err().contains("standby"));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
+    async fn standby_retirement_serializes_with_transfer() {
+        use crate::application_lifecycle::{Instance, Retirement, status};
+        let pool = fixture().await;
+        for migration in crate::store::embedded_migrations() {
+            sqlx::raw_sql(&migration.sql).execute(&pool).await.unwrap();
+        }
+        let owner = ExecutorOwner::register(pool.clone(), "us3").await.unwrap();
+        let standby = ExecutorOwner::register(pool.clone(), "eu1").await.unwrap();
+        standby.mark_ready().await.unwrap();
+        let request = Retirement {command_id:"retire-standby".into(), operation_id:"op".into(),
+            step_id:"eu-retire".into(), service_id:"ci".into(), survivors:vec![],
+            target:Instance {deployment_id:"eu1".into(), backend_server_id:"host-eu".into(),
+                backend_sandbox_id:"sandbox-eu".into(), region:"eu1".into(), boot_id:standby.boot_id()}};
+        let hash = request.hash().unwrap();
+        sqlx::query("INSERT INTO ci_application_retirement(command_id,target_boot,request_hash,request,phase) VALUES($1,$2,$3,$4,'pending')")
+            .bind(&request.command_id).bind(standby.boot_id()).bind(&hash)
+            .bind(serde_json::to_value(&request).unwrap()).execute(&pool).await.unwrap();
+        let (retirement, transfer) = tokio::join!(
+            standby.retire_application(&request),
+            async { owner.handoff_fence().await.unwrap()
+                .transfer_to(standby.boot_id(), VerifiedDurableContinuation::FullyQuiesced).await },
+        );
+        retirement.unwrap();
+        let receipt = status(&pool, &request.command_id, &hash).await.unwrap();
+        if transfer.is_err() {
+            assert_eq!(receipt["status"], "safe-to-retire");
+            standby.retire_application(&request).await.unwrap();
+            standby.mark_ready().await.unwrap();
+            assert!(owner.effect_permit().await.is_ok());
+            assert!(standby.effect_permit().await.is_err());
+            assert_eq!(owner.ready_successor().await.unwrap(), None);
+        } else {
+            // Promotion won the owner-row lock: no standby acknowledgment is
+            // allowed. With no approved survivor this owner must remain fenced
+            // against retirement, not manufacture a safe receipt.
+            assert_eq!(receipt["status"], "pending");
+            assert!(standby.effect_permit().await.is_ok());
+            assert!(owner.effect_permit().await.is_err());
+            assert!(standby.retire_application(&request).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
+    async fn transfer_rechecks_retirement_after_waiting_for_owner_lock() {
+        let pool = fixture().await;
+        let owner = ExecutorOwner::register(pool.clone(), "us3").await.unwrap();
+        let standby = ExecutorOwner::register(pool.clone(), "eu1").await.unwrap();
+        standby.mark_ready().await.unwrap();
+        // Hold the retirement transaction open until transfer is demonstrably
+        // waiting on it. This reproduces the stale statement-snapshot boundary.
+        let mut retirement = pool.begin().await.unwrap();
+        let blocker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *retirement).await.unwrap();
+        sqlx::query("SELECT boot_id FROM ci_executor_owner WHERE singleton=TRUE FOR UPDATE")
+            .execute(&mut *retirement).await.unwrap();
+        let successor = standby.boot_id();
+        let moving = owner.clone();
+        let transfer = tokio::spawn(async move {
+            moving.handoff_fence().await.unwrap()
+                .transfer_to(successor, VerifiedDurableContinuation::FullyQuiesced).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",
+                ).bind(blocker).fetch_one(&pool).await.unwrap();
+                if waiting { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        sqlx::query("UPDATE ci_executor_boot SET retired=TRUE WHERE boot_id=$1")
+            .bind(successor).execute(&mut *retirement).await.unwrap();
+        retirement.commit().await.unwrap();
+        assert!(transfer.await.unwrap().unwrap_err().contains("retired"));
+        assert!(owner.effect_permit().await.is_ok());
+        assert!(standby.effect_permit().await.is_err());
+        let generation: i64 = sqlx::query_scalar("SELECT generation FROM ci_executor_owner")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(generation, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
+    async fn transfer_cannot_return_to_another_boot_of_the_same_deployment() {
+        let pool = fixture().await;
+        let first = ExecutorOwner::register(pool.clone(), "us3").await.unwrap();
+        let second = ExecutorOwner::register(pool.clone(), "eu1").await.unwrap();
+        let duplicate = ExecutorOwner::register(pool, "eu1").await.unwrap();
+        second.mark_ready().await.unwrap();
+        duplicate.mark_ready().await.unwrap();
+        first.handoff_fence().await.unwrap()
+            .transfer_to(second.boot_id(), VerifiedDurableContinuation::FullyQuiesced).await.unwrap();
+        assert!(second.handoff_fence().await.unwrap()
+            .transfer_to(duplicate.boot_id(), VerifiedDurableContinuation::FullyQuiesced).await.is_err());
+        assert!(second.effect_permit().await.is_ok());
+        assert!(duplicate.effect_permit().await.is_err());
     }
 
     #[tokio::test]

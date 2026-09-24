@@ -755,7 +755,68 @@ references until ownership-safe cleanup is separately performed.
 | [ ] app-lb update | Continuous public and peer requests plus held stream during old/new switch; no failures; crash helper after switch intent and reconcile exact instance | Current updater restarts in place; replacement/handoff missing |
 | [ ] Overload / partition | Alternate region cannot meet budget; block planned drain. Stale observer cannot authorize maintenance; no forwarding loops under split views | Not live-proven |
 | [ ] Whole-host maintenance | Withdraw external origin and regional capacity, drain, stop target ingress/host, verify normal hostname and dependencies through survivor, restore | External entry and stateful dependency failover not established |
-| [ ] CI as one app | Shared run state, one job owner, controller/worker restart and regional evacuation without duplicate action | Deferred until platform gates pass |
+| [ ] CI as one app | Shared run state, one job owner, controller/worker restart and regional evacuation without duplicate action | Local shared-state/executor tests pass; generic lifecycle barrier and owner forwarding are drafts, not deployed capability. Fresh-boot rollback, hierarchical integration, managed self-release and composed acceptance remain incomplete |
+
+Local managed-CI checkpoint, 2026-09-24 (unpublished; no live state changed):
+
+- `cargo test --locked --manifest-path ci/Cargo.toml`: 458 CI and 46 native-agent
+  tests passed; 107 integrations remain ignored. Git fixtures used test-scoped
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=false`
+  because this orb has no commit-signing key. Orchestrator's equivalent default
+  command passed 107 main and 7 provider tests (16 and 3 ignored). These are local
+  default suites, not evidence that ignored or live gates passed.
+- CI's PostgreSQL executor suite has 9 passing tests, including two sequential
+  us3→eu1→new-us3 transfers, immutable receipt replay, wrong-target refusal,
+  retained failed-effect obligations, local effect permits and the production
+  standby-retirement/owner-selection race. A separate lock-wait test rejects a
+  stale successor snapshot after retirement commits. Freshness selects successors
+  but never expires ownership.
+- The PostgreSQL/NATS frontend fixture passes direct and forwarded writes,
+  owner-only native polling, original-caller authentication and wrong-boot/loop
+  rejection. Its Orchestrator proxy is a protocol fixture, not the private Cloud
+  or backend implementation. No large-artifact parity claim follows from this.
+- Orchestrator's PostgreSQL barrier fixture pins target boots and the retiring
+  hook contract, loses the successful hook reply, reconstructs the controller,
+  reads the same receipt, then retires eu1 toward the new us3 boot. Application
+  receipts in this fixture are doubles. It does not substitute for composing
+  the actual CI process, Cloud transport and regional rollout controller.
+- The raw-streaming Cloud client fixture verifies binary body preservation,
+  echoed backend identity, unsupported endpoint refusal and no redirect fallback.
+  Request/response metadata is capped at 16KiB, separately from CI's 512MiB native
+  artifact limit. Clients explicitly disable retries. Ordinary Cloud exec and
+  public data-plane proxy are forbidden fallbacks because they can wake instances.
+
+Reproduce targeted disposable checks with `cargo test --locked --manifest-path
+ci/Cargo.toml executor::tests -- --ignored`, the CI test filter
+`managed_frontends_preserve_auth_and_reject_wrong_boot_without_retry`, and the
+Orchestrator filter `lifecycle_barrier_pins_targets_and_recovers_lost_reply_after_restart`
+(the latter two also require `-- --ignored`). Set `CI_TEST_DATABASE_URL` and
+`ORCHESTRATOR_TEST_DATABASE_URL` to disposable PostgreSQL 17, and `CI_NATS_URL` /
+`CI_TEST_NATS_URL` to disposable JetStream. Run the frontend fixture alone because
+it temporarily scopes its database environment. Do not run all ignored CI tests:
+some invoke real heyvm.
+
+Remaining gates are explicit safety refusals, not completed implementation:
+hierarchical application plans reject lifecycle contracts; managed self-release
+rejects direct app-lb replacement until asynchronous platform submission and
+both-region completion verification exist; lifecycle rollback refuses retained
+boot reactivation. Fresh rollback requires a proven per-endpoint immutable archive,
+runtime, command, mount, configuration and secret-reference recipe. Ordinary
+`service_deployment_runs.request` retains `envRefCount`, not those references;
+scalar previous metadata is not per-endpoint provenance. Prior regional operation
+requests/slots or exact candidate intents are possible evidence, not assumed facts.
+No live baseline IDs or authoritative recipes were established in this orb.
+
+Owner crash before handoff, or successor crash after it, remains blocked pending
+authoritative runtime fencing and reconciliation. A successful stop with unknown
+runtime status is not fencing, and timeout takeover remains prohibited. Private
+transport must pin deployment/backend identities through the stream lifetime and
+prove the runtime is already running without waking it; CI must also validate the
+application boot. Private safety tests, unhealthy-candidate/fresh-rollback tests,
+the combined real-process restart/lost-receipt sequence, and all live acceptance
+gates remain outstanding. Admission closure is not uninterrupted submission
+availability. PR119, production registrations, databases, workspaces and disks
+were not changed by this checkpoint.
 
 Local evidence, 2026-09-22: app-lb has 854 passing tests (6 ignored); Orchestrator
 has 99 passing tests with ignored tests explicitly included against disposable
