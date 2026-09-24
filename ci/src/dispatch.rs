@@ -6652,7 +6652,7 @@ jobs:
         let mut networks = d.runners.snapshot().networks.clone();
         networks[0].runners.push(crate::runners::Runner { id: "hd-other".into(), name: "other".into(), status: crate::runners::RunnerStatus::Online, last_seen_at: None });
         d.runners.set_test_pool(crate::runners::Pool { networks, default_network_id: "local".into(), default_node_id: "hd-local".into(), ..Default::default() });
-        for scenario in ["success", "failed", "identity", "cancel-before", "cancel-after", "deadline", "old-cloud"] {
+        for scenario in ["success", "failed", "identity", "cancel-before", "cancel-after", "deadline", "deadline-after", "old-cloud"] {
             *remote.lock().unwrap() = Remote { status: "maintenance".into(), lost: true, ..Default::default() };
             let workflow = crate::workflow::Workflow::parse("maintenance.yml", "jobs:\n  upgrade:\n    steps: [{uses: ci/promote-service-archive}, {uses: ci/host-heyvm-maintenance}]\n  existing:\n    steps: [{run: echo existing}]\n  waiting:\n    steps: [{run: echo waiting}]\n  other:\n    steps: [{run: echo other}]\n").unwrap();
             let plan = crate::plan::Plan::build(&workflow).unwrap();
@@ -6779,7 +6779,8 @@ jobs:
                 assert_eq!(remote.lock().unwrap().posts.len(), 2);
                 { let mut r = remote.lock().unwrap(); r.hidden = false; r.status = if scenario == "failed" { "failed" } else { "completed" }.into(); r.wrong = scenario == "identity"; }
                 if scenario == "cancel-after" { d.store.cancel_run(&run).await.unwrap(); }
-                let (a,b) = tokio::join!(maintenance::poll(&restarted, &id, "fake-key", Some(&target)), maintenance::poll(&restarted, &id, "fake-key", Some(&target))); a.unwrap(); b.unwrap();
+                if scenario == "deadline-after" { sqlx::query("UPDATE ci_host_maintenance SET deadline=now()-interval '1 second' WHERE id=$1").bind(&id).execute(d.store.pool()).await.unwrap(); }
+                maintenance::poll(&restarted, &id, "fake-key", Some(&target)).await.unwrap();
             }
             let success = scenario == "success";
             assert_eq!(maintenance::cordoned(&d.store, "hd-local").await.unwrap(), !success, "{scenario}");
@@ -6787,11 +6788,27 @@ jobs:
             assert_eq!(d.store.get_job(&job.id).await.unwrap().unwrap().status, expected, "{scenario}");
             assert_eq!(d.store.get_run(&run).await.unwrap().unwrap().status, expected, "{scenario}");
             let posts = remote.lock().unwrap().posts.len();
-            remote.lock().unwrap().status = "completed".into();
+            // Missing credentials, changed trusted mapping, and unavailable
+            // remote evidence cannot release a failed operation's fence.
+            maintenance::poll(&d.store, &id, "", Some(&target)).await.unwrap();
+            maintenance::poll(&d.store, &id, "fake-key", None).await.unwrap();
+            remote.lock().unwrap().hidden = true;
             maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
+            assert_eq!(maintenance::cordoned(&d.store, "hd-local").await.unwrap(), !success);
+            remote.lock().unwrap().hidden = false;
+            remote.lock().unwrap().status = "completed".into();
+            let (a,b) = tokio::join!(maintenance::poll(&d.store, &id, "fake-key", Some(&target)), maintenance::poll(&d.store, &id, "fake-key", Some(&target))); a.unwrap(); b.unwrap();
             assert_eq!(remote.lock().unwrap().posts.len(), posts);
-            assert_eq!(maintenance::cordoned(&d.store, "hd-local").await.unwrap(), !success, "failure must be sticky");
-            // Disposable fixture cleanup only; production has no automatic uncordon.
+            let recovered = matches!(scenario, "failed" | "cancel-after" | "deadline-after");
+            assert_eq!(maintenance::cordoned(&d.store, "hd-local").await.unwrap(), !(success || recovered), "{scenario}");
+            assert_eq!(d.store.get_job(&job.id).await.unwrap().unwrap().status, expected, "original job history");
+            assert_eq!(d.store.get_run(&run).await.unwrap().unwrap().status, expected, "original run history");
+            if recovered {
+                let row = sqlx::query("SELECT status,message FROM ci_service_deployment WHERE id=$1").bind(&id).fetch_one(d.store.pool()).await.unwrap();
+                assert_eq!(row.get::<String,_>("status"), "failed");
+                assert_eq!(row.get::<String,_>("message").matches("Late authenticated Cloud completion").count(), 1);
+            }
+            // Disposable fixture cleanup only.
             sqlx::query("DELETE FROM ci_host_maintenance WHERE id=$1").bind(&id).execute(d.store.pool()).await.unwrap();
             d.pool.forget(&sandbox).await.unwrap();
         }

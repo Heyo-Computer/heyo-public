@@ -100,6 +100,23 @@ regions and inject the region at startup. This app does not register routes,
 publish discovery, or grant itself serving weight. Rewriting the workload does
 not enable the currently gated managed first-replica enrollment path below.
 
+For a fresh disposable gateway deployment, `.ci/workflows/regional-smoke.yml`
+packages one workload artifact with `REVISION`, `SHA256SUMS` and `start.sh`.
+Supply `HEYO_REGION` separately for each managed VM. Its live verifier uses only
+a public HTTPS source app-lb, preserving the application Host independently of
+the gateway's TLS identity:
+
+```sh
+python3 app-lb/testdata/regional_live_smoke.py --source-origin https://SOURCE_GATEWAY --host APPLICATION_HOST --region DESTINATION_REGION --revision EXACT_ARTIFACT_REVISION
+```
+
+Run it in both directions after configuring authenticated `forward` and `local`
+gateway routes with verified destination host-local VM bindings. It verifies
+region/revision headers, request preservation, exactly one POST admission and
+a held response body. It does not provision resources or bypass TLS validation.
+These transport checks do not establish automatic regional selection, failover,
+or coordinated rollout/drain acceptance.
+
 ### Hierarchical discovery (local integration; not live acceptance)
 
 `discovery.regional` contains `gateway_id`, `backend_server_id`, `environment` and
@@ -841,6 +858,14 @@ For hierarchical deployments, namespace administrators can POST to
 and the destination's `region`, `gatewayId`, `gatewayBootId`, `backendServerId`,
 `deploymentId` and `revision`. The receipt echoes that request, source gateway/boot,
 and the destination's gateway/boot and exact backend URL.
+
+Both `/deployments/:id/regional-active-probe` and
+`/deployments/:id/regional-probe` accept `?staged=true` to use the staged
+route-handoff successor as the source gateway before cutover. Omit the query
+to probe the live deployment. A missing staged successor returns 404; it never
+falls back to the live predecessor. Namespace authorization, maintenance checks,
+policy and boot validation apply to the selected deployment in either mode.
+Probing does not commit the handoff or change public route selection.
 
 This probes the **active** policy even when a newer proposal is pending. Execution
 identity correlates the result; it does not authorize using an inactive proposal.

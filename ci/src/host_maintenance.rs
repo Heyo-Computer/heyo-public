@@ -236,12 +236,39 @@ pub(crate) async fn poll(store: &Store, id: &str, token: &str, configured: Optio
     let Some(run) = run else { return Ok(()) };
     let run_status: String = sqlx::query_scalar("SELECT status FROM ci_run WHERE id=$1 FOR UPDATE SKIP LOCKED").bind(&run).fetch_optional(&mut *tx).await?.unwrap_or_default();
     if run_status.is_empty() { return Ok(()); }
-    let row = sqlx::query("SELECT h.*,s.job_id,s.step_id FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.id=$1 AND h.phase NOT IN ('passed','failed') FOR UPDATE OF h SKIP LOCKED")
+    let row = sqlx::query("SELECT h.*,s.job_id,s.step_id FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.id=$1 AND h.phase<>'passed' FOR UPDATE OF h SKIP LOCKED")
         .bind(id).fetch_optional(&mut *tx).await?;
     let Some(row) = row else { return Ok(()) };
     let request: Request = serde_json::from_value(row.get("request"))?;
     let job: String = row.get("job_id"); let step: String = row.get("step_id");
     let phase: String = row.get("phase");
+    if phase == "failed" {
+        // A failed CI run is immutable history, not proof the independent host
+        // helper failed. Observe only; never submit or replay from this phase.
+        sqlx::query("UPDATE ci_host_maintenance SET updated_at=now() WHERE id=$1")
+            .bind(id).execute(&mut *tx).await?;
+        if configured == Some(&request.target) && !token.trim().is_empty() {
+            let base = endpoint(&request.target.cloud_url)?;
+            let response = client()?.get(format!("{base}/internal/mvm-ctrl/backend-servers/host-heyvm/upgrade/{id}"))
+                .bearer_auth(token).send().await;
+            if let Ok(response) = response {
+                if response.status().is_success() {
+                    if let Ok(body) = response.json::<Value>().await {
+                        if matches!(verify(&body, &request), Ok(true)) {
+                            sqlx::query("UPDATE ci_host_maintenance SET phase='passed',updated_at=now() WHERE id=$1")
+                                .bind(id).execute(&mut *tx).await?;
+                            sqlx::query("UPDATE ci_service_deployment SET message=COALESCE(message,'') || $2,updated_at=now() WHERE id=$1")
+                                .bind(id).bind("\nLate authenticated Cloud completion verified against exact maintenance identity and executable provenance; host fence released. Original CI failure is preserved.")
+                                .execute(&mut *tx).await?;
+                            Store::add_service_deployment_event(&mut tx, id).await?;
+                        }
+                    }
+                }
+            }
+        }
+        tx.commit().await?;
+        return Ok(());
+    }
     let deadline: chrono::DateTime<chrono::Utc> = row.get("deadline");
     let job_status: String = sqlx::query_scalar("SELECT status FROM ci_job WHERE id=$1 FOR UPDATE").bind(&job).fetch_one(&mut *tx).await?;
     let stopped = matches!(run_status.as_str(), "cancelled" | "failure") || job_status != "running";
@@ -327,7 +354,7 @@ pub fn spawn(d: Arc<Dispatcher>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let rows = sqlx::query("SELECT h.id,h.request,s.job_id,s.run_id FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase NOT IN ('passed','failed') ORDER BY h.created_at LIMIT 32").fetch_all(d.store.pool()).await;
+            let rows = sqlx::query("SELECT h.id,h.request,s.job_id,s.run_id FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase<>'passed' ORDER BY (h.phase='failed'),h.updated_at LIMIT 32").fetch_all(d.store.pool()).await;
             let Ok(rows) = rows else { continue };
             for row in rows {
                 let id: String = row.get("id"); let run: String = row.get("run_id");
