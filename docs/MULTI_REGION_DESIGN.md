@@ -34,8 +34,9 @@ PostgreSQL storage locally, with retained-file import and no original-file
 deletion. Cross-controller source replay and log reads were exercised against
 disposable PostgreSQL; log appends preserve concurrent writes and native
 completion logs roll back with failed completion transactions. Verification:
-458 CI unit tests, 46 native-agent tests, 34 store tests, 5 native tests and the
-cross-controller HTTP/HTML log test passed; 94 integration tests remain ignored
+458 CI unit tests, 46 native-agent tests, 34 store tests, 5 native tests, 10
+controller-rollout tests and the cross-controller HTTP/HTML log test passed;
+95 integration tests remain ignored
 by the default suite. These changes are not deployed.
 
 Executor/HTTP role separation, positive worker quiescence/handoff and the live
@@ -44,8 +45,9 @@ barrier covering job tasks, infrastructure reconcilers and HTTP side effects;
 the current lifecycle work lock does not cover every effect producer. Transfer
 to a named surviving boot must precede self-replacement, with the exact rollout
 obligation transferred, rather than waiting for the replaced boot to release
-ownership. Admission and native grants also need transactional shared drain
-fencing; process-local locks alone do not fence a second HTTP instance.
+ownership. Admission and native grants now have transactional shared drain
+fencing, with a test of a peer's delayed submission and in-flight grant. This
+does not replace the still-missing barrier around external-effect producers.
 Uncertain remote effects must be reconciled, never replayed because a timer ran
 out. Production CI remains on the previous revision while this work proceeds.
 

@@ -1078,8 +1078,12 @@ claiming work still use the retry ladder.
 The same rule applies to native runners: expiry rejects stale reports but does
 not reassign the execution or free its runner capacity. These guards are
 prerequisites for regional CI, not a complete multi-controller implementation.
-Shared log storage, executor handoff and recovery remain required before
-running a second CI controller against production state.
+Source and logs use shared storage. Final submission transactions and native
+execution grants serialize with shared drain transitions, so a request that
+passed an earlier process-local check cannot commit through a closed gate.
+Already-admitted native jobs can obtain grants during draining; quiescence waits
+for those transactions and blocks later grants. Executor handoff and recovery
+remain required before running a second CI controller against production state.
 
 `uses: default` resolves through **`~/.heyo/daemon.json`** — heyvmd mints
 `backend_id` there on first start and registers and heartbeats under it, so it is

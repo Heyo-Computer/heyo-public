@@ -562,6 +562,7 @@ impl Dispatcher {
         warnings.extend(skipped.into_iter().map(|s| format!("no run started — {s}")));
         let mut tx = self.store.pool().begin().await
             .map_err(|e| DispatchError::Workflow(format!("begin submission: {e}")))?;
+        crate::lifecycle::Lifecycle::admit_in(&mut tx).await.map_err(DispatchError::Workflow)?;
         for (id, request, plan) in &planned {
             Store::create_run_in(&mut tx, id, request, plan).await?;
             Store::record_source_in(&mut tx, id, &source_bytes).await?;

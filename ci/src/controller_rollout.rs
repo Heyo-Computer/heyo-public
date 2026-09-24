@@ -535,6 +535,42 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
+    async fn regional_admission_and_native_grants_serialize_with_drain() {
+        let f = fixture().await;
+        let first = Lifecycle::default();
+        let peer = Lifecycle::default();
+        // This peer passed the early process-local check before source preparation.
+        let _early = peer.admission(&f.store).await.unwrap();
+        let mut admitted = f.store.pool().begin().await.unwrap();
+        Lifecycle::admit_in(&mut admitted).await.unwrap();
+        let closing_store = f.store.clone();
+        let mut closing = tokio::spawn(async move { first.close_admission(&closing_store, "op").await });
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut closing).await.is_err(),
+            "another process must wait for an already-admitted transaction");
+        admitted.commit().await.unwrap();
+        closing.await.unwrap().unwrap();
+        let mut late = f.store.pool().begin().await.unwrap();
+        assert!(Lifecycle::admit_in(&mut late).await.unwrap_err().contains("submissions are closed"),
+            "the early peer permit cannot authorize a late submission commit");
+        late.rollback().await.unwrap();
+
+        let mut grant = f.store.pool().begin().await.unwrap();
+        Lifecycle::grant_in(&mut grant).await.unwrap();
+        assert!(!peer.quiesce(&f.store, "op").await.unwrap(), "native grant is still in flight on a peer");
+        grant.commit().await.unwrap();
+        assert!(peer.quiesce(&f.store, "op").await.unwrap());
+        let mut late_grant = f.store.pool().begin().await.unwrap();
+        assert!(Lifecycle::grant_in(&mut late_grant).await.unwrap_err().contains("new work is paused"));
+        late_grant.rollback().await.unwrap();
+        let result = crate::native::poll(&f.store,
+            crate::native::Poll { runner_id: "unused".into(), protocol_version: 1 },
+            "http://localhost", &crate::secrets::Secrets::unconfigured()).await;
+        assert!(matches!(result, Err(crate::native::PollError::Internal(message)) if message.contains("new work is paused")),
+            "poll must enforce the transactional gate itself");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
     async fn durable_admission_and_job_lease_barriers_survive_restart() {
         let f = fixture().await; let s = &f.store;
         let gate = Arc::new(Lifecycle::default());

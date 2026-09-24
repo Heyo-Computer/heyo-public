@@ -5,6 +5,10 @@ use sqlx::Row;
 use std::sync::Arc;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
+// Shared by final admission/grant transactions and exclusive drain transitions.
+// A process-local permit alone cannot fence a request on another HTTP replica.
+const DRAIN_LOCK: i64 = 0x0c19_6472;
+
 #[derive(Clone, Default)]
 pub struct Lifecycle {
     admission: Arc<RwLock<()>>,
@@ -12,6 +16,31 @@ pub struct Lifecycle {
 }
 
 impl Lifecycle {
+    async fn transaction_phase(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<Option<String>, String> {
+        sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(DRAIN_LOCK)
+            .execute(&mut **tx).await.map_err(|e| e.to_string())?;
+        sqlx::query_scalar("SELECT phase FROM ci_controller_rollout WHERE phase <> 'complete' ORDER BY created_at LIMIT 1")
+            .fetch_optional(&mut **tx).await.map_err(|e| e.to_string())
+    }
+
+    /// Recheck at the commit boundary after potentially slow source preparation.
+    pub async fn admit_in(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), String> {
+        match Self::transaction_phase(tx).await? {
+            None => Ok(()),
+            Some(phase) if matches!(phase.as_str(), "prepared" | "pending") => Ok(()),
+            Some(phase) => Err(format!("controller rollout is {phase}; submissions are closed")),
+        }
+    }
+
+    /// Existing admitted jobs may receive native execution grants while draining.
+    pub async fn grant_in(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), String> {
+        match Self::transaction_phase(tx).await? {
+            None => Ok(()),
+            Some(phase) if matches!(phase.as_str(), "prepared" | "pending" | "draining") => Ok(()),
+            Some(phase) => Err(format!("controller rollout is {phase}; new work is paused")),
+        }
+    }
+
     async fn phase(store: &Store) -> Result<Option<String>, String> {
         sqlx::query_scalar(
             "SELECT phase FROM ci_controller_rollout WHERE phase <> 'complete' ORDER BY created_at LIMIT 1",
@@ -45,6 +74,8 @@ impl Lifecycle {
     pub async fn close_admission(&self, store: &Store, id: &str) -> Result<(), String> {
         let _exclusive = self.admission.write().await;
         let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(DRAIN_LOCK)
+            .execute(&mut *tx).await.map_err(|e| e.to_string())?;
         let phase: Option<String> = sqlx::query_scalar(
             "SELECT phase FROM ci_controller_rollout WHERE id=$1 FOR UPDATE",
         )
@@ -67,6 +98,9 @@ impl Lifecycle {
             return Ok(false);
         };
         let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
+        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)").bind(DRAIN_LOCK)
+            .fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
+        if !locked { return Ok(false); }
         let phase: Option<String> = sqlx::query_scalar(
             "SELECT phase FROM ci_controller_rollout WHERE id=$1 FOR UPDATE",
         ).bind(id).fetch_optional(&mut *tx).await.map_err(|e|e.to_string())?;

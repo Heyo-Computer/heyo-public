@@ -161,6 +161,7 @@ pub async fn poll(
     validate_protocol(p.protocol_version).map_err(PollError::Rejected)?;
     let internal = |e: Box<dyn std::fmt::Display>| PollError::Internal(e.to_string());
     let mut tx = store.pool().begin().await.map_err(|e| internal(Box::new(e)))?;
+    crate::lifecycle::Lifecycle::grant_in(&mut tx).await.map_err(PollError::Internal)?;
     let runner = sqlx::query("UPDATE ci_native_runner SET last_seen_at=now() WHERE id=$1 RETURNING labels,max_concurrent")
         .bind(&p.runner_id).fetch_optional(&mut *tx).await.map_err(|e| internal(Box::new(e)))?
         .ok_or_else(|| PollError::Rejected("runner is not registered".into()))?;
