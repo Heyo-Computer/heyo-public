@@ -183,6 +183,18 @@ impl Autoscaler {
         WorkspaceReplacementGuard { _creates: self.creates.acquire_many(CREATE_CONCURRENCY as u32).await.expect("create semaphore open") }
     }
 
+    /// A record may own resources absent from its in-memory pool. Removing it
+    /// would turn those resources into orphans for a later sweep. The caller
+    /// holds rollout, registry and allocation guards through removal.
+    pub(crate) async fn has_owned_resources(&self, id: &str) -> Result<bool, String> {
+        let fleet = self.runtime.list().await;
+        fleet.heyvm?;
+        if let Some(result) = fleet.lxc { result?; }
+        let inactive = self.vms().list_inactive().await.map_err(|e| e.to_string())?;
+        Ok(fleet.sandboxes.iter().chain(inactive.iter())
+            .any(|vm| vm::owner_of(&vm.name) == Some(id)))
+    }
+
     /// Fence a workspace rollout before its replacement becomes live.
     /// Acquiring all slots first waits out creates already using the old seed;
     /// the durable fence then prevents both the old and new objects creating.
@@ -3272,5 +3284,45 @@ mod tests {
         create.await;
         assert!(d.pending().is_empty());
         assert!(scaler.workspaces.blocked(&d).is_some());
+    }
+
+    #[tokio::test]
+    async fn record_only_inventory_detects_untracked_and_inactive_resources() {
+        use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+        use std::sync::atomic::AtomicUsize;
+        let mode = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/deployed-sandboxes", get(|State(mode): State<Arc<AtomicUsize>>| async move {
+                let owned = serde_json::json!({
+                    "id": "sb-1", "name": "applb-demo-000000000001", "status": "running",
+                    "image": "artifacts", "uptime_secs": 0, "is_deployed": true,
+                    "status_changed_at": "", "urls": [], "guest_ip": "127.0.0.1"
+                });
+                Json(if mode.load(Ordering::SeqCst) == 2 { vec![owned] } else { vec![] })
+            }))
+            .route("/sandboxes/inactive", get(|State(mode): State<Arc<AtomicUsize>>| async move {
+                if mode.load(Ordering::SeqCst) == 3 { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
+                let owned = serde_json::json!({
+                    "id": "sb-1", "name": "applb-demo-000000000001", "status": "stopped",
+                    "image": "artifacts", "uptime_secs": 0, "is_deployed": true,
+                    "status_changed_at": "", "urls": []
+                });
+                let rows = if mode.load(Ordering::SeqCst) == 1 { vec![owned] } else { vec![] };
+                Json(serde_json::json!({"sandboxes": rows, "next_cursor": null})).into_response()
+            })).with_state(mode.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (scaler, registry) = autoscaler_against(&url, spec());
+        assert!(registry.get("demo").unwrap().backends().is_empty());
+        assert!(!scaler.has_owned_resources("demo").await.unwrap());
+        for state in [1, 2] {
+            mode.store(state, Ordering::SeqCst);
+            assert!(scaler.has_owned_resources("demo").await.unwrap());
+            assert!(!scaler.has_owned_resources("another-deployment").await.unwrap());
+        }
+        mode.store(3, Ordering::SeqCst);
+        assert!(scaler.has_owned_resources("demo").await.is_err(), "unavailable inventory is not empty");
+        server.abort();
     }
 }

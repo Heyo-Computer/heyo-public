@@ -696,6 +696,8 @@ curl -XPOST localhost:9090/deployments -H 'content-type: application/json' -d '{
 curl localhost:9090/deployments          # list, with live VM state
 curl localhost:9090/deployments/demo     # one deployment
 curl -XDELETE localhost:9090/deployments/demo   # drain and reap every VM
+# Remove only a proven-empty stale record (ETag copied from GET):
+curl -XDELETE 'localhost:9090/deployments/demo/record' -H 'If-Match: "<sha256>"'
 curl localhost:9090/healthz
 curl localhost:9090/metrics              # metrics snapshot (JSON)
 curl localhost:9090/certs                # issued TLS certificates and expiry
@@ -988,6 +990,24 @@ Omitting `If-Match` retains the original unconditional replace behavior. Only
 one exact strong tag is supported: wildcard, list, weak, malformed, uppercase,
 or unquoted forms return **400 Bad Request**. A successful PUT also returns the
 new `ETag`.
+
+`DELETE /deployments/:id/record` is the metadata-cleanup endpoint. It
+requires the exact current strong `If-Match` ETag and returns **409 Conflict**
+unless the deployment is route-less, desires zero replicas, and has no live,
+pending/provisioning, suspended, rollout-generation, workspace, discovery,
+handoff, build/artifact/mount/host-update job configuration, job history, or
+host-update mapping. Complete runtime and disk inventories
+must confirm no remaining owned resources; unavailable inventories return **503**.
+The check and removal fence autoscaler reconciliation, registry mutation,
+allocation, and workspace lifecycle. Success removes only the
+persisted and in-memory deployment record; it never tears down a VM or queues
+disk/workspace cleanup. The separate path makes older servers reject the request
+rather than ignore a safety flag. Ordinary `DELETE /deployments/:id` keeps its
+existing drain-and-teardown behavior.
+
+Before operational cleanup, also inventory references held outside this app-lb
+(Orchestrator, Cloud, service routes and host configuration). This local endpoint
+cannot prove that another authority no longer references a registration.
 
 The tag is `"<hex>"`, where `<hex>` is lowercase SHA-256 of the compact JSON
 bytes produced by first serializing the full normalized `DeploymentSpec` to a

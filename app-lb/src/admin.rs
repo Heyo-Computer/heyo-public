@@ -8,7 +8,7 @@
 use crate::autoscale::{Autoscaler, EvictOutcome};
 use crate::config::DeploymentSpec;
 use crate::jobs::{Jobs, StartError};
-use crate::deployment::{UpstreamDrain, now_secs};
+use crate::deployment::{Deployment, UpstreamDrain, now_secs};
 use crate::metrics::{DeploymentMetricsSnapshot, HostSandboxView, HostUsageSnapshot, Metrics};
 use crate::registry::Registry;
 use crate::secrets::{SecretSpec, SecretStore};
@@ -4085,6 +4085,134 @@ async fn uncordon_upstream(
     Json(upstream_traffic_status(&deployment, &upstream)).into_response()
 }
 
+fn record_only_refusal(d: &Deployment, workspace_state: bool) -> Option<&'static str> {
+    let state = d.state();
+    if !d.spec.routes.is_empty() {
+        return Some("record-only removal requires a route-less deployment");
+    }
+    if d.desired_replicas() != 0 {
+        return Some("record-only removal requires zero desired replicas");
+    }
+    if !d.backends().is_empty() {
+        return Some("record-only removal requires zero live backends");
+    }
+    if !d.pending().is_empty() {
+        return Some("record-only removal requires zero pending or provisioning VMs");
+    }
+    if !state.suspended.is_empty() {
+        return Some("record-only removal requires zero suspended VMs");
+    }
+    if crate::rollout::reserved(d) || state.active_prefix.is_some() || !state.rollouts.is_empty() {
+        return Some("record-only removal requires no retained rollout generations");
+    }
+    if d.spec.vm.as_ref().is_some_and(|vm| vm.workspace.is_some()) || workspace_state {
+        return Some("record-only removal requires no workspace configuration or retained workspace state");
+    }
+    if d.spec.build.is_some() || d.spec.artifact.is_some() || d.spec.update.is_some()
+        || d.spec.vm.as_ref().is_some_and(|vm| !vm.mounts.is_empty())
+    {
+        return Some("record-only removal requires no build, artifact, host-update or mount job configuration");
+    }
+    if d.spec.discovery.is_some()
+        || !state.upstream_drains.is_empty()
+        || state.discovery_version.is_some()
+        || state.discovery_source_url.is_some()
+        || state.route_handoff.is_some()
+    {
+        return Some("record-only removal requires no retained service state");
+    }
+    None
+}
+
+async fn deregister_record(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // Match rollout cutover's lock order and wait out adoption/promotion and
+    // orphan sweeps, not just allocations. A separate endpoint makes an old
+    // server reject this request instead of ignoring a query flag and tearing down.
+    let _reconcile = state.autoscaler.rollout_guard().await;
+    let _change = state.registry.change_guard().await;
+    {
+        let expected_etag = match if_match(&headers) {
+            Ok(value) => value.map(str::to_owned),
+            Err(response) => return response,
+        };
+        let Some(expected_etag) = expected_etag.as_deref() else {
+            return err(StatusCode::PRECONDITION_REQUIRED, "record-only removal requires If-Match from GET /deployments/:id").into_response();
+        };
+        // This waits for create/boot completion while the registry writer is
+        // held. A completing boot must publish its pending/backend state before
+        // releasing the permit; no later boot can pass its is_live check after
+        // the record is removed.
+        let _allocations = state.autoscaler.workspace_recovery_guard().await;
+        let _workspace_lifecycle = state.autoscaler.workspaces().lifecycle_guard().await;
+        let Some(d) = state.registry.get(&id) else {
+            return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+        };
+        if let Err(status) = check_etag_precondition(Some(expected_etag), &d.spec) {
+            let message = if status == StatusCode::PRECONDITION_FAILED {
+                "If-Match does not match the current deployment spec"
+            } else {
+                "failed to serialize deployment ETag"
+            };
+            return err(status, message).into_response();
+        }
+        if let Some(message) = record_only_refusal(
+            &d,
+            state.autoscaler.workspaces().has_retained_state(&id),
+        ) {
+            return err(StatusCode::CONFLICT, message).into_response();
+        }
+        if !state.jobs.records(Some(&id)).is_empty() {
+            return err(StatusCode::CONFLICT, "job history still references this deployment").into_response();
+        }
+        if std::env::var_os("APP_LB_HOST_UPDATE_CONFIG").is_some() {
+            match crate::host_update::configured() {
+                Ok((_, config)) if config.deployment != id => {}
+                Ok(_) => return err(StatusCode::CONFLICT, "host update mapping still references this deployment").into_response(),
+                Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "host update mapping could not be verified").into_response(),
+            }
+        }
+        match state.autoscaler.has_owned_resources(&id).await {
+            Ok(false) => {}
+            Ok(true) => return err(StatusCode::CONFLICT, "runtime still reports resources owned by this deployment").into_response(),
+            Err(error) => {
+                tracing::warn!(deployment = %id, %error, "record-only inventory unavailable");
+                return err(StatusCode::SERVICE_UNAVAILABLE, "complete runtime inventory is required for record-only removal").into_response();
+            }
+        }
+        let Some(disks) = state.disks.as_ref() else {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "disk inventory is required for record-only removal").into_response();
+        };
+        let inventory = disks.inventory().await;
+        if !inventory.complete {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "complete disk inventory is required for record-only removal").into_response();
+        }
+        if inventory.disks.iter().any(|disk| disk.deployment.as_deref() == Some(id.as_str())) {
+            return err(StatusCode::CONFLICT, "retained disks still reference this deployment").into_response();
+        }
+        // Unlink first. A failure leaves the live registry untouched; a crash
+        // between unlink and the in-memory removal merely keeps the record
+        // until restart. This path deliberately never invokes teardown.
+        if let Err(error) = state.registry.forget(&id) {
+            tracing::error!(deployment = %id, %error, "failed record-only deregistration");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("deployment record was not removed: {error}")).into_response();
+        }
+        let d = state.registry.remove(&id).expect("deployment remained under registry mutation gate");
+        state.metrics.retire(&id);
+        tracing::info!(deployment = %id, "removed empty deployment record only");
+        state.feed.announce(
+            &d.spec,
+            crate::feed::FeedEventKind::Removed,
+            "the empty deployment record was removed without resource cleanup".to_string(),
+            now_secs(),
+        );
+        return StatusCode::NO_CONTENT.into_response();
+    }
+}
+
 async fn deregister(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
     let change = state.registry.change_guard().await;
     if state.registry.get(&id).is_some_and(|d| crate::rollout::reserved(&d) || !d.state().rollouts.is_empty()) {
@@ -5427,6 +5555,7 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/rollouts", post(start_rollout))
         .route("/deployments/:id/rollouts/:operation", get(get_rollout))
         .route("/deployments/:id", get(get_one).put(update).delete(deregister))
+        .route("/deployments/:id/record", axum::routing::delete(deregister_record))
         .route("/deployments/:id/discovery-status", get(discovery_status))
         .route("/deployments/:id/scaling", patch(scale))
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
@@ -6064,6 +6193,221 @@ mod tests {
             let expected = format!("\"{:x}\"", Sha256::digest(serde_json::to_vec(&value).unwrap()));
             assert_eq!(deployment_etag(&spec).unwrap(), expected);
             assert_eq!(expected.len(), 66);
+        }
+    }
+
+    mod record_only_deregistration {
+        use super::*;
+        use crate::deployment::PendingVm;
+        use axum::{Json, body::Body, http::Request, routing::get};
+        use std::path::{Path as FsPath, PathBuf};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use tower_service::Service;
+
+        static FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+        struct Fixture {
+            state: AdminState,
+            registry: Arc<Registry>,
+            root: PathBuf,
+            mutations: Arc<AtomicUsize>,
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.root); }
+        }
+
+        async fn fixture(inventory_available: bool) -> Fixture {
+            let root = std::env::temp_dir().join(format!(
+                "app-lb-record-handler-{}-{}", std::process::id(),
+                FIXTURE.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let mutations = Arc::new(AtomicUsize::new(0));
+            let mutation_count = mutations.clone();
+            let app = Router::new()
+                .route("/deployed-sandboxes", get(move || async move {
+                    if inventory_available { Json(serde_json::json!([])).into_response() }
+                    else { StatusCode::SERVICE_UNAVAILABLE.into_response() }
+                }))
+                .route("/sandboxes/inactive", get(|| async {
+                    Json(serde_json::json!({"sandboxes": [], "next_cursor": null}))
+                }))
+                .route("/storage", get(|| async {
+                    Json(serde_json::json!({
+                        "data_dir": "/data", "tmp_dir": "/tmp",
+                        "free_bytes": 10, "total_bytes": 20, "sandboxes": []
+                    }))
+                }))
+                .fallback(move |request: Request<Body>| {
+                    let mutation_count = mutation_count.clone();
+                    async move {
+                        if request.method() != axum::http::Method::GET {
+                            mutation_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        StatusCode::NOT_FOUND
+                    }
+                });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let daemon_url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let registry = Arc::new(Registry::new(root.join("deployments.json")));
+            registry.upsert(empty().spec.clone());
+            registry.persist_one("obsolete").unwrap();
+            let mounts = crate::mounts::MountStore::new(root.join("mounts"), 0);
+            let vms = crate::vm::VmManager::new(Some(daemon_url), None, mounts.clone()).unwrap();
+            let secrets = Arc::new(crate::secrets::SecretStore::new(root.join("secrets.json"), None));
+            let workspaces = Arc::new(crate::workspace::Workspaces::new(
+                crate::workspace::WorkspaceConfig {
+                    root: root.join("workspaces"), tar_bin: "tar".into(), aws_bin: "aws".into(),
+                    art_bin: "art".into(), s3_endpoint: None, home: None,
+                    timeout: std::time::Duration::from_secs(1),
+                }, vms.clone(), registry.clone(), secrets.clone(),
+            ));
+            let metrics = Arc::new(Metrics::new());
+            let feed = Arc::new(crate::feed::Feed::new());
+            let autoscaler = Arc::new(Autoscaler::new(
+                registry.clone(),
+                crate::runtime::Runtime::new(vms.clone(), crate::config::LxcConfig { enabled: false, ..Default::default() }),
+                metrics.clone(), feed.clone(), workspaces, secrets.clone(),
+            ));
+            let jobs = Arc::new(Jobs::new(crate::jobs::JobConfig {
+                work_dir: root.join("jobs"), heyvm_bin: "heyvm".into(), art_bin: "art".into(),
+                images_dir: root.join("images"), git_bin: "git".into(), mounts,
+                shell: "sh".into(), timeout: std::time::Duration::ZERO, home: None,
+            }, registry.clone(), autoscaler.clone(), secrets.clone(), None));
+            let disks = Arc::new(crate::disks::DiskStore::new(crate::disks::DiskConfig {
+                state_path: root.join("disks.json"), ttl_secs: 0, sweep_secs: 60,
+                aws_bin: "aws".into(), bucket: None, prefix: "test".into(), endpoint: None,
+                archive_on_expire: false, archive_timeout: std::time::Duration::from_secs(60),
+                orphan_ttl_secs: 0,
+            }, vms, registry.clone()));
+            let api = AdminApi::new(
+                "127.0.0.1:0".into(), registry.clone(), autoscaler, metrics, "test".into(),
+                None, None, false, false, None,
+                Arc::new(crate::tls::CertStore::new(root.join("certs"), None)), None, secrets,
+                Arc::new(crate::workflows::WorkflowStore::new(root.join("workflows"))),
+                Arc::new(crate::namespaces::NamespaceStore::new(root.join("namespaces"))),
+                Arc::new(crate::auth_providers::AuthProviderStore::new(root.join("providers"))),
+                Arc::new(crate::tokens::TokenStore::new(root.join("tokens.json"))), jobs,
+                None, None, Arc::new(crate::guard::Guard::new(root.join("guard.json"), false)),
+                Some(disks), PublicUrl::from_config(false, "127.0.0.1:80", "127.0.0.1:443"),
+                feed, &[], None,
+            );
+            Fixture { state: api.state, registry, root, mutations }
+        }
+
+        fn persisted(root: &FsPath) -> bool { root.join("obsolete.json").exists() }
+
+        async fn remove(f: &Fixture, etag: Option<&str>) -> StatusCode {
+            let mut request = Request::builder().method("DELETE").uri("/deployments/obsolete/record");
+            if let Some(etag) = etag { request = request.header(header::IF_MATCH, etag); }
+            let mut app = router(f.state.clone());
+            std::future::poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)).await.unwrap();
+            app.call(request.body(Body::empty()).unwrap()).await.unwrap().status()
+        }
+
+        fn empty() -> Arc<Deployment> {
+            Arc::new(Deployment::new(serde_json::from_value(serde_json::json!({
+                "id": "obsolete",
+                "routes": [],
+                "vm": {"driver": "firecracker", "port": 8080},
+                "scaling": {"min_replicas": 0, "warm_pool": 0}
+            })).unwrap()))
+        }
+
+        #[test]
+        fn empty_route_less_zero_desired_record_is_removable() {
+            let d = empty();
+            assert_eq!(d.desired_replicas(), 0);
+            assert_eq!(record_only_refusal(&d, false), None);
+        }
+
+        #[test]
+        fn host_job_configuration_is_not_an_empty_record() {
+            let mut spec = empty().spec.clone();
+            spec.update = Some(serde_json::from_value(serde_json::json!({
+                "working_dir": "/protected-service", "commands": ["service-update"]
+            })).unwrap());
+            let d = Deployment::new(spec);
+            assert!(record_only_refusal(&d, false).unwrap().contains("host-update"));
+        }
+
+        #[test]
+        fn exact_revision_is_required_and_a_stale_revision_fails() {
+            let d = empty();
+            let current = deployment_etag(&d.spec).unwrap();
+            assert!(check_etag_precondition(Some(&current), &d.spec).is_ok());
+            assert_eq!(
+                check_etag_precondition(
+                    Some("\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""),
+                    &d.spec,
+                ),
+                Err(StatusCode::PRECONDITION_FAILED),
+            );
+            assert!(if_match(&axum::http::HeaderMap::new()).unwrap().is_none());
+        }
+
+        #[test]
+        fn invisible_pending_suspended_and_workspace_state_are_not_empty() {
+            let pending = empty();
+            pending.set_pending(vec![PendingVm::new("sb-booting".into())]);
+            assert!(record_only_refusal(&pending, false).unwrap().contains("pending"));
+
+            let suspended = empty();
+            suspended.mutate_state(|state| state.suspended.push("sb-stopped".into()));
+            assert!(record_only_refusal(&suspended, false).unwrap().contains("suspended"));
+
+            assert!(record_only_refusal(&empty(), true).unwrap().contains("workspace"));
+        }
+
+        #[test]
+        fn active_routes_and_retained_rollout_generations_are_not_empty() {
+            let mut routed_spec = empty().spec.clone();
+            routed_spec.routes.push(crate::config::RouteRule {
+                host: Some("obsolete.example.com".into()),
+                ..Default::default()
+            });
+            let routed = Deployment::new(routed_spec);
+            assert!(record_only_refusal(&routed, false).unwrap().contains("route-less"));
+
+            let rollout = empty();
+            rollout.mutate_state(|state| state.active_prefix = Some("candidate-".into()));
+            assert!(record_only_refusal(&rollout, false).unwrap().contains("rollout"));
+        }
+
+        #[tokio::test]
+        async fn handler_fails_closed_and_never_mutates_retained_records_or_resources() {
+            let f = fixture(true).await;
+            assert_eq!(remove(&f, None).await, StatusCode::PRECONDITION_REQUIRED);
+            assert_eq!(remove(&f, Some("\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"")).await, StatusCode::PRECONDITION_FAILED);
+            let current = deployment_etag(&f.registry.get("obsolete").unwrap().spec).unwrap();
+            f.registry.get("obsolete").unwrap().set_pending(vec![PendingVm::new("sb-live".into())]);
+            assert_eq!(remove(&f, Some(&current)).await, StatusCode::CONFLICT);
+            assert!(f.registry.get("obsolete").is_some());
+            assert!(persisted(&f.registry.state_dir()));
+            assert_eq!(f.mutations.load(Ordering::SeqCst), 0, "no stop, destroy or disk cleanup request");
+        }
+
+        #[tokio::test]
+        async fn handler_unlinks_only_an_empty_record_without_runtime_cleanup() {
+            let f = fixture(true).await;
+            let current = deployment_etag(&f.registry.get("obsolete").unwrap().spec).unwrap();
+            assert_eq!(remove(&f, Some(&current)).await, StatusCode::NO_CONTENT);
+            assert!(f.registry.get("obsolete").is_none());
+            assert!(!persisted(&f.registry.state_dir()));
+            assert_eq!(f.mutations.load(Ordering::SeqCst), 0, "record cleanup must not call teardown or disk purge");
+        }
+
+        #[tokio::test]
+        async fn handler_keeps_live_and_persisted_record_when_inventory_is_unavailable() {
+            let f = fixture(false).await;
+            let current = deployment_etag(&f.registry.get("obsolete").unwrap().spec).unwrap();
+            assert_eq!(remove(&f, Some(&current)).await, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(f.registry.get("obsolete").is_some());
+            assert!(persisted(&f.registry.state_dir()));
+            assert_eq!(f.mutations.load(Ordering::SeqCst), 0);
         }
     }
 

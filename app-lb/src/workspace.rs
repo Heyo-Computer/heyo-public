@@ -451,6 +451,13 @@ impl Workspaces {
             .unwrap_or_default()
     }
 
+    /// Whether deleting the deployment record would detach workspace history
+    /// or an operation which must remain addressable by deployment id.
+    pub fn has_retained_state(&self, deployment_id: &str) -> bool {
+        self.record(deployment_id) != WorkspaceRecord::default()
+            || self.runtime.lock().unwrap().contains_key(deployment_id)
+    }
+
     /// Try again to write the in-memory record to state.json after a persist
     /// failure. Returns true once the disk has caught up. The worker calls
     /// this each pass so a transient failure (a full disk, a permissions
