@@ -1,0 +1,886 @@
+<!doctype html>
+<html lang="en" {{HTML_ATTRS}}>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{APP_NAME}} network</title>
+<link rel="stylesheet" href="/__ui/heyo.css">
+<script defer src="/__ui/theme.js"></script>
+<style>
+  /* ------------------------------------------------------------------------
+     app-lb network topology, layered on ui/heyo.css — the same sheet the
+     dashboard, directory, siem and disks pages serve, so the five read as one
+     product.
+
+     These names are aliases, not a second palette: written against
+     `--surface`/`--plane`/`--text-2`; each resolves to a shared token rather
+     than being renamed at several hundred call sites. `var()` resolves at use
+     time, so switching the theme still switches everything.
+     ------------------------------------------------------------------------ */
+  :root {
+    --plane: var(--bg-dark);
+    --surface: var(--bg-panel);
+    --text: var(--text-primary);
+    --text-2: var(--text-secondary);
+    --muted: var(--text-muted);
+    --border: var(--border-color);
+    --good: var(--success);
+    --success-text: var(--success);
+  }
+
+  .section-title, thead th, table th, .k {
+    font-family: var(--font-display);
+    font-size: 9px;
+    font-weight: 400;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  * { box-sizing: border-box; }
+  /* Fullscreen layout: the canvas fills the viewport below the topbar and a
+     fixed side panel slides over its right edge. Unlike the dashboard's
+     `max-width: 1200px` column, this page's subject is a graph that wants
+     every pixel it can get. */
+  html, body { height: 100%; }
+  body { margin: 0; overflow: hidden; }
+
+  header.top {
+    display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px 20px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  header.top .spacer { flex: 1 1 auto; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--text-2);
+    border: 1px solid var(--border); border-radius: 0; padding: 4px 10px;
+    background: var(--surface);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 0; background: var(--good); }
+  .dot.stale { background: var(--warning); }
+
+  /* The stage is the canvas's container. It sits below the header and grows to
+     fill the rest of the viewport; the canvas is sized to match it every
+     frame, so a window resize is handled without a redraw loop of its own. */
+  #stage {
+    position: relative;
+    width: 100%;
+    height: calc(100vh - 53px);
+    background: var(--plane);
+    overflow: hidden;
+  }
+  /* `display: block` so the canvas does not get an inline baseline gap. */
+  #topo { display: block; width: 100%; height: 100%; cursor: default; }
+  #topo.has-sel { cursor: pointer; }
+
+  /* The legend sits over the bottom-left of the canvas. */
+  .legend {
+    position: absolute; left: 16px; bottom: 16px;
+    display: flex; flex-direction: column; gap: 6px;
+    background: color-mix(in srgb, var(--surface) 88%, transparent);
+    border: 1px solid var(--border); border-radius: 0; padding: 10px 12px;
+    font-size: 12px; color: var(--text-2);
+  }
+  .legend .title {
+    font-family: var(--font-display); font-size: 9px; font-weight: 400;
+    letter-spacing: 0.8px; text-transform: uppercase; color: var(--muted);
+    margin-bottom: 2px;
+  }
+  .legend .row { display: flex; align-items: center; gap: 8px; }
+  .legend .swatch { width: 11px; height: 11px; border-radius: 0; flex: none; }
+
+  /* The side panel slides in from the right. Fixed width; its content scrolls
+     when it overflows. `pointer-events` stays on so the detail panel is
+     interactive even while it overlaps the canvas. */
+  #panel {
+    position: absolute; top: 0; right: 0; bottom: 0;
+    width: min(360px, 92vw);
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    transform: translateX(100%);
+    transition: transform .2s ease;
+    display: flex; flex-direction: column;
+    box-shadow: -8px 0 24px rgba(0,0,0,0.18);
+    z-index: 5;
+  }
+  #panel.open { transform: translateX(0); }
+  #panel .head {
+    display: flex; align-items: baseline; gap: 10px;
+    padding: 14px 16px 10px; border-bottom: 1px solid var(--border);
+  }
+  #panel .head .kind {
+    font-family: var(--font-display); font-size: 9px; font-weight: 400;
+    letter-spacing: 0.8px; text-transform: uppercase; color: var(--muted);
+  }
+  #panel .head .name { font-size: 15px; font-weight: 650; letter-spacing: -0.01em; word-break: break-all; }
+  #panel .head .close {
+    margin-left: auto; font: inherit; font-size: 13px; color: var(--text-2);
+    background: var(--plane); border: 1px solid var(--border); border-radius: 0;
+    padding: 2px 9px; cursor: pointer; line-height: 1.2;
+  }
+  #panel .head .close:hover { color: var(--text); }
+  #panel .body { padding: 12px 16px 20px; overflow-y: auto; flex: 1; }
+
+  .kv { display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; margin-top: 10px; }
+  .kv .label { font-size: 11px; color: var(--muted); }
+  .kv .value { font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; word-break: break-all; }
+
+  .section-title { font-size: 12px; font-weight: 600; margin: 18px 0 6px; }
+  .section-title:first-child { margin-top: 0; }
+
+  .badges { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+  .badge {
+    font-size: 11px; padding: 2px 8px; border-radius: 0;
+    border: 1px solid var(--border); color: var(--text-2);
+    font-variant-numeric: tabular-nums;
+  }
+  .badge.ns {
+    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+    color: var(--accent);
+  }
+
+  table.vms { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  table.vms th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 8px; border-bottom: 1px solid var(--grid); }
+  table.vms td { padding: 5px 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  table.vms td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-2); }
+
+  .tag { font-size: 10px; padding: 1px 6px; border-radius: 0; white-space: nowrap; }
+  .tag.drain { background: color-mix(in srgb, var(--serious) 22%, transparent); color: var(--serious); }
+  .tag.down { background: color-mix(in srgb, var(--critical) 22%, transparent); color: var(--critical); }
+  .tag.ok { background: color-mix(in srgb, var(--good) 20%, transparent); color: var(--success-text); }
+  .tag.boot { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+  .tag.idle { background: color-mix(in srgb, var(--muted) 20%, transparent); color: var(--text-2); }
+
+  .empty { color: var(--muted); padding: 20px 0; font-size: 13px; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+
+  a.ghost {
+    font: inherit; font-size: 12px; color: var(--text-2); text-decoration: none;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 0; padding: 4px 12px;
+  }
+  a.ghost:hover { color: var(--text); }
+  button.ghost {
+    font: inherit; font-size: 12px; color: var(--text-2);
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 0; padding: 4px 12px; cursor: pointer;
+  }
+  button.ghost:hover { color: var(--text); }
+
+  /* The empty-state overlay, shown before the first poll returns. */
+  #empty-overlay {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 14px; pointer-events: none;
+  }
+  #empty-overlay.hidden { display: none; }
+</style>
+</head>
+<body>
+<header class="topbar">
+    <a class="topbar-brand" href="/"><span>heyo</span><span class="topbar-app">{{APP_NAME}}</span></a>
+    <nav class="topbar-nav">
+      <a href="/">Directory</a>
+      <a href="/dashboard">Dashboard</a>
+      <a href="/siem">Security</a>
+      <a href="/storage">Disks</a>
+      <a href="/network" aria-current="page">Network</a>
+      <a href="/metrics">Metrics</a>
+    </nav>
+    <div class="topbar-right">
+      <span class="pill"><span class="dot" id="livedot"></span><span id="updated">connecting…</span></span>
+      <span class="topbar-user">{{WHO}}</span>
+      <button class="btn btn-sm" id="pausebtn">Pause</button>
+      <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-label>theme</span></button>
+    </div>
+</header>
+
+<div id="stage">
+  <canvas id="topo"></canvas>
+  <div id="empty-overlay">connecting…</div>
+  <div class="legend">
+    <div class="title">VM states</div>
+    <div class="row"><span class="swatch" id="lg-live"></span> serving</div>
+    <div class="row"><span class="swatch" id="lg-boot"></span> cold-booting</div>
+    <div class="row"><span class="swatch" id="lg-drain"></span> draining</div>
+    <div class="row"><span class="swatch" id="lg-down"></span> down</div>
+    <div class="row"><span class="swatch" id="lg-idle"></span> cold-idle (scale-to-zero)</div>
+  </div>
+  <aside id="panel" aria-hidden="true">
+    <div class="head">
+      <div>
+        <div class="kind" id="panel-kind"></div>
+        <div class="name" id="panel-name"></div>
+      </div>
+      <button class="close" id="panel-close" type="button">esc</button>
+    </div>
+    <div class="body" id="panel-body"></div>
+  </aside>
+</div>
+
+<script>
+"use strict";
+// Poll cadence matches the dashboard: the network moves at the same rate the
+// pool gauges do, so a faster poll would animate nothing the eye can tell apart
+// while doubling the request load on /metrics.
+const REFRESH_MS = 2000;
+let paused = false;
+let timer = null;
+let lastData = null;
+let ingress = { ipv4: [], ipv6: [] };
+
+// The selection: a node the user clicked. Persisted across renders so the
+// detail panel does not snap shut every poll. `{type, id}` — `type` is one of
+// `ingress`/`hostname`/`deployment`/`vm`, `id` the relevant key.
+let selected = null;
+// Hovered node, for cursor feedback. Not persisted.
+let hovered = null;
+
+// Canvas + 2D context, resolved once. `dpr` handles high-DPI panels so the
+// topology is crisp rather than interpolated.
+const canvas = document.getElementById("topo");
+const ctx = canvas.getContext("2d");
+let dpr = window.devicePixelRatio || 1;
+
+// The laid-out graph, rebuilt every render. Each node carries its centre and
+// radius in CSS pixels; edges carry their endpoints' indices.
+let nodes = [];
+let edges = [];
+
+// Distinguished VM states, as colours. Resolved from the CSS custom properties
+// the shared sheet owns, so a theme switch recolours the topology without a
+// reload. The five map exactly onto the five legend rows and the dashboard's
+// row tags.
+let STATE = { live: "", boot: "", drain: "", down: "", idle: "", accent: "", axis: "", text: "", muted: "" };
+function resolveColors() {
+  const css = getComputedStyle(document.documentElement);
+  const pick = (n) => css.getPropertyValue(n).trim();
+  STATE.live  = pick("--success") || "#3fa66a";
+  STATE.boot  = pick("--accent") || "#d2833b";
+  STATE.drain = pick("--serious") || pick("--warning") || "#c79a3a";
+  STATE.down  = pick("--critical") || "#c0473f";
+  STATE.idle  = pick("--text-muted") || "#888";
+  STATE.accent = pick("--accent") || "#d2833b";
+  STATE.axis   = pick("--axis") || "#444";
+  STATE.text   = pick("--text-primary") || "#eee";
+  STATE.muted  = pick("--text-muted") || "#888";
+  STATE.grid   = pick("--border-color") || "#333";
+  STATE.surface= pick("--bg-panel") || "#1c1c1c";
+
+  // Colour the legend swatches so the key matches the canvas. The ids are
+  // stable; setting them here keeps the key and the drawing in one place, so a
+  // retint of a state colour can never leave the legend showing the old one.
+  const swatch = (id, col) => { const el = document.getElementById(id); if (el) el.style.background = col; };
+  swatch("lg-live", STATE.live);
+  swatch("lg-boot", STATE.boot);
+  swatch("lg-drain", STATE.drain);
+  swatch("lg-down", STATE.down);
+  swatch("lg-idle", STATE.idle);
+}
+
+const $ = (id) => document.getElementById(id);
+const fmt = (n, d = 0) => (n == null || !isFinite(n)) ? "—" :
+  n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+function fmtDur(s) {
+  s = Math.floor(s || 0);
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600),
+        m = Math.floor(s % 3600 / 60), sec = s % 60;
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+function fmtBytes(b) {
+  if (b == null || !isFinite(b)) return "—";
+  if (b < 1024) return b + " B";
+  const u = ["KB", "MB", "GB", "TB"];
+  let i = -1, n = b;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(n < 10 ? 1 : 0) + " " + u[i];
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;" }[c])); }
+
+// A particle on an edge: a fraction [0,1] of the way from the source end to the
+// target end. Edges carry a population of these; each advances per frame and
+// wraps, which is the flow animation. Density (how many) scales with how much
+// the edge is doing — in-flight requests for ingress→hostname→deployment, and
+// VM liveness for deployment→VM.
+function makeParticles(n) {
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(Math.random());
+  return out;
+}
+
+// Classify a VM into one of the five states the legend distinguishes. Mirrors
+// the dashboard's row tags so the two read the same way for the same VM.
+function vmState(vm) {
+  if (vm.draining) return "drain";
+  if (!vm.healthy) return "down";
+  return "live";
+}
+function pendingState(/* vm */) { return "boot"; }
+// A deployment with zero ready and zero pending VMs whose pool wants none is
+// scale-to-zero — "cold-idle". `desired_replicas == 0` is the signal the
+// autoscaler gives for a pool that has gone to sleep.
+function deploymentIsColdIdle(d) {
+  return d.kind !== "site" && d.kind !== "static" &&
+    d.pool.ready === 0 && (d.pending_vms || []).length === 0 &&
+    d.pool.desired_replicas === 0;
+}
+
+// ---- layout ---------------------------------------------------------------
+
+// Lay the graph out in four left-to-right columns: ingress → hostnames →
+// deployments → VMs. Each column is centred vertically around the stage's
+// midline, with nodes stacked and spaced by their count. This is a static,
+// deterministic layout — no force simulation — because the topology is small
+// and a stable picture is easier to read than one that wiggles every poll.
+function layout(data) {
+  nodes = [];
+  edges = [];
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  const margin = 64;
+  const colW = (W - 2 * margin) / 3;
+
+  const colX = [margin, margin + colW, margin + 2 * colW, W - margin];
+  const placeColumn = (x, items, make) => {
+    const n = items.length;
+    const gap = Math.min(96, H / Math.max(n + 1, 2));
+    const total = (n - 1) * gap;
+    let y = H / 2 - total / 2;
+    for (const item of items) {
+      const node = make(item, x, y);
+      nodes.push(node);
+      y += gap;
+    }
+  };
+
+  // Column 0: ingress (one node). Collapses to a labelled dot when there are
+  // no public IPs configured — the entry point still exists, it just answers
+  // "ask your operator" rather than an address.
+  placeColumn(colX[0], [{ id: "ingress" }], (item, x, y) => ({
+    type: "ingress", id: item.id, x, y, r: 14, label: "ingress",
+  }));
+
+  // Column 1: hostnames. Drawn from the union of every routed deployment's
+  // `hosts`. A deployment with no host route (a path-only or sandbox
+  // deployment) does not appear here — it has no hostname a request could land
+  // on. Sorted for a stable picture.
+  const hostMap = new Map();
+  for (const d of (data.deployments || [])) {
+    for (const h of (d.hosts || [])) {
+      if (!hostMap.has(h)) hostMap.set(h, []);
+      hostMap.get(h).push(d.id);
+    }
+  }
+  const hostnames = [...hostMap.keys()].sort();
+  placeColumn(colX[1], hostnames, (h, x, y) => ({
+    type: "hostname", id: h, x, y, r: 11, label: h,
+  }));
+
+  // Column 2: deployments. All deployments the metrics response carries, in
+  // id order. A cold-idle deployment (scale-to-zero) is drawn hollow so it
+  // reads as "present but asleep".
+  const deps = [...(data.deployments || [])].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  placeColumn(colX[2], deps, (d, x, y) => ({
+    type: "deployment", id: d.id, x, y, r: 15, label: d.id,
+    data: d,
+    coldIdle: deploymentIsColdIdle(d),
+  }));
+
+  // Column 3: VMs. Only the VMs of deployments that are not cold-idle, to keep
+  // a fleet that has scaled to zero from drawing thousands of empty leaves.
+  // Booting (pending) VMs are included so a cold start is visible the moment it
+  // begins.
+  const vms = [];
+  for (const d of deps) {
+    if (deploymentIsColdIdle(d)) continue;
+    for (const v of (d.vms || [])) vms.push({ dep: d.id, vm: v });
+    for (const v of (d.pending_vms || [])) vms.push({ dep: d.id, vm: v, pending: true });
+  }
+  // Cap the leaf count so a very large pool does not paint an unreadable wall;
+  // the panel lists the full set when a deployment is selected.
+  const VM_CAP = 60;
+  const cap = vms.length > VM_CAP;
+  const shown = cap ? vms.slice(0, VM_CAP) : vms;
+  placeColumn(colX[3], shown, (entry, x, y) => ({
+    type: "vm", id: entry.dep + "/" + (entry.vm.sandbox_id || "?"),
+    x, y, r: 7,
+    state: entry.pending ? "boot" : vmState(entry.vm),
+    dep: entry.dep,
+    vm: entry.vm,
+    pending: !!entry.pending,
+    label: (entry.vm.sandbox_id || "").slice(0, 8),
+  }));
+  if (cap) {
+    nodes.push({
+      type: "vm-more", id: "vm-more", x: colX[3],
+      y: canvas.clientHeight / 2 + Math.min(96, canvas.clientHeight / 2),
+      r: 0, label: "+" + (vms.length - VM_CAP) + " more",
+    });
+  }
+
+  // Index lookups for edge building.
+  const byId = (type, id) => nodes.find(n => n.type === type && n.id === id);
+
+  // Edges: ingress → hostname → deployment → VM.
+  const ingressNode = nodes[0];
+  for (const h of hostnames) {
+    const hn = byId("hostname", h);
+    if (hn) {
+      // Density scales with how many deployments this host routes to (a
+      // rough proxy for the share of traffic landing here).
+      const dens = Math.min(6, 1 + hostMap.get(h).length);
+      edges.push({ a: ingressNode, b: hn, kind: "net", particles: makeParticles(dens) });
+    }
+  }
+  for (const d of deps) {
+    const dn = byId("deployment", d.id);
+    if (!dn) continue;
+    // hostname → deployment: one edge per host route.
+    for (const h of (d.hosts || [])) {
+      const hn = byId("hostname", h);
+      if (hn) {
+        const dens = Math.min(6, 1 + Math.floor((d.pool.total_in_flight || 0) / 2));
+        edges.push({ a: hn, b: dn, kind: "net", particles: makeParticles(Math.max(1, dens)) });
+      }
+    }
+    // A routed deployment whose host did not surface (host_suffix / path-only
+    // routes name no hostname to draw) still needs an entry edge, so it is not
+    // stranded to the right of the hostnames column with nothing feeding it.
+    if ((d.hosts || []).length === 0 && d.routed) {
+      const dens = Math.min(6, 1 + Math.floor((d.pool.total_in_flight || 0) / 2));
+      edges.push({ a: ingressNode, b: dn, kind: "net", particles: makeParticles(Math.max(1, dens)) });
+    }
+    // deployment → VM: only for VMs we actually drew.
+    for (const entry of shown.filter(e => e.dep === d.id)) {
+      const vn = byId("vm", entry.dep + "/" + (entry.vm.sandbox_id || "?"));
+      if (vn) {
+        // A live VM with in-flight requests flows; a draining/down/idle one is
+        // drawn as a static (dim) edge so the connection is visible without
+        // suggesting active traffic.
+        const live = vn.state === "live";
+        const n = live ? Math.min(4, 1 + Math.floor((entry.vm.in_flight || 0))) : 0;
+        edges.push({ a: dn, b: vn, kind: "vm", state: vn.state, particles: makeParticles(n) });
+      }
+    }
+  }
+}
+
+// ---- drawing --------------------------------------------------------------
+
+function stateColor(state) {
+  return STATE[state] || STATE.muted;
+}
+
+// Draw a node. The shape encodes the layer; the fill encodes the state.
+function drawNode(n, t) {
+  ctx.save();
+  ctx.translate(n.x, n.y);
+  const isSel = selected && selected.type === n.type && selected.id === n.id;
+  const isHover = hovered && hovered.type === n.type && hovered.id === n.id;
+
+  if (n.type === "ingress") {
+    // A rounded square for the entry point.
+    ctx.fillStyle = STATE.surface;
+    ctx.strokeStyle = STATE.accent;
+    ctx.lineWidth = isSel || isHover ? 2.5 : 1.5;
+    const s = n.r;
+    ctx.beginPath();
+    ctx.rect(-s, -s, s * 2, s * 2);
+    ctx.fill();
+    ctx.stroke();
+  } else if (n.type === "hostname") {
+    ctx.fillStyle = STATE.surface;
+    ctx.strokeStyle = STATE.accent;
+    ctx.lineWidth = isSel || isHover ? 2.5 : 1.5;
+    ctx.beginPath();
+    ctx.arc(0, 0, n.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  } else if (n.type === "deployment") {
+    // A diamond. Hollow when cold-idle, so scale-to-zero reads as "asleep".
+    ctx.fillStyle = n.coldIdle ? "transparent" : STATE.surface;
+    ctx.strokeStyle = n.coldIdle ? STATE.idle : STATE.accent;
+    ctx.lineWidth = isSel || isHover ? 2.5 : 1.5;
+    const s = n.r;
+    ctx.beginPath();
+    ctx.moveTo(0, -s); ctx.lineTo(s, 0); ctx.lineTo(0, s); ctx.lineTo(-s, 0); ctx.closePath();
+    if (!n.coldIdle) ctx.fill();
+    ctx.stroke();
+  } else if (n.type === "vm") {
+    // A small square, coloured by state.
+    ctx.fillStyle = stateColor(n.state);
+    ctx.strokeStyle = isSel || isHover ? STATE.text : "transparent";
+    ctx.lineWidth = 2;
+    const s = n.r;
+    ctx.beginPath();
+    ctx.rect(-s, -s, s * 2, s * 2);
+    ctx.fill();
+    if (isSel || isHover) ctx.stroke();
+  }
+
+  // Label, drawn to the right of the node. VMs label left (they are the
+  // rightmost column) so the text does not run off the canvas edge.
+  if (n.label) {
+    ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+    ctx.textBaseline = "middle";
+    if (n.type === "vm" || n.type === "vm-more") {
+      ctx.textAlign = "right";
+      ctx.fillStyle = STATE.muted;
+      ctx.fillText(n.label, -n.r - 6, 0);
+    } else {
+      ctx.textAlign = "left";
+      ctx.fillStyle = isSel ? STATE.text : STATE.text;
+      // Truncate long hostnames so they do not collide with the next column.
+      let label = n.label;
+      const max = n.type === "hostname" ? 28 : 20;
+      if (label.length > max) label = label.slice(0, max - 1) + "…";
+      ctx.fillText(label, n.r + 6, 0);
+    }
+  }
+  ctx.restore();
+}
+
+// Draw an edge as a curved line with moving particles. The particles are the
+// flow animation: their position along the edge advances every frame and wraps.
+function drawEdge(e, t) {
+  const { a, b } = e;
+  // A slight curve so overlapping edges fan apart.
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const nx = -dy, ny = dx;
+  const len = Math.hypot(nx, ny) || 1;
+  const bend = 0.12;
+  const cx = mx + (nx / len) * (b.y - a.y) * bend;
+  const cy = my + (ny / len) * (b.y - a.y) * bend;
+
+  const dim = e.kind === "vm" && e.state !== "live";
+  ctx.strokeStyle = dim ? STATE.grid : STATE.axis;
+  ctx.globalAlpha = dim ? 0.5 : 0.7;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.quadraticCurveTo(cx, cy, b.x, b.y);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  // Particles. `t` (ms) drives their motion so the animation is time-based
+  // rather than frame-based — a slow machine gets the same flow, slower.
+  const pcol = e.kind === "vm" ? stateColor(e.state) : STATE.accent;
+  ctx.fillStyle = pcol;
+  for (let i = 0; i < e.particles.length; i++) {
+    let p = (e.particles[i] + (t / 1400)) % 1;
+    if (p < 0) p += 1;
+    // Quadratic Bézier point at parameter p.
+    const u = 1 - p;
+    const px = u * u * a.x + 2 * u * p * cx + p * p * b.x;
+    const py = u * u * a.y + 2 * u * p * cy + p * p * b.y;
+    const pr = e.kind === "vm" ? 1.6 : 2;
+    ctx.globalAlpha = dim ? 0.35 : 0.9;
+    ctx.beginPath();
+    ctx.arc(px, py, pr, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function draw(t) {
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  ctx.clearRect(0, 0, W, H);
+
+  // Edges first so nodes paint on top.
+  for (const e of edges) drawEdge(e, t);
+  for (const n of nodes) drawNode(n, t);
+}
+
+// ---- interaction ----------------------------------------------------------
+
+// Hit-test in reverse paint order (topmost first).
+function hitTest(x, y) {
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    if (n.r <= 0) continue;
+    if (Math.hypot(x - n.x, y - n.y) <= n.r + 3) return n;
+  }
+  return null;
+}
+
+canvas.addEventListener("mousemove", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  const n = hitTest(x, y);
+  hovered = n;
+  canvas.classList.toggle("has-sel", !!n);
+});
+canvas.addEventListener("mouseleave", () => { hovered = null; canvas.classList.remove("has-sel"); });
+canvas.addEventListener("click", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  const n = hitTest(x, y);
+  if (n) {
+    selected = { type: n.type, id: n.id };
+    openPanel(n);
+  } else {
+    closePanel();
+  }
+});
+$("panel-close").addEventListener("click", closePanel);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePanel(); });
+
+function openPanel(node) {
+  const panel = $("panel");
+  panel.classList.add("open");
+  panel.setAttribute("aria-hidden", "false");
+  renderPanel(node);
+}
+function closePanel() {
+  selected = null;
+  const panel = $("panel");
+  panel.classList.remove("open");
+  panel.setAttribute("aria-hidden", "true");
+}
+
+// Render the side panel for the selected node. Re-runs every poll while a node
+// is selected, so the detail stays fresh — `selected` survives a re-layout.
+function renderPanel(node) {
+  // Resolve the live node from the freshly-laid-out graph, so a removed
+  // deployment closes the panel rather than showing stale data.
+  const live = nodes.find(n => n.type === node.type && n.id === node.id);
+  if (!live) { closePanel(); return; }
+
+  const kind = $("panel-kind");
+  const name = $("panel-name");
+  const body = $("panel-body");
+
+  if (live.type === "ingress") {
+    kind.textContent = "Ingress";
+    name.textContent = "Public addresses";
+    const ips = [...(ingress.ipv4 || []).map(i => i), ...(ingress.ipv6 || []).map(i => "[" + i + "]")];
+    body.innerHTML =
+      `<div class="note">Where DNS should point. Clients land here and are
+       routed to a hostname, then a deployment.</div>` +
+      kv("IPv4", (ingress.ipv4 || []).join(", ") || "—") +
+      kv("IPv6", (ingress.ipv6 || []).join(", ") || "—") +
+      (ips.length ? "" : `<div class="empty">No public IPs configured.
+        Set <code>APP_LB_PUBLIC_IPS</code> so clients know where to point.</div>`);
+  } else if (live.type === "hostname") {
+    kind.textContent = "Hostname";
+    name.textContent = live.id;
+    const deps = (lastData.deployments || []).filter(d => (d.hosts || []).includes(live.id));
+    body.innerHTML =
+      `<div class="note">Routed deployments served on this hostname.</div>` +
+      `<div class="badges">${deps.map(d => `<span class="badge">${esc(d.id)}</span>`).join("") || `<span class="empty">none</span>`}</div>` +
+      `<div class="section-title">Deployments</div>` +
+      deps.map(d => depSummaryRow(d)).join("") ||
+      `<div class="empty">no deployments route here</div>`;
+  } else if (live.type === "deployment") {
+    const d = live.data;
+    kind.textContent = "Deployment";
+    name.textContent = d.id;
+    body.innerHTML = depDetail(d);
+  } else if (live.type === "vm") {
+    const d = (lastData.deployments || []).find(x => x.id === live.dep);
+    kind.textContent = live.pending ? "VM (cold-booting)" : "VM";
+    name.textContent = live.vm.sandbox_id || "—";
+    body.innerHTML =
+      (d ? `<div class="badges"><span class="badge ns">${esc(d.namespace || "default")}</span>
+            <span class="badge">${esc(d.id)}</span></div>` : "") +
+      vmDetail(live.vm, live.pending, d);
+  }
+}
+
+function kv(label, value) {
+  return `<div class="kv"><div class="label">${esc(label)}</div><div class="value">${esc(String(value))}</div></div>`;
+}
+
+function depSummaryRow(d) {
+  const state = deploymentIsColdIdle(d) ? `<span class="tag idle">cold-idle</span>`
+    : d.pool.ready === 0 && (d.pending_vms || []).length ? `<span class="tag boot">booting</span>`
+    : `<span class="tag ok">${d.pool.ready} ready</span>`;
+  return `<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--grid)">
+    <span style="font-size:13px;font-weight:600">${esc(d.id)}</span>
+    ${state}
+    <span style="margin-left:auto;font-size:12px;color:var(--muted)">${fmt(d.pool.total_in_flight)} in-flight</span>
+  </div>`;
+}
+
+function depDetail(d) {
+  const isStatic = d.kind === "static";
+  const isSite = d.kind === "site";
+  const p = d.pool;
+  const coldIdle = deploymentIsColdIdle(d);
+  const stateBadge = coldIdle ? `<span class="tag idle">cold-idle</span>`
+    : isSite ? `<span class="tag ok">static site</span>`
+    : isStatic ? `<span class="tag ok">static</span>`
+    : `<span class="tag ok">${p.ready} ready</span>` +
+      (p.draining ? ` <span class="tag drain">${p.draining} draining</span>` : "") +
+      (p.pending ? ` <span class="tag boot">${p.pending} booting</span>` : "");
+
+  const nsBadge = d.namespace && d.namespace !== "default"
+    ? `<span class="badge ns">${esc(d.namespace)}</span>` : "";
+
+  let vms = "";
+  if (isSite) {
+    vms = `<table class="vms"><tr><th>root</th><th>mode</th></tr>
+      <tr><td class="mono">${esc(d.site_root || "—")}</td>
+      <td>${d.site_spa ? `<span class="tag boot">SPA</span>` : `<span class="tag ok">files</span>`}</td></tr></table>`;
+  } else if (isStatic) {
+    vms = `<div class="section-title">Upstreams</div>
+      <table class="vms"><tr><th>address</th><th>state</th></tr>` +
+      (d.vms || []).map(v => `<tr><td class="mono">${esc(v.addr)}</td>
+        <td>${v.healthy ? `<span class="tag ok">up</span>` : `<span class="tag down">down</span>`}</td></tr>`).join("") +
+      `</table>`;
+  } else {
+    const ready = (d.vms || []).map(v => {
+      const st = v.draining ? `<span class="tag drain">draining</span>`
+              : !v.healthy ? `<span class="tag down">down</span>`
+              : `<span class="tag ok">serving</span>`;
+      return `<tr><td class="mono">${esc(v.sandbox_id)}</td>
+        <td>${fmt(v.in_flight)}</td><td>${fmtDur(v.uptime_secs)}</td><td>${st}</td></tr>`;
+    }).join("");
+    const pending = (d.pending_vms || []).map(v =>
+      `<tr><td class="mono">${esc(v.sandbox_id)}</td><td>—</td>
+        <td>${fmtDur(v.age_secs)}</td><td><span class="tag boot">booting</span></td></tr>`).join("");
+    vms = `<div class="section-title">VMs</div>
+      <table class="vms"><tr><th>sandbox</th><th>in-flight</th><th>uptime</th><th>state</th></tr>` +
+      (ready + pending || `<tr><td colspan="4" class="empty">${coldIdle ? "scale-to-zero: no VMs running" : "no VMs"}</td></tr>`) +
+      `</table>`;
+  }
+
+  return `${nsBadge ? `<div class="badges">${nsBadge}<span class="badge">${esc(d.kind)}</span></div>` : `<div class="badges"><span class="badge">${esc(d.kind)}</span></div>`}
+    <div class="badges">${stateBadge}</div>` +
+    (d.hosts && d.hosts.length ? `<div class="section-title">Hosts</div>
+      <div class="badges">${d.hosts.map(h => `<span class="badge">${esc(h)}</span>`).join("")}</div>` : "") +
+    (d.urls && d.urls.length ? `<div class="section-title">URLs</div>
+      ${d.urls.map(u => `<div><a href="${esc(u)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);text-decoration:none;font-size:12px">${esc(u.replace(/^https?:\/\//, ""))} ↗</a></div>`).join("")}` : "") +
+    `<div class="section-title">Pool</div>` +
+    kv("desired", p.desired_replicas) + kv("ready", p.ready) +
+    (isStatic || isSite ? "" : kv("pending", p.pending) + kv("draining", p.draining) +
+      kv("in-flight", p.total_in_flight) + kv("min", p.min_replicas) + kv("max", p.max_replicas)) +
+    `<div class="section-title">Requests</div>` +
+    kv("total", d.metrics.requests.total) + kv("2xx", d.metrics.requests.c2xx) +
+    kv("5xx", d.metrics.requests.c5xx) + kv("errors", d.metrics.requests.errors) +
+    kv("latency p50", d.metrics.latency_ms.count ? fmt(d.metrics.latency_ms.p50) + " ms" : "—") +
+    kv("latency p99", d.metrics.latency_ms.count ? fmt(d.metrics.latency_ms.p99) + " ms" : "—") +
+    vms;
+}
+
+function vmDetail(vm, pending, d) {
+  if (pending) {
+    return `<div class="note">A VM that has been created but not yet joined the
+      pool — a cold start in progress.</div>` +
+      kv("sandbox", vm.sandbox_id) +
+      kv("age", fmtDur(vm.age_secs)) +
+      kv("status", vm.status || "creating") +
+      (d && d.pool ? kv("boot budget", fmtDur(d.pool.boot_timeout_secs)) : "");
+  }
+  const st = vm.draining ? `<span class="tag drain">draining</span>`
+          : !vm.healthy ? `<span class="tag down">down</span>`
+          : `<span class="tag ok">serving</span>`;
+  // The state value is a badge rather than text, so it reads at a glance the
+  // same way the canvas node and the dashboard row do.
+  return kv("sandbox", vm.sandbox_id) +
+    kv("address", vm.addr) +
+    `<div class="kv"><div class="label">state</div><div class="value">${st}</div></div>` +
+    kv("in-flight", fmt(vm.in_flight)) +
+    kv("uptime", fmtDur(vm.uptime_secs)) +
+    kv("CPU", vm.cpu_percent == null ? "—" : fmt(vm.cpu_percent, 0) + "%") +
+    kv("memory", vm.memory_bytes == null ? "—" : fmtBytes(vm.memory_bytes)) +
+    (vm.subdomain ? kv("subdomain", vm.subdomain) : "");
+}
+
+// ---- data + render loop ---------------------------------------------------
+
+function render(data) {
+  lastData = data;
+  $("empty-overlay").classList.add("hidden");
+  layout(data);
+  // Refresh the open panel against the new layout, if any.
+  if (selected) renderPanel({ type: selected.type, id: selected.id });
+  // Freshness indicator, the same way the dashboard does it.
+  $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+  $("livedot").classList.remove("stale");
+}
+
+async function poll() {
+  try {
+    // /metrics with summary=false carries the per-VM rows the leaf column needs.
+    // No paging here: the topology shows the whole fleet at once, and a fleet
+    // large enough to page is exactly the one an operator wants a picture of.
+    const r = await fetch("metrics?summary=false", { headers: { accept: "application/json" }, cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    render(await r.json());
+  } catch (e) {
+    $("updated").textContent = "disconnected — retrying";
+    $("livedot").classList.add("stale");
+  } finally {
+    if (!paused) timer = setTimeout(poll, REFRESH_MS);
+  }
+}
+
+async function pollIngress() {
+  try {
+    const r = await fetch("ingress", { headers: { accept: "application/json" }, cache: "no-store" });
+    if (r.ok) ingress = await r.json();
+  } catch (e) { /* keep the last known; the metrics poll owns the indicator */ }
+}
+
+$("pausebtn").addEventListener("click", () => {
+  paused = !paused;
+  $("pausebtn").textContent = paused ? "Resume" : "Pause";
+  if (!paused) { poll(); }
+  else { clearTimeout(timer); }
+});
+
+// Resize handling: re-lay the graph and keep the backing store in sync with
+// the device pixel ratio. Throttled with rAF so a drag-resize does not lay out
+// dozens of times per second.
+let resizePending = false;
+function onResize() {
+  if (resizePending) return;
+  resizePending = true;
+  requestAnimationFrame(() => {
+    resizePending = false;
+    sizeCanvas();
+    if (lastData) { layout(lastData); if (selected) renderPanel(selected); }
+  });
+}
+function sizeCanvas() {
+  dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", onResize);
+
+// The animation loop. Runs every frame to advance the particles; the graph
+// itself is re-laid-out only on poll / resize, not here, so the picture is
+// stable between data refreshes.
+function loop(t) {
+  if (nodes.length) draw(t);
+  requestAnimationFrame(loop);
+}
+
+// Resolve colours now (theme may already be stamped on <html> by the server)
+// and again whenever the theme changes, so a switch recolours the canvas.
+// theme.js does not emit an event of its own; it flips `data-theme` on the
+// root, so a MutationObserver on that attribute is the reliable signal.
+resolveColors();
+new MutationObserver(resolveColors).observe(document.documentElement, {
+  attributes: true, attributeFilter: ["data-theme"],
+});
+
+sizeCanvas();
+poll();
+pollIngress();
+// Ingress barely moves; a slow refresh is plenty and keeps the network tab off
+// the fast poll the dashboard shares with /metrics.
+setInterval(pollIngress, 10000);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

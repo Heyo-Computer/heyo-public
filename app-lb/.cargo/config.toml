@@ -1,0 +1,2 @@
+[build]
+target-dir = "/workspace/cargo-target"
