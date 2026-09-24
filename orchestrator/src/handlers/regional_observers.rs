@@ -58,6 +58,19 @@ pub(super) fn topology(state: &AppState, service_id: &str) -> Result<String> {
 pub(super) async fn validate_regional_observers(
     state: &AppState, service_id: &str, regions: &[String],
 ) -> Result<()> {
+    let covered = validate_ingress_observers(state, service_id)?;
+    if regions.is_empty() || regions.iter().any(|r| !covered.contains(r.as_str())) {
+        bail!("configure every ingress observer, including at least one in each rollout region");
+    }
+    Ok(())
+}
+
+/// Observer inventory checks shared by single- and multi-region deploys.
+/// Region coverage is a separate gate: a deploy without replica regions
+/// places every replica in the request's own region and needs none.
+pub(super) fn validate_ingress_observers<'a>(
+    state: &'a AppState, service_id: &str,
+) -> Result<HashSet<&'a str>> {
     if !state.config.service_uses_discovery_routing(service_id) {
         bail!("regional rollout requires existing discovery-routed ingress");
     }
@@ -70,13 +83,13 @@ pub(super) async fn validate_regional_observers(
         }
         covered.insert(observer.region.as_str());
     }
-    if regions.is_empty() || regions.iter().any(|r| !covered.contains(r.as_str())) {
-        bail!("configure every ingress observer, including at least one in each rollout region");
+    if covered.is_empty() {
+        bail!("no ingress observers configured");
     }
     if state.config.heyosecret_url.is_empty() {
         bail!("regional observer credentials require HeyoSecret");
     }
-    Ok(())
+    Ok(covered)
 }
 
 /// IDs are resolved against the exact versioned snapshot being observed. A

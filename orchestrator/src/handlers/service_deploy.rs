@@ -607,8 +607,13 @@ pub(super) async fn validate_service_deployment_request(
         if super::host_ingress::enabled(state, &service_id) {
             super::host_ingress::validate(state, &service_id, route)
                 .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-            validate_regional_observers(state, &service_id, &request.replica_regions).await
-                .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+            if request.replica_regions.is_empty() {
+                super::regional_observers::validate_ingress_observers(state, &service_id)
+                    .map(drop)
+            } else {
+                validate_regional_observers(state, &service_id, &request.replica_regions).await
+            }
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
         }
         if route.path_prefix.as_deref().is_none_or(str::is_empty) {
             return Err((
@@ -4932,6 +4937,31 @@ mod tests {
         let guard = request.revision_guard.unwrap();
         assert_eq!(guard.git_ref, "refs/heads/main");
         assert!(!guard.force);
+    }
+
+    #[tokio::test]
+    async fn host_ingress_deploy_without_replica_regions_stays_single_region() {
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "server_port":0,"database_url":"unused","agent_provider":"test","agent_model":"test","agent_api_key":"",
+            "agent_timeout_seconds":1,"agent_max_iterations":1,"jwt_secret":"test","cloud_internal_url":"http://cloud",
+            "internal_api_key":"test","heyosecret_url":"http://secrets","discovery_routed_services":"smoke",
+            "discovery_observers":[{"service_id":"smoke","region":"us3","deployment_id":"smoke",
+                "base_url":"http://lb","ingress_url":"http://lb",
+                "discovery_url":"http://orch/orchestration/services/smoke/discovery","token_secret_path":"test/observer"}]
+        })).unwrap();
+        let state = crate::AppState { config: std::sync::Arc::new(config), http_client: reqwest::Client::new(),
+            worker_id: std::sync::Arc::new("test".into()), ci_workspace_cache: Default::default() };
+        let request = |regions: serde_json::Value| -> ServiceDeployRequest {
+            serde_json::from_value(serde_json::json!({
+                "serviceId":"smoke","userId":"u","desiredReplicas":1,"replicaRegions":regions,
+                "route":{"host":"smoke.example","pathPrefix":"/smoke","stripPrefix":false}
+            })).unwrap()
+        };
+        super::validate_service_deployment_request(&state, &request(serde_json::json!([]))).await.unwrap();
+        super::validate_service_deployment_request(&state, &request(serde_json::json!(["us3"]))).await.unwrap();
+        let (_, error) = super::validate_service_deployment_request(&state, &request(serde_json::json!(["eu1"])))
+            .await.unwrap_err();
+        assert!(error.contains("each rollout region"), "{error}");
     }
 
     #[test]
