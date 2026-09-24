@@ -32,13 +32,25 @@ work. This document does not itself change running infrastructure.
   removed with exact sandbox/domain/proxy guards. Read-back confirms all nine
   Cloud records are tombstoned, both dashboard inventories omit the old smoke
   app, and both Orchestrator service reads have no active deployment or discovery.
-- Runtime release remains blocked: current authenticated Cloud status confirms
+- Runtime recovery checkpoint, 2026-09-24: authenticated Cloud status confirms
   operation `36fce8c5ce851b3276aec416ec0b745fdcf2d0324526d20b18b0b52ee3ee494c`
-  completed with the expected target, archive and executable digest. Read-only
-  CI inspection through its configured `ci-regional/database-url` binding confirms
-  that exact operation still has phase `failed`. No CI fence/history was cleared,
-  and no runtime upgrade was blindly replayed. eu1 still needs the skipped managed
-  runtime upgrade before the new Cloud creation contract can succeed there.
+  completed with the expected target, archive and executable digest. After exact
+  installed/running executable verification, the explicitly approved guarded
+  reconciliation released only that CI maintenance fence and appended audit
+  evidence. Its original deployment, run, job and step remain failed. Execution
+  receipt: `/tmp/ci-approved-maintenance-reconciliation-executed-20260924.json`.
+  No runtime upgrade was replayed. eu1 still needs the skipped managed runtime
+  upgrade before the new Cloud creation contract can succeed there.
+  Root cause: the independent upgrade helper can restart the POST responder;
+  Cloud stopped observing its one-shot delivery fence, and CI stopped polling
+  failed operations. Private PR619 adds durable daemon upgrade receipts; public
+  PR117 adds exact GET-only late-completion recovery without rewriting history.
+  Linux validation runs `01a0d207d530-00000019` (daemon) and
+  `01a0d208b3a8-0000001b` (CI) are pending. These are not deployment evidence.
+  Deploy receipt-capable daemons before receipt-required Cloud reconciliation:
+  a legacy daemon cannot produce the first upgrade's receipt retroactively.
+  Any uncertain first upgrade retains its fence until exact helper-terminal and
+  installed/running executable evidence can be reconciled. No local tests run.
 - Live replacement progress, 2026-09-24: Linux packaging run
   `01a0d1a2edaa-00000014` succeeded; downloaded artifact SHA-256
   `5d99e96eec05ac277104bdc60a46ed5e54f0947037652e55ed55793f85190c4d`
