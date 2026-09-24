@@ -293,19 +293,9 @@ impl Pool {
         Ok(id)
     }
 
-    /// Drop `building` rows whose holder stopped renewing.
-    ///
-    /// The counterpart to [`Self::release_orphans`], and a delete rather than a
-    /// release because there is nothing to release: the row stands for an
-    /// attempt, not for a machine. A sandbox the dead process did manage to
-    /// create before it died is left to its TTL, which is what happened before
-    /// this state existed too.
-    ///
-    /// Scoped to `runners` for the reason every sweep here is: instances own
-    /// disjoint hosts, and one must not clear another's in-flight work.
-    /// Host maintenance fences new claims, but must not fence this reclamation:
-    /// the maintenance coordinator waits for stale builds to disappear before
-    /// it can touch the host.
+    /// Drop expired build records only when no executor obligation remains.
+    /// A lost create response can leave a real VM behind; lease expiry does not
+    /// resolve that uncertainty or authorize maintenance of its host.
     pub async fn sweep_stale_builds(
         &self,
         runners: &[String],
@@ -318,6 +308,7 @@ impl Pool {
             "DELETE FROM ci_vm_pool
               WHERE status = 'building'
                 AND runner_hd_id = ANY($1)
+                AND NOT EXISTS (SELECT 1 FROM ci_host_work w WHERE w.job_id=ci_vm_pool.claimed_by_job)
                 AND leased_by IS DISTINCT FROM $2
                 AND (leased_until IS NULL OR leased_until < now())",
         )
@@ -768,26 +759,11 @@ impl Pool {
             .collect())
     }
 
-    /// Return VMs whose holder has stopped renewing their lease.
-    ///
-    /// **The lease is the authority, not the job's status.** A job left
-    /// `running` by a process that died is indistinguishable, from a row, from a
-    /// job another instance is running right now — so keying on it meant an
-    /// orchestrator could not reclaim even its own VMs after a restart. They
-    /// stayed `claimed` until the sandbox TTL reaped them, and the row leaked
-    /// until some later restart found the job terminal. An expired lease says
-    /// something the job status cannot: nobody is holding this.
-    ///
-    /// A row with **no** lease is one written before this existed, so it falls
-    /// back to the old job-status test. That matters for exactly one deploy —
-    /// the one that introduces leases, where a previous build may still be
-    /// running beside this one — and costs a clause to be safe through it.
-    ///
-    /// Still scoped to `runners`: a VM on a host this instance does not serve
-    /// belongs to whichever instance does, however stale its lease looks.
-    /// An active host operation protects only its own coordinator VM. Protecting
-    /// every VM on the target runner would deadlock that operation's drain on an
-    /// expired lease left by an earlier controller.
+    /// Reclaim expired records without an unresolved executor obligation.
+    /// A missing heartbeat cannot distinguish process death from a partition.
+    /// Work claimed through Store::claim_job must use verified cleanup; even a
+    /// terminal job or an expired lease cannot hand its VM to another executor.
+    /// Reclamation remains scoped to the runners served by this instance.
     pub async fn release_orphans(
         &self,
         runners: &[String],
@@ -801,6 +777,7 @@ impl Pool {
                 SET status='idle', claimed_by_job=NULL, leased_by=NULL, leased_until=NULL
               WHERE p.status = 'claimed'
                 AND p.runner_hd_id = ANY($1)
+                AND NOT EXISTS (SELECT 1 FROM ci_host_work w WHERE w.job_id=p.claimed_by_job)
                 AND NOT EXISTS (SELECT 1 FROM ci_vm_cleanup c WHERE c.sandbox_id=p.sandbox_id)
                 AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase<>'passed' AND s.job_id=p.claimed_by_job)
                 AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase NOT IN ('passed','superseded') AND s.job_id=p.claimed_by_job)

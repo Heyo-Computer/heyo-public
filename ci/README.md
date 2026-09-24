@@ -188,11 +188,12 @@ retry controller replacement. Use the coordinated release policy for deployment;
 do not treat an individual validation rerun or a successful artifact upload as
 authorization to publish or as evidence that a replacement occurred.
 
-The durable rollout waits for jobs, claimed/building VMs, live native leases and
-other unresolved deployments. A historical running native job does not block
-once its lease has expired and its parent run is terminal: native endpoints
-reject further writes and the job cannot be leased again. An expired lease on
-a still-runnable run remains a blocker. No historical rows are deleted.
+The durable rollout waits for jobs, claimed/building VMs, unresolved host-work
+obligations, native executions and other unresolved deployments. Expired leases
+and terminal parent runs do not prove that a remote command stopped. Native
+leases remain reserved after expiry; another runner cannot take over that job.
+Unresolved execution blocks replacement until positively reconciled. No
+historical rows are deleted to bypass this barrier.
 Before the first replacement attempt,
 `CI_MAX_JOB_SECONDS` bounds the drain; timeout or cancellation leaves the
 controller unchanged and reopens submissions. After an ambiguous replacement
@@ -1049,31 +1050,26 @@ run left this behind", which is the question cleanup is asking.
 The pool table survives a restart. Without it a crash orphans every VM until its
 TTL, and the next run builds a second pool beside the one already sitting there.
 
-### A claimed VM is held by a lease, not by a job
+### Lease expiry is not execution takeover authority
 
-Each instance takes a **random id at startup** and stamps it, with an expiry, on
-every VM it claims — renewing on a timer while it holds them. Reclaim keys on
-that expiry.
+Each instance has a random startup identity and renews its VM leases. A missed
+renewal can mean either process death or a network partition while the process
+still drives a VM. It does not authorize reusing that VM.
 
-The obvious alternative does not work, and this is the bug it caused: asking
-whether the *job* is still `running` cannot distinguish "another instance is
-running it" from "the process that was running it died". A restart leaves the row
-`running` either way, so reclaim had to leave the VM alone — an orchestrator
-could not take back even its own VMs. They stayed `claimed` until the sandbox TTL
-reaped them (`CI_VM_TTL_SECONDS`, an hour by default), and the row leaked until
-some later restart happened to find the job terminal.
+Claiming a job atomically records `ci_host_work` and transitions the job to
+`running`. A concurrent claim or queue redelivery cannot replace that owner.
+While the obligation exists, lease expiry cannot repool its VM or delete a
+pending-create record. Cancellation does not remove this evidence either.
+Normal execution hands release to verified VM cleanup. Errors after a claim
+retain the obligation and report that reconciliation is required instead of
+automatically replaying potentially completed external effects. Errors before
+claiming work still use the retry ladder.
 
-A lease is a fact about the holder rather than an inference from the work. Three
-properties follow:
-
-- **A restarted instance reclaims its own previous life**, because the id is
-  fresh per process — a stable one would inherit the dead process's leases and
-  reclaim nothing.
-- **An instance never reclaims what it is holding**, whatever the clock says. A
-  slow database must not make a process fight itself; two dispatchers on one
-  sandbox is far worse than a VM reclaimed a minute late.
-- **Reclaim runs on a timer, not only at startup**, so a dead sibling's VMs come
-  back within a lease period instead of waiting for somebody to restart this one.
+The same rule applies to native runners: expiry rejects stale reports but does
+not reassign the execution or free its runner capacity. These guards are
+prerequisites for regional CI, not a complete multi-controller implementation.
+Shared source/log storage, executor handoff and recovery remain required before
+running a second CI controller against production state.
 
 `uses: default` resolves through **`~/.heyo/daemon.json`** — heyvmd mints
 `backend_id` there on first start and registers and heartbeats under it, so it is

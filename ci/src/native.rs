@@ -164,7 +164,9 @@ pub async fn poll(
     let runner = sqlx::query("UPDATE ci_native_runner SET last_seen_at=now() WHERE id=$1 RETURNING labels,max_concurrent")
         .bind(&p.runner_id).fetch_optional(&mut *tx).await.map_err(|e| internal(Box::new(e)))?
         .ok_or_else(|| PollError::Rejected("runner is not registered".into()))?;
-    let active: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_native_job WHERE runner_id=$1 AND state='leased' AND lease_expires_at>now()")
+    // Expiry revokes writes, not execution already running on a disconnected
+    // native host. Keep its capacity and job reserved until quiescence is known.
+    let active: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_native_job WHERE runner_id=$1 AND state='leased'")
         .bind(&p.runner_id).fetch_one(&mut *tx).await.map_err(|e| internal(Box::new(e)))?;
     if active >= runner.get::<i32, _>("max_concurrent") as i64 {
         tx.commit().await.map_err(|e| internal(Box::new(e)))?;
@@ -172,7 +174,7 @@ pub async fn poll(
     }
     let labels: Vec<String> = runner.get("labels");
     let token = Uuid::new_v4();
-    let row = sqlx::query("WITH candidate AS (SELECT n.job_id FROM ci_native_job n JOIN ci_job j ON j.id=n.job_id JOIN ci_run r ON r.id=n.run_id WHERE (n.state='queued' OR (n.state='leased' AND n.lease_expires_at<=now())) AND n.required_labels <@ $2 AND j.status IN ('queued','running') AND r.status NOT IN ('success','failure','cancelled') AND ((j.plan->>'max_parallel') IS NULL OR (SELECT count(*) FROM ci_native_job peer JOIN ci_job pj ON pj.id=peer.job_id WHERE pj.run_id=j.run_id AND pj.base_id=j.base_id AND peer.state='leased' AND peer.lease_expires_at>now()) < (j.plan->>'max_parallel')::int) ORDER BY n.created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE ci_native_job n SET state='leased',runner_id=$1,lease_token=$3,lease_expires_at=now()+make_interval(secs=>$4) FROM candidate WHERE n.job_id=candidate.job_id RETURNING n.job_id,n.run_id,n.lease_expires_at")
+    let row = sqlx::query("WITH candidate AS (SELECT n.job_id FROM ci_native_job n JOIN ci_job j ON j.id=n.job_id JOIN ci_run r ON r.id=n.run_id WHERE n.state='queued' AND n.required_labels <@ $2 AND j.status='queued' AND r.status NOT IN ('success','failure','cancelled') AND ((j.plan->>'max_parallel') IS NULL OR (SELECT count(*) FROM ci_native_job peer JOIN ci_job pj ON pj.id=peer.job_id WHERE pj.run_id=j.run_id AND pj.base_id=j.base_id AND peer.state='leased') < (j.plan->>'max_parallel')::int) ORDER BY n.created_at FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE ci_native_job n SET state='leased',runner_id=$1,lease_token=$3,lease_expires_at=now()+make_interval(secs=>$4) FROM candidate WHERE n.job_id=candidate.job_id RETURNING n.job_id,n.run_id,n.lease_expires_at")
         .bind(&p.runner_id).bind(labels).bind(token).bind(LEASE_SECONDS as f64).fetch_optional(&mut *tx).await.map_err(|e| internal(Box::new(e)))?;
     let Some(row) = row else {
         tx.commit().await.map_err(|e| internal(Box::new(e)))?;
@@ -464,12 +466,25 @@ mod tests {
         sqlx::query("UPDATE ci_native_job SET lease_expires_at=now()-interval '1 second' WHERE job_id=$1")
             .bind(&job.id).execute(store.pool()).await.unwrap();
         assert!(release_source_context(&store,first.lease_token,0).await.unwrap().is_none(),"expired lease must be fenced");
-        let second = poll(&store,request(),"http://localhost",&secrets).await.unwrap().unwrap();
-        assert_ne!(first.lease_token,second.lease_token);
+        assert!(poll(&store,request(),"http://localhost",&secrets).await.unwrap().is_none(), "expiry cannot free the old runner's capacity");
+        let peer = crate::vm::new_id();
+        register(&store, Registration { runner_id:peer.clone(),name:peer.clone(),
+            labels:vec![label.clone(),"macos".into(),"x86_64".into()], platform:"macos".into(),arch:"x86_64".into(),
+            protocol_version:1,max_concurrent_jobs:1 }).await.unwrap();
+        assert!(poll(&store,Poll{runner_id:peer.clone(),protocol_version:1},"http://localhost",&secrets).await.unwrap().is_none(),
+            "another runner cannot take over an expired execution");
         assert!(!heartbeat(&store,&LeaseUpdate{runner_id:runner.clone(),lease_token:first.lease_token}).await.unwrap());
         let report = |token,status:&str,step_status:&str,exit| Completion{runner_id:runner.clone(),lease_token:token,
             status:status.into(),error:None,outputs:serde_json::json!({}),steps:vec![StepResult{index:0,status:step_status.into(),exit_code:Some(exit),log:"native test log".into(),error:None,outputs:serde_json::json!({})}]};
         assert!(complete(&store,&secrets,report(first.lease_token,"success","success",0)).await.unwrap().is_none());
+        let retained: Uuid = sqlx::query_scalar("SELECT lease_token FROM ci_native_job WHERE job_id=$1")
+            .bind(&job.id).fetch_one(store.pool()).await.unwrap();
+        assert_eq!(retained, first.lease_token, "no replacement execution identity was issued");
+        // Restore the fixture's clock boundary to test valid completion below;
+        // this is not a production recovery operation or a replacement lease.
+        sqlx::query("UPDATE ci_native_job SET lease_expires_at=now()+interval '10 minutes' WHERE job_id=$1")
+            .bind(&job.id).execute(store.pool()).await.unwrap();
+        let second = first;
         assert!(complete(&store,&secrets,report(second.lease_token,"success","failure",7)).await.is_err());
         assert_eq!(store.get_job(&job.id).await.unwrap().unwrap().status,"running");
         let constraint = format!("reject_native_{run}");
@@ -492,10 +507,13 @@ mod tests {
         assert!(!heartbeat(&store,&LeaseUpdate{runner_id:runner.clone(),lease_token:lease.lease_token}).await.unwrap());
         assert!(complete(&store,&secrets,report(lease.lease_token,"success","success",0)).await.unwrap().is_none());
         assert_eq!(store.get_job(&cancelled.id).await.unwrap().unwrap().status,"cancelled");
-        // Cancellation fences the worker immediately; capacity remains reserved
-        // until that worker's lease expires. Advance that deadline for this test.
+        // Cancellation and expiry cannot prove that the native process stopped.
         sqlx::query("UPDATE ci_native_job SET lease_expires_at=now()-interval '1 second' WHERE job_id=$1")
             .bind(&cancelled.id).execute(store.pool()).await.unwrap();
+        assert!(poll(&store,request(),"http://localhost",&secrets).await.unwrap().is_none());
+        // Independent work can still execute on the unused peer runner.
+        let runner = peer;
+        let request = || Poll{runner_id:runner.clone(),protocol_version:1};
 
         let release_workflow=crate::workflow::Workflow::parse("native-release.yml",&format!("jobs:\n  native:\n    runs-on: [{label}]\n    steps:\n      - id: checkout\n        uses: ci/checkout-release\n")).unwrap();
         let release_plan=crate::plan::Plan::build(&release_workflow).unwrap();let release_run=crate::vm::new_id();

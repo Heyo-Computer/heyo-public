@@ -1326,8 +1326,9 @@ impl Store {
     /// `sandbox_id` and `fingerprint` stay null until then, which is the honest
     /// reading: running, no machine yet.
     ///
-    /// Returns false when the job was already terminal — cancelled while it sat
-    /// on the queue, or finished by a delivery whose ack was lost.
+    /// Returns false for terminal or already-running work. Queue redelivery is
+    /// not evidence that the previous executor stopped issuing remote commands.
+    /// Reconciliation, not a delivery counter, must resolve an interrupted claim.
     pub async fn claim_job(
         &self,
         job_id: &str,
@@ -1348,7 +1349,8 @@ impl Store {
                 SET status = 'running', runner_hd_id = $2, attempt = $3,
                     started_at = COALESCE(started_at, now())
               WHERE id = $1
-                AND status NOT IN ('success','failure','skipped','cancelled')
+                AND status IN ('pending','queued')
+                AND NOT EXISTS (SELECT 1 FROM ci_host_work w WHERE w.job_id=ci_job.id)
                 AND NOT EXISTS (SELECT 1 FROM ci_service_deployment s JOIN ci_host_maintenance h ON h.id=s.id WHERE s.job_id=ci_job.id)
                 AND NOT EXISTS (SELECT 1 FROM ci_service_deployment s JOIN ci_host_heyvm_bootstrap h ON h.id=s.id WHERE s.job_id=ci_job.id)
               RETURNING run_id, job_key",
@@ -1375,6 +1377,18 @@ impl Store {
         sqlx::query("DELETE FROM ci_host_work WHERE job_id=$1 AND runner_hd_id=$2 AND attempt=$3")
             .bind(job_id).bind(runner).bind(attempt).execute(&self.pool).await.map_err(StoreError::sql)?;
         Ok(())
+    }
+
+    /// A recorded executor obligation survives cancellation, process death and
+    /// lease expiry. Only verified release may remove it.
+    pub async fn has_host_work(&self, job_id: &str) -> Result<bool, StoreError> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_work WHERE job_id=$1)")
+            .bind(job_id).fetch_one(&self.pool).await.map_err(StoreError::sql)
+    }
+
+    pub async fn has_unresolved_execution(&self, run_id: &str) -> Result<bool, StoreError> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_work w JOIN ci_job j ON j.id=w.job_id WHERE j.run_id=$1) OR EXISTS(SELECT 1 FROM ci_native_job WHERE run_id=$1 AND state='leased')")
+            .bind(run_id).fetch_one(&self.pool).await.map_err(StoreError::sql)
     }
 
     /// Record why an attempt failed, without deciding the job's fate.
@@ -3372,6 +3386,51 @@ jobs:
         let after: i64 = sqlx::query("SELECT count(*) n FROM ci_event_outbox WHERE run_id=$1")
             .bind(&run_id).fetch_one(&store.pool).await.unwrap().get("n");
         assert_eq!(after, before, "terminal cancel and claim no-ops emit no false transition");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn regional_claims_and_expiry_cannot_reassign_unresolved_execution() {
+        let store = test_store().await;
+        let other = test_store().await;
+        let run = crate::vm::new_id();
+        store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+        let job = job_id(&run, "build-x86_64");
+        let us = format!("hd-us-{run}");
+        let eu = format!("hd-eu-{run}");
+        // Different runner locks must still serialize on the one job row.
+        let (a, b) = tokio::join!(store.claim_job(&job, &us, 1), other.claim_job(&job, &eu, 2));
+        assert_ne!(a.as_ref().unwrap(), b.as_ref().unwrap(), "exactly one regional claim wins");
+        let (runner, attempt) = if a.unwrap() { (&us, 1) } else { (&eu, 2) };
+        let first = store.get_job(&job).await.unwrap().unwrap();
+        assert_eq!(first.runner_hd_id.as_deref(), Some(runner.as_str()));
+        assert_eq!(first.attempt, attempt);
+        assert!(!other.claim_job(&job, &eu, 9).await.unwrap(), "redelivery cannot steal running work");
+        assert_eq!(other.get_job(&job).await.unwrap().unwrap().attempt, attempt);
+
+        let pool = crate::pool::Pool::new(store.pool().clone());
+        let sandbox = format!("sb-{run}");
+        let expired = crate::pool::Lease { instance: "partitioned-controller", ttl: Duration::ZERO };
+        pool.register(&sandbox, runner, "fp", "wf", None, &job, expired).await.unwrap();
+        let building = pool.begin_build(&job, runner, "fp-build", "wf", None,
+            crate::pool::Lease { instance: "partitioned-controller", ttl: Duration::ZERO }).await.unwrap();
+        let runners = vec![runner.clone()];
+        assert_eq!(pool.release_orphans(&runners, "new-controller").await.unwrap(), 0);
+        assert_eq!(pool.sweep_stale_builds(&runners, "new-controller").await.unwrap(), 0);
+        assert_eq!(pool.get(&sandbox).await.unwrap().unwrap().status, "claimed");
+        assert!(pool.get(&building).await.unwrap().is_some(), "lost create response retains its evidence");
+
+        store.cancel_run(&run).await.unwrap();
+        assert!(other.has_host_work(&job).await.unwrap(), "cancellation is not executor quiescence");
+        assert_eq!(pool.release_orphans(&runners, "new-controller").await.unwrap(), 0);
+        assert_eq!(pool.sweep_stale_builds(&runners, "new-controller").await.unwrap(), 0);
+        assert!(!other.claim_job(&job, &us, 10).await.unwrap());
+        // A verified release is an explicit action, not an expired timer.
+        store.end_host_work(&job, runner, attempt).await.unwrap();
+        assert!(!other.has_host_work(&job).await.unwrap());
+        assert_eq!(pool.release_orphans(&runners, "new-controller").await.unwrap(), 1);
+        assert_eq!(pool.sweep_stale_builds(&runners, "new-controller").await.unwrap(), 1);
+        assert_eq!(pool.get(&sandbox).await.unwrap().unwrap().status, "idle");
     }
 
     // ---- log retention ---------------------------------------------------

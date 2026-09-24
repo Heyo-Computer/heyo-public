@@ -1311,16 +1311,17 @@ pub fn valid_operation_id(id: &str) -> bool {
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Mint an id usable as both an `operationId` and a NATS subject token:
-/// `<epoch_ms:012x>-<seq:08x>`.
+/// `<epoch_ms:012x>-<seq:08x>-<random_uuid:032x>`.
 ///
-/// Hex and dash only, and time-ordered so a sorted listing reads
-/// chronologically. Same scheme queue-fn uses for invocation ids.
+/// The timestamp and local counter retain ordering within a process. Random
+/// identity prevents two regional processes starting their counters in the
+/// same millisecond from creating the same run or external operation.
 pub fn new_id() -> String {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{:012x}-{:08x}", ms, seq & 0xffff_ffff)
+    format!("{:012x}-{:08x}-{}", ms, seq & 0xffff_ffff, uuid::Uuid::new_v4().simple())
 }
 
 /// Sandbox name for a pooled VM: `ci-<workflow>-<fingerprint>-<nonce>`.
@@ -2195,7 +2196,10 @@ mod tests {
             assert!(valid_operation_id(id), "{id}");
             // Also usable as a NATS subject token — no dots.
             assert!(crate::config::is_subject_token(id), "{id}");
+            let random = uuid::Uuid::parse_str(id.rsplit('-').next().unwrap()).unwrap();
+            assert_eq!(random.get_version_num(), 4, "identity must not rely on the process-local counter");
         }
+        assert_ne!(a.rsplit('-').next(), b.rsplit('-').next(), "each id has its own random identity");
         assert!(a < b, "ids must sort chronologically");
     }
 

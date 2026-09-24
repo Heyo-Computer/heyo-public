@@ -561,10 +561,15 @@ mod tests {
         s.set_job_status("job", JobStatus::Running, None).await.unwrap();
         sqlx::query("UPDATE ci_native_job SET lease_expires_at=now()-interval '1 minute'").execute(s.pool()).await.unwrap();
         s.set_run_status("run", RunStatus::Running, None).await.unwrap();
-        assert!(!gate.quiesce(s, "op").await.unwrap(), "an expired lease on a runnable run can be claimed again");
+        assert!(!gate.quiesce(s, "op").await.unwrap(), "lease expiry does not prove the native process stopped");
         s.set_run_status("run", RunStatus::Failure, None).await.unwrap();
-        // All native writes and future claims are fenced by expiry and the
-        // terminal parent, even if historical job status still says running.
+        s.set_job_status("job", JobStatus::Cancelled, None).await.unwrap();
+        assert!(!gate.quiesce(s, "op").await.unwrap(), "terminal rows cannot discharge native execution");
+        // Model an explicit native completion, not a timer-based release.
+        sqlx::query("UPDATE ci_native_job SET state='completed'").execute(s.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_host_work(job_id,runner_hd_id,attempt) VALUES('job','host',1)").execute(s.pool()).await.unwrap();
+        assert!(!gate.quiesce(s, "op").await.unwrap(), "host work can exist before its VM is recorded");
+        s.end_host_work("job", "host", 1).await.unwrap();
         assert!(gate.quiesce(s, "op").await.unwrap());
         assert!(Lifecycle::default().work(s).await.is_err());
         sqlx::query("UPDATE ci_controller_rollout SET phase='complete'").execute(s.pool()).await.unwrap();

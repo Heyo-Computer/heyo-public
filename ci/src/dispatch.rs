@@ -637,6 +637,11 @@ impl Dispatcher {
                 "jobs in this run are still active; wait for them to finish before re-running it".into()
             ));
         }
+        if self.store.has_unresolved_execution(run_id).await? {
+            return Err(DispatchError::Workflow(
+                "this run still owns unresolved execution; reconcile its workers before re-running it".into()
+            ));
+        }
         if self.store.service_deployments_of(run_id).await?.iter()
             .any(|d| !matches!(d.status.as_str(), "passed" | "failed")) {
             return Err(DispatchError::Workflow(
@@ -1223,13 +1228,16 @@ impl Dispatcher {
         // one nothing had touched looked the same on every page, and the
         // waiting-for-a-runner reaper could not tell them apart either.
         //
-        // False means the job went terminal while it sat on the queue —
-        // cancelled, or finished by a delivery whose ack was lost — and the
-        // right move is to stop here, before spending a VM on it.
+        // Another delivery may already own this job. Redelivery cannot grant
+        // a second execution, even if the first controller stopped heartbeating.
         if !self.store.claim_job(&msg.job_id, &runner, attempt).await? {
             if crate::host_maintenance::cordoned(&self.store, &runner).await
                 .map_err(|e| DispatchError::StepFailed(e.to_string()))? {
                 return Err(DispatchError::MaintenancePaused);
+            }
+            if self.store.has_host_work(&msg.job_id).await? {
+                tracing::info!(job = %msg.job_key, "execution already claimed; dropping duplicate delivery");
+                return Ok(JobStatus::Running);
             }
             tracing::info!(job = %msg.job_key, "no longer runnable; dropping delivery");
             return Ok(JobStatus::Success);
@@ -3406,9 +3414,8 @@ async fn process_delivery(
     // decorative — a documented ceiling on a job that bounded nothing.
     //
     // A job cut off this way leaves its VM claimed, because `run_job`
-    // never reaches its own release. The lease reclaims it once this
-    // dispatcher stops renewing, which is exactly the case leases exist
-    // for.
+    // never reaches its own release. Its durable executor obligation blocks
+    // reuse: dropping this future does not prove remote execution stopped.
     //
     // The clock starts *here*, on pickup. A job that sat on a queue
     // behind another build has spent none of its budget waiting: a
@@ -3444,6 +3451,28 @@ async fn process_delivery(
             let _ = msg.ack().await;
         }
         Err(e) => {
+            // Once an executor has claimed the job, even a timeout can mean
+            // that a remote command is still running. Keep the claim and its
+            // drain obligation; neither NATS redelivery nor lease expiry may
+            // retry these effects. Pre-claim placement errors still use the
+            // ordinary retry ladder below.
+            match dispatcher.store.has_host_work(&job.job_id).await {
+                Ok(true) => {
+                    let detail = format!("Execution outcome requires reconciliation; automatic retry withheld: {e}");
+                    tracing::warn!(job = %job.job_key, "{detail}");
+                    if let Err(error) = dispatcher.store.note_job_error(&job.job_id, &detail).await {
+                        tracing::error!(job = %job.job_key, %error, "could not persist unresolved execution");
+                        return;
+                    }
+                    let _ = msg.ack().await;
+                    return;
+                }
+                Err(error) => {
+                    tracing::error!(job = %job.job_key, %error, "execution ownership unknown; refusing retry");
+                    return;
+                }
+                Ok(false) => {}
+            }
             // Retryable up to `MAX_DELIVER`. Past that JetStream stops
             // redelivering, so the job is marked failed here rather than
             // left `running` forever with nothing coming back to it.
@@ -6374,6 +6403,37 @@ mod tests {
             // takes anyway.
             objects: Arc::new(crate::objects::Workflows::new(&config)),
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
+    async fn cancellation_cannot_bypass_execution_ownership_by_rerunning() {
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let wf = crate::workflow::Workflow::parse("retry.yml", "jobs:\n  build:\n    steps: [{run: echo test}]\n").unwrap();
+        let plan = crate::plan::Plan::build(&wf).unwrap();
+        for native in [false, true] {
+            let run = crate::vm::new_id();
+            d.store.create_run(&run, &crate::store::RunRequest::default(), &plan).await.unwrap();
+            let job = d.store.jobs_of(&run).await.unwrap().remove(0);
+            if native {
+                sqlx::query("INSERT INTO ci_native_job(job_id,run_id,required_labels,state,lease_expires_at) VALUES($1,$2,'{}','leased',now()-interval '1 hour')")
+                    .bind(&job.id).bind(&run).execute(d.store.pool()).await.unwrap();
+            } else {
+                assert!(d.store.claim_job(&job.id, "hd-local", 1).await.unwrap());
+            }
+            d.store.cancel_run(&run).await.unwrap();
+            assert!(d.rerun(&run, false, None).await.err().expect("rerun must be refused").to_string().contains("unresolved execution"));
+            assert!(d.store.reruns_of(&run).await.unwrap().is_empty());
+            // Model verified release to exercise both sides of the barrier.
+            if native {
+                sqlx::query("UPDATE ci_native_job SET state='completed' WHERE job_id=$1")
+                    .bind(&job.id).execute(d.store.pool()).await.unwrap();
+            } else { d.store.end_host_work(&job.id, "hd-local", 1).await.unwrap(); }
+            assert!(!d.store.has_unresolved_execution(&run).await.unwrap());
+            let error = d.rerun(&run, false, None).await.err().expect("fixture source is absent").to_string();
+            assert!(error.contains("source of run"), "ownership cleared, so the absent fixture source is now the blocker: {error}");
+        }
     }
 
     #[tokio::test]

@@ -5,6 +5,35 @@ decisions and checklist below supersede conflicting next-step statements in the
 historical checkpoints. Existing capabilities are identified separately from new
 work. This document does not itself change running infrastructure.
 
+## CI correction and release reconciliation — 2026-09-24
+
+The required outcome is one logical `ci` application with instances in us3 and
+eu1, shared run/source/log/artifact state and coordinated execution ownership.
+An observation-only entry or adoption of the existing eu1 singleton is not that
+outcome. The acceptance checklist below remains authoritative and incomplete.
+
+PR #118 merged through release run `01a0d4e169d3-00000038`. The coordinator was
+cancelled before its eu1 and CI stages after the singleton scope was rejected.
+The us3 app-lb replacement completed. The already-submitted us3 Orchestrator
+operation `ci-service-919bf3328ffe2bfdde7c1e770965700fc8794131599323a0a50b472b558efae1`
+continued independently, then reported `failed`, `phase=verifying`,
+`readiness_verified=false`, `previous_stopped=false`, and
+`candidate readiness deadline elapsed; source retained`. Both public CI
+`/healthz` endpoints still returned revision
+`afc133a5e95eb0d29d02eab5ad86f191292758f8`. The us3 CI hostname still forwards to
+eu1; these responses are not independent regional CI availability. No CI
+adoption or obsolete-record deletion was performed.
+
+Local work on `fix/ci-shared-execution` first removes unsafe takeover authority:
+queue redelivery cannot claim running jobs; unresolved executor records protect
+expired VM/build claims; native expiry cannot reassign execution; drain includes
+unresolved native and host work. Repeated startup exposed a non-idempotent
+migration in PR #118, now corrected locally. These are safety prerequisites,
+not deployment completion. Executor/HTTP role separation, shared source/log
+storage, positive worker quiescence/handoff and the live platform gates remain.
+Uncertain remote effects must be reconciled, never replayed because a timer ran
+out. Production CI remains on the previous revision while this work proceeds.
+
 ## Unified control-plane checkpoint — 2026-09-23
 
 - Preparation investigation, 2026-09-24: authenticated HEAD reads confirmed
