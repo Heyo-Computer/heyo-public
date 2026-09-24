@@ -2465,6 +2465,14 @@ function renderFleet(result) {
     return;
   }
   if (!result.data.configured) {
+    // Without a fleet this gateway is the whole deployment, so its local view is
+    // the only truthful default. An explicit ?view= is always respected.
+    const params = new URLSearchParams(location.search);
+    if (!params.has("view")) {
+      params.set("view", "local");
+      location.replace(location.pathname + "?" + params + location.hash);
+      return;
+    }
     target.textContent = "Regional observations are not configured. No region is assumed from this page's hostname.";
     return;
   }
