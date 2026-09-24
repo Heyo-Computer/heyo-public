@@ -18,6 +18,7 @@ use crate::siem::SecuritySink;
 use crate::registry::Registry;
 use async_trait::async_trait;
 use pingora_core::prelude::HttpPeer;
+use pingora_core::protocols::TcpKeepalive;
 use pingora_core::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
@@ -283,8 +284,32 @@ async fn resolve_peer(peer: &str) -> Option<SocketAddr> {
     tokio::net::lookup_host(peer).await.ok()?.next()
 }
 
+/// Keepalive on every upstream connection, so a backend that vanishes without
+/// a word is noticed. A destroyed Firecracker VM takes its tap device with it:
+/// no RST ever arrives, and a request waiting on a response has nothing
+/// unacknowledged in flight, so without probes the socket sits in ESTABLISHED
+/// forever — holding the caller, the backend's `in_flight` slot, and anything
+/// queued behind that caller. Probes are answered by a live peer's kernel, so a
+/// slow response or a long-lived stream is unaffected; a dead peer is dropped
+/// within about a minute of its last word.
+const UPSTREAM_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const UPSTREAM_KEEPALIVE_COUNT: usize = 3;
+/// `TCP_USER_TIMEOUT`: the same bound for data that was sent and never
+/// acknowledged — a pooled keep-alive connection reused after its VM died.
+#[cfg(target_os = "linux")]
+const UPSTREAM_USER_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn http_peer(backend: &VmBackend, address: SocketAddr) -> HttpPeer {
-    HttpPeer::new(address, backend.tls, backend.sni.clone())
+    let mut peer = HttpPeer::new(address, backend.tls, backend.sni.clone());
+    peer.options.tcp_keepalive = Some(TcpKeepalive {
+        idle: UPSTREAM_KEEPALIVE_IDLE,
+        interval: UPSTREAM_KEEPALIVE_INTERVAL,
+        count: UPSTREAM_KEEPALIVE_COUNT,
+        #[cfg(target_os = "linux")]
+        user_timeout: UPSTREAM_USER_TIMEOUT,
+    });
+    peer
 }
 
 /// The key authorization to serve for `path`, if it names an outstanding
@@ -1371,6 +1396,27 @@ mod tests {
         assert_eq!(peer.sni, "ci.eu1.heyo.work");
         assert!(peer.options.verify_cert);
         assert!(peer.options.verify_hostname);
+    }
+
+    #[test]
+    fn upstream_peers_probe_for_a_vanished_backend() {
+        let backend = backend("172.25.128.50:8080");
+        let peer = http_peer(&backend, "172.25.128.50:8080".parse().unwrap());
+        let ka = peer
+            .options
+            .tcp_keepalive
+            .as_ref()
+            .expect("keepalive is set on every upstream");
+        let detect = ka.idle + ka.interval * ka.count as u32;
+        assert!(
+            detect <= Duration::from_secs(90),
+            "a dead VM should be dropped well inside cold-start budgets, got {detect:?}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            !ka.user_timeout.is_zero(),
+            "unacknowledged writes to a dead VM must time out too"
+        );
     }
 
     #[test]
