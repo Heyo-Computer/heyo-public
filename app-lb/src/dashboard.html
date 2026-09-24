@@ -2433,6 +2433,14 @@ function renderServices(result) {
   const services = result.data.inventory.services;
   target.innerHTML = `<div class="sub">Shared Orchestrator state · recorded health, not a live reachability test.</div>` +
     (services.length ? services.map(s => {
+      if (s.external) {
+        const external = s.external;
+        return `<article style="margin-top:16px;overflow-wrap:anywhere"><h3>${esc(s.serviceId)}</h3>
+          <div>Lifecycle owner: ${esc(external.lifecycleOwner)} · Observation only</div>
+          <div>${esc(external.region)} · Deployment: ${esc(external.deploymentId)}</div>
+          <div>Registered observation: ${esc(external.observedAt || "unknown")}</div>
+          <div class="sub">Lifecycle remains with the existing app-lb controller. No Orchestrator rollout or regional failover is enabled.</div></article>`;
+      }
       const endpoints = s.endpoints;
       const regions = [...new Set([...(s.replicaRegions || []), ...(endpoints || []).map(e => e.region || "unplaced")])];
       const ready = endpoints?.filter(e => e.healthStatus === "healthy" && !e.draining).length;
