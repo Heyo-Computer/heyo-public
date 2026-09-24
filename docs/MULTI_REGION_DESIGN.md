@@ -7,6 +7,38 @@ work. This document does not itself change running infrastructure.
 
 ## Unified control-plane checkpoint — 2026-09-23
 
+- Latest live result, 2026-09-24: revised Linux packaging run
+  `01a0d1badd67-00000017` succeeded; artifact digest
+  `ceec58d8f3cd507e6665d2e08c0530891d0279af0a8f83191cbd2c83ae1e5b5c`
+  was verified before Cloud deployment `gateway-smoke-eb23c75-us3`.
+  Runtime `sb-c3552b06b608407484b485fadad32b10` is running on us3;
+  its verified local binding is `http://127.0.0.1:2227`. The full public verifier
+  passed twice through `https://ci.eu1.heyo.work` with application Host
+  `gateway-smoke-us3.us3.heyo.work`: exact region/revision, request preservation,
+  single POST delivery and held response-body timing. Direct unauthenticated
+  destination traffic returned 403; attempted second-hop admission returned 508.
+  This is eu1-to-us3 transport verification only, not an eu1 VM, regional
+  selection, shared Orchestrator application inventory or rollout/drain acceptance.
+  The superseded first replacement us3 VM was deleted after route handoff and
+  completed probes; its domain, metadata and proxy references are absent.
+- Old-smoke retirement completed through the product Cloud deletion API for all
+  nine inventoried deployment records. Under the service lifecycle advisory lock,
+  exact-state guards retired the stale candidate-create run with an explanatory
+  failure reason and removed only old smoke discovery/service state. Historical
+  failure records remain. The obsolete eu1 Traefik snippet was removed after
+  validating its single smoke-only route. Post-delete inventories on both hosts
+  found no old smoke domains, metadata directories, qcow2 disks or proxy/link
+  references. Eight unreferenced ISO/console sidecars (1,916,082 bytes) were
+  removed with exact sandbox/domain/proxy guards. Read-back confirms all nine
+  Cloud records are tombstoned, both dashboard inventories omit the old smoke
+  app, and both Orchestrator service reads have no active deployment or discovery.
+- Runtime release remains blocked: current authenticated Cloud status confirms
+  operation `36fce8c5ce851b3276aec416ec0b745fdcf2d0324526d20b18b0b52ee3ee494c`
+  completed with the expected target, archive and executable digest. Read-only
+  CI inspection through its configured `ci-regional/database-url` binding confirms
+  that exact operation still has phase `failed`. No CI fence/history was cleared,
+  and no runtime upgrade was blindly replayed. eu1 still needs the skipped managed
+  runtime upgrade before the new Cloud creation contract can succeed there.
 - Live replacement progress, 2026-09-24: Linux packaging run
   `01a0d1a2edaa-00000014` succeeded; downloaded artifact SHA-256
   `5d99e96eec05ac277104bdc60a46ed5e54f0947037652e55ed55793f85190c4d`
@@ -20,7 +52,7 @@ work. This document does not itself change running infrastructure.
   checks passed before the verifier failed its held-body timing assertion.
   A five-second diagnostic delivered its first byte at 5.944 seconds; this
   does not prove streaming. The fixture now sends a 64-KiB prefix before holding
-  the tail to cross proxy/TLS buffering boundaries; that change awaits live verification.
+  the tail to cross proxy/TLS buffering boundaries; the subsequent live result is above.
   eu1 edge registration used its existing service-route API on port 3000;
   the managed daemon on 34099 rejected service-route writes because its
   `HEYVM_TRAEFIK_DYNAMIC_CONFIG_DIR` is unset. No route file was hand-written.
