@@ -400,6 +400,7 @@ pub(super) fn ordered_regions(slots: &[String]) -> Vec<String> {
 async fn admit(state: &AppState, request: RegionalRolloutRequest) -> Result<(Rollout, bool)> {
     let hash = payload_hash(&request)?;
     let db = db::get_db()?;
+    super::service_adoption::ensure_managed(db, &request.deployment.service_id).await?;
     if let Some(existing) = load(Some(db), &request.operation_id).await? {
         let stored = db
             .query_one(Statement::from_sql_and_values(
@@ -418,6 +419,7 @@ async fn admit(state: &AppState, request: RegionalRolloutRequest) -> Result<(Rol
     let lock = service_deploy::try_service_lifecycle_lock(db, &request.deployment.service_id)
         .await?
         .context("service lifecycle is busy")?;
+    super::service_adoption::ensure_managed(&lock, &request.deployment.service_id).await?;
     // Close the admission race after taking the same lock used by ordinary
     // deploy/retire operations.
     if let Some(existing) = load(Some(db), &request.operation_id).await? {

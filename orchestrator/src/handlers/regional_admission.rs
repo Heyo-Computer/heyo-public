@@ -216,6 +216,7 @@ pub(super) async fn enroll_cold_fleet(state: &crate::AppState, db: &sea_orm::Dat
     anyhow::ensure!(health_path.starts_with('/') && !health_path.starts_with("//"), "health path must be an absolute path");
     anyhow::ensure!(request.expected_predecessor.is_none(), "cold enrollment cannot replace an active fleet");
     let tx = super::service_deploy::try_service_lifecycle_lock(db,&request.service_id).await?.context("service lifecycle busy")?;
+    super::service_adoption::ensure_managed(&tx,&request.service_id).await?;
     super::regional_rollout::ensure_no_regional_rollout(&tx,&request.service_id).await?;
     anyhow::ensure!(tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
         "SELECT 1 FROM service_rollouts WHERE service_id=$1 AND status='running'", [request.service_id.clone().into()])).await?.is_none(),
@@ -276,6 +277,7 @@ pub(super) async fn enroll_cold_fleet(state: &crate::AppState, db: &sea_orm::Dat
 
 pub(super) async fn admit(state: &crate::AppState, db: &sea_orm::DatabaseConnection, request: &Request) -> Result<Receipt> {
     validate(request)?;
+    super::service_adoption::ensure_managed(db,&request.service_id).await?;
     let hash = format!("{:x}",Sha256::digest(serde_json::to_vec(request)?));
     if let Some(existing) = receipt(db,request,&hash).await? { return Ok(existing); }
     super::regional_rollout::ensure_no_regional_rollout(db,&request.service_id).await?;
@@ -285,6 +287,7 @@ pub(super) async fn admit(state: &crate::AppState, db: &sea_orm::DatabaseConnect
     let participants: Vec<_> = fleet.iter().map(|p| p.participant.clone()).collect();
     regional_reports::validate_participants(&participants,&proposed,predecessor.as_ref())?;
     let tx = super::service_deploy::try_service_lifecycle_lock(db,&request.service_id).await?.context("service lifecycle busy")?;
+    super::service_adoption::ensure_managed(&tx,&request.service_id).await?;
     if let Some(existing) = receipt(&tx,request,&hash).await? { return Ok(existing); }
     anyhow::ensure!(observed.elapsed() <= Duration::from_secs(5), "fleet admission observations expired");
     let (current, _) = policy(&tx,request).await?;
@@ -386,6 +389,7 @@ pub(super) fn admit_application<'a>(state: &'a crate::AppState, db: &'a sea_orm:
     Box::pin(async move {
     use super::{regional_rollout, service_deploy};
     let hash = format!("{:x}",Sha256::digest(serde_json::to_vec(&serde_json::to_value(request)?)?));
+    super::service_adoption::ensure_managed(db,&request.rollout.deployment.service_id).await?;
     if application_exists(db,request,&hash).await? { return Ok(false); }
     let rollout = &request.rollout;
     let deployment = &rollout.deployment;
@@ -414,6 +418,7 @@ pub(super) fn admit_application<'a>(state: &'a crate::AppState, db: &'a sea_orm:
     let regions = regional_rollout::ordered_regions(&deployment.replica_regions);
     regional_observers::validate_regional_observers(state,&scope.service_id,&regions).await?;
     let tx = service_deploy::try_service_lifecycle_lock(db,&scope.service_id).await?.context("service lifecycle busy")?;
+    super::service_adoption::ensure_managed(&tx,&scope.service_id).await?;
     if application_exists(&tx,request,&hash).await? { return Ok(false); }
     let mut baseline = application_baseline(&tx,&scope,&regions,rollout.minimum_serving_replicas.into()).await?;
     tx.commit().await?;
@@ -432,6 +437,7 @@ pub(super) fn admit_application<'a>(state: &'a crate::AppState, db: &'a sea_orm:
     let participants: Vec<_> = fleet.iter().map(|p| p.participant.clone()).collect();
     regional_reports::validate_participants(&participants,&active,None)?;
     let tx = service_deploy::try_service_lifecycle_lock(db,&scope.service_id).await?.context("service lifecycle busy")?;
+    super::service_adoption::ensure_managed(&tx,&scope.service_id).await?;
     if application_exists(&tx,request,&hash).await? { return Ok(false); }
     anyhow::ensure!(observed.elapsed() <= Duration::from_secs(5),"fleet admission observations expired");
     anyhow::ensure!(application_baseline(&tx,&scope,&regions,rollout.minimum_serving_replicas.into()).await? == baseline,

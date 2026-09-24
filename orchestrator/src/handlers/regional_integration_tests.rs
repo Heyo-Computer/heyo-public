@@ -118,7 +118,8 @@ async fn two_real_gateways_scenario() -> Result<()> {
         include_str!("../../migrations/036_add_service_deployment_environment.sql"),
         include_str!("../../migrations/037_add_regional_routing_policy.sql"), include_str!("../../migrations/038_add_regional_policy_proposals.sql"),
         include_str!("../../migrations/039_add_regional_candidate_receipts.sql"), include_str!("../../migrations/040_add_application_plan_journal.sql"),
-        include_str!("../../migrations/041_add_application_probe_claims.sql"), include_str!("../../migrations/041_add_application_probe_claims.sql")] {
+        include_str!("../../migrations/041_add_application_probe_claims.sql"), include_str!("../../migrations/041_add_application_probe_claims.sql"),
+        include_str!("../../migrations/042_add_external_service_bindings.sql")] {
         db.execute_unprepared(migration).await?;
     }
     db.execute_unprepared("INSERT INTO service_discovery_sets(service_id) VALUES('smoke')").await?;

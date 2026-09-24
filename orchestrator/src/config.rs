@@ -114,6 +114,10 @@ pub struct Config {
     #[serde(default)]
     pub discovery_observers: Vec<DiscoveryObserver>,
 
+    /// Trusted app-lb deployments which may be recorded as externally managed.
+    #[serde(default)]
+    pub external_service_bindings: Vec<ExternalServiceBinding>,
+
     #[serde(default)]
     pub nats: NatsConfig,
 }
@@ -144,6 +148,17 @@ pub struct DiscoveryObserver {
     pub discovery_url: Option<String>,
     /// HeyoSecret path containing an app-lb admin bearer. Never persisted in
     /// rollout requests or returned by status APIs.
+    pub token_secret_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalServiceBinding {
+    pub service_id: String,
+    pub authority: String,
+    pub region: String,
+    pub namespace: String,
+    pub deployment_id: String,
+    pub health_origin: String,
     pub token_secret_path: String,
 }
 
@@ -405,8 +420,11 @@ impl Config {
         let config = config_builder.build()?;
         let observers = Self::load_discovery_observers(&config,
             env::var("ORCHESTRATOR_DISCOVERY_OBSERVERS_JSON").ok().as_deref())?;
+        let external_bindings = Self::load_external_service_bindings(&config,
+            env::var("ORCHESTRATOR_EXTERNAL_SERVICE_BINDINGS_JSON").ok().as_deref())?;
         let mut orchestrator_config: Config = config.try_deserialize()?;
         orchestrator_config.discovery_observers = observers;
+        orchestrator_config.external_service_bindings = external_bindings;
 
         if let Ok(server_port) = env::var("ORCHESTRATOR_SERVER_PORT") {
             if !server_port.is_empty() {
@@ -542,6 +560,30 @@ impl Config {
         }
         serde_json::from_str(env_json.filter(|s| !s.trim().is_empty()).unwrap_or("[]"))
             .context("invalid ORCHESTRATOR_DISCOVERY_OBSERVERS_JSON")
+    }
+
+    fn load_external_service_bindings(config: &ConfigBuilder, env_json: Option<&str>) -> Result<Vec<ExternalServiceBinding>> {
+        let mut bindings: Vec<ExternalServiceBinding> = if config.get::<config::Value>("external_service_bindings").is_ok() {
+            config.get("external_service_bindings")?
+        } else {
+            serde_json::from_str(env_json.filter(|s| !s.trim().is_empty()).unwrap_or("[]"))
+                .context("invalid ORCHESTRATOR_EXTERNAL_SERVICE_BINDINGS_JSON")?
+        };
+        let mut identities = std::collections::HashSet::new();
+        let mut services = std::collections::HashSet::new();
+        for binding in &mut bindings {
+            for value in [&mut binding.authority, &mut binding.health_origin] {
+                let url = reqwest::Url::parse(value)?;
+                anyhow::ensure!(matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                    && url.path() == "/" && url.query().is_none() && url.fragment().is_none()
+                    && url.username().is_empty() && url.password().is_none(), "external service URLs must be credential-free origins");
+                *value = url.to_string();
+            }
+            anyhow::ensure!(services.insert(binding.service_id.clone()), "duplicate external service ID");
+            anyhow::ensure!(identities.insert((binding.authority.clone(), binding.namespace.clone(), binding.deployment_id.clone())),
+                "duplicate external service authority/namespace/deployment binding");
+        }
+        Ok(bindings)
     }
 
     fn get_config_path() -> Option<std::path::PathBuf> {

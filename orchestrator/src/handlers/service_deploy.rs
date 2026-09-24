@@ -349,6 +349,17 @@ pub async fn deploy_service(
             Ok(service_id) => service_id,
             Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error.to_string() }))),
         };
+        let database = match db::get_db() {
+            Ok(database) => database,
+            Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":error.to_string()}))),
+        };
+        let admission = match try_service_lifecycle_lock(database, &service_id).await {
+            Ok(Some(tx)) => tx,
+            _ => return (StatusCode::CONFLICT, Json(json!({"error":"Service lifecycle is busy"}))),
+        };
+        if let Err(error) = super::service_adoption::ensure_managed(&admission, &service_id).await {
+            return (StatusCode::CONFLICT, Json(json!({"error":error.to_string()})));
+        }
         let deployment_id = request
             .deployment_id
             .clone()
@@ -373,6 +384,9 @@ pub async fn deploy_service(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "Failed to persist service deployment run" })),
             );
+        }
+        if let Err(error) = admission.commit().await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":error.to_string()})));
         }
 
         let async_state = state.clone();
@@ -487,6 +501,7 @@ async fn deploy_service_inner(
     let _guard = try_service_lifecycle_lock(db::get_db()?, &service_id)
         .await?
         .with_context(|| format!("service {service_id} has a deployment or retirement in progress"))?;
+    super::service_adoption::ensure_managed(&_guard, &service_id).await?;
     super::regional_rollout::ensure_no_regional_rollout(db::get_db()?, &service_id).await?;
     super::regional_policy::require_legacy_topology(db::get_db()?, &service_id).await?;
     bind_deployment_environment_identity(
@@ -2466,6 +2481,9 @@ async fn reconcile_pending_service_retirements(state: &AppState) -> Result<()> {
         let Some(guard) = try_service_lifecycle_lock(db, &retirement.service_id).await? else {
             continue;
         };
+        if super::service_adoption::ensure_managed(&guard, &retirement.service_id).await.is_err() {
+            continue;
+        }
         if super::regional_rollout::ensure_no_regional_rollout(&guard, &retirement.service_id).await.is_err() {
             continue;
         }
@@ -4464,7 +4482,7 @@ fn service_state_path(state: &AppState, service_id: &str) -> Result<PathBuf> {
     Ok(Path::new(base).join(format!("{service_id}.json")))
 }
 
-fn sanitize_service_id(service_id: &str) -> Result<String> {
+pub(super) fn sanitize_service_id(service_id: &str) -> Result<String> {
     let trimmed = service_id.trim();
     if trimmed.is_empty() {
         anyhow::bail!("serviceId is required");

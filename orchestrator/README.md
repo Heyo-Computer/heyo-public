@@ -159,10 +159,36 @@ In CICD's environment, point `CICD_ORCHESTRATOR_URL` at this service (e.g. `http
 - `POST /orchestration/resources/deployments/{id}/exec` — run a command inside.
 - `POST /orchestration/services/archives/presign` (and `/finalize`) — authenticated direct upload for large Heyo-managed service archives; pass the finalized `archiveId` to the service deployment request.
 - `POST /orchestration/services/deployments` — deploy a Heyo-managed service using the snake_case app-lb-style service format described below. **Breaking change:** old flat camelCase requests are rejected, not converted or accepted through aliases.
+- `POST /orchestration/services/adoptions` — internal-key authenticated, create-only registration of configured external app-lb inventory. The request pins `{serviceId,deploymentId,sourceRolloutRevision,artifactDigest,applicationRevision,binarySha256,runtimeSandboxId,runtimePort}`. Orchestrator reads the configured app-lb authority with a HeyoSecret-referenced admin token, verifies its spec ETag, workspace-backed singleton VM and `/opt/ci-release` mount, then verifies the configured health origin's CI identity headers. It re-reads under the lifecycle lock before storing observation-only evidence. It performs no runtime, route, or discovery mutation; lifecycle ownership remains `app-lb`, and exact retries alone are idempotent. This protects the current single-region CI controller inventory only. Full lifecycle integration requires a CI-specific adapter to `ci/src/controller_rollout.rs`; generic Cloud/app-lb candidate rollout cannot preserve CI's workspace and is unsupported.
 - `GET /orchestration/services?after=<service_id>` — internal-key authenticated shared inventory for regional control-plane views. Returns up to 100 services and `nextCursor`, including desired replicas/regions, recorded discovery membership, and latest regional rollout phase. Each page uses one read-only repeatable-read transaction. Missing discovery is `null`; database failure returns 503, never a local-file fallback. Deployment metadata and credentials are excluded.
 - `GET  /orchestration/services/{service_id}/discovery` — authenticated, versioned endpoint membership for app-lb, including each endpoint's region when known. Rolling deploys publish and health-gate one candidate, drain one old replica, and repeat. A failed candidate leaves the remaining healthy set serving. `retirePrevious=false` only adds capacity up to `desiredReplicas`.
 - `POST /internal/deployments/lifecycle` — callback from the backend reporting deploy state transitions.
 - `POST /orchestration/approvals/{approval_id}/decide` — gate an in-flight workflow.
+
+### Registering the existing CI controller
+
+Configure `external_service_bindings` in Orchestrator's configuration file, or
+use `ORCHESTRATOR_EXTERNAL_SERVICE_BINDINGS_JSON` as a fallback. An explicit
+file value, including an empty list, wins. Each binding supplies `service_id`,
+`authority` (app-lb admin origin), `namespace`, `region`, `deployment_id`,
+`health_origin`, and `token_secret_path` (a HeyoSecret reference, not a value).
+The caller cannot choose a remote authority or supply its credential.
+
+Register canonical service `ci` against the retained `ci-eu1` deployment only
+after reading its current app-lb spec and public `/healthz` identity. Do not use
+the legacy private `cicd` definition, invent a Cloud archive ID from a workspace
+digest, or replay a captured VM identity after a controller update. Registration
+requires a new service identity with no Cloud-managed state or operation history.
+It creates no VM and does not change the current app-lb routes, workspace,
+database, NATS consumers, artifacts, warm pool, or runner records.
+
+Inventory exposes `external.lifecycleOwner`, `external.capabilities`, and
+`external.observedAt`; this is timestamped registration evidence, not a continuous
+health monitor. Ordinary Cloud deploys and regional rollouts reject this identity.
+There is no refresh, ownership transfer, or controller-update operation in this
+API yet. Integrating CI's existing durable controller-rollout/quiescence protocol
+is required before Orchestrator can manage its lifecycle. US serving and
+active-active CI are not enabled by registration.
 
 ### Service deployment files
 

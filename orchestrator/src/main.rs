@@ -218,6 +218,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)),
         )
         .route(
+            "/orchestration/services/adoptions",
+            post(handlers::service_adoption::adopt_retained_deployment),
+        )
+        .route(
             "/orchestration/services/deployments/{deployment_id}",
             get(handlers::service_deploy::get_service_deployment_run),
         )

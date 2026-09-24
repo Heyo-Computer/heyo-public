@@ -11,6 +11,7 @@ mod regional_reports;
 #[cfg(test)]
 mod regional_integration_tests;
 pub mod regional_rollout;
+pub mod service_adoption;
 pub mod service_deploy;
 pub mod service_discovery;
 pub mod service_spec;
