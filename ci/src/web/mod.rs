@@ -535,7 +535,10 @@ async fn run_page(
     let event_before = q.get("events_before").and_then(|value| value.parse::<i64>().ok());
     match state.store.get_run(&run_id).await {
         Ok(Some(run)) => {
-            let jobs = state.store.jobs_of(&run_id).await.unwrap_or_default();
+            let jobs = match state.store.jobs_of(&run_id).await {
+                Ok(jobs) => jobs,
+                Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
+            };
             let artifacts = state.store.artifacts_of(&run_id).await.unwrap_or_default();
 
             // The VM log is the step recorded at index -2 by the executor. Read
@@ -543,9 +546,16 @@ async fn run_page(
             // the row with the bytes gone rather than vanishing from the page.
             let mut vm_logs = Vec::new();
             for job in &jobs {
-                let steps = state.store.steps_of(&job.id).await.unwrap_or_default();
+                let steps = match state.store.steps_of(&job.id).await {
+                    Ok(steps) => steps,
+                    Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
+                };
                 if let Some(step) = steps.iter().find(|s| s.idx == VM_LOG_STEP_IDX) {
-                    vm_logs.push((job.display.clone(), state.store.read_log(step).await));
+                    let log = match state.store.read_log(step).await {
+                        Ok(log) => log,
+                        Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
+                    };
+                    vm_logs.push((job.display.clone(), log));
                 }
             }
 
@@ -725,8 +735,15 @@ async fn job_page(
     };
 
     let mut steps = Vec::new();
-    for step in state.store.steps_of(&job.id).await.unwrap_or_default() {
-        let log = state.store.read_log(&step).await.unwrap_or_default();
+    let stored_steps = match state.store.steps_of(&job.id).await {
+        Ok(steps) => steps,
+        Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
+    };
+    for step in stored_steps {
+        let log = match state.store.read_log(&step).await {
+            Ok(log) => log.unwrap_or_default(),
+            Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
+        };
         steps.push((step, log));
     }
 
@@ -1320,8 +1337,23 @@ async fn log_stream(
             let Ok(jobs) = state.store.jobs_of(&run_id).await else { break };
             let Some(job) = jobs.into_iter().find(|j| j.job_key == job_key) else { break };
 
-            for step in state.store.steps_of(&job.id).await.unwrap_or_default() {
-                let text = state.store.read_log(&step).await.unwrap_or_default();
+            let steps = match state.store.steps_of(&job.id).await {
+                Ok(steps) => steps,
+                Err(e) => {
+                    tracing::error!("could not load steps for log stream: {e}");
+                    yield Ok::<Event, std::convert::Infallible>(Event::default().event("error").data("step logs are temporarily unavailable"));
+                    return;
+                }
+            };
+            for step in steps {
+                let text = match state.store.read_log(&step).await {
+                    Ok(log) => log.unwrap_or_default(),
+                    Err(e) => {
+                        tracing::error!("could not stream shared step logs: {e}");
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().event("error").data("step logs are temporarily unavailable"));
+                        return;
+                    }
+                };
                 let already = *sent.get(&step.idx).unwrap_or(&0);
                 if text.len() > already {
                     // Split on a character boundary: a log is arbitrary bytes
@@ -1746,6 +1778,42 @@ mod tests {
             objects: Arc::new(crate::objects::Workflows::new(&config)),
         });
         router(config, runners, store, dispatcher)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_NATS_URL"]
+    async fn another_controller_serves_shared_logs_and_reports_unavailable_history() {
+        let app = test_router().await;
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::connect(&std::env::var("CI_TEST_DATABASE_URL").unwrap(), root.path().into(), Duration::from_secs(30)).await.unwrap();
+        let run = crate::vm::new_id();
+        let url = format!("https://example.test/{run}.git");
+        let repo = store.register_repo(&url, "shared logs", None, None, None).await.unwrap();
+        let (_, token) = store.create_repo_token(&repo.id, "logs", None).await.unwrap();
+        let plan = crate::plan::Plan::build(&crate::workflow::Workflow::parse("logs.yml", "jobs:\n  build:\n    steps: [{run: 'true'}]\n").unwrap()).unwrap();
+        store.create_run(&run, &crate::store::RunRequest { repo_id: Some(repo.id), repo_url: url, ..Default::default() }, &plan).await.unwrap();
+        let job = store.jobs_of(&run).await.unwrap().remove(0);
+        let sid = crate::store::step_id(&job.id, 0);
+        store.create_step(&sid, &job.id, 0, "Shared output", None).await.unwrap();
+        let path = root.path().join("not-created.log");
+        store.append_log(&sid, &path, "regional log 雪 <tag>\n").await.unwrap();
+        drop(root);
+        let response = app.clone().oneshot(Request::builder().uri(format!("/api/runs/{run}/logs"))
+            .header("Authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["jobs"][0]["steps"][0]["log"], "regional log 雪 <tag>\n");
+        let response = app.clone().oneshot(Request::builder().uri(format!("/runs/{run}/jobs/{}", job.job_key)).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("regional log 雪 &lt;tag&gt;"), "shared logs must remain escaped in the HTML");
+        // An unimported record must not masquerade as an empty log.
+        sqlx::query("UPDATE ci_step SET log_path='missing-retained-file' WHERE id=$1").bind(&sid).execute(store.pool()).await.unwrap();
+        let response = app.oneshot(Request::builder().uri(format!("/api/runs/{run}/logs"))
+            .header("Authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        sqlx::query("UPDATE ci_step SET log_path='postgres:ci_step_log' WHERE id=$1").bind(&sid).execute(store.pool()).await.unwrap();
     }
 
     #[tokio::test]

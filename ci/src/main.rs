@@ -253,6 +253,13 @@ async fn main() {
             std::process::exit(1);
         }
     }
+    match store.import_logs().await {
+        Ok(count) => tracing::info!(count, "retained logs imported into shared storage"),
+        Err(e) => {
+            eprintln!("ci: refusing to start — {e}");
+            std::process::exit(1);
+        }
+    }
 
     let bus = match Bus::connect(&config.nats, &config.nats_prefix).await {
         Ok(b) => Arc::new(b),
@@ -370,18 +377,15 @@ async fn main() {
 
 /// Delete step and VM logs older than `CI_LOG_RETENTION_DAYS`.
 ///
-/// Logs are the bulk of what this process writes and nothing else prunes them —
-/// a build log is megabytes, and an orchestrator that fills its disk stops being
-/// an orchestrator. The rows stay: a step that ran and its exit code are the
+/// Logs are the bulk of what this process writes and nothing else prunes them.
+/// The rows stay: a step that ran and its exit code are the
 /// run's history, and losing those with the bytes would make an old run look as
 /// though it never happened.
 ///
-/// Bounded per pass rather than deleting everything found. A first sweep against
-/// months of history would otherwise be one enormous burst of unlink syscalls on
-/// the same disk a build is writing to.
+/// Bounded per pass to avoid expiring months of shared history in one transaction.
 fn spawn_log_sweeper(config: Arc<Config>, store: Store) {
     let Some(retention) = config.log_retention else {
-        tracing::info!("CI_LOG_RETENTION_DAYS=0, so logs are kept forever; watch the disk");
+        tracing::info!("CI_LOG_RETENTION_DAYS=0, so shared logs are kept forever; watch database storage");
         return;
     };
     /// How often to look. Logs age in days; checking hourly is prompt enough and
@@ -414,19 +418,9 @@ fn spawn_log_sweeper(config: Arc<Config>, store: Store) {
 
             let mut swept = 0u64;
             for run_id in &runs {
-                let dir = store.run_log_dir(run_id);
-                // A missing directory is not an error: the files may have been
-                // removed by hand, or the run may have written none. The rows
-                // are still cleared so it is not offered again.
-                if let Err(e) = tokio::fs::remove_dir_all(&dir).await
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::warn!("could not remove {}: {e}", dir.display());
-                    continue;
-                }
                 match store.forget_logs_of(run_id).await {
                     Ok(n) => swept += n,
-                    Err(e) => tracing::warn!("swept {run_id} on disk but not in the database: {e}"),
+                    Err(e) => tracing::warn!("could not expire shared logs for {run_id}: {e}"),
                 }
             }
             tracing::info!(

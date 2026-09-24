@@ -29,8 +29,23 @@ queue redelivery cannot claim running jobs; unresolved executor records protect
 expired VM/build claims; native expiry cannot reassign execution; drain includes
 unresolved native and host work. Repeated startup exposed a non-idempotent
 migration in PR #118, now corrected locally. These are safety prerequisites,
-not deployment completion. Executor/HTTP role separation, shared source/log
-storage, positive worker quiescence/handoff and the live platform gates remain.
+not deployment completion. Submitted source and step logs now use shared
+PostgreSQL storage locally, with retained-file import and no original-file
+deletion. Cross-controller source replay and log reads were exercised against
+disposable PostgreSQL; log appends preserve concurrent writes and native
+completion logs roll back with failed completion transactions. Verification:
+458 CI unit tests, 46 native-agent tests, 34 store tests, 5 native tests and the
+cross-controller HTTP/HTML log test passed; 94 integration tests remain ignored
+by the default suite. These changes are not deployed.
+
+Executor/HTTP role separation, positive worker quiescence/handoff and the live
+platform gates remain. The executor handoff needs a separate owner-local effect
+barrier covering job tasks, infrastructure reconcilers and HTTP side effects;
+the current lifecycle work lock does not cover every effect producer. Transfer
+to a named surviving boot must precede self-replacement, with the exact rollout
+obligation transferred, rather than waiting for the replaced boot to release
+ownership. Admission and native grants also need transactional shared drain
+fencing; process-local locks alone do not fence a second HTTP instance.
 Uncertain remote effects must be reconciled, never replayed because a timer ran
 out. Production CI remains on the previous revision while this work proceeds.
 

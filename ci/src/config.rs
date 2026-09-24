@@ -357,12 +357,12 @@ pub struct Config {
     /// A whole boot log is long and nobody reads all of it; the tail is what
     /// answers "why did this VM not come up".
     pub vm_log_lines: usize,
-    /// How long a run's step and VM logs are kept on disk.
+    /// How long a run's step and VM logs are kept in shared storage.
     ///
     /// Logs are the bulk of what this app writes — a build log is megabytes and
     /// nothing prunes itself — so this defaults to something short rather than
     /// to forever. `CI_LOG_RETENTION_DAYS=0` disables the sweep, which is a
-    /// choice about disk somebody should make deliberately.
+    /// choice about database storage somebody should make deliberately.
     pub log_retention: Option<Duration>,
     /// Emails seeded as admins on first sight. app-lb has no roles, so this app
     /// keeps its own.

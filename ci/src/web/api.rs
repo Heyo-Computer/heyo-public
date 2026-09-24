@@ -630,8 +630,8 @@ struct LogQuery {
 ///
 /// Separate from the status route because it is unbounded where that one is
 /// small: status is for polling, this is for the one time a run failed. Logs
-/// are read from the same files the dashboard reads, so a run whose logs have
-/// been swept returns the rows with `log: null` and the byte counts intact,
+/// are read from the same shared storage as the dashboard, so a run whose logs
+/// have been swept returns the rows with `log: null` and zero byte counts,
 /// rather than looking as though the steps never ran.
 async fn run_logs(
     State(state): State<AppState>,
@@ -652,7 +652,13 @@ async fn run_logs(
     let tail = q.tail.unwrap_or(DEFAULT_TAIL_BYTES).min(MAX_TAIL_BYTES);
     let failed_only = q.failed_only.unwrap_or(false);
 
-    let mut jobs = state.store.jobs_of(&run_id).await.unwrap_or_default();
+    let mut jobs = match state.store.jobs_of(&run_id).await {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            tracing::error!("could not load jobs for shared logs: {e}");
+            return error(StatusCode::SERVICE_UNAVAILABLE, "step logs are temporarily unavailable");
+        }
+    };
     if let Some(want) = q.job.as_deref() {
         jobs.retain(|j| j.job_key == want);
         if jobs.is_empty() {
@@ -665,13 +671,25 @@ async fn run_logs(
 
     let mut out = Vec::with_capacity(jobs.len());
     for job in &jobs {
-        let steps = state.store.steps_of(&job.id).await.unwrap_or_default();
+        let steps = match state.store.steps_of(&job.id).await {
+            Ok(steps) => steps,
+            Err(e) => {
+                tracing::error!("could not load steps for shared logs: {e}");
+                return error(StatusCode::SERVICE_UNAVAILABLE, "step logs are temporarily unavailable");
+            }
+        };
         let mut step_logs = Vec::new();
         for step in &steps {
             if failed_only && matches!(step.status.as_str(), "success" | "skipped" | "pending") {
                 continue;
             }
-            let full = state.store.read_log(step).await;
+            let full = match state.store.read_log(step).await {
+                Ok(log) => log,
+                Err(e) => {
+                    tracing::error!("could not read shared step logs: {e}");
+                    return error(StatusCode::SERVICE_UNAVAILABLE, "step logs are temporarily unavailable");
+                }
+            };
             let (text, truncated) = match &full {
                 Some(t) => tail_of(t, tail),
                 None => (None, false),

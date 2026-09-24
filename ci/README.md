@@ -1388,9 +1388,19 @@ local-only loop.
 
 ### Storage
 
-Postgres for runs, jobs, steps, artifacts and the pool; **step logs go to disk**
-with the path and byte count on the row. A build log is megabytes, and putting it
-in a column means every listing query drags all of it across the wire.
+Postgres holds runs, jobs, steps, source descriptors, artifact metadata and the
+pool. Step logs use a separate shared chunk table, so status queries do not fetch
+log bodies. Appends and byte counts commit atomically; native completion commits
+its logs with the completion evidence. Retention deletes shared chunks and clears
+their metadata in one transaction. Database failures are not empty logs.
+
+When upgrading from local log storage, drain and stop the old controller before
+starting the new binary with access to its retained log paths. Startup imports
+those files into Postgres without deleting the originals. Missing or unreadable
+files block startup. Once imported, another regional instance needs no local log
+files. Do not mix old disk-writing controllers with shared-storage controllers
+or roll back the binary without a compatible log-storage plan. This storage
+change alone does not authorize a second executor or prove regional failover.
 
 ### One submission across validation workflows and deployment
 

@@ -338,10 +338,7 @@ pub async fn complete(store: &Store, secrets:&crate::secrets::Secrets, c: Comple
         let sid = crate::store::step_id(&job_id, s.index);
         let step_error=s.error.as_deref().map(|e|masker.mask(e));
         if !s.log.is_empty() {
-            let path = store.log_path(&run_id, &job_id, s.index as i32, &sid);
-            if let Some(parent)=path.parent(){tokio::fs::create_dir_all(parent).await.map_err(|e|e.to_string())?;}
-            let log=masker.mask(&s.log);tokio::fs::write(&path,&log).await.map_err(|e|e.to_string())?;
-            sqlx::query("UPDATE ci_step SET log_path=$2,log_bytes=$3 WHERE id=$1").bind(&sid).bind(path.to_string_lossy().as_ref()).bind(log.len() as i64).execute(&mut *tx).await.map_err(|e|e.to_string())?;
+            Store::append_log_in(&mut tx, &sid, &masker.mask(&s.log)).await.map_err(|e|e.to_string())?;
         }
         sqlx::query("UPDATE ci_step SET status=$2,exit_code=$3,error=$4,operation_id=$5,started_at=COALESCE(started_at,now()),finished_at=now() WHERE id=$1 AND job_id=$6")
             .bind(&sid).bind(&s.status).bind(s.exit_code).bind(step_error.as_deref()).bind(format!("native-{}",c.lease_token)).bind(&job_id).execute(&mut *tx).await.map_err(|e|e.to_string())?;
@@ -492,12 +489,15 @@ mod tests {
             .execute(store.pool()).await.unwrap();
         assert!(complete(&store,&secrets,report(second.lease_token,"success","success",0)).await.is_err());
         assert_eq!(store.get_job(&job.id).await.unwrap().unwrap().status,"running");
+        let step = store.steps_of(&job.id).await.unwrap().remove(0);
+        assert_eq!(store.read_log(&step).await.unwrap(), None, "failed completion must roll back its log bytes");
         assert!(heartbeat(&store,&LeaseUpdate{runner_id:runner.clone(),lease_token:second.lease_token}).await.unwrap());
         sqlx::query(&format!("ALTER TABLE ci_event_outbox DROP CONSTRAINT \"{constraint}\""))
             .execute(store.pool()).await.unwrap();
         assert_eq!(complete(&store,&secrets,report(second.lease_token,"success","success",0)).await.unwrap(),Some(run.clone()));
         assert_eq!(complete(&store,&secrets,report(second.lease_token,"success","success",0)).await.unwrap(),Some(run.clone()),"identical completion retries must resume DAG advancement");
         assert_eq!(store.get_job(&job.id).await.unwrap().unwrap().status,"success");
+        assert_eq!(store.read_log(&step).await.unwrap().as_deref(), Some("native test log"), "completion retry must not duplicate logs");
         let cancelled_run=crate::vm::new_id();
         store.create_run(&cancelled_run,&crate::store::RunRequest::default(),&plan).await.unwrap();
         let cancelled=store.jobs_of(&cancelled_run).await.unwrap().remove(0);

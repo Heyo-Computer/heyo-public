@@ -7138,7 +7138,7 @@ jobs:
             .iter()
             .find(|s| s.name == "Prove the image was built")
             .expect("the step ran");
-        let log = d.store.read_log(proof).await.unwrap_or_default();
+        let log = d.store.read_log(proof).await.unwrap().unwrap_or_default();
         assert!(log.contains("a-copied-file"), "COPY did not land: {log:?}");
         assert!(log.contains("and-a-run-layer"), "RUN did not land: {log:?}");
         assert!(
@@ -7152,7 +7152,7 @@ jobs:
             .iter()
             .find(|s| s.name.starts_with("Image ci-img-"))
             .expect("the build log is attached to the job");
-        let build_log = d.store.read_log(img_step).await.unwrap_or_default();
+        let build_log = d.store.read_log(img_step).await.unwrap().unwrap_or_default();
         for want in ["building image ci-img-", "is ready after"] {
             assert!(
                 build_log.contains(want),
@@ -7254,12 +7254,14 @@ jobs:
             .store
             .read_log(named("Say hello"))
             .await
+            .unwrap()
             .unwrap_or_default();
         assert!(log0.contains("hello from ci"), "step 1 log: {log0:?}");
         let log1 = d
             .store
             .read_log(named("Use the step output"))
             .await
+            .unwrap()
             .unwrap_or_default();
         assert!(
             log1.contains("greeting was hi"),
