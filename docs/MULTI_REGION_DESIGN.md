@@ -7,6 +7,38 @@ work. This document does not itself change running infrastructure.
 
 ## Unified control-plane checkpoint — 2026-09-23
 
+- Live replacement progress, 2026-09-24: Linux packaging run
+  `01a0d1a2edaa-00000014` succeeded; downloaded artifact SHA-256
+  `5d99e96eec05ac277104bdc60a46ed5e54f0947037652e55ed55793f85190c4d`
+  was independently verified. Cloud created `gateway-smoke-e477b71-us3`,
+  runtime `sb-31d6a990da1747e0bab630aef4d9439d`, and authenticated receipt
+  observation returned the destination-local binding `http://127.0.0.1:2225`.
+  New `regional-gateway-smoke-us3` registrations on both app-lbs use a dedicated
+  shared HeyoSecret peer role, not the discovery/operator credential. Public
+  eu1 HTTPS reaches eu1 app-lb, authenticated us3 HTTPS, then the us3 VM.
+  Identity, request body, application Authorization and peer-header stripping
+  checks passed before the verifier failed its held-body timing assertion.
+  A five-second diagnostic delivered its first byte at 5.944 seconds; this
+  does not prove streaming. The fixture now sends a 64-KiB prefix before holding
+  the tail to cross proxy/TLS buffering boundaries; that change awaits live verification.
+  eu1 edge registration used its existing service-route API on port 3000;
+  the managed daemon on 34099 rejected service-route writes because its
+  `HEYVM_TRAEFIK_DYNAMIC_CONFIG_DIR` is unset. No route file was hand-written.
+- Confirmed eu1 creation blocker: `gateway-smoke-e477b71-eu1` failed because
+  its registered backend returns 404 for `/sandbox-creations/{operation}`.
+  Public health and running executable inspection show eu1 heyvm 0.50.3
+  (`ccfedcc7...de43`) versus us3 0.50.4 (`b4522bf5...18b1`). The historical
+  release `01a0cc4c8eac-0000002c` explicitly records eu1's runtime job as
+  skipped after us3 maintenance timed out. Cloud upgrades succeeded in that
+  run, not the entire runtime release. Do not duplicate the failed eu1 create
+  or clear the prior CI maintenance fence to manufacture progress.
+- Old-smoke cleanup: product Cloud DELETE returned 200 for the five failed,
+  VM-less records `acceptance-v1c-20260922-r2`, `acceptance-v1f-20260922-r1`,
+  `acceptance-v1h-20260922-r1`, `acceptance-v1i-20260922-r1`, and
+  `acceptance-v1j-20260922-r1`. Remaining old VMs, Orchestrator state and the
+  stale `regional-acceptance-baseline-20260922-r1` run are not yet removed.
+  Read-only ownership inventory found no other service referencing the four
+  old sandbox IDs, and no advisory lifecycle lock was held at inspection.
 - Fresh-smoke replacement, 2026-09-24: Gary explicitly requested removing the
   old smoke app completely and replacing it with a gateway-based live test,
   without further local test runs. Both obsolete `regional-rollout-smoke`

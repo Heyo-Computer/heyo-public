@@ -59,6 +59,11 @@ class RegionalApp(BaseHTTPRequestHandler):
                 payload = record
                 if url.path != '/health':
                     self.server.admissions.append(record)
+        held = url.path == '/held' or seconds > 0
+        if held:
+            # Cross normal proxy/TLS buffer boundaries before holding the tail.
+            # A one-byte prefix can be coalesced until the entire reply arrives.
+            payload = {'streamPadding': 'x' * 65536, **payload}
         data = json.dumps(payload).encode()
         self.send_response(503 if self.server.unhealthy else 200)
         self.send_header('Content-Type', 'application/json')
@@ -69,11 +74,12 @@ class RegionalApp(BaseHTTPRequestHandler):
         self.end_headers()
         # Begin the response before holding it: exercise response-body lifetime,
         # not merely the time spent waiting for response headers.
-        self.wfile.write(data[:1])
+        split = 65536 if held else 1
+        self.wfile.write(data[:split])
         self.wfile.flush()
-        if url.path == '/held' or seconds:
+        if held:
             self.hold(seconds)
-        self.wfile.write(data[1:])
+        self.wfile.write(data[split:])
         self.wfile.flush()
 
     def log_message(self, *args):
