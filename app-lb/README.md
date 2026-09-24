@@ -166,8 +166,18 @@ IDs are 1–128 ASCII letters, digits, hyphens or underscores. Exact replay retu
 same operation, including terminal operations; conflicting payloads/revisions return 409.
 GET `/deployments/:id/rollouts/:operation_id` reports `operation_id`, `deployment`,
 `source_revision`, `target_spec_sha256`, `status`, `phase`, `readiness_verified`,
-`previous_stopped`, and `error`. Status is `running`, `succeeded`, `failed`, or
+`previous_stopped`, `preparation_stage`, and `error`. Status is `running`, `succeeded`, `failed`, or
 `reconciliation_required`. Admission is not rollout success.
+
+Preparation uses the remaining persisted `scaling.boot_timeout_secs` rollout
+budget (30–1800 seconds), not a separate two-minute limit. Restart does not reset
+that deadline. The latest preparation stage is persisted while work runs and on
+failure: for example `rootfs_manifest`, `blob_download`, `blob_http_403`,
+`blob_digest_mismatch`, `daemon_image_import`, or `mount_unpack`. Deadline expiry
+is reported separately from preparation failure. Diagnostics contain bounded
+stage/status codes, not remote response bodies or credentials. Old operation
+records without this field remain readable. A failed preparation never creates
+a candidate or retires the serving generation.
 
 `target_spec_sha256` hashes compact JSON of the **requested normalized spec**, with
 all object keys recursively sorted and array order preserved. A spec copied from

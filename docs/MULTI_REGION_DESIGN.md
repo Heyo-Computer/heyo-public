@@ -7,6 +7,84 @@ work. This document does not itself change running infrastructure.
 
 ## Unified control-plane checkpoint — 2026-09-23
 
+- Preparation investigation, 2026-09-24: authenticated HEAD reads confirmed
+  the pinned rootfs blob exists (805306368 bytes) and the validated Orchestrator
+  bundle exists (8040047 bytes). Read-only host diagnostic `job-3f3c87335dd2`
+  attempted a complete rootfs read from us3 and exceeded its 240-second limit;
+  the host-command runner discarded partial stdout on timeout. Bounded probe
+  `job-8078bc5ca5f3` then received HTTP 200 in 0.369 seconds and read 8388608
+  bytes in 6.424 seconds. Extrapolating that sample gives roughly ten minutes
+  for the full rootfs, not an observed completed transfer. This demonstrates
+  that the hard-coded 120-second preparation cutoff is inadequate on the
+  measured path; the registered 300-second rollout budget is also too short
+  at that rate. No missing artifact or credential rejection was observed.
+  Correlated log search `job-c549138710bc` found no preserved preparation
+  events; the original operation's exact failing substep cannot be recovered
+  from those logs. Neither probe created a VM, changed a service route, or
+  changed the registered rollout budget. Diagnostic spec was restored.
+  Completion receipt `job-c171646e3aef` found no remaining probe processes;
+  subsequent authenticated regional reads showed one healthy Orchestrator
+  backend in each region and both rollout budgets still at 300 seconds.
+- App-lb preparation fix is local, not published: preparation shares the
+  remaining persisted rollout deadline rather than an independent two-minute
+  cap; latest safe stage/status codes are persisted during preparation and
+  survive failure/reload. Deadline expiry is distinct from preparation error,
+  with remote bodies and credentials excluded. The complete app-lb binary
+  test suite passed on macOS (880 passed, 6 ignored), including slow successful
+  preparation, remaining-budget expiry, durable error stages, and HTTP/digest
+  failure classification. Linux CI/release and live verification remain due.
+  PR114 is merged; publishing this additional fix requires a new public PR/CI
+  release authorization. Deployment should also raise the Orchestrator rollout
+  budget to 1800 seconds through the pool-preserving scaling PATCH API before
+  retrying the validated candidate. No such publication or policy write occurred.
+- Latest release supersedes the older publication failure below: Linux
+  validations `01a0d0633d65-00000008` (app-lb) and
+  `01a0d0633d69-00000009` (Orchestrator) passed. Release
+  `01a0d0633d6a-0000000a` published
+  [the candidate](https://github.com/Heyo-Computer/heyo-public/commit/edbe5eae73c890b5a9dc44b6a6dd82b651639c1d)
+  and replaced us3 app-lb, then failed us3 Orchestrator creation on subnet
+  exhaustion. Eu1 and controller stages did not run. Public `/healthz` checks
+  still show that candidate on us3 and revision
+  `5089a900e2f4312c252b9e2d43c6705acd72036b` on eu1; both return HTTP 200.
+- Subnet incident: receipt `job-156325a6e4f1` records the daemon refusing
+  candidate `sb-8368d453`; inventory `job-f2cc8b1ef5e5` found 63 reservations
+  and 18 live sockets. After service/reference checks, the repository-owned
+  cache destruction API deleted only stopped, unclaimed, unretained caches
+  `sb-4d20b5c9`, `sb-a53bd9a5`, and `sb-1457f52a` from successful public runs.
+  Receipt `job-3fabca13ad78` confirmed their state directories were removed,
+  60 reservations remained, and every remaining IP was unchanged. This gives
+  the old allocator three free slots, not a durable capacity fix. Libvirt's
+  DHCP range overlaps the old pool; its live `10.88.0.102` lease also appears
+  in a stopped CI reservation. Do not blindly restart that VM or resize the
+  live network without reconciling the collision. Read-only all-table route
+  inventory `job-3ebe144abe90` found no routes in the proposed added space
+  `10.88.1.0–10.88.3.255`; the existing libvirt DHCP lease is unchanged.
+- Managed recovery `network-recovery-us3-edbe5ea-20260923` used the same
+  validated Orchestrator artifact and exact target-spec fingerprint as the
+  failed CI operation. It failed in artifact preparation after approximately
+  120 seconds, before any candidate allocation or cutover; the API does not
+  distinguish its preparation timeout from an underlying preparation error.
+  Source `sb-a4dbf6b3` remains recorded healthy at `10.88.0.98:4446`.
+  Receipt `job-e5b8cfd77890` shows 2.4 TiB free on the target host, so host
+  disk exhaustion is not established. Do not retry creates or clear operation
+  history. CI's failed-run retry also returned a workflow-selector conflict;
+  no rerun was created.
+- Private backend allocator correction is **local and uncommitted**, not
+  installed: atomic cross-process reservation before returning an address,
+  retained-address reuse under compatible pool expansion, fail-closed corrupt
+  or duplicate records, DHCP exclusion for new allocations, and non-allocating
+  reattachment. Six isolated Linux tests passed (four allocator regressions,
+  including sixteen competing processes, plus two config tests). These tests
+  compile source-extracted allocator code with a minimal error-type fixture;
+  they are not live VM verification. Full backend library compilation also
+  passed with `cargo check --locked --lib` on Linux x86-64/Rust 1.95.0, with
+  21 existing warnings. No release binary has been built. The macOS crate
+  test filter ran zero relevant tests and is not counted. No private
+  publication, backend deployment, or live network-mask change has occurred.
+  Remaining gates: backend Linux release build/integration, authorized
+  publication and rollout, reconciled DHCP overlap and pool expansion, then
+  live capacity/restart checks. Artifact-preparation diagnosis and the broader
+  two-region acceptance remain incomplete.
 - Live NATS recovery: host memory admission evicted `sb-055d2cfb` at
   19:22:31 UTC while admitting an 8192 MiB build VM. The empty replacement
   `sb-f1b3942a` did not contain the original JetStream queues; CI still used

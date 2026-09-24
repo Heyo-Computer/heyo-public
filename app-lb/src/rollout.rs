@@ -43,6 +43,8 @@ pub struct Operation {
     pub readiness_verified: bool,
     pub previous_stopped: bool,
     pub error: Option<String>,
+    #[serde(default)]
+    pub preparation_stage: Option<String>,
     pub spec: DeploymentSpec,
     pub prepared: Option<DeploymentSpec>,
     pub prefix: String,
@@ -58,7 +60,7 @@ impl Operation {
         serde_json::json!({"operation_id":self.operation_id,"deployment":self.deployment,
             "source_revision":self.source_revision,"target_spec_sha256":self.target_spec_sha256,
             "status":self.status,"phase":self.phase,"readiness_verified":self.readiness_verified,
-            "previous_stopped":self.previous_stopped,"error":self.error})
+            "previous_stopped":self.previous_stopped,"error":self.error,"preparation_stage":self.preparation_stage})
     }
 }
 
@@ -116,7 +118,7 @@ pub fn validate(old: &DeploymentSpec, next: &DeploymentSpec) -> Result<(), Strin
 
 #[async_trait::async_trait]
 pub trait Runtime: Send + Sync {
-    async fn prepare(&self, spec: &DeploymentSpec, generation: &str) -> Result<DeploymentSpec, String>;
+    async fn prepare(&self, spec: &DeploymentSpec, generation: &str, progress: tokio::sync::watch::Sender<String>) -> Result<DeploymentSpec, String>;
     async fn list(&self) -> Result<Vec<heyo_sdk::SandboxInfo>, String>;
     async fn create(&self, spec: &DeploymentSpec, name: &str) -> Result<String, String>;
     async fn healthy(&self, info: &heyo_sdk::SandboxInfo, spec: &DeploymentSpec) -> Option<std::net::SocketAddr>;
@@ -126,7 +128,7 @@ pub trait Runtime: Send + Sync {
 struct Live { scaler: Arc<crate::autoscale::Autoscaler>, jobs: Arc<crate::jobs::Jobs> }
 #[async_trait::async_trait]
 impl Runtime for Live {
-    async fn prepare(&self, spec: &DeploymentSpec, generation: &str) -> Result<DeploymentSpec, String> { self.jobs.prepare_candidate(spec, generation).await }
+    async fn prepare(&self, spec: &DeploymentSpec, generation: &str, progress: tokio::sync::watch::Sender<String>) -> Result<DeploymentSpec, String> { self.jobs.prepare_candidate(spec, generation, progress).await }
     async fn list(&self) -> Result<Vec<heyo_sdk::SandboxInfo>, String> { self.scaler.vms().list().await.map_err(|e| e.to_string()) }
     async fn create(&self, spec: &DeploymentSpec, name: &str) -> Result<String, String> { self.scaler.create_candidate(spec, name).await }
     async fn healthy(&self, info: &heyo_sdk::SandboxInfo, spec: &DeploymentSpec) -> Option<std::net::SocketAddr> {
@@ -170,7 +172,7 @@ impl Rollouts {
         let count = request.spec.scaling.min_replicas.max(request.spec.scaling.warm_pool).max(1);
         let o = Operation { operation_id: request.operation_id, deployment: d.spec.id.clone(), source_revision: request.expected_revision,
             target_spec_sha256: hash, status: "running".into(), phase: "preparing".into(), readiness_verified: false, previous_stopped: false,
-            error: None, prefix: prefix.clone(), allocations: (0..count).map(|i| Allocation { name: format!("{prefix}{i:08x}"), sandbox_id: None, attempted: false }).collect(),
+            error: None, preparation_stage: None, prefix: prefix.clone(), allocations: (0..count).map(|i| Allocation { name: format!("{prefix}{i:08x}"), sandbox_id: None, attempted: false }).collect(),
             previous: d.backends().iter().map(|b| b.sandbox_id.clone()).chain(d.state().suspended.iter().cloned()).collect(), stopped: vec![],
             deadline: now_secs() + request.spec.scaling.boot_timeout_secs.max(30).min(1800), drain_deadline: None, spec: request.spec, prepared: None };
         let mut state = (*d.state()).clone(); state.rollouts.push(o.clone());
@@ -212,7 +214,11 @@ impl Rollouts {
     async fn advance(&self, d: Arc<Deployment>, index: usize, retiring: &mut HashMap<String, Vec<Arc<VmBackend>>>) -> Result<(), String> {
         let mut o = d.state().rollouts[index].clone();
         if o.phase != "draining" && now_secs() >= o.deadline {
-            o.status = "failed".into(); o.error = Some("candidate readiness deadline elapsed; source retained".into());
+            o.status = "failed".into();
+            o.error = Some(if o.phase == "preparing" {
+                format!("candidate artifact preparation deadline expired during {}; source retained",
+                    o.preparation_stage.as_deref().unwrap_or("initializing"))
+            } else { "candidate readiness deadline elapsed; source retained".into() });
             return self.record(&d, index, o).await;
         }
         if o.phase == "preparing" {
@@ -221,9 +227,40 @@ impl Rollouts {
                 o.status = "reconciliation_required".into(); o.error = Some("untracked source allocations require reconciliation before rollout".into());
                 return self.record(&d, index, o).await;
             }
-            match tokio::time::timeout(Duration::from_secs(120), self.runtime.prepare(&o.spec, &o.prefix)).await {
-                Ok(Ok(spec)) => { o.prepared = Some(spec); o.phase = "creating".into(); }
-                _ => { o.status = "failed".into(); o.error = Some("candidate artifact preparation failed; source retained".into()); }
+            let (progress, mut stages) = tokio::sync::watch::channel("initializing".to_string());
+            // Rootfs transfers can legitimately exceed two minutes. Preparation
+            // shares the persisted rollout deadline; restart never resets it.
+            let result = {
+                let preparation = tokio::time::timeout(Duration::from_secs(o.deadline.saturating_sub(now_secs())),
+                    self.runtime.prepare(&o.spec, &o.prefix, progress));
+                tokio::pin!(preparation);
+                let mut progress_open = true;
+                loop {
+                    tokio::select! {
+                        result = &mut preparation => break result,
+                        changed = stages.changed(), if progress_open => {
+                            if changed.is_err() { progress_open = false; continue; }
+                            let mut snapshot = o.clone();
+                            snapshot.preparation_stage = Some(stages.borrow_and_update().clone());
+                            self.record(&d, index, snapshot).await?;
+                        }
+                    }
+                }
+            };
+            o.preparation_stage = Some(stages.borrow().clone());
+            let stage = o.preparation_stage.as_deref().unwrap_or("initializing");
+            match result {
+                Ok(Ok(spec)) if now_secs() < o.deadline => { o.prepared = Some(spec); o.phase = "creating".into(); }
+                Ok(Err(_)) => {
+                    // Remote errors can echo credentials or response bodies.
+                    // Persist our bounded stage/status codes, never that text.
+                    o.status = "failed".into();
+                    o.error = Some(format!("candidate artifact preparation failed during {stage}; source retained"));
+                }
+                _ => {
+                    o.status = "failed".into();
+                    o.error = Some(format!("candidate artifact preparation deadline expired during {stage}; source retained"));
+                }
             }
             return self.record(&d, index, o).await;
         }
@@ -340,6 +377,8 @@ mod tests {
         lose_response: AtomicBool,
         hide: AtomicBool,
         stop_failure: AtomicBool,
+        prepare_delay: Mutex<Duration>,
+        prepare_failure: AtomicBool,
     }
     fn info(id: &str, name: &str) -> heyo_sdk::SandboxInfo {
         serde_json::from_value(serde_json::json!({"id":id,"name":name,"status":"Running","image":"verified-rootfs",
@@ -347,7 +386,14 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Runtime for Fake {
-        async fn prepare(&self, spec: &DeploymentSpec, _: &str) -> Result<DeploymentSpec, String> {
+        async fn prepare(&self, spec: &DeploymentSpec, _: &str, progress: tokio::sync::watch::Sender<String>) -> Result<DeploymentSpec, String> {
+            progress.send_replace("blob_download".into());
+            let delay = *self.prepare_delay.lock().unwrap();
+            tokio::time::sleep(delay).await;
+            if self.prepare_failure.load(Ordering::SeqCst) {
+                progress.send_replace("blob_http_403".into());
+                return Err("remote response containing credential-super-secret".into());
+            }
             let mut prepared = spec.clone(); prepared.vm.as_mut().unwrap().image = Some("verified-rootfs".into()); Ok(prepared)
         }
         async fn list(&self) -> Result<Vec<heyo_sdk::SandboxInfo>, String> {
@@ -388,6 +434,45 @@ mod tests {
         (dir, registry, d, runtime, e, request)
     }
     async fn to_verifying(e: &Rollouts) { for _ in 0..3 { e.tick().await; } }
+
+    #[tokio::test(start_paused = true)]
+    async fn preparation_over_two_minutes_uses_remaining_durable_deadline() {
+        let (_dir, _registry, d, runtime, e, request) = setup();
+        *runtime.prepare_delay.lock().unwrap() = Duration::from_secs(150);
+        e.admit(&d, request).unwrap();
+        e.tick().await;
+        let state = d.state();
+        assert_eq!(state.rollouts[0].phase, "creating");
+        assert_eq!(state.rollouts[0].status, "running");
+        assert!(runtime.created.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preparation_failure_and_deadline_preserve_source_and_durable_diagnostics() {
+        for timeout in [false, true] {
+            let (dir, _registry, d, runtime, e, request) = setup();
+            *runtime.prepare_delay.lock().unwrap() = Duration::from_secs(if timeout { 301 } else { 1 });
+            runtime.prepare_failure.store(!timeout, Ordering::SeqCst);
+            e.admit(&d, request).unwrap();
+            // A resumed operation gets only its remaining budget, not a fresh one.
+            if timeout { d.mutate_state(|s| s.rollouts[0].deadline = now_secs() + 3); }
+            let started = tokio::time::Instant::now();
+            e.tick().await;
+            assert!(started.elapsed() <= Duration::from_secs(3));
+            let reloaded = Registry::new(dir.path().join("state.json"));
+            reloaded.load().unwrap();
+            let state = reloaded.get("svc").unwrap().state();
+            let op = &state.rollouts[0];
+            assert_eq!(op.status, "failed");
+            assert_eq!(op.preparation_stage.as_deref(), Some(if timeout { "blob_download" } else { "blob_http_403" }));
+            assert_eq!(op.error.as_deref().unwrap().contains("deadline expired"), timeout);
+            assert!(!serde_json::to_string(op).unwrap().contains("credential-super-secret"));
+            assert!(op.allocations.iter().all(|a| !a.attempted));
+            assert!(d.select(&[]).is_some());
+            assert!(runtime.created.lock().unwrap().is_empty());
+            assert!(runtime.stopped.lock().unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn operation_ids_accept_ci_prefix_and_enforce_length_and_path_boundaries() {
