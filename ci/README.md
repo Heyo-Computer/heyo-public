@@ -128,8 +128,10 @@ deploys sequentially to us3, eu1, and finally the CI controller. The merge uses
 the registered HeyoSecret `GIT_AUTH_TOKEN`, with no version bump or tags. The
 captured trunk must still match at publication; a moved trunk requires revalidation.
 
-CI runtime changes also require `ci/deploy-controller`. It records a durable
-rollout, closes new submissions (HTTP 503), and lets existing jobs finish before
+CI runtime changes also require `ci/deploy-controller`. It prepares a durable
+release intent and obtains acceptance from Orchestrator's shared application
+update API. Only Orchestrator's authenticated activation can advance a prepared
+intent into a rollout. CI then closes new submissions (HTTP 503) and lets existing jobs finish before
 replacing the controller. The requesting job finishes first; the **run remains
 running** until the replacement resumes reconciliation and its public health
 endpoint identifies the expected revision and executable SHA256. Documentation
@@ -144,12 +146,28 @@ configuration before enabling the workflow:
 
 - `CI_CONTROLLER_DEPLOYMENT`: the app-lb deployment ID of this controller.
 - `CI_CONTROLLER_REPOSITORY`: the only repository allowed to replace it.
+- `CI_APPLICATION_ID`: the adopted shared application identity, normally `ci`.
+- `CI_APPLICATION_ORCHESTRATOR_URL`: the shared application authority origin.
+- `CI_APPLICATION_LIFECYCLE_TOKEN`: a HeyoSecret-backed credential scoped to
+  this application's update exchange. Orchestrator's binding references the same
+  credential. It is not the app-lb admin, repository submit or native runner token.
 - `CI_CONTROLLER_APP_LB_URL` and `CI_CONTROLLER_APP_LB_TOKEN`: its app-lb admin
   endpoint and a credential restricted to that deployment. These are separate
   from `CI_APP_LB_URL/TOKEN`, which enable workflow-object discovery; enabling
   self-deployment must not change how existing repositories find workflows.
 - `CI_PUBLIC_URL`: must match the deployment's configured public URL.
 - `CI_EXPECTED_SHA`: set by promotion; health also hashes the running executable.
+
+Expose `/api/lifecycle` and its descendants through app-lb's public machine
+paths. These endpoints require `CI_APPLICATION_LIFECYCLE_TOKEN` themselves:
+`GET /api/lifecycle` advertises the configured identity, and
+`GET/POST /api/lifecycle/updates/{id}` reads/activates a previously prepared
+release intent. POST takes `{intentHash}` and cannot invent a release or artifact.
+Orchestrator persists acceptance before calling POST; both acceptance and
+activation reject changed replays. A prepared intent permits normal work and
+cannot mutate app-lb without activation. Cancellation and the existing drain
+deadline still apply. In-flight updates from an older binary retain their phase
+and finish without creating a second operation.
 
 The deployment must have min/max replicas of one, no warm pool, and exactly one
 read-only `/opt/ci-release` artifact mount with `strip_components: 1`, using the

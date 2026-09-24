@@ -1,4 +1,4 @@
-//! Observation-only registration of applications whose lifecycle remains owned by app-lb.
+//! Attested adoption of a running application without replacing its workspace.
 
 use std::time::Duration;
 
@@ -132,11 +132,12 @@ async fn observe(binding: &ExternalServiceBinding, r: &ExternalServiceAdoptionRe
 pub(super) async fn ensure_managed(db: &impl ConnectionTrait, service: &str) -> Result<()> {
     anyhow::ensure!(db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
         "SELECT 1 FROM external_service_bindings WHERE service_id=$1",[service.into()])).await?.is_none(),
-        "service lifecycle is externally managed by app-lb"); Ok(())
+        "application requires retained-workspace release updates, not Cloud archive deployment"); Ok(())
 }
 
 async fn register(state: &AppState, r: &ExternalServiceAdoptionRequest) -> Result<bool> {
     let binding = configured(state,r)?; let bearer = token(state,binding).await?;
+    super::application_update::verify_ready(state,binding).await?;
     let started = std::time::Instant::now();
     let first = observe(binding,r,&bearer).await?;
     let tx = service_deploy::try_service_lifecycle_lock(db::get_db()?,&r.service_id).await?.context("service lifecycle is busy")?;
@@ -173,7 +174,7 @@ pub async fn adopt_retained_deployment(headers: HeaderMap, State(state):State<Ap
     if let Err(status)=auth::require_internal_api_key(&headers,&state.config.internal_api_key) { return (status,Json(json!({"error":"Unauthorized"}))) }
     if let Err(e)=validate(&mut r) { return (StatusCode::BAD_REQUEST,Json(json!({"error":e.to_string()}))) }
     match register(&state,&r).await { Ok(created)=>(if created {StatusCode::CREATED}else{StatusCode::OK},Json(json!({"created":created,"serviceId":r.service_id,
-        "deploymentId":r.deployment_id,"externallyManaged":true,"lifecycleOwner":"app-lb","capabilities":["observation-only"]}))),
+        "deploymentId":r.deployment_id,"lifecycleOwner":"orchestrator","capabilities":["release-update"]}))),
         Err(e)=>(StatusCode::CONFLICT,Json(json!({"error":e.to_string()}))) }
 }
 
@@ -216,6 +217,9 @@ pub async fn adopt_retained_deployment(headers: HeaderMap, State(state):State<Ap
                     "valueBase64":base64::engine::general_purpose::STANDARD.encode("test-admin"),
                     "createdAt":Utc::now(),"metadata":{}}))
             }))
+            .route("/api/lifecycle", get(|| async {
+                Json(json!({"applicationId":"ci","deploymentId":"ci-eu1","capabilities":["release-update"]}))
+            }))
             .route("/deployments/ci-eu1", get(move |headers: HeaderMap| {
                 let mode = request_mode.clone(); let reads = request_reads.clone();
                 async move {
@@ -244,7 +248,8 @@ pub async fn adopt_retained_deployment(headers: HeaderMap, State(state):State<Ap
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-        let binding = ExternalServiceBinding { service_id:"ci".into(),authority:base.clone(),region:"eu1".into(),
+        let binding = ExternalServiceBinding { lifecycle_token_secret_path:"test/lifecycle".into(),
+            service_id:"ci".into(),authority:base.clone(),region:"eu1".into(),
             namespace:"default".into(),deployment_id:"ci-eu1".into(),health_origin:base.clone(),token_secret_path:"test/admin".into() };
         let config = serde_json::from_value(json!({"server_port":0,
             "database_url":std::env::var("ORCHESTRATOR_TEST_DATABASE_URL").unwrap_or_default(),
@@ -295,7 +300,7 @@ pub async fn adopt_retained_deployment(headers: HeaderMap, State(state):State<Ap
         assert!(ensure_managed(&lock,"ci").await.is_err());
         lock.commit().await?;
         let inventory = super::super::service_discovery::read_inventory(database, None).await?;
-        assert_eq!(inventory["services"][0]["external"]["lifecycleOwner"], "app-lb");
+        assert_eq!(inventory["services"][0]["external"]["lifecycleOwner"], "orchestrator");
         assert!(inventory["services"][0]["endpoints"].is_null());
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-key".parse()?);
@@ -304,13 +309,14 @@ pub async fn adopt_retained_deployment(headers: HeaderMap, State(state):State<Ap
             "deploy":{"async":true,"archive_id":"must-not-create"}}))?;
         let (status, body) = service_deploy::deploy_service(headers, State(state.clone()), Json(spec)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{}", body.0);
-        assert!(body.0["error"].as_str().unwrap().contains("externally managed"));
+        assert!(body.0["error"].as_str().unwrap().contains("retained-workspace"));
         for table in ["service_deployment_states", "service_discovery_sets", "service_deployment_runs"] {
             assert!(database.query_one(Statement::from_string(DbBackend::Postgres,
                 format!("SELECT 1 FROM {table} WHERE service_id='ci'"))).await?.is_none());
         }
         let mut changed = r.clone(); changed.binary_sha256 = "d".repeat(64);
         assert!(register(&state, &changed).await.is_err());
+        super::super::application_update::test_durable_updates(&state).await?;
         task.abort();
         Ok(())
     }

@@ -91,15 +91,26 @@ pub(super) async fn read_inventory(db: &sea_orm::DatabaseConnection, after: Opti
             "phase":r.try_get::<String>("","phase")?,"targetRevision":r.try_get::<String>("","target_revision")?
         })) }).transpose()?;
         let external = row.try_get::<Option<String>>("","external_deployment_id")?.map(|deployment| -> Result<Value> { Ok(json!({
-            "externallyManaged":true,"lifecycleOwner":row.try_get::<String>("","lifecycle_owner")?,
+            "externallyManaged":false,"lifecycleOwner":row.try_get::<String>("","lifecycle_owner")?,
             "deploymentId":deployment,"region":row.try_get::<String>("","external_region")?,
             "observedAt":row.try_get::<DateTime<Utc>>("","external_observed_at")?,
             "capabilities":row.try_get::<Value>("","capabilities")?})) }).transpose()?;
+        let update = tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT operation_id,status,intent,observation,observed_at,error FROM application_updates WHERE service_id=$1 ORDER BY created_at DESC,operation_id DESC LIMIT 1",[id.clone().into()])).await?
+            .map(|r| -> Result<Value> {
+                let intent: Value = r.try_get("","intent")?;
+                let observation: Option<Value> = r.try_get("","observation")?;
+                Ok(json!({"operationId":r.try_get::<String>("","operation_id")?,
+                    "status":r.try_get::<String>("","status")?,"targetRevision":intent["targetRevision"],
+                    "runId":intent["runId"],"phase":observation.as_ref().and_then(|o|o.get("phase")),
+                    "observedAt":r.try_get::<Option<DateTime<Utc>>>("","observed_at")?,
+                    "error":r.try_get::<Option<String>>("","error")?}))
+            }).transpose()?;
         services.push(json!({"serviceId":id,
             "desiredReplicas":row.try_get::<Option<i32>>("","desired_replicas")?,
             "replicaRegions":row.try_get::<Option<serde_json::Value>>("","replica_regions")?,
             "discoveryVersion":snapshot.as_ref().map(|s|s.version),
-            "endpoints":snapshot.as_ref().map(|s| &s.endpoints), "rollout":rollout,"external":external}));
+            "endpoints":snapshot.as_ref().map(|s| &s.endpoints), "rollout":rollout,"external":external,"update":update}));
     }
     let next = if rows.len() > 100 { services.last().map(|s| s["serviceId"].clone()) } else { None };
     tx.commit().await?;

@@ -132,6 +132,8 @@ pub fn router(
         .route("/api/native/jobs/{lease}/source", get(native_source))
         .route("/api/native/jobs/{lease}/release-source/{index}", get(native_release_source))
         .route("/api/native/jobs/{lease}/artifacts/{index}", post(native_artifact).layer(DefaultBodyLimit::max(512 * 1024 * 1024)))
+        .route("/api/lifecycle", get(application_lifecycle))
+        .route("/api/lifecycle/updates/{id}", get(application_update_status).post(activate_application_update))
         .route(
             "/api/submit",
             post(submit).layer(DefaultBodyLimit::max(submit_limit)),
@@ -142,6 +144,49 @@ pub fn router(
         // behind the gate answers 401 whatever it carries. See [`api`].
         .merge(api::router())
         .with_state(state)
+}
+
+fn application_lifecycle_auth(state: &AppState, headers: &HeaderMap) -> Result<(), axum::response::Response> {
+    use subtle::ConstantTimeEq;
+    let Some(expected) = state.config.application_lifecycle_token.as_deref().filter(|s| !s.is_empty()) else {
+        return Err(error(StatusCode::SERVICE_UNAVAILABLE, "application lifecycle is not configured"));
+    };
+    let Some(got) = bearer(headers) else { return Err(error(StatusCode::UNAUTHORIZED, "application lifecycle bearer required")); };
+    if !bool::from(got.as_bytes().ct_eq(expected.as_bytes())) {
+        return Err(error(StatusCode::UNAUTHORIZED, "invalid application lifecycle bearer"));
+    }
+    Ok(())
+}
+
+async fn application_lifecycle(State(state): State<AppState>, headers: HeaderMap) -> axum::response::Response {
+    if let Err(response) = application_lifecycle_auth(&state, &headers) { return response; }
+    if state.config.application_id.is_none() || state.config.application_orchestrator_url.is_none()
+        || state.config.controller_deployment.is_none() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "application lifecycle is not configured");
+    }
+    Json(serde_json::json!({"applicationId":state.config.application_id,
+        "deploymentId":state.config.controller_deployment,"capabilities":["release-update"]})).into_response()
+}
+
+async fn application_update_status(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> axum::response::Response {
+    if let Err(response) = application_lifecycle_auth(&state, &headers) { return response; }
+    match crate::controller_rollout::application_status(&state.dispatcher, &id).await {
+        Ok(status) => Json(status).into_response(),
+        Err(_) => error(StatusCode::NOT_FOUND, "application update unavailable"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApplicationActivation { intent_hash: String }
+
+async fn activate_application_update(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap,
+    Json(activation): Json<ApplicationActivation>) -> axum::response::Response {
+    if let Err(response) = application_lifecycle_auth(&state, &headers) { return response; }
+    match crate::controller_rollout::activate_application_update(&state.dispatcher, &id, &activation.intent_hash).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => error(StatusCode::CONFLICT, "application update cannot be activated"),
+    }
 }
 
 fn native_auth(state: &AppState, headers: &HeaderMap) -> Result<(), axum::response::Response> {

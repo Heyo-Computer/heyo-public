@@ -28,7 +28,7 @@ impl Lifecycle {
         let permit = self.admission.clone().read_owned().await;
         match Self::phase(store).await? {
             None => Ok(permit),
-            Some(phase) if phase == "pending" => Ok(permit),
+            Some(phase) if matches!(phase.as_str(), "prepared" | "pending") => Ok(permit),
             Some(phase) => Err(format!("controller rollout is {phase}; submissions are closed")),
         }
     }
@@ -37,7 +37,7 @@ impl Lifecycle {
         let permit = self.work.clone().read_owned().await;
         match Self::phase(store).await? {
             None => Ok(permit),
-            Some(phase) if matches!(phase.as_str(), "pending" | "draining") => Ok(permit),
+            Some(phase) if matches!(phase.as_str(), "prepared" | "pending" | "draining") => Ok(permit),
             Some(phase) => Err(format!("controller rollout is {phase}; new work is paused")),
         }
     }

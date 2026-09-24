@@ -310,6 +310,10 @@ pub struct Config {
     pub controller_repository: Option<String>,
     pub controller_app_lb_url: Option<String>,
     pub controller_app_lb_token: Option<String>,
+    /// Shared app identity and its authenticated lifecycle authority.
+    pub application_id: Option<String>,
+    pub application_orchestrator_url: Option<String>,
+    pub application_lifecycle_token: Option<String>,
     pub expected_sha: Option<String>,
     /// Operator-owned runner/backend/archive-database mapping; never workflow supplied.
     pub host_maintenance_targets: Option<String>,
@@ -652,6 +656,9 @@ impl Config {
             controller_repository: opt("CI_CONTROLLER_REPOSITORY"),
             controller_app_lb_url: opt("CI_CONTROLLER_APP_LB_URL").map(|u| u.trim_end_matches('/').to_string()),
             controller_app_lb_token: opt("CI_CONTROLLER_APP_LB_TOKEN"),
+            application_id: opt("CI_APPLICATION_ID"),
+            application_orchestrator_url: opt("CI_APPLICATION_ORCHESTRATOR_URL").map(|u| u.trim_end_matches('/').to_string()),
+            application_lifecycle_token: opt("CI_APPLICATION_LIFECYCLE_TOKEN"),
             expected_sha: opt("CI_EXPECTED_SHA"),
             host_maintenance_targets: opt("CI_HOST_MAINTENANCE_TARGETS"),
             host_app_lb_targets: opt("CI_HOST_APP_LB_TARGETS"),

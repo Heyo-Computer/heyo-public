@@ -159,7 +159,8 @@ In CICD's environment, point `CICD_ORCHESTRATOR_URL` at this service (e.g. `http
 - `POST /orchestration/resources/deployments/{id}/exec` — run a command inside.
 - `POST /orchestration/services/archives/presign` (and `/finalize`) — authenticated direct upload for large Heyo-managed service archives; pass the finalized `archiveId` to the service deployment request.
 - `POST /orchestration/services/deployments` — deploy a Heyo-managed service using the snake_case app-lb-style service format described below. **Breaking change:** old flat camelCase requests are rejected, not converted or accepted through aliases.
-- `POST /orchestration/services/adoptions` — internal-key authenticated, create-only registration of configured external app-lb inventory. The request pins `{serviceId,deploymentId,sourceRolloutRevision,artifactDigest,applicationRevision,binarySha256,runtimeSandboxId,runtimePort}`. Orchestrator reads the configured app-lb authority with a HeyoSecret-referenced admin token, verifies its spec ETag, workspace-backed singleton VM and `/opt/ci-release` mount, then verifies the configured health origin's CI identity headers. It re-reads under the lifecycle lock before storing observation-only evidence. It performs no runtime, route, or discovery mutation; lifecycle ownership remains `app-lb`, and exact retries alone are idempotent. This protects the current single-region CI controller inventory only. Full lifecycle integration requires a CI-specific adapter to `ci/src/controller_rollout.rs`; generic Cloud/app-lb candidate rollout cannot preserve CI's workspace and is unsupported.
+- `POST /orchestration/services/adoptions` — internal-key authenticated adoption of an existing application. The request pins `{serviceId,deploymentId,sourceRolloutRevision,artifactDigest,applicationRevision,binarySha256,runtimeSandboxId,runtimePort}`. Registration verifies the app-lb spec ETag, retained workspace, singleton VM, immutable artifact, public health identity and authenticated application lifecycle capability. It creates the shared app identity without replacing the running VM.
+- `POST /orchestration/services/{service_id}/updates` — accepts `{operationId,intentHash}` using the application's scoped lifecycle credential. The referenced CI release intent must already be prepared and match the adopted runtime authority. Acceptance is durable and idempotent; a restartable dispatcher activates that exact intent and reconciles its outcome. Progress appears in shared inventory under `update`. The read-only fleet credential cannot initiate updates.
 - `GET /orchestration/services?after=<service_id>` — internal-key authenticated shared inventory for regional control-plane views. Returns up to 100 services and `nextCursor`, including desired replicas/regions, recorded discovery membership, and latest regional rollout phase. Each page uses one read-only repeatable-read transaction. Missing discovery is `null`; database failure returns 503, never a local-file fallback. Deployment metadata and credentials are excluded.
 - `GET  /orchestration/services/{service_id}/discovery` — authenticated, versioned endpoint membership for app-lb, including each endpoint's region when known. Rolling deploys publish and health-gate one candidate, drain one old replica, and repeat. A failed candidate leaves the remaining healthy set serving. `retirePrevious=false` only adds capacity up to `desiredReplicas`.
 - `POST /internal/deployments/lifecycle` — callback from the backend reporting deploy state transitions.
@@ -171,7 +172,9 @@ Configure `external_service_bindings` in Orchestrator's configuration file, or
 use `ORCHESTRATOR_EXTERNAL_SERVICE_BINDINGS_JSON` as a fallback. An explicit
 file value, including an empty list, wins. Each binding supplies `service_id`,
 `authority` (app-lb admin origin), `namespace`, `region`, `deployment_id`,
-`health_origin`, and `token_secret_path` (a HeyoSecret reference, not a value).
+`health_origin`, `token_secret_path` (app-lb admin), and
+`lifecycle_token_secret_path` (the application's lifecycle exchange credential).
+Both credential fields are HeyoSecret references, not values.
 The caller cannot choose a remote authority or supply its credential.
 
 Register canonical service `ci` against the retained `ci-eu1` deployment only
@@ -182,13 +185,28 @@ requires a new service identity with no Cloud-managed state or operation history
 It creates no VM and does not change the current app-lb routes, workspace,
 database, NATS consumers, artifacts, warm pool, or runner records.
 
-Inventory exposes `external.lifecycleOwner`, `external.capabilities`, and
-`external.observedAt`; this is timestamped registration evidence, not a continuous
-health monitor. Ordinary Cloud deploys and regional rollouts reject this identity.
-There is no refresh, ownership transfer, or controller-update operation in this
-API yet. Integrating CI's existing durable controller-rollout/quiescence protocol
-is required before Orchestrator can manage its lifecycle. US serving and
-active-active CI are not enabled by registration.
+CI prepares an immutable release intent, then obtains durable acceptance from
+Orchestrator before it may close admissions or replace itself. CI remains the
+executor of job/lease draining and exact-binary verification; app-lb remains the
+executor of retained-workspace replacement. Orchestrator never creates a second
+CI VM through the Cloud archive path. Existing Cloud creation, regional rollout
+and delayed-retirement guards prevent competing writers.
+
+Shared Apps exposes the accepted update's phase, target revision, CI run and
+last observation time. An unreachable controller is reported as unknown, not
+successful. Job logs and release history remain in CI. This path does not provide
+active-active CI, regional failover, automatic rollback, or recovery independent
+of a controller that cannot boot. Registration attestation is historical evidence,
+not continuous runtime health.
+
+Install the lifecycle-capable CI and Orchestrator versions before adoption, and
+configure CI's `CI_APPLICATION_ID`, `CI_APPLICATION_ORCHESTRATOR_URL`, and
+HeyoSecret-backed `CI_APPLICATION_LIFECYCLE_TOKEN`. Add `/api/lifecycle` to CI's
+app-lb public machine paths; the endpoint requires its own scoped bearer. Do not
+delete the active `ci-eu1` deployment to clean inventory: deployment DELETE can
+also destroy suspended VMs that are absent from the ordinary VM list. Inventory
+cleanup must first establish that no runtime, workspace or route references the
+record.
 
 ### Service deployment files
 

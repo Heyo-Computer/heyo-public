@@ -114,7 +114,7 @@ pub struct Config {
     #[serde(default)]
     pub discovery_observers: Vec<DiscoveryObserver>,
 
-    /// Trusted app-lb deployments which may be recorded as externally managed.
+    /// Trusted retained-workspace runtimes for adopted applications.
     #[serde(default)]
     pub external_service_bindings: Vec<ExternalServiceBinding>,
 
@@ -158,6 +158,9 @@ pub struct ExternalServiceBinding {
     pub region: String,
     pub namespace: String,
     pub deployment_id: String,
+    /// HeyoSecret credential scoped to this application's lifecycle exchange.
+    #[serde(default)]
+    pub lifecycle_token_secret_path: String,
     pub health_origin: String,
     pub token_secret_path: String,
 }

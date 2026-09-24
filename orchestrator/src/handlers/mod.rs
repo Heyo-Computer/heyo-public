@@ -1,4 +1,5 @@
 pub mod internal;
+pub mod application_update;
 mod host_ingress;
 pub mod orchestration;
 mod regional_admission;

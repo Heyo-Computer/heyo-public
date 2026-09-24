@@ -146,6 +146,7 @@ async fn snapshot(d: &Dispatcher) -> Result<Value, String> {
 /// merge must already have succeeded; the run remains running after this job.
 pub async fn request(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &str, workflow: Option<&str>) -> Result<String, String> {
     let (deployment, base, _) = target(d)?;
+    let (application, _, _) = application_target(d)?;
     let run = d.store.get_run(&msg.run_id).await.map_err(|e| e.to_string())?.ok_or("missing run")?;
     let repository = d.config.controller_repository.as_deref().ok_or("CI_CONTROLLER_REPOSITORY is not configured")?;
     if !crate::repos::same_repo(repository, &run.repo_url) { return Err("this repository may not replace the CI controller".into()); }
@@ -171,6 +172,7 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &st
         if existing.sha != sha || existing.artifact != digest || existing.deployment != deployment || existing.base_url != base {
             return Err("controller rollout request changed on replay".into());
         }
+        accept_application_update(d, &id).await?;
         return Ok(format!("[ci] controller deployment {id} is durably recorded\n"));
     }
     if !(1..=256 * 1024 * 1024).contains(&stored.size_bytes) { return Err("controller artifact exceeds verification budget".into()); }
@@ -201,11 +203,72 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &st
     let inserted = sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) SELECT $1,s.id,r.id,j.id,$3,$4,'running','pending',$5,rel.git_ref FROM ci_step s JOIN ci_job j ON j.id=s.job_id JOIN ci_run r ON r.id=j.run_id JOIN ci_release rel ON rel.run_id=r.id AND rel.status='published' WHERE s.id=$2 AND j.status='running' AND r.status<>'cancelled'")
         .bind(&id).bind(step).bind(deployment).bind(hash).bind(&sha).execute(&mut *tx).await.map_err(|e| e.to_string())?.rows_affected();
     if inserted != 1 { return Err("requesting job is no longer running".into()); }
-    sqlx::query("INSERT INTO ci_controller_rollout(id,request) VALUES($1,$2)")
-        .bind(&id).bind(value).execute(&mut *tx).await.map_err(|e| format!("another controller rollout is active, or intent could not be recorded: {e}"))?;
+    sqlx::query("INSERT INTO ci_controller_rollout(id,request,phase,application_id) VALUES($1,$2,'prepared',$3)")
+        .bind(&id).bind(value).bind(application).execute(&mut *tx).await.map_err(|e| format!("another controller rollout is active, or intent could not be recorded: {e}"))?;
     Store::add_service_deployment_event(&mut tx, &id).await.map_err(|e| e.to_string())?;
     tx.commit().await.map_err(|e| e.to_string())?;
+    accept_application_update(d, &id).await?;
     Ok(format!("[ci] controller deployment {id} recorded; run waits for drain, replacement, and public revision verification\n"))
+}
+
+fn application_target(d: &Dispatcher) -> Result<(&str, &str, &str), String> {
+    let application = d.config.application_id.as_deref().filter(|id| !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b)))
+        .ok_or("CI_APPLICATION_ID must be configured")?;
+    let base = d.config.application_orchestrator_url.as_deref().ok_or("CI_APPLICATION_ORCHESTRATOR_URL must be configured")?;
+    crate::cd::app_lb_endpoint(base)?;
+    let token = d.config.application_lifecycle_token.as_deref().filter(|t| !t.is_empty())
+        .ok_or("CI_APPLICATION_LIFECYCLE_TOKEN must be configured through HeyoSecret")?;
+    Ok((application, base, token))
+}
+
+async fn accept_application_update(d: &Dispatcher, id: &str) -> Result<(), String> {
+    let (application, base, token) = application_target(d)?;
+    let intent = application_status(d, id).await?;
+    let response = client()?.post(format!("{base}/orchestration/services/{application}/updates"))
+        .bearer_auth(token).json(&json!({"operationId":id,"intentHash":intent["intentHash"]}))
+        .send().await.map_err(|_| "application update acceptance is unknown; replay the same release step")?;
+    if !response.status().is_success() { return Err("application authority refused the update; controller unchanged".into()); }
+    let receipt: Value = response.json().await.map_err(|_| "invalid application update receipt")?;
+    if receipt["operationId"] != id || receipt["intentHash"] != intent["intentHash"] {
+        return Err("application authority returned a different update receipt".into());
+    }
+    Ok(())
+}
+
+pub async fn application_status(d: &Dispatcher, id: &str) -> Result<Value, String> {
+    let row = sqlx::query("SELECT c.request,c.application_id,c.phase,s.run_id,s.status,s.message FROM ci_controller_rollout c JOIN ci_service_deployment s ON s.id=c.id WHERE c.id=$1")
+        .bind(id).fetch_optional(d.store.pool()).await.map_err(|e| e.to_string())?.ok_or("unknown controller update")?;
+    let request: Value = row.get("request");
+    Ok(json!({"operationId":id,"applicationId":row.get::<Option<String>,_>("application_id"),
+        "intentHash":etag(&request),"deploymentId":request["deployment"],"authority":request["base_url"],
+        "targetRevision":request["sha"],"artifactDigest":request["artifact"],
+        "runId":row.get::<String,_>("run_id"),"status":row.get::<String,_>("status"),
+        "phase":row.get::<String,_>("phase"),"message":row.get::<Option<String>,_>("message")}))
+}
+
+pub async fn activate_application_update(d: &Dispatcher, id: &str, hash: &str) -> Result<(), String> {
+    let (application, _, _) = application_target(d)?;
+    let mut tx = d.store.pool().begin().await.map_err(|e| e.to_string())?;
+    // Use the same run-before-operation lock order as cancellation/submission.
+    let run: String = sqlx::query_scalar("SELECT run_id FROM ci_service_deployment WHERE id=$1")
+        .bind(id).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
+    let run_status: String = sqlx::query_scalar("SELECT status FROM ci_run WHERE id=$1 FOR UPDATE")
+        .bind(run).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
+    let row = sqlx::query("SELECT request,application_id,phase,activation_hash FROM ci_controller_rollout WHERE id=$1 FOR UPDATE")
+        .bind(id).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
+    if row.get::<Option<String>,_>("application_id").as_deref() != Some(application)
+        || etag(&row.get::<Value,_>("request")) != hash { return Err("application intent identity mismatch".into()); }
+    if let Some(previous) = row.get::<Option<String>,_>("activation_hash") {
+        if previous != hash { return Err("application activation changed on replay".into()); }
+        return Ok(());
+    }
+    if row.get::<String,_>("phase") != "prepared" || matches!(run_status.as_str(), "cancelled" | "failure") {
+        return Err("application update is no longer eligible for activation".into());
+    }
+    sqlx::query("UPDATE ci_controller_rollout SET phase='pending',activation_hash=$2,updated_at=now() WHERE id=$1")
+        .bind(id).bind(hash).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())
 }
 
 async fn finish(d: &Dispatcher, id: &str, run: &str, passed: bool, message: &str) -> Result<(), String> {
@@ -257,6 +320,7 @@ async fn reconcile(d: &Dispatcher) -> Result<(), String> {
         return finish(d, &id, &run, false, "Controller drain exceeded CI_MAX_JOB_SECONDS; no update submitted and submissions reopened.").await;
     }
     match phase.as_str() {
+        "prepared" => return Ok(()),
         "pending" => {
             d.lifecycle.close_admission(&d.store, &id).await?;
             d.store.update_service_deployment(&id, "running", Some("draining"), Some("Submissions closed; waiting for jobs and leases to finish."), None).await.map_err(|e| e.to_string())?;
@@ -419,6 +483,36 @@ mod tests {
 
     struct Fixture { store: Store, _dir: tempfile::TempDir }
 
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL"]
+    async fn application_activation_is_required_durable_and_cancellation_fenced() {
+        let f = fixture().await;
+        let d = dispatcher(&f, "http://127.0.0.1:1").await;
+        sqlx::query("UPDATE ci_controller_rollout SET phase='prepared',application_id='ci' WHERE id='op'")
+            .execute(f.store.pool()).await.unwrap();
+        let hash = "\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\"";
+        assert!(Lifecycle::default().admission(&f.store).await.is_ok());
+        assert!(Lifecycle::default().work(&f.store).await.is_ok());
+        assert!(activate_application_update(&d, "op", "different").await.is_err());
+        let phase: String = sqlx::query_scalar("SELECT phase FROM ci_controller_rollout WHERE id='op'")
+            .fetch_one(f.store.pool()).await.unwrap();
+        assert_eq!(phase, "prepared");
+        activate_application_update(&d, "op", hash).await.unwrap();
+        let restarted = dispatcher(&f, "http://127.0.0.1:1").await;
+        activate_application_update(&restarted, "op", hash).await.unwrap();
+        let phase: String = sqlx::query_scalar("SELECT phase FROM ci_controller_rollout WHERE id='op'")
+            .fetch_one(f.store.pool()).await.unwrap();
+        assert_eq!(phase, "pending");
+        assert!(activate_application_update(&restarted, "op", "different").await.is_err());
+        sqlx::query("UPDATE ci_controller_rollout SET phase='prepared',activation_hash=NULL WHERE id='op'")
+            .execute(f.store.pool()).await.unwrap();
+        f.store.cancel_run("run").await.unwrap();
+        assert!(activate_application_update(&d, "op", hash).await.is_err());
+        let phase: String = sqlx::query_scalar("SELECT phase FROM ci_controller_rollout WHERE id='op'")
+            .fetch_one(f.store.pool()).await.unwrap();
+        assert_eq!(phase, "prepared");
+    }
+
     async fn fixture() -> Fixture {
         let base = std::env::var("CI_TEST_DATABASE_URL").expect("disposable CI_TEST_DATABASE_URL");
         let admin = sqlx::PgPool::connect(&base).await.unwrap();
@@ -505,6 +599,9 @@ mod tests {
             std::env::set_var("CI_NATS_URL", std::env::var("CI_TEST_NATS_URL").expect("disposable CI_TEST_NATS_URL"));
         }
         let mut config = crate::config::Config::from_env().unwrap();
+        config.application_id = Some("ci".into());
+        config.application_orchestrator_url = Some(base.into());
+        config.application_lifecycle_token = Some("test-lifecycle".into());
         config.controller_deployment = Some("ci-test".into());
         config.controller_repository = Some("https://github.com/example/ci.git".into());
         config.app_lb_url = None; config.app_lb_token = None;
@@ -583,6 +680,13 @@ mod tests {
         let (base, remote, server) = remote().await;
         seed_request(&f, &base).await;
         let d = dispatcher(&f, &base).await;
+        sqlx::query("UPDATE ci_controller_rollout SET phase='prepared',application_id='ci' WHERE id='op'")
+            .execute(f.store.pool()).await.unwrap();
+        reconcile(&d).await.unwrap();
+        assert_eq!(remote.puts.load(SeqCst),0,"prepared intent cannot replace the controller");
+        assert!(d.lifecycle.admission(&f.store).await.is_ok());
+        let intent = application_status(&d,"op").await.unwrap();
+        activate_application_update(&d,"op",intent["intentHash"].as_str().unwrap()).await.unwrap();
         reconcile(&d).await.unwrap(); // pending -> draining
         assert!(d.lifecycle.admission(&f.store).await.is_err());
         reconcile(&d).await.unwrap(); // draining -> quiesced

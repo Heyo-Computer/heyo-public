@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS external_service_bindings (
     runtime_port INTEGER NOT NULL CHECK (runtime_port BETWEEN 1 AND 65535),
     observed_at TIMESTAMPTZ NOT NULL,
     evidence JSONB NOT NULL,
-    lifecycle_owner TEXT NOT NULL DEFAULT 'app-lb' CHECK (lifecycle_owner = 'app-lb'),
-    capabilities JSONB NOT NULL DEFAULT '["observation-only"]'::jsonb,
+    lifecycle_owner TEXT NOT NULL DEFAULT 'orchestrator' CHECK (lifecycle_owner = 'orchestrator'),
+    capabilities JSONB NOT NULL DEFAULT '["release-update"]'::jsonb,
     UNIQUE (authority, namespace, deployment_id)
 );
