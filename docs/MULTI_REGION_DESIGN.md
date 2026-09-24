@@ -46,7 +46,30 @@ work. This document does not itself change running infrastructure.
   failed operations. Private PR619 adds durable daemon upgrade receipts; public
   PR117 adds exact GET-only late-completion recovery without rewriting history.
   Linux validation runs `01a0d207d530-00000019` (daemon) and
-  `01a0d208b3a8-0000001b` (CI) are pending. These are not deployment evidence.
+  `01a0d208b3a8-0000001b` (CI, including disposable Postgres/NATS recovery
+  integration) passed. Complete release validation `01a0d2133cbc-0000001f`
+  then caught intermittent admission-lock retention after descriptor close;
+  its release correctly stopped before merge/deployment. Explicit unlock-on-drop
+  and deterministic retained-descriptor coverage were added. Corrected complete
+  release `01a0d21cb643-00000022`, validation `01a0d21cb641-00000021`, passed
+  validation and merged private PR619. Both Cloud updates and the legacy
+  bootstrap were correctly skipped.
+  us3 operation `8d593c659dff7c262709d05a0839819d26042de610a91b7095eaaec72651438f`
+  installed and runs the intended executable
+  `b2d142aa7df27624b5c93bf4532317c9d4e1a8249090cfa28c6f46a0af59c2f9`
+  (heyvm 0.50.5, active `heyvm.service`, receipt capability enabled).
+  The old accepting daemon lost its POST reply and cannot retroactively create
+  a receipt. Cloud therefore retains `maintenance` and eu1 is still queued.
+  Systemd journal invocation `91cb2459d89d475fa965143c6dfb2838` identifies
+  the full-digest upgrade script and positively records successful termination,
+  not merely an absent helper. Evidence is saved in
+  `/tmp/us3-first-receipt-runtime-status-20260924.json` and
+  `/tmp/us3-first-receipt-helper-terminal-20260924.json`.
+  No new operation or CI fence has been manually changed. This new Cloud
+  reconciliation is distinct from the earlier approved CI-only repair and needs
+  exact shared-state authorization. Public CI recovery passed Linux validation
+  but is not deployed. Receipt-required Cloud is private draft PR620, not yet
+  Linux-verified or deployed.
   Deploy receipt-capable daemons before receipt-required Cloud reconciliation:
   a legacy daemon cannot produce the first upgrade's receipt retroactively.
   Any uncertain first upgrade retains its fence until exact helper-terminal and
