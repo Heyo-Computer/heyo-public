@@ -1492,10 +1492,15 @@ Only an exact `completed` operation with matching backend, target, archive owner
 archive ID, executable digest and operation identity releases the fence.
 
 Cancellation, timeout, missing identity, changed configuration and terminal
-failure **retain the CI cordon**, even if Cloud uncordons its own backend. An
-expired/unknown lease blocks drain rather than proving the VM stopped. Operators
-must reconcile the persisted operation and host before explicitly repairing an
-unresolved fence; this action has no automatic failure-unlock or force option.
+failure **retain the CI cordon**, even if Cloud uncordons its own backend.
+Failed operations continue authenticated GET-only observation under the original
+trusted mapping. An exact, verified late completion releases only that host fence
+and appends an audit note; the original failed/cancelled run, job, step and
+deployment status remain unchanged. This never retries the upgrade POST or
+resumes skipped jobs. Missing credentials, changed mappings and unavailable or
+mismatched evidence keep the fence closed. An expired/unknown lease blocks drain
+rather than proving the VM stopped. Unresolved operations still require operator
+reconciliation; there is no failure-unlock or force option.
 `ci_host_work` records each claimed delivery/runner until verified release.
 Cancelled VM acquisition, interrupted delivery, or failed stop can leave durable
 drain evidence requiring operator reconciliation; terminal job status alone is

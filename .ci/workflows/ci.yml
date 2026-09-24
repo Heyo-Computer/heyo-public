@@ -257,6 +257,31 @@ jobs:
         run: cargo test --release --locked -- --test-threads=1
         timeout-minutes: 10
 
+      - name: Verify host maintenance recovery with disposable database and NATS
+        working-directory: /workspace/ci
+        timeout-minutes: 10
+        run: |
+          set -eu
+          apt-get update -qq
+          apt-get install -y --no-install-recommends postgresql-16 nats-server
+          fixture=$(mktemp -d /tmp/maintenance-recovery.XXXXXX)
+          chown postgres:postgres "$fixture"
+          pg=/usr/lib/postgresql/16/bin
+          nats_pid=
+          cleanup() {
+            if [ -n "$nats_pid" ]; then kill "$nats_pid"; wait "$nats_pid" || true; fi
+            runuser -u postgres -- "$pg/pg_ctl" -D "$fixture/pg" -m immediate stop || true
+            rm -rf "$fixture"
+          }
+          trap cleanup EXIT
+          runuser -u postgres -- "$pg/initdb" -D "$fixture/pg" -A trust
+          runuser -u postgres -- "$pg/pg_ctl" -D "$fixture/pg" -l "$fixture/postgres.log" -o "-h 127.0.0.1 -p 54329 -k $fixture" -w start
+          nats-server -a 127.0.0.1 -p 42229 -js -sd "$fixture/nats" > "$fixture/nats.log" 2>&1 &
+          nats_pid=$!
+          export CI_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:54329/postgres
+          export CI_TEST_NATS_URL=nats://127.0.0.1:42229
+          cargo test --release --locked host_maintenance_drains_recovers_and_fails_closed -- --ignored --test-threads=1
+
       - name: Test CI boot and deployment templates
         run: python3 /workspace/ci/deploy/test_start_artifact.py
 
