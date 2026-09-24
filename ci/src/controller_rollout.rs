@@ -133,6 +133,10 @@ fn target(d: &Dispatcher) -> Result<(&str, &str, &str), String> {
 
 async fn snapshot(d: &Dispatcher) -> Result<Value, String> {
     let (id, base, token) = target(d)?;
+    snapshot_at(base, id, token).await
+}
+
+async fn snapshot_at(base: &str, id: &str, token: &str) -> Result<Value, String> {
     let response = client()?.get(format!("{base}/deployments/{id}")).bearer_auth(token).send().await
         .map_err(|_| "could not read controller deployment")?.error_for_status().map_err(|_| "controller deployment read refused")?;
     let tag = response.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok())
@@ -279,6 +283,11 @@ async fn finish(d: &Dispatcher, id: &str, run: &str, passed: bool, message: &str
         .bind(id).execute(&mut *tx).await.map_err(|e| e.to_string())?;
     Store::add_service_deployment_event(&mut tx, id).await.map_err(|e| e.to_string())?;
     Store::roll_up_run_in(&mut tx, run).await.map_err(|e| e.to_string())?;
+    // Completion and opening normal execution are one durable outcome. A crash
+    // between separate commits would leave an owner restricted to a finished
+    // operation that the reconciler no longer selects.
+    sqlx::query("UPDATE ci_executor_owner SET continuation_operation_id=NULL WHERE singleton=TRUE AND boot_id=$1 AND continuation_operation_id=$2")
+        .bind(d.executor.boot_id()).bind(id).execute(&mut *tx).await.map_err(|e| e.to_string())?;
     tx.commit().await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -300,6 +309,9 @@ async fn mark_submitting(store: &Store, id: &str, run: &str) -> Result<bool, Str
 }
 
 async fn reconcile(d: &Dispatcher) -> Result<(), String> {
+    // A standby is not a rollout failure. In particular it must not overwrite
+    // the owner's progress with submission_unknown on every polling tick.
+    if !d.executor.is_owner().await? { return Ok(()); }
     let row = sqlx::query("SELECT c.*,s.run_id,r.status AS run_status FROM ci_controller_rollout c JOIN ci_service_deployment s ON s.id=c.id JOIN ci_run r ON r.id=s.run_id WHERE c.phase<>'complete'")
         .fetch_optional(d.store.pool()).await.map_err(|e| e.to_string())?;
     let Some(row) = row else { return Ok(()) };
@@ -307,10 +319,11 @@ async fn reconcile(d: &Dispatcher) -> Result<(), String> {
     let phase: String = row.get("phase");
     let run: String = row.get("run_id");
     let request: Request = serde_json::from_value(row.get("request")).map_err(|e| e.to_string())?;
-    let (deployment, base, token) = target(d)?;
-    if deployment != request.deployment || base != request.base_url || d.config.public_url != request.public_url {
-        return Err("controller configuration changed during rollout; admission remains closed".into());
-    }
+    let continuation = matches!(phase.as_str(), "quiesced" | "submitting" | "verifying");
+    let permit = d.executor.effect_permit_for(continuation.then_some(id.as_str())).await?;
+    let (local_deployment, local_base, token) = target(d)?;
+    let deployment = request.deployment.as_str();
+    let base = request.base_url.as_str();
     let attempted = matches!(phase.as_str(), "submitting" | "verifying");
     if !attempted && matches!(row.get::<String,_>("run_status").as_str(), "cancelled" | "failure") {
         return finish(d, &id, &run, false, "Release cancelled or failed before deployment; controller unchanged.").await;
@@ -330,9 +343,20 @@ async fn reconcile(d: &Dispatcher) -> Result<(), String> {
         "quiesced" | "submitting" | "verifying" => {}
         _ => return Err("invalid controller rollout phase".into()),
     }
-    let current = snapshot(d).await?;
+    let current = snapshot_at(base, deployment, token).await?;
     let tag = etag(&current["spec"]);
     if tag == request.previous_etag && tag != request.desired_etag && phase != "verifying" {
+        if permit.continuation_operation_id().is_none()
+            && local_deployment == deployment && local_base == base {
+            // Do not queue the exclusive fence behind our own pass permit.
+            drop(permit);
+            let successor = d.executor.ready_successor().await?
+                .ok_or("no ready surviving executor replica; self replacement remains safely paused")?;
+            let fence = d.executor.handoff_fence().await?;
+            d.lifecycle.verify_handoff_quiesced(&d.store, &id).await?;
+            fence.transfer_to(successor, crate::executor::VerifiedDurableContinuation::ContinueExactOperation(&id)).await?;
+            return Ok(());
+        }
         // CAS makes retry after a lost response safe: only a writer observing
         // the original spec may change it. Also reject a rolled-back/new VM.
         let original = current["vms"].as_array().is_some_and(|v| v.len() == 1 && v[0]["sandbox_id"] == request.previous_vm && v[0]["healthy"] == true);
@@ -498,7 +522,7 @@ mod tests {
             .fetch_one(f.store.pool()).await.unwrap();
         assert_eq!(phase, "prepared");
         activate_application_update(&d, "op", hash).await.unwrap();
-        let restarted = dispatcher(&f, "http://127.0.0.1:1").await;
+        let restarted = dispatcher(&f, "http://127.0.0.1:2").await;
         activate_application_update(&restarted, "op", hash).await.unwrap();
         let phase: String = sqlx::query_scalar("SELECT phase FROM ci_controller_rollout WHERE id='op'")
             .fetch_one(f.store.pool()).await.unwrap();
@@ -655,6 +679,7 @@ mod tests {
         let config = Arc::new(config);
         Dispatcher {
             config: config.clone(), store: f.store.clone(), lifecycle: Arc::new(Lifecycle::default()),
+            executor: Arc::new(crate::executor::ExecutorOwner::register(f.store.pool().clone(), &format!("{base}/deployments/ci-test")).await.unwrap()),
             pool: crate::pool::Pool::new(f.store.pool().clone()), images: crate::image::Catalog::new(f.store.pool().clone()),
             bus: Arc::new(crate::bus::Bus::connect(&config.nats, &config.nats_prefix).await.unwrap()),
             runners: Arc::new(crate::runners::Runners::new(config.clone())),
@@ -715,12 +740,17 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL"]
-    async fn lost_update_response_and_restart_reconcile_once_without_false_success() {
+    async fn regional_handoff_and_lost_update_response_reconcile_once_without_false_success() {
         use std::sync::atomic::Ordering::SeqCst;
         let f = fixture().await;
         let (base, remote, server) = remote().await;
         seed_request(&f, &base).await;
         let d = dispatcher(&f, &base).await;
+        // Same deployment name, different authority: one CI app, two replicas.
+        // This authority has no mock route, so accidentally using the peer's
+        // local target instead of the persisted operation must fail the test.
+        let restarted = dispatcher(&f, &format!("{base}/peer")).await;
+        restarted.executor.mark_ready().await.unwrap();
         sqlx::query("UPDATE ci_controller_rollout SET phase='prepared',application_id='ci' WHERE id='op'")
             .execute(f.store.pool()).await.unwrap();
         reconcile(&d).await.unwrap();
@@ -732,10 +762,13 @@ mod tests {
         assert!(d.lifecycle.admission(&f.store).await.is_err());
         reconcile(&d).await.unwrap(); // draining -> quiesced
         assert!(d.lifecycle.work(&f.store).await.is_err());
-        reconcile(&d).await.unwrap(); // remote changed; response lost
+        reconcile(&d).await.unwrap(); // transfer before any replacement request
+        assert_eq!(remote.puts.load(SeqCst), 0);
+        assert!(d.executor.effect_permit().await.is_err());
+        assert!(restarted.executor.effect_permit().await.is_err(), "only the exact continuation is admitted");
+        reconcile(&restarted).await.unwrap(); // remote changed; response lost
         assert_eq!(remote.puts.load(SeqCst), 1);
         drop(d);
-        let restarted = dispatcher(&f, &base).await;
         assert!(reconcile(&restarted).await.unwrap_err().contains("exact replacement"));
         assert_eq!(remote.puts.load(SeqCst), 1, "must not replace twice after a lost response");
         assert_eq!(f.store.get_run("run").await.unwrap().unwrap().status, "running");
@@ -744,12 +777,14 @@ mod tests {
         sqlx::query("ALTER TABLE ci_event_outbox ADD CONSTRAINT reject_success CHECK (status <> 'passed')").execute(f.store.pool()).await.unwrap();
         assert!(reconcile(&restarted).await.is_err(), "simulate failure at the final durable outcome commit");
         assert!(restarted.lifecycle.admission(&f.store).await.is_err(), "gate and result must roll back together");
+        assert!(restarted.executor.effect_permit().await.is_err(), "continuation must roll back with the result");
         assert_eq!(f.store.get_run("run").await.unwrap().unwrap().status, "running");
         sqlx::query("ALTER TABLE ci_event_outbox DROP CONSTRAINT reject_success").execute(f.store.pool()).await.unwrap();
         reconcile(&restarted).await.unwrap();
         assert_eq!(f.store.get_run("run").await.unwrap().unwrap().status, "success");
         assert_eq!(f.store.service_deployments_of("run").await.unwrap()[0].status, "passed");
         assert!(restarted.lifecycle.admission(&f.store).await.is_ok());
+        assert!(restarted.executor.effect_permit().await.is_ok(), "verified completion opens normal execution atomically");
         reconcile(&restarted).await.unwrap();
         assert_eq!(remote.puts.load(SeqCst), 1);
         server.abort();
@@ -771,5 +806,22 @@ mod tests {
         assert!(d.lifecycle.admission(&f.store).await.is_ok());
         assert_eq!(remote.snapshot.lock().unwrap()["spec"]["vm"]["env_vars"]["OTHER"], "concurrent-edit");
         server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
+    async fn failed_remote_operation_still_blocks_handoff() {
+        let f = fixture().await;
+        sqlx::raw_sql("UPDATE ci_controller_rollout SET phase='quiesced' WHERE id='op';
+            INSERT INTO ci_step(id,job_id,idx,name,uses,status) VALUES('maintenance-step','job',1,'Maintenance','ci/host-heyvm-maintenance','failure');
+            INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES('maintenance','maintenance-step','run','job','host','hash','failed','source','refs/heads/main');
+            INSERT INTO ci_host_maintenance(id,runner_hd_id,request,phase,deadline) VALUES('maintenance','runner','{}','failed',now());")
+            .execute(f.store.pool()).await.unwrap();
+        let lifecycle = Lifecycle::default();
+        assert!(lifecycle.verify_handoff_quiesced(&f.store, "op").await.unwrap_err().contains("obligations remain"));
+        // Only positive settlement of the remote operation releases this fence.
+        sqlx::query("UPDATE ci_host_maintenance SET phase='passed' WHERE id='maintenance'")
+            .execute(f.store.pool()).await.unwrap();
+        lifecycle.verify_handoff_quiesced(&f.store, "op").await.unwrap();
     }
 }

@@ -16,6 +16,30 @@ pub struct Lifecycle {
 }
 
 impl Lifecycle {
+    /// Re-prove global quiescence while the executor handoff fence is held.
+    /// Terminal errors and expired leases are deliberately insufficient: all
+    /// durable remote-effect obligations must have been positively removed.
+    pub async fn verify_handoff_quiesced(&self, store: &Store, id: &str) -> Result<(), String> {
+        let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(DRAIN_LOCK)
+            .execute(&mut *tx).await.map_err(|e| e.to_string())?;
+        let phase: Option<String> = sqlx::query_scalar("SELECT phase FROM ci_controller_rollout WHERE id=$1 FOR UPDATE")
+            .bind(id).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
+        if !matches!(phase.as_deref(), Some("quiesced" | "submitting" | "verifying")) {
+            return Err(format!("rollout {id} is not durably quiesced"));
+        }
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ci_job j JOIN ci_run r ON r.id=j.run_id WHERE j.status='running' OR (j.status IN ('pending','queued') AND r.status NOT IN ('success','failure','cancelled'))) OR EXISTS(SELECT 1 FROM ci_native_job WHERE state='leased') OR EXISTS(SELECT 1 FROM ci_host_work) OR EXISTS(SELECT 1 FROM ci_vm_cleanup) OR EXISTS(SELECT 1 FROM ci_vm_pool WHERE status IN ('claimed','building','draining')) OR EXISTS(SELECT 1 FROM ci_service_deployment WHERE id<>$1 AND status NOT IN ('passed','failed'))"
+        ).bind(id).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
+        // These ledgers explicitly retain fences after a reported failure.
+        // Never interpret a failed run or a polling timeout as remote teardown.
+        let retained: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE phase NOT IN ('passed','superseded')) OR EXISTS(SELECT 1 FROM ci_service_deployment s WHERE s.status<>'passed' AND (EXISTS(SELECT 1 FROM ci_service_rollout r WHERE r.id=s.id) OR EXISTS(SELECT 1 FROM ci_host_app_lb h WHERE h.id=s.id)))"
+        ).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
+        if blocked || retained { return Err("durable external-effect obligations remain".into()); }
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+
     async fn transaction_phase(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<Option<String>, String> {
         sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(DRAIN_LOCK)
             .execute(&mut **tx).await.map_err(|e| e.to_string())?;

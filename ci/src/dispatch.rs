@@ -163,6 +163,7 @@ impl QueueVerdict {
 
 pub struct Dispatcher {
     pub lifecycle: Arc<crate::lifecycle::Lifecycle>,
+    pub executor: Arc<crate::executor::ExecutorOwner>,
     pub config: Arc<Config>,
     pub store: Store,
     pub pool: Pool,
@@ -3236,6 +3237,22 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
         };
 
         loop {
+            // Do not pull during a global drain's quiesced phase. In particular,
+            // a stale delivery must not hold an effect permit while waiting for
+            // the rollout that needs that same permit to finish.
+            if dispatcher.lifecycle.work(&dispatcher.store).await.is_err() {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            // Acquire before pulling: a standby must never remove a delivery
+            // from the shared consumer merely to hold or redeliver it.
+            let effect = match dispatcher.executor.effect_permit().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
             let (msg, permit) = match pull_with_capacity(&consumer, Arc::clone(&slots)).await {
                 Ok(Some(delivery)) => delivery,
                 Ok(None) => continue,
@@ -3259,6 +3276,7 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                 // host at a time, each getting its full budget from pickup.
                 Route::Runner(_) => {
                     let _permit = permit;
+                    let _effect = effect;
                     process_delivery(Arc::clone(&dispatcher), msg, job, attempt).await;
                 }
                 // The network's shared queue is where "any host" jobs wait, and
@@ -3274,6 +3292,7 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                     let dispatcher = Arc::clone(&dispatcher);
                     tokio::spawn(async move {
                         let _permit = permit;
+                        let _effect = effect;
                         process_delivery(dispatcher, msg, job, attempt).await;
                     });
                 }
@@ -3336,16 +3355,19 @@ async fn process_delivery(
         })
     };
 
-    // A delivery already removed from the pull stream stays ours while the
-    // controller is quiesced. Progress ACKs preserve its delivery attempt;
-    // retrying admission does not burn the JetStream retry ladder.
-    let _work = loop {
-        match dispatcher.lifecycle.work(&dispatcher.store).await {
-            Ok(permit) => break permit,
-            Err(e) => {
-                tracing::debug!(job = %job.job_key, "holding delivery until work reopens: {e}");
-                tokio::time::sleep(Duration::from_secs(2)).await;
+    // Quiescence can race an already outstanding pull. Return that delivery
+    // without beginning execution, releasing the caller's effect permit so
+    // handoff can finish. The pull-loop gate prevents repeatedly taking it
+    // while closed and consuming the entire redelivery budget.
+    let _work = match dispatcher.lifecycle.work(&dispatcher.store).await {
+        Ok(permit) => permit,
+        Err(e) => {
+            heartbeat.abort();
+            tracing::debug!(job = %job.job_key, "returning delivery across executor handoff: {e}");
+            if let Err(error) = msg.ack_with(AckKind::Nak(Some(Duration::from_secs(30)))).await {
+                tracing::warn!(job = %job.job_key, %error, "could not return delivery; broker acknowledgement timeout retains recovery");
             }
+            return;
         }
     };
 
@@ -4118,6 +4140,7 @@ impl Dispatcher {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                let Ok(_effect) = images.executor.effect_permit().await else { continue };
                 let Ok(_work) = images.lifecycle.work(&images.store).await else { continue };
                 for runner in images.served_runner_ids() {
                     let result = async {
@@ -4143,6 +4166,7 @@ impl Dispatcher {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                let Ok(_effect) = self.executor.effect_permit().await else { continue };
                 let Ok(_work) = self.lifecycle.work(&self.store).await else { continue };
                 if let Err(e) = self.pool.renew_leases(self.lease()).await {
                     // Not fatal, and not worth giving up a VM over: the lease
@@ -6330,6 +6354,7 @@ mod tests {
 
         Arc::new(Dispatcher {
             lifecycle: Arc::new(crate::lifecycle::Lifecycle::default()),
+            executor: Arc::new(crate::executor::ExecutorOwner::register(store.pool().clone(), &format!("dispatch-test-{}", uuid::Uuid::new_v4())).await.expect("executor")),
             config: config.clone(),
             store: store.clone(),
             pool: Pool::new(store.pool().clone()),
@@ -6344,6 +6369,44 @@ mod tests {
             // takes anyway.
             objects: Arc::new(crate::objects::Workflows::new(&config)),
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
+    async fn delivery_racing_quiescence_releases_the_handoff_permit() {
+        let base = std::env::var("CI_TEST_DATABASE_URL").unwrap();
+        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        let schema = format!("delivery_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&admin).await.unwrap();
+        admin.close().await;
+        let mut url = reqwest::Url::parse(&base).unwrap();
+        url.query_pairs_mut().append_pair("options", &format!("-c search_path={schema}"));
+        unsafe { std::env::set_var("CI_TEST_DATABASE_URL", url.as_str()); }
+        let root = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(root.path()).await;
+        unsafe { std::env::set_var("CI_TEST_DATABASE_URL", base); }
+        sqlx::raw_sql("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES('run','test','ci.yml','running');
+            INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES('job','run','deploy','deploy','Deploy','success');
+            INSERT INTO ci_step(id,job_id,idx,name,uses,status) VALUES('step','job',0,'Request','ci/deploy-controller','success');
+            INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES('op','step','run','job','ci','hash','running','source','main');
+            INSERT INTO ci_controller_rollout(id,request,phase) VALUES('op','{}','quiesced');")
+            .execute(d.store.pool()).await.unwrap();
+        let route = Route::Network("handoff-network".into());
+        let consumer = d.bus.consumer_for(&route).await.unwrap();
+        let job = JobMessage { run_id: "run".into(), job_id: "job".into(), job_key: "deploy".into() };
+        d.bus.publish_job(&route, &job).await.unwrap();
+        let (message, _slot) = pull_with_capacity(&consumer, Arc::new(tokio::sync::Semaphore::new(1))).await.unwrap().unwrap();
+        let effect = d.executor.effect_permit().await.unwrap();
+        let running = d.clone();
+        let task = tokio::spawn(async move {
+            let _effect = effect;
+            process_delivery(running, message, job, 1).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), task).await.expect("closed work cannot wait for rollout while retaining the handoff permit").unwrap();
+        let fence = tokio::time::timeout(Duration::from_secs(2), d.executor.handoff_fence()).await.unwrap().unwrap();
+        d.lifecycle.verify_handoff_quiesced(&d.store, "op").await.unwrap();
+        assert_eq!(d.store.get_job("job").await.unwrap().unwrap().status, "success");
+        drop(fence);
     }
 
     #[tokio::test]

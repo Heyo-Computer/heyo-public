@@ -1354,6 +1354,34 @@ Binding also **reconciles an existing consumer**: JetStream returns the durable
 that is already there and ignores the config passed with it, so an upgrade would
 otherwise keep the old window and none of this would take effect.
 
+### Shared executor ownership is not automatic failover
+
+CI replicas sharing PostgreSQL register distinct process boots. One boot owns
+external effects; the others can serve shared run/source/log reads, submission,
+rerun and transactional completion writes. Queue execution, native grants,
+artifact uploads, VM changes and infrastructure reconcilers require the owner's
+permit. Owner-only HTTP operations return 503 on a standby; deployment routing
+must account for this before exposing both replicas as interchangeable endpoints.
+
+The owner is **non-expiring**. A timeout, cancelled run or lost heartbeat never
+proves that a worker or VM command stopped. An unplanned owner restart therefore
+does not recover execution automatically. There is no force-takeover API; runtime
+fencing and reconciliation must be implemented before claiming crash failover.
+
+Planned controller replacement closes shared admission and grants, waits for
+local effect permits, then verifies durable jobs, leases, VM cleanup and remote
+operation fences. It transfers to a named, recently ready boot at a different
+deployment authority before replacing itself. The successor may perform only
+that exact recorded rollout until public revision verification and the atomic
+completion commit release normal execution. Both regions use the same canonical
+HeyoSecret service-role credential for that recorded authority. Readiness refresh
+only filters handoff candidates; it never revokes or grants ownership.
+
+These are CI-side prerequisites, not a completed managed two-region application.
+The existing external-service adoption binding still represents one deployment;
+it must not be used to label a singleton as a two-region CI service. The platform's
+managed regional application lifecycle and live acceptance remain required.
+
 ### Migrations
 
 `migrations/*.sql` are re-executed on every startup with no tracking table —

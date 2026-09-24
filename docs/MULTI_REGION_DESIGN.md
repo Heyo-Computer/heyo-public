@@ -39,17 +39,34 @@ controller-rollout tests and the cross-controller HTTP/HTML log test passed;
 95 integration tests remain ignored
 by the default suite. These changes are not deployed.
 
-Executor/HTTP role separation, positive worker quiescence/handoff and the live
-platform gates remain. The executor handoff needs a separate owner-local effect
-barrier covering job tasks, infrastructure reconcilers and HTTP side effects;
-the current lifecycle work lock does not cover every effect producer. Transfer
-to a named surviving boot must precede self-replacement, with the exact rollout
-obligation transferred, rather than waiting for the replaced boot to release
-ownership. Admission and native grants now have transactional shared drain
-fencing, with a test of a peer's delayed submission and in-flight grant. This
-does not replace the still-missing barrier around external-effect producers.
-Uncertain remote effects must be reconciled, never replayed because a timer ran
-out. Production CI remains on the previous revision while this work proceeds.
+The local continuation adds non-expiring executor ownership and effect permits
+around deliveries, VM/image recovery, infrastructure reconcilers and direct
+HTTP infrastructure mutations. Planned self-replacement transfers to a named
+ready surviving boot before PUT, restricted to the exact persisted operation.
+Completion clears that restriction in the same transaction as the result.
+Readiness expires only for successor selection, never for ownership. Tests cover
+stale readiness, retired-boot refusal, cross-controller handoff, lost PUT response,
+atomic completion failure, failed remote-operation fences, and a delivery racing
+quiescence without retaining the handoff permit indefinitely. Record-only app-lb
+cleanup requires exact ETag and complete inventories and refuses retained jobs,
+workspace, rollout, disk or host-update references; it never invokes teardown.
+Verification: 458 CI unit and 46 native-agent tests, 5 executor PostgreSQL tests,
+11 controller-rollout tests, the PostgreSQL/NATS delivery-race test, and 890
+app-lb tests passed. All were local/disposable; no production deletion occurred.
+
+These prerequisites still do not make CI a managed two-region app. The existing
+external adoption/update path binds exactly one deployment and must not be
+expanded to disguise the singleton. The managed regional rollout needs a generic,
+exact-instance app lifecycle barrier before HTTP withdrawal; CI must implement
+durable background-work drain and handoff receipts through that contract. The
+platform, not CI's direct app-lb PUT loop, must then own replacement and rollback.
+Successors must be restricted to the platform-approved surviving instance set.
+Rollback needs a fresh eligible boot of the baseline revision, not reversal of a
+retired boot's fence. Owner-only HTTP operations currently return 503 on standbys;
+transparent owner routing remains required. Crash takeover remains blocked until
+authoritative runtime fencing and reconciliation exist. The live platform gates
+and global reference inventory before obsolete-record cleanup remain outstanding.
+Production CI remains on the previous revision while this work proceeds.
 
 ## Unified control-plane checkpoint — 2026-09-23
 

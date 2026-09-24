@@ -327,6 +327,7 @@ pub fn spawn(d: Arc<Dispatcher>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
+            let Ok(_effect) = d.executor.effect_permit().await else { continue };
             let rows = sqlx::query("SELECT h.id,h.request,s.job_id,s.run_id FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase NOT IN ('passed','failed') ORDER BY h.created_at LIMIT 32").fetch_all(d.store.pool()).await;
             let Ok(rows) = rows else { continue };
             for row in rows {

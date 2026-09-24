@@ -48,6 +48,7 @@ pub fn spawn(d: std::sync::Arc<Dispatcher>) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            let Ok(_effect) = d.executor.effect_permit().await else { continue };
             let Ok(_work) = d.lifecycle.work(&d.store).await else { continue };
             if let Err(e) = reconcile(&d).await {
                 tracing::warn!("could not reconcile VM cleanup: {e}");

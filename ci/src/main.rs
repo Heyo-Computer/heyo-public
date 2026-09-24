@@ -22,6 +22,7 @@ mod cd;
 mod config;
 mod controller_rollout;
 mod dispatch;
+mod executor;
 mod expr;
 mod host_app_lb;
 mod host_bootstrap;
@@ -300,8 +301,30 @@ async fn main() {
         );
     }
 
+    // Bind before registering non-expiring ownership. A failed bind must not
+    // leave a boot that can never serve as the durable executor.
+    let listener = match tokio::net::TcpListener::bind(config.listen_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("ci: cannot bind CI_LISTEN_ADDR={} — {e}", config.listen_addr);
+            std::process::exit(1);
+        }
+    };
+    // Deployment IDs are scoped to their regional authority; both regions may
+    // legitimately use the same ID for instances of the one CI application.
+    let executor_identity = match (&config.controller_deployment, &config.controller_app_lb_url) {
+        (Some(id), Some(base)) => format!("{}/deployments/{id}", base.trim_end_matches('/')),
+        _ => config.instance_id.clone(),
+    };
     let dispatcher = Arc::new(Dispatcher {
         lifecycle: Arc::new(lifecycle::Lifecycle::default()),
+        executor: Arc::new(match executor::ExecutorOwner::register(
+            store.pool().clone(),
+            &executor_identity,
+        ).await {
+            Ok(owner) => owner,
+            Err(e) => { eprintln!("ci: refusing to start — {e}"); std::process::exit(1); }
+        }),
         config: config.clone(),
         store: store.clone(),
         pool: Pool::new(store.pool().clone()),
@@ -333,8 +356,10 @@ async fn main() {
     // or the pool leaks its capacity one restart at a time. This instance's own
     // id is fresh, so VMs leased by the process this one replaced no longer look
     // like somebody's live work.
-    if let Err(e) = dispatcher.reclaim_pool().await {
-        tracing::warn!("could not reclaim the VM pool: {e}");
+    if let Ok(_effect) = dispatcher.executor.effect_permit().await {
+        if let Err(e) = dispatcher.reclaim_pool().await {
+            tracing::warn!("could not reclaim the VM pool: {e}");
+        }
     }
     dispatcher.clone().spawn_lease_loop();
     dispatcher.clone().spawn_consumers();
@@ -343,19 +368,19 @@ async fn main() {
     host_heyvm_bootstrap_coordinator::spawn(dispatcher.clone());
     vm_cleanup::spawn(dispatcher.clone());
 
-    // Bind before announcing readiness. A listener that cannot bind is a hard
-    // failure here rather than a task that dies quietly and leaves the process
-    // up with no data plane.
-    let listener = match tokio::net::TcpListener::bind(config.listen_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!(
-                "ci: cannot bind CI_LISTEN_ADDR={} — {e}",
-                config.listen_addr
-            );
-            std::process::exit(1);
+    if let Err(e) = dispatcher.executor.mark_ready().await {
+        eprintln!("ci: refusing to announce readiness — {e}");
+        std::process::exit(1);
+    }
+    let executor = dispatcher.executor.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if let Err(error) = executor.mark_ready().await {
+                tracing::warn!(%error, "could not refresh executor handoff readiness");
+            }
         }
-    };
+    });
 
     let app = web::router(
         config.clone(),

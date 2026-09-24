@@ -107,6 +107,10 @@ async fn destroy_run_cache(
         Err(response) => return response,
     };
     if let Err(response) = readable_run(&state, &reader, &run_id).await { return response; }
+    let _effect = match state.dispatcher.executor.effect_permit().await {
+        Ok(permit) => permit,
+        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    };
     match state.dispatcher.destroy_run_cache(&sandbox_id, Some(&run_id)).await {
         Ok(message) => {
             tracing::info!(run = %run_id, sandbox = %sandbox_id, "repository caller reclaimed its idle cache");
