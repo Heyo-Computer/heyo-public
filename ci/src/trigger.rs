@@ -367,9 +367,7 @@ pub fn materialize(
 
     // Validation must precede every filesystem mutation. A malformed retry for
     // an existing run must leave its last valid descriptor and workflows intact.
-    let descriptor: GitPatchSource = serde_json::from_slice(&bytes)
-        .map_err(|e| TriggerError::BadArchive(format!("git-patch descriptor is not valid JSON: {e}")))?;
-    validate_descriptor(&descriptor)?;
+    let descriptor = decode_descriptor(&bytes)?;
 
     if workspace.root.exists() {
         std::fs::remove_dir_all(&workspace.root).map_err(|e| TriggerError::Io {
@@ -448,7 +446,11 @@ pub fn read_descriptor_path(path: &Path) -> Result<GitPatchSource, TriggerError>
     let bytes = std::fs::read(path).map_err(|e| TriggerError::Io {
         path: path.to_path_buf(), reason: e.to_string(),
     })?;
-    let source = serde_json::from_slice(&bytes)
+    decode_descriptor(&bytes)
+}
+
+pub fn decode_descriptor(bytes: &[u8]) -> Result<GitPatchSource, TriggerError> {
+    let source = serde_json::from_slice(bytes)
         .map_err(|e| TriggerError::BadArchive(format!("stored git-patch descriptor is invalid: {e}")))?;
     validate_descriptor(&source)?;
     Ok(source)

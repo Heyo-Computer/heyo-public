@@ -246,6 +246,13 @@ async fn main() {
         "database ready ({} migrations applied)",
         store::EMBEDDED_MIGRATIONS.len()
     );
+    match store.import_sources(&config.workspace_dir, config.max_source_bytes).await {
+        Ok(count) => tracing::info!(count, "retained source descriptors verified in shared storage"),
+        Err(e) => {
+            eprintln!("ci: refusing to start — {e}");
+            std::process::exit(1);
+        }
+    }
 
     let bus = match Bus::connect(&config.nats, &config.nats_prefix).await {
         Ok(b) => Arc::new(b),

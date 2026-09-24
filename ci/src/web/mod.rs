@@ -212,8 +212,7 @@ async fn native_source(State(s):State<AppState>,h:HeaderMap,Path(lease):Path<uui
     if let Err(e)=native_auth(&s,&h){return e}
     let run_id=match crate::native::source_run(&s.store,lease).await {Ok(Some(r))=>r,Ok(None)=>return error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>return error(StatusCode::INTERNAL_SERVER_ERROR,&e)};
     let run=match s.store.get_run(&run_id).await {Ok(Some(r))=>r,Ok(None)=>return error(StatusCode::CONFLICT,"run disappeared"),Err(e)=>return error(StatusCode::INTERNAL_SERVER_ERROR,&e.to_string())};
-    let workspace=crate::trigger::Workspace::for_run(&s.config,&run_id);
-    let descriptor=match crate::trigger::read_descriptor(&workspace){Ok(v)=>v,Err(e)=>return error(StatusCode::INTERNAL_SERVER_ERROR,&e.to_string())};
+    let descriptor=match s.store.source_descriptor(&run_id).await{Ok(v)=>v,Err(e)=>return error(StatusCode::INTERNAL_SERVER_ERROR,&e.to_string())};
     Json(serde_json::json!({"repository":run.repo_url,"descriptor":descriptor,"workflowPath":run.workflow_path})).into_response()
 }
 async fn native_release_source(State(s):State<AppState>,h:HeaderMap,Path((lease,index)):Path<(uuid::Uuid,usize)>)->impl IntoResponse {

@@ -224,6 +224,8 @@ impl Dispatcher {
 
         let size =
             crate::trigger::materialize(&req.source, &workspace, self.config.max_source_bytes)?;
+        let source_bytes = tokio::fs::read(&workspace.descriptor).await
+            .map_err(|e| DispatchError::Checkout(e.to_string()))?;
 
         // Read once, from the seed workspace, before any run is created: every
         // workflow file in this submit is looking at the same commit, and a
@@ -433,16 +435,12 @@ impl Dispatcher {
                 // stored rather than recomputed.
                 self.assign_network(&mut plan, source.network.as_deref(), &mut warnings)?;
 
-                // The first run reuses the workspace already materialized under
-                // the seed id; the rest get their own copy of the same archive,
-                // so no two runs share a directory a step could write into.
+                // Every run's descriptor is committed below with its metadata.
+                // No accepted run depends on this controller's staging directory.
                 let run_id = if run_ids.is_empty() {
                     run_seed.clone()
                 } else {
-                    let id = crate::vm::new_id();
-                    let ws = crate::trigger::Workspace::for_run(&self.config, &id);
-                    copy_tree(&workspace, &ws).await?;
-                    id
+                    crate::vm::new_id()
                 };
 
                 let request = crate::store::RunRequest {
@@ -566,6 +564,7 @@ impl Dispatcher {
             .map_err(|e| DispatchError::Workflow(format!("begin submission: {e}")))?;
         for (id, request, plan) in &planned {
             Store::create_run_in(&mut tx, id, request, plan).await?;
+            Store::record_source_in(&mut tx, id, &source_bytes).await?;
             if !only.is_empty() || req.workflow_id.is_some() || req.rerun.is_some() {
                 sqlx::query("UPDATE ci_run SET validation_only=true WHERE id=$1")
                     .bind(id).execute(&mut *tx).await
@@ -595,9 +594,9 @@ impl Dispatcher {
     /// name their logs, step operation ids derive from them and the daemon
     /// reattaches to an operation it has already seen, and the failed attempt
     /// is the thing somebody will want to read next to the one that passed.
-    /// What the two share is the source: every submit keeps its validated patch
-    /// descriptor beside the workspace, so the immutable revisions and patch
-    /// are replayed exactly. Checkout credentials are resolved afresh per job.
+    /// What the two share is the source: every submit commits its validated
+    /// descriptor with the run in Postgres, so another regional controller can
+    /// replay it exactly. Checkout credentials are resolved afresh per job.
     ///
     /// It goes through [`Self::submit`] with the original run's workflow file
     /// as its one `--only` selector, so it is planned, routed and secreted
@@ -665,25 +664,7 @@ impl Dispatcher {
             )));
         }
 
-        let workspace = crate::trigger::Workspace::for_run(&self.config, run_id);
-        let Some((format, path)) = workspace.stored_source() else {
-            return Err(DispatchError::Workflow(format!(
-                "the source of run {run_id} is no longer under {} — it was submitted before \
-                 this instance kept sources, or the directory was cleaned — so there is \
-                 nothing to re-run; `git submit` the commit again instead",
-                self.config.workspace_dir.display()
-            )));
-        };
-        if format != crate::trigger::SourceFormat::GitPatch {
-            return Err(DispatchError::Workflow(format!(
-                "run {run_id} uses legacy source format {}; its historical source is retained, \
-                 but cannot be rerun. Upgrade `git submit` and resubmit the revision",
-                format.as_str()
-            )));
-        }
-        let bytes = tokio::fs::read(path)
-            .await
-            .map_err(|e| DispatchError::Checkout(format!("{}: {e}", path.display())))?;
+        let bytes = self.store.source_bytes(run_id).await?;
 
         let req = crate::trigger::SubmitRequest {
             repository: crate::trigger::RepositoryRef {
@@ -708,7 +689,7 @@ impl Dispatcher {
             workflow_id: None,
             only: vec![run.workflow_path.clone()],
             source: crate::trigger::SourceArchive {
-                format: format.as_str().to_string(),
+                format: crate::trigger::SourceFormat::GitPatch.as_str().to_string(),
                 content_base64: String::new(),
                 bytes: Some(bytes),
             },
@@ -1400,8 +1381,7 @@ impl Dispatcher {
         msg: &JobMessage,
         deadline: Duration,
     ) -> Result<crate::image::PreparedSource, DispatchError> {
-        let source_workspace = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
-        let descriptor = crate::trigger::read_descriptor(&source_workspace)?;
+        let descriptor = self.store.source_descriptor(&msg.run_id).await?;
         let run = self.store.get_run(&msg.run_id).await?.ok_or_else(|| {
             DispatchError::Checkout(format!("run {} disappeared before source preparation", msg.run_id))
         })?;
@@ -2238,31 +2218,15 @@ impl Dispatcher {
         self.store.start_step(&sid, &sid).await?;
         let log_path = self.store.log_path(&msg.run_id, &plan.key, -1, &sid);
 
-        let workspace = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
-        let Some((format, _archive)) = workspace.stored_source() else {
-            let detail = format!(
-                "no submitted source is on disk for run {} under {}",
-                msg.run_id,
-                self.config.workspace_dir.display()
-            );
-            self.store
-                .append_log(&sid, &log_path, &format!("[ci] {detail}\n"))
-                .await?;
-            self.store
-                .finish_step(&sid, StepStatus::Failure, Some(1), Some(&detail))
-                .await?;
-            return Err(DispatchError::Checkout(detail));
+        let descriptor = match self.store.source_descriptor(&msg.run_id).await {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                let detail = error.to_string();
+                self.store.append_log(&sid, &log_path, &format!("[ci] {detail}\n")).await?;
+                self.store.finish_step(&sid, StepStatus::Failure, Some(1), Some(&detail)).await?;
+                return Err(error.into());
+            }
         };
-        if format != crate::trigger::SourceFormat::GitPatch {
-            let detail = format!(
-                "legacy source format {} cannot be checked out; upgrade `git submit` and resubmit",
-                format.as_str()
-            );
-            self.store.append_log(&sid, &log_path, &format!("[ci] {detail}\n")).await?;
-            self.store.finish_step(&sid, StepStatus::Failure, Some(1), Some(&detail)).await?;
-            return Err(DispatchError::Checkout(detail));
-        }
-        let descriptor = crate::trigger::read_descriptor(&workspace)?;
         let run = self.store.get_run(&msg.run_id).await?.ok_or_else(|| {
             DispatchError::Checkout(format!("run {} disappeared before checkout", msg.run_id))
         })?;
@@ -2650,8 +2614,7 @@ impl Dispatcher {
                 let tags = with("tags").map(|raw| serde_json::from_str(&raw)
                     .map_err(|_| DispatchError::StepFailed("with.tags must be a JSON object mapping manifest paths to tag prefixes".into())))
                     .transpose()?.unwrap_or_default();
-                let source = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
-                let release = crate::release::merge(&self.store, msg, plan, &source.root,
+                let release = crate::release::merge(&self.store, msg, plan,
                     &manifests, &tags, &required("token")?).await.map_err(DispatchError::StepFailed)?;
                 Ok((format!("[ci] merged and published release {} on {}\nVersions: {}\n",
                     release.release_sha, release.git_ref, release.versions), serde_json::json!({
@@ -3220,29 +3183,6 @@ fn artifact_download_path(workdir: &str, path: &str) -> Result<String, DispatchE
         ));
     }
     Ok(std::path::Path::new(workdir).join(relative).to_string_lossy().into_owned())
-}
-
-/// Give a second run of the same submission its own workspace.
-///
-/// Copy the source descriptor and regenerate its bounded workflow metadata.
-/// No repository is fetched or copied by the CI service.
-async fn copy_tree(
-    from: &crate::trigger::Workspace,
-    to: &crate::trigger::Workspace,
-) -> Result<(), DispatchError> {
-    let (format, path) = from
-        .stored_source()
-        .ok_or_else(|| DispatchError::Checkout("the first run's source is gone".into()))?;
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| DispatchError::Checkout(e.to_string()))?;
-    let source = crate::trigger::SourceArchive {
-        format: format.as_str().to_string(),
-        content_base64: String::new(),
-        bytes: Some(bytes),
-    };
-    crate::trigger::materialize(&source, to, usize::MAX)?;
-    Ok(())
 }
 
 /// Run one job under `CI_MAX_JOB_SECONDS`, measured from now — the moment the
@@ -6403,6 +6343,36 @@ mod tests {
             // takes anyway.
             objects: Arc::new(crate::objects::Workflows::new(&config)),
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
+    async fn accepted_source_can_be_rerun_from_another_controller_without_its_disk() {
+        unsafe { std::env::set_var("CI_NATIVE_RUNNER_SECRET", "test-shared-source"); }
+        let first_disk = tempfile::tempdir().unwrap();
+        let second_disk = tempfile::tempdir().unwrap();
+        let first = test_dispatcher(first_disk.path()).await;
+        let second = test_dispatcher(second_disk.path()).await;
+        let source = serde_json::to_vec(&json!({
+            "baseRevision": "a".repeat(40), "targetTree": "b".repeat(40), "patchBase64": "AAEC",
+            "workflows": {".ci/workflows/build.yml": "name: shared-source\njobs:\n  build:\n    runs-on: [macos-intel]\n    steps: [{run: echo shared}]\n"}
+        })).unwrap();
+        let mut req: crate::trigger::SubmitRequest = serde_json::from_value(json!({
+            "repository": {"url": "https://example.test/shared.git", "name": "shared"},
+            "ref": "refs/heads/main", "after": "a".repeat(40),
+            "source": {"format": "git-patch", "contentBase64": ""}
+        })).unwrap();
+        req.source.bytes = Some(source.clone());
+        let accepted = first.submit(&req, None, None).await.unwrap();
+        assert_eq!(accepted.run_ids.len(), 1);
+        let run = &accepted.run_ids[0];
+        assert_eq!(second.store.source_bytes(run).await.unwrap(), source);
+        first.store.cancel_run(run).await.unwrap();
+        drop(first_disk);
+        let rerun = second.rerun(run, false, None).await.unwrap();
+        assert_eq!(rerun.run_ids.len(), 1);
+        assert_eq!(second.store.source_bytes(&rerun.run_ids[0]).await.unwrap(), source);
+        assert_eq!(second.store.get_run(&rerun.run_ids[0]).await.unwrap().unwrap().rerun_of.as_deref(), Some(run.as_str()));
     }
 
     #[tokio::test]

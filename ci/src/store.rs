@@ -1044,6 +1044,64 @@ impl Store {
         Ok(())
     }
 
+    /// Commit the immutable descriptor in the same transaction as admission.
+    /// Exact replay is allowed; another descriptor cannot replace accepted work.
+    pub(crate) async fn record_source_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        run_id: &str,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        crate::trigger::decode_descriptor(bytes).map_err(|e| StoreError::source(run_id, e))?;
+        let written = sqlx::query(
+            "INSERT INTO ci_run_source(run_id,descriptor) VALUES($1,$2)
+             ON CONFLICT(run_id) DO UPDATE SET descriptor=ci_run_source.descriptor
+             WHERE ci_run_source.descriptor=EXCLUDED.descriptor",
+        ).bind(run_id).bind(bytes).execute(&mut **tx).await.map_err(StoreError::sql)?;
+        if written.rows_affected() != 1 {
+            return Err(StoreError::source(run_id, "accepted source cannot be replaced"));
+        }
+        Ok(())
+    }
+
+    pub async fn source_bytes(&self, run_id: &str) -> Result<Vec<u8>, StoreError> {
+        sqlx::query_scalar("SELECT descriptor FROM ci_run_source WHERE run_id=$1")
+            .bind(run_id).fetch_optional(&self.pool).await.map_err(StoreError::sql)?
+            .ok_or_else(|| StoreError::source(run_id, "source is not in shared storage; import its retained descriptor before retrying"))
+    }
+
+    pub async fn source_descriptor(&self, run_id: &str) -> Result<crate::trigger::GitPatchSource, StoreError> {
+        crate::trigger::decode_descriptor(&self.source_bytes(run_id).await?)
+            .map_err(|e| StoreError::source(run_id, e))
+    }
+
+    /// Import retained descriptors before starting any executor or HTTP handler.
+    /// Local files remain untouched. Once imported, every reader uses Postgres.
+    pub async fn import_sources(&self, directory: &Path, max_bytes: usize) -> Result<u64, StoreError> {
+        let mut entries = match tokio::fs::read_dir(directory).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(StoreError::source("local import", e)),
+        };
+        let mut imported = 0;
+        while let Some(entry) = entries.next_entry().await.map_err(|e| StoreError::source("local import", e))? {
+            let name = entry.file_name();
+            let Some(run_id) = name.to_str().and_then(|name| name.strip_suffix(".source.json")) else { continue };
+            // Submission staging files without an admitted run are not history.
+            if self.get_run(run_id).await?.is_none() { continue; }
+            let metadata = entry.metadata().await.map_err(|e| StoreError::source(run_id, e))?;
+            if !metadata.is_file() || metadata.len() > max_bytes as u64 {
+                return Err(StoreError::source(run_id, "retained descriptor is not a bounded file"));
+            }
+            let bytes = tokio::fs::read(entry.path()).await.map_err(|e| StoreError::source(run_id, e))?;
+            if bytes.len() > max_bytes { return Err(StoreError::source(run_id, "retained descriptor exceeds source limit")); }
+            let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+            Self::record_source_in(&mut tx, run_id, &bytes).await?;
+            tx.commit().await.map_err(StoreError::sql)?;
+            imported += 1;
+        }
+        Ok(imported)
+    }
+
     pub async fn get_run(&self, run_id: &str) -> Result<Option<Run>, StoreError> {
         let row = sqlx::query(
             "SELECT r.*, rp.name AS repo_name
@@ -2277,12 +2335,17 @@ pub enum StoreError {
     Connect(String),
     Migrations { path: PathBuf, reason: String },
     LogDir { path: PathBuf, reason: String },
+    Source { run_id: String, reason: String },
     Sql(String),
 }
 
 impl StoreError {
     fn sql(e: sqlx::Error) -> Self {
         Self::Sql(e.to_string())
+    }
+
+    fn source(run_id: &str, reason: impl fmt::Display) -> Self {
+        Self::Source { run_id: run_id.into(), reason: reason.to_string() }
     }
 }
 
@@ -2299,6 +2362,7 @@ impl fmt::Display for StoreError {
             Self::LogDir { path, reason } => {
                 write!(f, "could not write logs under {}: {reason}", path.display())
             }
+            Self::Source { run_id, reason } => write!(f, "source of run {run_id}: {reason}"),
             Self::Sql(e) => write!(f, "database error: {e}"),
         }
     }
@@ -2401,6 +2465,63 @@ mod tests {
             .expect("connects");
         store.migrate().await.expect("migrations apply");
         store
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Postgres"]
+    async fn shared_source_is_atomic_immutable_and_independent_of_local_files() {
+        let store = test_store().await;
+        let peer = test_store().await;
+        let source = serde_json::to_vec(&serde_json::json!({
+            "baseRevision": "a".repeat(40), "targetTree": "b".repeat(40),
+            "patchBase64": "AAEC", "workflows": {"build.yml": "# héllo\njobs: {}\n"}
+        })).unwrap();
+        let run = crate::vm::new_id();
+        let mut tx = store.pool.begin().await.unwrap();
+        Store::create_run_in(&mut tx, &run, &RunRequest::default(), &test_plan()).await.unwrap();
+        Store::record_source_in(&mut tx, &run, &source).await.unwrap();
+        assert!(peer.get_run(&run).await.unwrap().is_none());
+        assert!(peer.source_bytes(&run).await.is_err(), "source is not visible before admission commits");
+        tx.commit().await.unwrap();
+        assert_eq!(peer.source_bytes(&run).await.unwrap(), source);
+        assert_eq!(peer.source_descriptor(&run).await.unwrap().patch().unwrap(), vec![0, 1, 2]);
+
+        let mut changed: serde_json::Value = serde_json::from_slice(&source).unwrap();
+        changed["targetTree"] = serde_json::json!("c".repeat(40));
+        let changed = serde_json::to_vec(&changed).unwrap();
+        let mut tx = peer.pool.begin().await.unwrap();
+        Store::record_source_in(&mut tx, &run, &source).await.unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = peer.pool.begin().await.unwrap();
+        assert!(Store::record_source_in(&mut tx, &run, &changed).await.is_err());
+        tx.rollback().await.unwrap();
+        assert_eq!(store.source_bytes(&run).await.unwrap(), source);
+
+        let rejected = crate::vm::new_id();
+        let mut tx = store.pool.begin().await.unwrap();
+        Store::create_run_in(&mut tx, &rejected, &RunRequest::default(), &test_plan()).await.unwrap();
+        assert!(Store::record_source_in(&mut tx, &rejected, b"{}").await.is_err());
+        tx.rollback().await.unwrap();
+        assert!(peer.get_run(&rejected).await.unwrap().is_none());
+        assert!(peer.jobs_of(&rejected).await.unwrap().is_empty());
+        assert!(peer.run_events(&rejected, None, 100).await.unwrap().is_empty());
+
+        // Existing admitted history is imported without deleting its files.
+        let old = crate::vm::new_id();
+        store.create_run(&old, &RunRequest::default(), &test_plan()).await.unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let file = local.path().join(format!("{old}.source.json"));
+        std::fs::write(&file, &source).unwrap();
+        assert!(store.import_sources(local.path(), source.len() - 1).await.is_err());
+        assert!(peer.source_bytes(&old).await.is_err());
+        assert_eq!(store.import_sources(local.path(), source.len()).await.unwrap(), 1);
+        assert_eq!(store.import_sources(local.path(), source.len()).await.unwrap(), 1);
+        assert_eq!(std::fs::read(&file).unwrap(), source);
+        std::fs::write(&file, &changed).unwrap();
+        assert!(store.import_sources(local.path(), changed.len()).await.is_err());
+        assert_eq!(peer.source_bytes(&old).await.unwrap(), source);
+        drop(local);
+        assert_eq!(peer.source_bytes(&old).await.unwrap(), source, "removing the old disk cannot remove admitted source");
     }
 
     #[tokio::test]

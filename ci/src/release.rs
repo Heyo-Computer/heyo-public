@@ -9,6 +9,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -84,7 +85,6 @@ pub async fn merge(
     store: &Store,
     msg: &JobMessage,
     plan: &JobPlan,
-    source: &Path,
     manifests: &[String],
     tags: &BTreeMap<String, String>,
     token: &str,
@@ -170,9 +170,7 @@ pub async fn merge(
     let request_hash = hex::encode(Sha256::digest(
         serde_json::to_vec(&identity).map_err(|e| e.to_string())?,
     ));
-    // `source` is Workspace::root. Submissions intentionally persist metadata,
-    // not a controller-side checkout, alongside it as `<run>.source.json`.
-    let descriptor = crate::trigger::read_descriptor_path(&source.with_extension("source.json"))
+    let descriptor = store.source_descriptor(&msg.run_id).await
         .map_err(|e| format!("read release source descriptor: {e}"))?;
     let release_checkout=release_git::materialize(&run.repo_url,&descriptor,token).await?;
     if coordinated {
@@ -454,6 +452,7 @@ mod tests {
         git(&source, &["add", "."]);
         git(&source, &["commit", "-m", "feat: change"]);
         let head = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["push", "origin", "HEAD:refs/heads/feature"]);
 
         let workflow = crate::workflow::Workflow::parse("release.yml", "jobs:\n  validate:\n    vm: { driver: firecracker }\n    steps:\n      - run: cargo test\n  release:\n    needs: [validate]\n    vm: { driver: firecracker }\n    steps:\n      - uses: ci/merge-release\n").unwrap();
         let plan = crate::plan::Plan::build(&workflow).unwrap();
@@ -491,6 +490,13 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let descriptor = serde_json::to_vec(&json!({
+                "baseRevision": head, "targetTree": git(remote, &["rev-parse", &format!("{head}^{{tree}}")]),
+                "patchBase64": "", "workflows": {}
+            })).unwrap();
+            let mut tx = store.pool().begin().await.unwrap();
+            Store::record_source_in(&mut tx, &run, &descriptor).await.unwrap();
+            tx.commit().await.unwrap();
             let jobs = store.jobs_of(&run).await.unwrap();
             let validation = jobs.iter().find(|j| j.base_id == "validate").unwrap();
             store
@@ -550,7 +556,6 @@ mod tests {
                 &store,
                 &msg,
                 release_plan,
-                &source,
                 &["package.json".into()],
                 &BTreeMap::new(),
                 "test"
@@ -573,7 +578,6 @@ mod tests {
             &store,
             &msg,
             release_plan,
-            &source,
             &["package.json".into()],
             &BTreeMap::new(),
             "test",
@@ -592,7 +596,6 @@ mod tests {
                 &store,
                 &msg,
                 release_plan,
-                &source,
                 &["package.json".into()],
                 &BTreeMap::new(),
                 "test"
@@ -609,7 +612,6 @@ mod tests {
                 &store,
                 &failed_msg,
                 release_plan,
-                &source,
                 &["package.json".into()],
                 &BTreeMap::new(),
                 "test"

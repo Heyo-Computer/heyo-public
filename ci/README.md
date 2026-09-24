@@ -875,10 +875,20 @@ reattaches to, and the failed attempt is what somebody will want to read beside
 the one that passed.
 
 **What it runs is the source the submit described.** The CI service never clones
-or stores a repository credential. It durably keeps the immutable revisions and
-patch descriptor under `CI_WORKSPACE_DIR`; the selected runner reconstructs and
-verifies that tree using a freshly resolved job-scoped HeyoSecret. A run whose
-descriptor is gone says so and asks for a new submit. The re-run goes through
+or stores a repository credential during submission. It commits the immutable
+revisions, patch and workflow descriptor in `ci_run_source` in the same Postgres
+transaction as the run and jobs. The selected runner reconstructs and verifies
+that tree using a freshly resolved job-scoped HeyoSecret. Release publication
+also reads this shared descriptor before making its authorized temporary checkout.
+
+`CI_WORKSPACE_DIR` holds local submission staging files, not accepted source
+authority. On startup, retained `<run>.source.json` files for existing runs are
+validated and imported into shared storage without deleting the originals.
+Exact re-import is safe; conflicting or invalid descriptors stop startup instead
+of replacing accepted history. Source reads, native-runner checkout and reruns
+then use Postgres exclusively. A run without an imported descriptor reports the
+missing source explicitly; it never falls back to a different revision.
+The re-run goes through
 the same path as a submit, with the run's own
 workflow file as its `--only` selector, so it is planned, routed and given
 secrets exactly as the original was. As with `--only`, the `on.submit` branch
@@ -1068,7 +1078,7 @@ claiming work still use the retry ladder.
 The same rule applies to native runners: expiry rejects stale reports but does
 not reassign the execution or free its runner capacity. These guards are
 prerequisites for regional CI, not a complete multi-controller implementation.
-Shared source/log storage, executor handoff and recovery remain required before
+Shared log storage, executor handoff and recovery remain required before
 running a second CI controller against production state.
 
 `uses: default` resolves through **`~/.heyo/daemon.json`** — heyvmd mints
