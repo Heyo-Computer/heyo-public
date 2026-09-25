@@ -22,6 +22,7 @@ mod cd;
 // each one wires its own routes. See `ui/README.md`.
 mod config;
 mod controller_rollout;
+mod debug_report;
 mod dispatch;
 mod executor;
 mod expr;
@@ -389,6 +390,7 @@ async fn main() {
     host_maintenance::spawn(dispatcher.clone());
     host_heyvm_bootstrap_coordinator::spawn(dispatcher.clone());
     vm_cleanup::spawn(dispatcher.clone());
+    debug_report::spawn(dispatcher.clone());
 
     if let Err(e) = dispatcher.executor.mark_ready().await {
         eprintln!("ci: refusing to announce readiness — {e}");

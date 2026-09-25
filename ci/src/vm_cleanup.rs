@@ -8,7 +8,7 @@ use std::time::Duration;
 /// Called only after this executor has stopped issuing commands to its owned VM.
 /// Publish the job result and cleanup obligation together, before attempting IO.
 pub async fn handoff(d: &Dispatcher, job: &str, runner: &str, attempt: i32,
-    sandbox: &str, destroy: bool, status: JobStatus, error: Option<&str>) -> Result<()> {
+    sandbox: &str, status: JobStatus, error: Option<&str>) -> Result<()> {
     ensure!(status.is_terminal(), "cleanup requires a terminal executor outcome");
     let mut tx = d.store.pool().begin().await?;
     let j = sqlx::query("SELECT run_id,job_key,attempt,status FROM ci_job WHERE id=$1 FOR UPDATE")
@@ -24,7 +24,7 @@ pub async fn handoff(d: &Dispatcher, job: &str, runner: &str, attempt: i32,
         .bind(job).bind(runner).bind(attempt).fetch_one(&mut *tx).await?;
     ensure!(work, "cleanup has no executor ownership evidence");
     sqlx::query("INSERT INTO ci_vm_cleanup(sandbox_id,job_id,runner_hd_id,attempt,destroy) VALUES($1,$2,$3,$4,$5)")
-        .bind(sandbox).bind(job).bind(runner).bind(attempt).bind(destroy).execute(&mut *tx).await?;
+        .bind(sandbox).bind(job).bind(runner).bind(attempt).bind(true).execute(&mut *tx).await?;
     // Change the pool tuple too: an orphan UPDATE already waiting on this row
     // must recheck a non-expiring lease, even if its snapshot predates the intent.
     // Cleanup now owns release; process heartbeats no longer own this lease.
@@ -38,6 +38,7 @@ pub async fn handoff(d: &Dispatcher, job: &str, runner: &str, attempt: i32,
         .bind(job).bind(final_status).bind(error).execute(&mut *tx).await?;
     Store::add_event(&mut tx, &j.get::<String,_>("run_id"), Some(job), Some(&j.get::<String,_>("job_key")),
         None, "ci.job.status.v1", final_status, error).await?;
+    crate::debug_report::enqueue(&mut tx, job, sandbox).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -93,10 +94,12 @@ async fn finish(d: &Dispatcher, sandbox: &str) -> Result<()> {
     let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_job WHERE id=$1 AND attempt=$2 AND status IN ('success','failure','skipped','cancelled')) AND NOT EXISTS(SELECT 1 FROM ci_service_deployment s JOIN ci_host_maintenance h ON h.id=s.id WHERE s.job_id=$1)")
         .bind(&job).bind(attempt).fetch_one(&mut *tx).await?;
     ensure!(valid, "cleanup job identity or lifecycle owner changed");
+    // Covers cleanup intents created by older controllers that requested a
+    // stopped warm cache. CI-owned job VMs are now always ephemeral.
+    crate::debug_report::enqueue(&mut tx, &job, sandbox).await?;
     let vm = d.vms.open(d.runners.options_for(&runner).await?, sandbox.to_string()).await?;
-    let destroy: bool = c.get("destroy");
     let already_removed = match vm.info().await {
-        Err(VmError::Daemon { source: HeyoError::NotFound(_), .. }) if destroy => true,
+        Err(VmError::Daemon { source: HeyoError::NotFound(_), .. }) => true,
         result => {
             let info = result?;
             ensure!(info.id == sandbox, "cleanup daemon returned another VM");
@@ -106,16 +109,11 @@ async fn finish(d: &Dispatcher, sandbox: &str) -> Result<()> {
             false
         }
     };
-    if destroy {
-        if !already_removed {
-            vm.destroy().await?;
-            ensure!(matches!(vm.info().await, Err(VmError::Daemon { source: HeyoError::NotFound(_), .. })), "daemon has not confirmed VM removal");
-        }
-        sqlx::query("DELETE FROM ci_vm_pool WHERE sandbox_id=$1").bind(sandbox).execute(&mut *tx).await?;
-    } else {
-        sqlx::query("UPDATE ci_vm_pool SET status='idle',claimed_by_job=NULL,leased_by=NULL,leased_until=NULL,last_used_at=now() WHERE sandbox_id=$1")
-            .bind(sandbox).execute(&mut *tx).await?;
+    if !already_removed {
+        vm.destroy().await?;
+        ensure!(matches!(vm.info().await, Err(VmError::Daemon { source: HeyoError::NotFound(_), .. })), "daemon has not confirmed VM removal");
     }
+    sqlx::query("DELETE FROM ci_vm_pool WHERE sandbox_id=$1").bind(sandbox).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM ci_host_work WHERE job_id=$1 AND runner_hd_id=$2 AND attempt=$3")
         .bind(&job).bind(&runner).bind(attempt).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM ci_vm_cleanup WHERE sandbox_id=$1").bind(sandbox).execute(&mut *tx).await?;

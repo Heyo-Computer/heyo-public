@@ -73,6 +73,12 @@ subtle = "2.6"
 # reqwest, so this adds no second TLS stack.
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
+# Private S3 artifact storage. Credentials come from the standard AWS provider
+# chain (environment, shared config, web identity, ECS/EC2 roles); CI never
+# accepts or persists access keys itself.
+aws-config = "1"
+aws-sdk-s3 = "1"
+
 # Run history, the job DAG and the VM pool. Postgres rather than the
 # JSON-file-per-object app-lb uses for specs: this data is append-heavy and
 # needs indexes and pagination, which a rewritten file does not give.

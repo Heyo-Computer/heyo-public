@@ -201,21 +201,8 @@ pub struct HeyvmConfig {
     /// Backstop TTL on every VM we create, so a crashed orchestrator does not
     /// strand a fleet. Renewed on the lease loop while a job holds the VM.
     ///
-    /// Only a *running* VM is subject to it: the daemon's reaper skips stopped
-    /// sandboxes, and a released VM is stopped — see `vm_idle` for the clock
-    /// that bounds those.
+    /// Only running VMs are subject to TTL; durable cleanup owns deletion.
     pub vm_ttl: Duration,
-    /// How long an idle pooled VM is kept before the sweep destroys it.
-    ///
-    /// A VM handed back to the pool is *stopped*, so an idle one costs disk —
-    /// the rootfs clone and the cache disk — and nothing else, and this bounds
-    /// that disk rather than memory or CPU. It has to be this app's own clock:
-    /// heyvmd's TTL only ever reaps a running VM, which is precisely why a
-    /// stopped one needs a sweep here. Measured from the VM's last use, so a
-    /// workflow that runs at all keeps its cache; default a week, so a build
-    /// cache survives a weekend and the predecessor of a retired fingerprint
-    /// does not sit on a 40 GB disk for ever.
-    pub vm_idle: Duration,
     /// Drive one local `heyvmd` directly instead of discovering hosts through
     /// the cloud.
     ///
@@ -473,7 +460,6 @@ impl Config {
                 Some(_) => Some(secs("CI_QUEUE_WAIT_SECS", 0)?),
             },
             vm_ttl: secs("CI_VM_TTL_SECONDS", 3600)?,
-            vm_idle: secs("CI_VM_IDLE_SECS", 7 * 24 * 3600)?,
             local_runner: opt("CI_LOCAL_RUNNER").map(|v| match v.as_str() {
                 "1" | "true" | "yes" | "on" => heyo_sdk::DEFAULT_LOCAL_BASE_URL.to_string(),
                 other => other.trim_end_matches('/').to_string(),
@@ -549,21 +535,22 @@ impl Config {
         let artifact_dir =
             PathBuf::from(opt("CI_ARTIFACT_DIR").unwrap_or_else(|| "ci-artifacts".to_string()));
 
-        // Companion variables are required only for the sink actually selected —
-        // but when it *is* selected, missing ones fail here rather than at the
-        // first upload, which would be after a green build.
-        let s3 = match artifact_sink {
-            ArtifactSinkKind::S3 => Some(S3Config {
-                bucket: opt("CI_S3_BUCKET").ok_or(ConfigError::Missing {
-                    var: "CI_S3_BUCKET",
-                    purpose: "the bucket artifacts go to, required by CI_ARTIFACT_SINK=s3",
-                })?,
-                prefix: opt("CI_S3_PREFIX").unwrap_or_else(|| "ci".to_string()),
-                region: opt("CI_S3_REGION"),
-                endpoint: opt("CI_S3_ENDPOINT"),
-            }),
-            _ => None,
-        };
+        // S3 is also used for debug reports when another primary artifact sink
+        // is selected, so resolve it whenever a bucket is present. Selecting S3
+        // as the primary sink still makes the bucket mandatory at startup.
+        let s3_bucket = opt("CI_S3_BUCKET");
+        if matches!(artifact_sink, ArtifactSinkKind::S3) && s3_bucket.is_none() {
+            return Err(ConfigError::Missing {
+                var: "CI_S3_BUCKET",
+                purpose: "the bucket artifacts go to, required by CI_ARTIFACT_SINK=s3",
+            });
+        }
+        let s3 = s3_bucket.map(|bucket| S3Config {
+            bucket,
+            prefix: opt("CI_S3_PREFIX").unwrap_or_else(|| "ci".to_string()),
+            region: opt("CI_S3_REGION"),
+            endpoint: opt("CI_S3_ENDPOINT"),
+        });
         let artifacts = match artifact_sink {
             ArtifactSinkKind::Artifacts => Some(ArtifactsConfig {
                 url: opt("CI_ARTIFACT_URL")

@@ -487,6 +487,14 @@ async fn run_status(
         job_views.push(job_json(job, &steps));
     }
     let artifacts = state.store.artifacts_of(&run_id).await.unwrap_or_default();
+    let reports: Vec<serde_json::Value> = match sqlx::query_scalar("SELECT jsonb_build_object('job_id',job_id,'attempt',attempt,'sandbox_id',sandbox_id,'s3_uri',s3_uri,'uploaded_at',uploaded_at,'error',last_error) FROM ci_debug_report WHERE run_id=$1 ORDER BY job_key,attempt")
+        .bind(&run_id).fetch_all(state.store.pool()).await {
+        Ok(reports) => reports,
+        Err(e) => {
+            tracing::error!("could not load debug reports for {run_id}: {e}");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "could not load debug reports");
+        }
+    };
     let reruns = match state.store.reruns_of(&run_id).await {
         Ok(reruns) => reruns,
         Err(e) => {
@@ -514,6 +522,7 @@ async fn run_status(
         "validations": validations,
         "reruns": reruns.iter().map(|run| run_json(&state, run)).collect::<Vec<_>>(),
         "jobs": job_views,
+        "debug_reports": reports,
         "artifacts": artifacts
             .iter()
             .map(|a| serde_json::json!({

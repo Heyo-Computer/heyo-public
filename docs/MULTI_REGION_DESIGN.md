@@ -75,12 +75,67 @@ must be confirmed before stop/delete or cancelled-boot reservation release.
 After both CI jobs finished and their processes/TAPs were absent, the two `.206`
 caches were classified against host service state, proxy/link records, routes,
 database registry and both public app-lb deployment lists. Their owning-run
-cleanup requests returned 503; neither deletion is claimed complete. CI logs
+cleanup requests initially returned 503. CI logs
 showed durable eviction retries repeatedly using the same reset runner tunnel.
+After the next full submission, host inspection confirmed both caches absent
+from sandbox, run and KVM state; neither process nor TAP remained. The `.206`
+collision is gone. At 18:01 UTC, inventory still had 64 reservation records for
+63 unique addresses, with only the untouched `.210` preflight pair duplicated.
 The public fix makes failed cache eviction discard that runner's cached tunnel,
 matching the existing job and run-owned cleanup recovery paths. Active operations
 retain their own connection ownership. No manual host deletion or firewall repair
 was used to bypass these failures.
+
+Follow-up verification passed: 50 selected Linux tests, the separately executed
+privileged TAP-refusal test with real iproute2, and the stop/delete retention
+regressions. The CI eviction test passed against disposable Postgres/NATS/HTTP
+fixtures, along with 25 runner tests (one integration test remained ignored).
+Latest public trunk was incorporated and app-lb `cargo check` passed. Test
+containers were removed. These are not deployed or live-acceptance results.
+
+Private revision `10a58e0e5496e0fc26b7a7605fe394a466bd63f8` is pushed in PR #624
+and submitted through full release `01a0d9b75b46-00000060`; Cloud validation is
+`01a0d9b75b44-0000005e`, heyvm validation is `01a0d9b75b46-0000005f`.
+Public PR #122 also contains the failed-eviction reconnection fix. This retry's
+heyvm attempt 2 compiled successfully on `sb-6ea175f7`, but failed polling the
+test operation when its runner tunnel stopped accepting connections. The release
+coordinator failed before deployment. Cloud also encountered memory admission
+and secret-access failures. This is not a successful deployment.
+
+At 18:20 UTC, an app-lb-managed diagnostic exec found CI PID 421 at 1,024 open
+descriptors (its soft limit), including 1,018 sockets. CI logs reported `Too many
+open files` during ticket resolution, runner dials and VM cleanup. The SDK's
+inlined proxy omitted EOF propagation and detached accepted connection tasks;
+both published 0.1.9 and 0.1.11 contain that implementation. The private SDK fix
+propagates half-close, returns on copy errors, and cancels accepted tasks with
+their tunnel. Its 36 library tests and two real P2P tests passed. It is not yet
+published or installed in CI.
+
+Owning-run cleanup of the classified idle caches `sb-58e2f9a6` and `sb-c6b2d8e6`
+returned 503 during descriptor exhaustion. Host inspection still found both;
+their deletion is not claimed. No service/database VM was deleted to compensate.
+
+The requested CI policy is now ephemeral: snapshot diagnostics to a durable
+outbox, delete job VMs after success/failure/cancellation, and independently retry
+private S3 report uploads. Boot identities are returned before readiness polling
+so known boot/sizing failures enter ordinary cleanup. Legacy idle caches and
+unreferenced source-built images no longer get a retention window. Report
+snapshots exclude raw environments/workspaces, preserve available step logs,
+and explicitly record unavailable or bounded console diagnostics. S3 failure
+does not retain a VM. This is code, not executed live acceptance. A private
+`CI_S3_BUCKET` and service-role credentials still need to be configured, and CI
+must consume the corrected SDK. Create requests whose response is lost before
+identity persistence remain an unresolved lifecycle gap; they must not be
+guessed away or reported reclaimed from a terminal job alone.
+
+Final local checks: 462 CI tests passed (112 integration/environment tests
+ignored); the separately executed disposable Postgres/NATS cleanup regression
+and report restart/S3-failure regression passed. The cleanup regression covers
+lost stop/delete responses, concurrent reconciliation, ownership refusal and
+legacy `destroy=false` intents. Signed S3 HTTP tests passed, but no upload to a
+real report bucket has been verified. Cloud validation `01a0d9b75b44-0000005e`
+ended in failure after four attempts; the final attempt was refused by host
+memory admission. No new regional deployment completed.
 
 Read-only diagnostics found healthy host memory/disk capacity and successful
 fresh database TCP/TLS handshakes, but established database connections suffered

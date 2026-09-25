@@ -208,7 +208,7 @@ pub fn sink_for(config: &Config) -> Result<Box<dyn ArtifactSink>, ArtifactError>
                 .s3
                 .clone()
                 .ok_or_else(|| ArtifactError::Misconfigured("CI_S3_BUCKET is not set".into()))?;
-            Ok(Box::new(S3Sink { config: s3 }))
+            Ok(Box::new(S3Sink::new(s3)?))
         }
         ArtifactSinkKind::Artifacts => {
             let a = config
@@ -279,6 +279,7 @@ impl ArtifactSink for DiskSink {
 
 pub struct S3Sink {
     config: S3Config,
+    client: tokio::sync::OnceCell<aws_sdk_s3::Client>,
 }
 
 #[async_trait]
@@ -287,37 +288,136 @@ impl ArtifactSink for S3Sink {
         "s3"
     }
 
-    async fn put(&self, r: &ArtifactRef, _bytes: Vec<u8>) -> Result<StoredArtifact, ArtifactError> {
-        // Deliberately not implemented rather than silently succeeding: an
-        // artifact that reports stored and is not there is worse than a build
-        // that fails saying so. Selecting `CI_ARTIFACT_SINK=s3` is checked at
-        // startup, so this is reachable only by having asked for it.
-        Err(ArtifactError::NotImplemented {
+    async fn put(&self, r: &ArtifactRef, bytes: Vec<u8>) -> Result<StoredArtifact, ArtifactError> {
+        let key = self.key_for(r);
+        let size = bytes.len() as u64;
+        let digest = hex::encode(Sha256::digest(&bytes));
+        self.client()
+            .await?
+            .put_object()
+            .bucket(&self.config.bucket)
+            .key(&key)
+            .content_length(size as i64)
+            .content_type("application/octet-stream")
+            .metadata("sha256", &digest)
+            .body(bytes.into())
+            .send()
+            .await
+            .map_err(|e| {
+                ArtifactError::Transport(format!("S3 PUT s3://{}/{key}: {e}", self.config.bucket))
+            })?;
+        Ok(StoredArtifact {
             sink: "s3",
-            detail: format!(
-                "would upload {} to s3://{}/{}",
-                r.name,
-                self.config.bucket,
-                self.key_for(r)
-            ),
+            digest: Some(digest),
+            size_bytes: size,
+            uri: format!("s3://{}/{key}", self.config.bucket),
+            public_url: None,
         })
     }
 
-
     async fn get(&self, stored: &StoredArtifact) -> Result<Vec<u8>, ArtifactError> {
-        Err(ArtifactError::NotImplemented { sink: "s3", detail: format!("would download {}", stored.uri) })
+        if stored.sink != self.kind() {
+            return Err(ArtifactError::InvalidRecord(format!(
+                "artifact was recorded for the {} sink, not s3",
+                stored.sink
+            )));
+        }
+        let key = self.key_from_uri(&stored.uri)?;
+        let response = self
+            .client()
+            .await?
+            .get_object()
+            .bucket(&self.config.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| ArtifactError::Transport(format!("S3 GET {}: {e}", stored.uri)))?;
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| {
+                ArtifactError::Transport(format!("reading S3 object {}: {e}", stored.uri))
+            })?
+            .into_bytes()
+            .to_vec();
+        validate(stored, &bytes)?;
+        Ok(bytes)
     }
 }
 
 impl S3Sink {
+    pub fn new(config: S3Config) -> Result<Self, ArtifactError> {
+        if config.bucket.trim().is_empty() {
+            return Err(ArtifactError::Misconfigured("CI_S3_BUCKET is empty".into()));
+        }
+        if let Some(endpoint) = &config.endpoint {
+            reqwest::Url::parse(endpoint).map_err(|e| {
+                ArtifactError::Misconfigured(format!("CI_S3_ENDPOINT is not a valid URL: {e}"))
+            })?;
+        }
+        Ok(Self {
+            config,
+            client: tokio::sync::OnceCell::new(),
+        })
+    }
+
+    #[cfg(test)]
+    fn with_client(config: S3Config, client: aws_sdk_s3::Client) -> Self {
+        let cell = tokio::sync::OnceCell::new();
+        cell.set(client).expect("new S3 client cell");
+        Self {
+            config,
+            client: cell,
+        }
+    }
+
+    async fn client(&self) -> Result<&aws_sdk_s3::Client, ArtifactError> {
+        self.client
+            .get_or_try_init(|| async {
+                let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+                if let Some(region) = &self.config.region {
+                    loader = loader.region(aws_sdk_s3::config::Region::new(region.clone()));
+                }
+                let shared = loader.load().await;
+                let mut builder = aws_sdk_s3::config::Builder::from(&shared);
+                if let Some(endpoint) = &self.config.endpoint {
+                    builder = builder.endpoint_url(endpoint).force_path_style(true);
+                }
+                Ok(aws_sdk_s3::Client::from_conf(builder.build()))
+            })
+            .await
+    }
+
     fn key_for(&self, r: &ArtifactRef) -> String {
-        format!(
-            "{}/{}/{}/{}",
-            self.config.prefix.trim_matches('/'),
-            safe(&r.run_id),
-            safe(&r.job_key),
-            safe(&r.name)
-        )
+        let suffix = format!("{}/{}/{}", safe(&r.run_id), safe(&r.job_key), safe(&r.name));
+        let prefix = self.config.prefix.trim_matches('/');
+        if prefix.is_empty() {
+            suffix
+        } else {
+            format!("{prefix}/{suffix}")
+        }
+    }
+
+    fn key_from_uri<'a>(&self, uri: &'a str) -> Result<&'a str, ArtifactError> {
+        let rest = uri.strip_prefix("s3://").ok_or_else(|| {
+            ArtifactError::InvalidRecord("S3 artifact URI must start with s3://".into())
+        })?;
+        let (bucket, key) = rest.split_once('/').ok_or_else(|| {
+            ArtifactError::InvalidRecord("S3 artifact URI has no object key".into())
+        })?;
+        if bucket != self.config.bucket {
+            return Err(ArtifactError::InvalidRecord(
+                "S3 artifact URI names a foreign bucket".into(),
+            ));
+        }
+        let prefix = self.config.prefix.trim_matches('/');
+        if key.is_empty() || (!prefix.is_empty() && !key.starts_with(&format!("{prefix}/"))) {
+            return Err(ArtifactError::InvalidRecord(
+                "S3 artifact URI is outside the configured prefix".into(),
+            ));
+        }
+        Ok(key)
     }
 }
 
@@ -769,10 +869,6 @@ pub enum ArtifactError {
         slug: String,
         message: String,
     },
-    NotImplemented {
-        sink: &'static str,
-        detail: String,
-    },
     /// A guest reported pushing a blob the store then could not vouch for.
     NotPushed {
         digest: String,
@@ -812,11 +908,6 @@ impl fmt::Display for ArtifactError {
                     _ => Ok(()),
                 }
             }
-            Self::NotImplemented { sink, detail } => write!(
-                f,
-                "the {sink} artifact sink is not implemented yet ({detail}). Set \
-                 CI_ARTIFACT_SINK=disk or =artifacts."
-            ),
             Self::NotPushed { digest, detail } => write!(
                 f,
                 "the guest reported pushing blob {digest} to the store, but {detail}. \
@@ -1010,36 +1101,149 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Reporting an artifact as stored when it is not is worse than failing.
-    #[tokio::test]
-    async fn the_s3_sink_fails_loudly_rather_than_pretending() {
-        let sink = S3Sink {
-            config: S3Config {
-                bucket: "bkt".into(),
-                prefix: "ci".into(),
-                region: None,
-                endpoint: None,
-            },
-        };
-        let err = sink.put(&aref(), b"x".to_vec()).await.unwrap_err();
-        assert!(matches!(err, ArtifactError::NotImplemented { .. }));
-        assert!(err.to_string().contains("CI_ARTIFACT_SINK=disk"), "{err}");
-    }
-
     #[test]
     fn an_s3_key_is_stable_and_slash_separated() {
-        let sink = S3Sink {
-            config: S3Config {
+        let sink = S3Sink::new(S3Config {
                 bucket: "bkt".into(),
                 prefix: "/ci/".into(),
                 region: None,
                 endpoint: None,
-            },
-        };
+        })
+        .unwrap();
         assert_eq!(
             sink.key_for(&aref()),
             "ci/019fca648a6e-00000000/build-x86_64/binary.tar.gz"
         );
+    }
+
+    fn mock_s3(endpoint: String) -> S3Sink {
+        let config = S3Config {
+            bucket: "private-reports".into(),
+            prefix: "ci".into(),
+            region: Some("us-test-1".into()),
+            endpoint: Some(endpoint.clone()),
+        };
+        let sdk = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-test-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test-access",
+                "test-secret",
+                None,
+                None,
+                "test",
+            ))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build();
+        S3Sink::with_client(config, aws_sdk_s3::Client::from_conf(sdk))
+    }
+
+    #[tokio::test]
+    async fn s3_upload_and_download_are_signed_private_and_integrity_checked() {
+        use axum::{
+            Router,
+            body::Bytes,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::put,
+        };
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Mock(Arc<Mutex<Vec<u8>>>);
+        async fn object(
+            State(state): State<Mock>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> impl IntoResponse {
+            assert!(
+                headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.starts_with("AWS4-HMAC-SHA256 "))
+            );
+            if body.is_empty() {
+                (StatusCode::OK, state.0.lock().unwrap().clone())
+            } else {
+                *state.0.lock().unwrap() = body.to_vec();
+                (StatusCode::OK, Vec::new())
+            }
+        }
+        let app = Router::new()
+            .route(
+                "/private-reports/ci/019fca648a6e-00000000/build-x86_64/binary.tar.gz",
+                put(object).get(object),
+            )
+            .with_state(Mock::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let sink = mock_s3(endpoint);
+        let stored = sink.put(&aref(), b"debug-report".to_vec()).await.unwrap();
+        assert_eq!(
+            stored.uri,
+            "s3://private-reports/ci/019fca648a6e-00000000/build-x86_64/binary.tar.gz"
+        );
+        assert_eq!(stored.public_url, None);
+        assert_eq!(sink.get(&stored).await.unwrap(), b"debug-report");
+        let bad = StoredArtifact {
+            digest: Some("0".repeat(64)),
+            ..stored
+        };
+        assert!(matches!(
+            sink.get(&bad).await.unwrap_err(),
+            ArtifactError::Corrupt(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn s3_rejects_foreign_uris_before_network_access() {
+        let sink = S3Sink::new(S3Config {
+            bucket: "ours".into(),
+            prefix: "reports".into(),
+            region: None,
+            endpoint: None,
+        })
+        .unwrap();
+        for uri in [
+            "s3://theirs/reports/run/job/file",
+            "s3://ours/other/run/job/file",
+            "https://ours/reports/run/job/file",
+        ] {
+            let stored = StoredArtifact {
+                sink: "s3",
+                digest: None,
+                size_bytes: 0,
+                uri: uri.into(),
+                public_url: None,
+            };
+            assert!(
+                matches!(
+                    sink.get(&stored).await.unwrap_err(),
+                    ArtifactError::InvalidRecord(_)
+                ),
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_server_errors_fail_the_upload() {
+        use axum::{Router, http::StatusCode, routing::put};
+        let app = Router::new().route(
+            "/{*path}",
+            put(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let err = mock_s3(endpoint)
+            .put(&aref(), b"report".to_vec())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ArtifactError::Transport(_)), "{err}");
     }
 
     /// A sink that cannot take a pushed blob says so through the trait, so

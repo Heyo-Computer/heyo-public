@@ -1227,6 +1227,11 @@ impl Dispatcher {
         }
         tracing::info!(job = %plan.key, runner = %runner, attempt, "acquiring a VM");
 
+        // CI owns disposable job machines, not a stopped VM cache. Keep parsing
+        // legacy `reuse` declarations, but never retain their disks or /30s.
+        if !plan.target.is_existing_vm() {
+            plan.vm.reuse = false;
+        }
         let needs_source = existing_vm.is_none()
             && (plan.vm.build.is_some() || !plan.vm.cache_key_files.is_empty());
         let prepared = if needs_source {
@@ -1294,7 +1299,7 @@ impl Dispatcher {
             // Something else finished this job while we were booting a VM.
             if !plan.target.is_existing_vm() {
                 crate::vm_cleanup::handoff(self, &msg.job_id, &runner, attempt, vm.id(),
-                    !plan.vm.reuse, JobStatus::Cancelled, None).await
+                    JobStatus::Cancelled, None).await
                     .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
             } else if self.release_vm(&plan, &vm, false).await {
                 self.store.end_host_work(&msg.job_id, &runner, attempt).await?;
@@ -1306,10 +1311,12 @@ impl Dispatcher {
             "running"
         );
 
-        let outcome = match self.checkout(msg, &plan, &vm).await {
-            Ok(()) => self.run_steps(msg, &plan, &vm).await,
-            Err(e) => Err(e),
-        };
+        let outcome = async {
+            vm.ensure_running(BOOT_TIMEOUT).await?;
+            self.ensure_sized(&plan, &runner, &vm).await?;
+            self.checkout(msg, &plan, &vm).await?;
+            self.run_steps(msg, &plan, &vm).await
+        }.await;
         // Durable maintenance owns strict VM stop/release and final job status.
         // Do not stop or repool here: another reconciler may already have done
         // so and that VM might now belong to a different job.
@@ -1351,14 +1358,8 @@ impl Dispatcher {
         };
         let error = outcome.as_ref().err().map(|e| e.to_string());
         if !plan.target.is_existing_vm() {
-            if plan.vm.reuse && !guest_corrupted {
-                let ttl = idle_pool_ttl(plan.vm.ttl_seconds, self.config.heyvm.vm_ttl);
-                if let Err(e) = vm.renew_ttl(ttl).await {
-                    tracing::warn!(vm = vm.id(), "could not renew the TTL: {e}");
-                }
-            }
             crate::vm_cleanup::handoff(self, &msg.job_id, &runner, attempt, vm.id(),
-                !plan.vm.reuse || guest_corrupted, status, error.as_deref()).await
+                status, error.as_deref()).await
                 .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
             // The durable reconciler owns retries, including after restart.
             // No more guest commands or direct release after this handoff.
@@ -1832,7 +1833,6 @@ impl Dispatcher {
                 &name,
                 &plan.vm,
                 self.config.heyvm.vm_ttl,
-                BOOT_TIMEOUT,
             )
             .await;
 
@@ -1855,7 +1855,6 @@ impl Dispatcher {
                     &name,
                     &plan.vm,
                     self.config.heyvm.vm_ttl,
-                    BOOT_TIMEOUT,
                 ).await;
             }
         }
@@ -1900,15 +1899,8 @@ impl Dispatcher {
                 self.lease(),
             )
             .await?;
-        if let Err(e) = self.ensure_sized(plan, runner, &vm).await {
-            // Parked, not destroyed, although it has never built anything: the
-            // next delivery on the ladder claims it and checks again, so a
-            // resize from /vms in between is all it takes for the retry to go
-            // through — and if the runner simply cannot size VMs, a fresh one
-            // would be no better than this one, only slower to say so.
-            self.release_vm(plan, &vm, false).await;
-            return Err(e);
-        }
+        // Boot and sizing checks run after start_job records this exact VM;
+        // their failures must enter the same durable cleanup as failed steps.
         Ok((vm, false))
     }
 
@@ -2079,12 +2071,29 @@ impl Dispatcher {
             return;
         }
 
-        let text = match vm.logs(self.config.vm_log_lines).await {
-            Ok(text) if text.trim().is_empty() => {
-                "[ci] the daemon reported no console output for this VM\n".to_string()
+        let capture = async {
+            let run = self.store.get_run(&msg.run_id).await?
+                .ok_or_else(|| anyhow::anyhow!("run no longer exists"))?;
+            let environment = plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default");
+            let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix(&run.workflow_id, environment)).await?;
+            let masker = resolved.masker();
+            let mut text = match vm.info().await {
+                Ok(info) => format!("[ci] VM {} status={:?} size={:?}\n", info.id, info.status, info.size_class),
+                Err(error) => format!("[ci] VM metadata unavailable: {error}\n"),
+            };
+            text.push_str(&format!("[ci] console capture limit: {} lines\n", self.config.vm_log_lines));
+            match vm.logs(self.config.vm_log_lines).await {
+                Ok(log) => text.push_str(&log),
+                Err(error) => text.push_str(&format!("[ci] VM console unavailable: {error}\n")),
             }
-            Ok(text) => text,
-            Err(e) => format!("[ci] could not read this VM's logs: {e}\n"),
+            Ok::<_, anyhow::Error>(masker.mask(&text))
+        };
+        let text = match tokio::time::timeout(Duration::from_secs(40), capture).await {
+            Ok(Ok(text)) => text,
+            // Do not archive an unredacted guest console when secret resolution
+            // fails. Record the gap and continue resource cleanup.
+            Ok(Err(_)) => "[ci] VM diagnostics unavailable: could not resolve safe redaction context\n".into(),
+            Err(_) => "[ci] VM diagnostics timed out after 40s; cleanup will continue\n".into(),
         };
 
         let path = self.store.log_path(&msg.run_id, &plan.key, -2, &sid);
@@ -4043,13 +4052,16 @@ impl Dispatcher {
                 // durable intent on error or cancellation, including after a
                 // daemon delete succeeds but this transaction cannot commit.
                 let mut tx = self.store.pool().begin().await?;
-                let owned: Option<String> = sqlx::query_scalar(
-                    "SELECT sandbox_id FROM ci_vm_pool WHERE sandbox_id=$1
+                let owned: Option<Option<String>> = sqlx::query_scalar(
+                    "SELECT last_job FROM ci_vm_pool WHERE sandbox_id=$1
                      AND runner_hd_id=$2 AND status='draining' AND eviction_requested
                      FOR UPDATE SKIP LOCKED",
                 ).bind(&vm.sandbox_id).bind(&vm.runner_hd_id)
                     .fetch_optional(&mut *tx).await?;
                 if owned.is_none() { return Ok::<_, anyhow::Error>(false); }
+                if let Some(job) = owned.flatten() {
+                    crate::debug_report::enqueue(&mut tx, &job, &vm.sandbox_id).await?;
+                }
                 let options = self.runners.options_for(&vm.runner_hd_id).await?;
                 let handle = self.vms.open(options, vm.sandbox_id.clone()).await?;
                 handle.destroy().await?;
@@ -4193,7 +4205,7 @@ impl Dispatcher {
                 for runner in images.served_runner_ids() {
                     let result = async {
                         let options = images.runners.options_for(&runner).await?;
-                        images.images.evict_one(&runner, images.config.heyvm.vm_idle, options).await?;
+                        images.images.evict_one(&runner, Duration::ZERO, options).await?;
                         Ok::<_, DispatchError>(())
                     };
                     match tokio::time::timeout(Duration::from_secs(30), result).await {
@@ -4247,7 +4259,9 @@ impl Dispatcher {
     /// fail a live build or forget a machine that still exists.
     async fn sweep_idle_pool(&self) {
         let ours = self.served_runner_ids();
-        let idle_secs = self.config.heyvm.vm_idle.as_secs() as i64;
+        // Retire legacy idle job caches immediately; active/service ownership
+        // remains protected by the pool's claim and maintenance checks.
+        let idle_secs = 0;
         let taken = async {
             let live = self.pool.recent_fingerprints(&ours, idle_secs).await?;
             self.pool.take_for_sweep(&ours, &live, idle_secs).await
@@ -6345,8 +6359,8 @@ mod tests {
     //
     // The whole path: a run is created, the scheduler queues its jobs, a
     // consumer pulls one, a real VM boots on the local heyvmd, the steps run,
-    // and the results land in Postgres. Then a second run proves the VM is
-    // reused, and a third proves a changed `cache_key_files` entry busts it.
+    // and the results land in Postgres. A second run must use a fresh VM even
+    // with the same fingerprint; changed inputs must change the fingerprint.
     //
     //   CI_TEST_DATABASE_URL=postgres://… CI_TEST_NATS_URL=nats://127.0.0.1:4222 \
     //     cargo test --bin ci -- --ignored --nocapture end_to_end
@@ -6744,7 +6758,7 @@ jobs:
             d.store.start_job(&job.id, "hd-local", &sandbox, "fp", 1).await.unwrap();
             d.pool.register(&sandbox, "hd-local", "fp", "wf", None, &job.id, d.lease()).await.unwrap();
             // A bad handoff must not publish a terminal job or a cleanup intent.
-            assert!(handoff(&d, &job.id, "hd-local", 2, &sandbox, false, JobStatus::Failure, None).await.is_err());
+            assert!(handoff(&d, &job.id, "hd-local", 2, &sandbox, JobStatus::Failure, None).await.is_err());
             let status: String = sqlx::query_scalar("SELECT status FROM ci_job WHERE id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap();
             assert_eq!(status, "running");
             if scenario == "cancel" {
@@ -6752,13 +6766,16 @@ jobs:
                 reconcile(&d).await.unwrap();
                 assert_eq!(remote.lock().unwrap().stops, 0, "cancellation is not a handoff");
             }
-            handoff(&d, &job.id, "hd-local", 1, &sandbox, scenario == "destroy-loss", JobStatus::Failure, Some("executor finished")).await.unwrap();
+            handoff(&d, &job.id, "hd-local", 1, &sandbox, JobStatus::Failure, Some("executor finished")).await.unwrap();
+            // An intent written by the prior controller requested a stopped
+            // cache; after upgrade it must still be deleted, not repooled.
+            sqlx::query("UPDATE ci_vm_cleanup SET destroy=false WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
             d.pool.renew_leases(d.lease()).await.unwrap();
             assert!(sqlx::query_scalar::<_,bool>("SELECT leased_until='infinity'::timestamptz FROM ci_vm_pool WHERE sandbox_id=$1")
                 .bind(&sandbox).fetch_one(d.store.pool()).await.unwrap(), "process heartbeat must not replace cleanup ownership");
             let status: String = sqlx::query_scalar("SELECT status FROM ci_job WHERE id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap();
             assert_eq!(status, if scenario == "cancel" { "cancelled" } else { "failure" });
-            assert!(handoff(&d, &job.id, "hd-local", 1, &sandbox, false, JobStatus::Success, None).await.is_err());
+            assert!(handoff(&d, &job.id, "hd-local", 1, &sandbox, JobStatus::Success, None).await.is_err());
             assert_eq!(sqlx::query_scalar::<_,String>("SELECT status FROM ci_job WHERE id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap(), status);
             let rollout = format!("rollout-{run}");
             d.store.create_step(&rollout, &job.id, 0, "controller", None).await.unwrap();
@@ -6804,11 +6821,18 @@ jobs:
             assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM ci_vm_cleanup WHERE sandbox_id=$1").bind(&sandbox).fetch_one(d.store.pool()).await.unwrap(), 0);
             assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM ci_host_work WHERE job_id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap(), 0);
             let status: Option<String> = sqlx::query_scalar("SELECT status FROM ci_vm_pool WHERE sandbox_id=$1").bind(&sandbox).fetch_optional(d.store.pool()).await.unwrap();
-            assert_eq!(status.as_deref(), if scenario == "destroy-loss" { None } else { Some("idle") });
+            assert_eq!(status, None, "even legacy reuse handoffs must delete the VM");
+            let report: serde_json::Value = sqlx::query_scalar("SELECT payload FROM ci_debug_report WHERE job_id=$1 AND sandbox_id=$2")
+                .bind(&job.id).bind(&sandbox).fetch_one(d.store.pool()).await.unwrap();
+            assert_eq!(report["job"]["status"], if scenario == "cancel" { "cancelled" } else { "failure" });
+            assert_eq!(report["job"]["sandbox"], sandbox);
+            assert!(sqlx::query_scalar::<_,bool>("SELECT uploaded_at IS NULL FROM ci_debug_report WHERE job_id=$1 AND sandbox_id=$2")
+                .bind(&job.id).bind(&sandbox).fetch_one(d.store.pool()).await.unwrap(), "S3 unavailability must not retain the VM");
             assert!(d.lifecycle.quiesce(&d.store, &rollout).await.unwrap(), "verified cleanup unblocks drain");
             sqlx::query("DELETE FROM ci_controller_rollout WHERE id=$1").bind(&rollout).execute(d.store.pool()).await.unwrap();
             sqlx::query("DELETE FROM ci_service_deployment WHERE id=$1").bind(&rollout).execute(d.store.pool()).await.unwrap();
             sqlx::query("DELETE FROM ci_vm_pool WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
+            sqlx::query("DELETE FROM ci_debug_report WHERE job_id=$1").bind(&job.id).execute(d.store.pool()).await.unwrap();
             sqlx::query("DELETE FROM ci_run WHERE id=$1").bind(&run).execute(d.store.pool()).await.unwrap();
         }
         server.abort();
@@ -7466,7 +7490,7 @@ jobs:
 
     #[tokio::test]
     #[ignore = "needs Postgres, NATS and a local heyvmd"]
-    async fn end_to_end_a_run_executes_reuses_its_vm_and_busts_on_a_changed_file() {
+    async fn end_to_end_runs_use_disposable_vms_and_fingerprint_changed_files() {
         let root = std::env::temp_dir().join(format!("ci-e2e-{}", crate::vm::new_id()));
         let d = test_dispatcher(&root).await;
 
@@ -7556,7 +7580,7 @@ jobs:
         let vm1 = build.sandbox_id.clone().expect("a sandbox was used");
         let fp1 = build.fingerprint.clone().expect("a fingerprint");
 
-        // ---- run 2: same lockfile, so the same VM is inherited.
+        // ---- run 2: same lockfile, but CI must not retain or reuse the VM.
         let run2_id = crate::vm::new_id();
         seed_workspace(&d, &run2_id, &[("lockfile.txt", "v1")]);
         let (run2, status2) = run_workflow_with_id(&d, E2E_YAML, &run2_id).await;
@@ -7575,13 +7599,13 @@ jobs:
             Some(fp1.as_str()),
             "an unchanged lockfile must produce the same fingerprint"
         );
-        assert_eq!(
+        assert_ne!(
             build2.sandbox_id.as_deref(),
             Some(vm1.as_str()),
-            "the warm VM must be reused"
+            "even an unchanged fingerprint must get a disposable VM"
         );
 
-        // ---- run 3: the lockfile changed, so the pool is busted.
+        // ---- run 3: changed source still changes the recorded fingerprint.
         let run3_id = crate::vm::new_id();
         seed_workspace(&d, &run3_id, &[("lockfile.txt", "v2-changed")]);
         let (run3, status3) = run_workflow_with_id(&d, E2E_YAML, &run3_id).await;

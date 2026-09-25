@@ -565,10 +565,8 @@ for an image already in the catalog answers `ready` without building — so even
 a lost claim collapses into one docker build rather than two racing for the
 same tag.
 
-CI sweeps unused source-built base images after `CI_VM_IDLE_SECS` (default
-seven days), separately from VM eviction. Cache hits refresh the image's last
-use; existing catalog entries receive a full grace period when the retention
-migration is first applied. Each minute, CI considers at most one image per
+CI sweeps unused source-built base images without a cache-retention window,
+separately from VM deletion. Each minute, CI considers at most one image per
 served runner and refuses cleanup while that runner has active job work or
 maintenance. Failed deletions stay recorded and retry after five minutes.
 
@@ -668,18 +666,35 @@ the author declares the driver, image, size and setup hooks — and, via
 (instead of `timeout-minutes:`) is a parse error naming the job, not a field that
 quietly does nothing.
 
-**A released VM is parked, not left running.** It is stopped — the daemon
-keeps its rootfs and its cache disk; only `destroy` removes those — and started
-again by the next job that claims it. Before this a pooled VM idled *running*
-until the daemon's TTL reaped it, which made the warm cache a matter of cadence:
-the next push had to land inside the TTL (an hour by default, four for
-`app-obs.yml`) or it booted a blank VM and paid the full cold build. For a
-repository pushed to a few times a day, most gaps are longer than that, so
-most builds were cold, and a `xlarge` sat on 16 GB of the host in between.
-Stopped, the VM costs disk and nothing else, the reaper ignores it, and
-`CI_VM_IDLE_SECS` (default a week) is what retires it — see the pool section.
-The TTL it is parked with is still the longer of `CI_VM_TTL_SECONDS` and the
-job's `vm.ttl_seconds`, because that is what it boots with next time.
+**CI-owned job VMs are deleted, not parked.** Success, failure and cancellation
+all hand the VM to durable cleanup after diagnostic capture. The daemon must
+confirm stop and deletion before CI forgets ownership. Failed cleanup retries
+after controller restart. Legacy `vm.reuse` declarations still parse but do not
+retain job VMs; existing idle caches are swept without a retention window.
+Explicit existing-VM `uses:` targets and service/maintenance resources are not
+ordinary disposable job VMs and remain under their owner's lifecycle.
+
+**Debug reports go to private S3 storage, not retained VMs.** CI snapshots job
+identity/revision, outcome, timestamps, operation IDs, all retained step logs,
+and captured VM metadata/console into a transactional outbox before cleanup.
+Console capture is bounded by `CI_VM_LOG_LINES` and 40 seconds; unavailable
+diagnostics are recorded explicitly. Environment values, raw commands and
+workspace contents are not exported. Known job secrets are redacted from the
+console; if secret resolution fails, that console is omitted rather than leaked.
+
+Configure `CI_S3_BUCKET`, optional `CI_S3_PREFIX` (default `ci`),
+`CI_S3_REGION`, and `CI_S3_ENDPOINT`. This report destination is independent of
+`CI_ARTIFACT_SINK`; regular artifacts can continue using the artifact service.
+AWS credentials come from the standard AWS credential chain, provisioned through
+the service's HeyoSecret configuration. Use a private bucket with public access
+blocked. No public ACL or public URL is requested. Report keys are
+`<prefix>/<run>/<job>/debug-<attempt>-<sandbox>.json`.
+
+S3 failures retain the report in shared Postgres for bounded upload retries but
+**never retain the VM**. After upload, the outbox releases its payload and keeps
+the S3 receipt. The authenticated `GET /api/runs/{run}` response includes
+`debug_reports` with upload state, URI and retry error. Missing S3 configuration
+is reported as an error; it is not silently replaced with disk storage.
 
 ### This repository's own
 
@@ -896,7 +911,12 @@ and path filters do not apply — and the run inherits the original's recorded
 change set, so job-level `changed()` filters decide as they did the first time.
 Same authority as cancel: `CI_ADMIN_EMAILS` through app-lb's gate, when set.
 
-## The warm VM pool
+## Legacy warm-pool bookkeeping
+
+The following fingerprint and cache-management surfaces describe legacy pool
+records. New execution is ephemeral as described above: it does not claim warm
+VMs, park failed jobs, or wait a week to reclaim capacity. The existing pool
+table remains the ownership ledger until deletion is confirmed.
 
 ```
 fingerprint = sha256( canonical_json(vm block, minus cache_key_files)
@@ -2146,8 +2166,9 @@ to download an earlier successful job's stored archive in the same run. Declare
 the producer in `needs`; set `with.job` to its expanded job key if multiple
 producers used the same artifact name. Missing, ambiguous, unfinished, or failed
 producers are refused. Downloads verify size and SHA256 when recorded, preserve
-the uploaded tar.gz bytes, and do not unpack them. Disk and `artifacts` stores
-support downloads; the S3 sink remains unimplemented. Downloading an artifact
+the uploaded tar.gz bytes, and do not unpack them. Disk, S3 and `artifacts` stores
+support downloads. S3 reads are restricted to the configured bucket/prefix.
+Downloading an artifact
 does not make it an approved release or service archive.
 
 This is CI execution history, not deployment authorization. The release actions
@@ -2207,13 +2228,11 @@ CI_TEST_STREAM_PREFIXES=citest cargo test -- --ignored delete_leftover
 Working: workflow parsing and planning (matrix, `needs`, `if`, `max-parallel`),
 branch and path filters with the `changed()` condition, runner discovery, the VM
 pool, the job queue, `git submit` with per-repository tokens, secrets with
-masking, disk and `artifacts` sinks, the dashboard with live logs, and workflow
+masking, disk, S3 and `artifacts` sinks, the dashboard with live logs, and workflow
 objects.
 
 Not built yet:
 
-- **The S3 artifact sink.** Declared and selectable; fails loudly naming the
-  alternatives rather than reporting an artifact stored that is not there.
 - **Composite `uses:` actions.** Artifact, release and deployment actions above are built in. Fetching
   an `action.yml` from a repository is a different feature with a different trust
   model.
