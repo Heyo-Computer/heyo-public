@@ -857,10 +857,16 @@ missing capabilities/evidence, in order:
    finish or explicitly reconcile admitted work and remote obligations, and
    persist progress while retaining all workspaces, disks and database state.
    The new boot cannot assert this on the old process's behalf.
-3. Obtain a durable platform fencing receipt for the exact legacy runtime/boot,
-   preventing restart through exec/proxy and controller reconciliation. Unknown
-   stop status, an observation-before-exec check, or a timeout is not that proof.
-   The non-starting HTTP transport alone does not supply a fencing operation.
+3. Obtain a durable platform retirement receipt for the exact backend, canonical
+   sandbox ID and persisted creation identity. Initial migration may permanently
+   retire the whole legacy sandbox, including all boot incarnations, without a
+   guest boot nonce. Persist retirement intent before termination; require strict
+   host-side termination confirmation before completing the receipt. Reserve the
+   retired ID permanently and preserve disks/metadata. Every product CLI/daemon
+   start, exec, restore and reconciliation path must honor the fence across
+   processes and restarts; app-lb must also prevent replacement under a new ID.
+   Unknown stop status, an observation-before-exec check, or a timeout is not
+   that proof. The non-starting HTTP transport alone is not a retirement operation.
 4. Implement an authenticated, idempotent initial-owner transaction consuming that
    receipt plus the preserved-state reconciliation result, naming the exact first
    managed boot and atomically opening shared admission. Lost responses must replay
@@ -881,6 +887,15 @@ waiting on a streaming lifecycle read lease), and an actual Wasmer revision,
 replay-PID, incompatible-update and failed-start rollback test passed in47.71s.
 The private integration branch is committed locally, not pushed. These results
 do not establish public/private composition or deployed capability.
+Parent integration verification on 2026-09-25 also passed 97 Orchestrator tests
+and 7 provider tests on macOS, plus the disposable PostgreSQL immutable-recipe
+binding test. Private lifecycle serialization now uses host file locks shared by
+CLI/daemon processes using the same sandbox data directory. Its final suites
+passed 354 Linux tests and 309 macOS tests (2 ignored on each platform), including
+separate-process exclusion, concurrent readers, storage errors and explicit unlock
+with inherited/duplicated descriptors. The first strengthened process test failed
+before explicit unlock was added; only the corrected rerun is counted here.
+This cross-process lock is not the durable retirement capability required above.
 Composed actual CI/Orchestrator/Cloud/backend
 unhealthy-candidate/fresh-rollback and restart/lost-receipt sequences, plus all live
 acceptance gates, remain outstanding. Admission closure is not uninterrupted submission
