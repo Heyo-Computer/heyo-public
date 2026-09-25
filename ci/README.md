@@ -997,6 +997,19 @@ If no idle caches remain and space is
 still insufficient, the host cannot admit a new VM. This is admission headroom,
 not a disk reservation against concurrent allocations or unknown build scratch.
 
+Firecracker network pressure uses the same bounded eviction policy. A `/24`
+contains 64 `/30` TAP links, and stopped reusable VMs retain their link while
+they remain cached (normally up to `CI_VM_IDLE_SECS`). When the backend
+explicitly rejects a cold create with its "no usable /30 TAP subnet" capacity
+verdict, CI atomically takes the oldest idle CI cache on that same runner,
+destroys it, confirms that the daemon reports it absent, and retries the create
+once. A failed deletion retains the pool record and stops recovery; CI neither
+deletes another cache nor retries creation. Transport failures, timeouts, and
+other ambiguous create errors never trigger eviction. Running or claimed VMs,
+idle rows whose last owning job is not terminal, maintenance-fenced runners,
+service VMs, caches on another runner, and anything outside CI's pool are not
+eligible.
+
 A claim that cannot *reach* a pooled VM — the tunnel, the daemon not answering
 — hands the row back and fails the delivery so the ladder retries; discarding a
 warm cache because the runner blinked is the most expensive thing this code can

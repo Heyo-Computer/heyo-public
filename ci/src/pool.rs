@@ -634,16 +634,23 @@ impl Pool {
         Ok(rows.iter().map(PooledVm::from_row).collect())
     }
 
-    /// Take just the oldest idle cache on this host under disk pressure.
+    /// Take just the oldest safely-evictable idle cache on this host.
     /// Locking and marking it draining atomically excludes concurrent claims.
+    /// Maintenance fences and a non-terminal last owner make an apparently
+    /// idle row ineligible: both are durable evidence that cleanup still has
+    /// obligations to this VM.
     pub async fn take_oldest_idle(&self, runner: &str) -> Result<Option<PooledVm>, PoolError> {
         let row = sqlx::query(
             "UPDATE ci_vm_pool SET status = 'draining', eviction_requested = TRUE
               WHERE sandbox_id = (
-                    SELECT sandbox_id FROM ci_vm_pool
-                     WHERE status = 'idle' AND runner_hd_id = $1
-                     ORDER BY last_used_at ASC, sandbox_id ASC
-                     LIMIT 1 FOR UPDATE SKIP LOCKED
+                    SELECT p.sandbox_id FROM ci_vm_pool p
+                      JOIN ci_job j ON j.id = p.last_job
+                     WHERE p.status = 'idle' AND p.runner_hd_id = $1
+                       AND j.status IN ('success','failure','cancelled','skipped')
+                       AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h WHERE h.runner_hd_id=p.runner_hd_id AND h.phase<>'passed')
+                       AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h WHERE h.runner_hd_id=p.runner_hd_id AND h.phase NOT IN ('passed','superseded'))
+                     ORDER BY p.last_used_at ASC, p.sandbox_id ASC
+                     LIMIT 1 FOR UPDATE OF p SKIP LOCKED
               ) RETURNING *",
         )
         .bind(runner)
@@ -1724,22 +1731,33 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs CI_TEST_DATABASE_URL"]
     async fn disk_pressure_takes_oldest_idle_only_on_requested_host() {
-        let (pool, _) = test_pool().await;
+        let (pool, store) = test_pool().await;
         let runner = runner_id();
         let other = runner_id();
+        let run = format!("run-{runner}");
+        sqlx::query("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES($1,'test','test.yml','success')")
+            .bind(&run).execute(store.pool()).await.unwrap();
         for (host, name, age, idle) in [
             (&runner, "new", 1, true),
             (&runner, "old", 2, true),
             (&runner, "claimed", 3, false),
             (&other, "foreign", 4, true),
+            (&runner, "nonterminal", 5, true),
         ] {
             let id = sb(host, name);
-            pool.register(&id, host, name, "wf", None, "j", held()).await.unwrap();
+            let job = format!("job-{id}");
+            sqlx::query("INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES($1,$2,$1,$1,$1,'success')")
+                .bind(&job).bind(&run).execute(store.pool()).await.unwrap();
+            if name == "nonterminal" {
+                sqlx::query("UPDATE ci_job SET status='running' WHERE id=$1")
+                    .bind(&job).execute(store.pool()).await.unwrap();
+            }
+            pool.register(&id, host, name, "wf", None, &job, held()).await.unwrap();
             if idle { pool.release(&id).await.unwrap(); }
             sqlx::query("UPDATE ci_vm_pool SET last_used_at = now() - make_interval(secs => $2) WHERE sandbox_id = $1")
                 .bind(id).bind(f64::from(age)).execute(&pool.db).await.unwrap();
         }
-        let building = pool.begin_build("j", &runner, "building", "wf", None, held()).await.unwrap();
+        let building = pool.begin_build("building-job", &runner, "building", "wf", None, held()).await.unwrap();
         // A concurrent claim holding the oldest row wins; eviction skips it.
         let mut claim = pool.db.begin().await.unwrap();
         sqlx::query("SELECT sandbox_id FROM ci_vm_pool WHERE sandbox_id = $1 FOR UPDATE")
@@ -1753,6 +1771,7 @@ mod tests {
         assert!(pool.claim(&runner, "old", "j2", held()).await.unwrap().is_none());
         assert_eq!(pool.get(&sb(&runner, "claimed")).await.unwrap().unwrap().status, "claimed");
         assert_eq!(pool.get(&sb(&other, "foreign")).await.unwrap().unwrap().status, "idle");
+        assert_eq!(pool.get(&sb(&runner, "nonterminal")).await.unwrap().unwrap().status, "idle");
         assert_eq!(pool.get(&building).await.unwrap().unwrap().status, "building");
     }
 

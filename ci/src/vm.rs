@@ -1617,6 +1617,30 @@ impl VmError {
             _ => false,
         }
     }
+
+    /// The daemon explicitly rejected a create because its Firecracker TAP
+    /// subnet pool is full. Keep this deliberately narrower than a generic
+    /// create failure: only this backend verdict makes deleting a warm cache a
+    /// safe and useful recovery action.
+    pub fn is_subnet_capacity(&self) -> bool {
+        const VERDICT: &str = "has no usable /30 TAP subnet";
+        match self {
+            Self::Create {
+                source: HeyoError::Api { status, message, body },
+                ..
+            } if *status != 0 => {
+                message.contains(VERDICT)
+                    || body
+                        .as_ref()
+                        .is_some_and(|value| value.to_string().contains(VERDICT))
+            }
+            Self::Create {
+                source: HeyoError::SandboxFailed { reason, .. },
+                ..
+            } => reason.contains(VERDICT),
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for VmError {
@@ -1952,6 +1976,38 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn only_explicit_subnet_capacity_rejections_are_destructive() {
+        let capacity = VmError::Create {
+            name: "new".into(),
+            source: HeyoError::Api {
+                status: 500,
+                message: "Firecracker virtual network fc has no usable /30 TAP subnet in \
+                          10.0.0.0/24 after retained reservations"
+                    .into(),
+                body: None,
+            },
+        };
+        assert!(capacity.is_subnet_capacity());
+
+        let transport = VmError::Create {
+            name: "new".into(),
+            source: HeyoError::Api {
+                status: 0,
+                message: "network error calling /sandbox-deploy".into(),
+                body: None,
+            },
+        };
+        assert!(!transport.is_subnet_capacity());
+        assert!(transport.is_transport());
+
+        let unknown = VmError::Create {
+            name: "new".into(),
+            source: HeyoError::Timeout(Duration::from_secs(1), "create timed out".into()),
+        };
+        assert!(!unknown.is_subnet_capacity());
+    }
 
     /// A daemon stand-in on a local port that answers one HTTP request per
     /// connection: the POST with `queued`, the *first* poll with nothing —

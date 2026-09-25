@@ -1762,10 +1762,23 @@ impl Dispatcher {
                         vm = %sandbox_id,
                         "pooled VM is unusable; destroying it and building a fresh one: {e}"
                     );
-                    if let Err(e) = vm.destroy().await {
-                        tracing::warn!(vm = %sandbox_id, "could not destroy: {e}");
+                    match vm.destroy().await {
+                        Ok(())
+                            if matches!(
+                                vm.info().await,
+                                Err(VmError::Daemon {
+                                    source: heyo_sdk::HeyoError::NotFound(_),
+                                    ..
+                                })
+                            ) =>
+                        {
+                            self.pool.forget(&sandbox_id).await?;
+                        }
+                        Ok(()) => return Err(DispatchError::StepFailed(
+                            format!("daemon did not confirm destruction of {sandbox_id}; retaining pool ownership")
+                        )),
+                        Err(e) => return Err(e.into()),
                     }
-                    let _ = self.pool.forget(&sandbox_id).await;
                 }
             }
         }
@@ -1812,16 +1825,40 @@ impl Dispatcher {
             "creating VM {name}"
         );
 
-        let created = self
+        let mut created = self
             .vms
             .create(
-                options,
+                options.clone(),
                 &name,
                 &plan.vm,
                 self.config.heyvm.vm_ttl,
                 BOOT_TIMEOUT,
             )
             .await;
+
+        // A /24 supplies only 64 /30 TAP links. Stopped reusable CI caches
+        // retain those links, so an explicit capacity verdict may evict one
+        // idle cache on this exact runner and retry this create once. Unknown,
+        // transport and timeout failures are intentionally not destructive.
+        if created.as_ref().is_err_and(VmError::is_subnet_capacity)
+            && let Some(cache) = self.pool.take_oldest_idle(runner).await?
+        {
+            tracing::info!(
+                runner,
+                sandbox = %cache.sandbox_id,
+                "evicting idle CI cache for VM subnet headroom"
+            );
+            let (destroyed, failed) = self.destroy_swept(vec![cache]).await;
+            if destroyed == 1 && failed.is_empty() {
+                created = self.vms.create(
+                    options,
+                    &name,
+                    &plan.vm,
+                    self.config.heyvm.vm_ttl,
+                    BOOT_TIMEOUT,
+                ).await;
+            }
+        }
 
         // Whichever way it went, the placeholder goes: it stands for an attempt
         // in flight, and on success `register` below writes the real row under
@@ -6976,6 +7013,72 @@ jobs:
 
     #[tokio::test]
     #[ignore = "needs CI_TEST_DATABASE_URL and CI_TEST_NATS_URL"]
+    async fn subnet_pressure_retries_only_after_confirmed_cache_deletion() {
+        use axum::{Json, Router, extract::Path, http::StatusCode, routing::{get, post}};
+        for (capacity, confirmed, expected_creates, expected_deletes) in [
+            (true, true, 2, 1), (true, false, 1, 1), (false, true, 1, 0),
+        ] {
+            let creates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let deletes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let calls = creates.clone();
+            let removed = deletes.clone();
+            let app = Router::new()
+                .route("/storage", get(|| async { Json(serde_json::json!({"free_bytes": 1000})) }))
+                .route("/sandbox-deploy", post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        // The second rejection bounds the retry. This fixture
+                        // must never need a real guest to prove admission order.
+                        let error = if capacity { "Firecracker virtual network test has no usable /30 TAP subnet" }
+                            else { "image not found" };
+                        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": error})))
+                    }
+                }))
+                .route("/deployed-sandboxes/{id}", get(move || async move {
+                    if confirmed { StatusCode::NOT_FOUND } else { StatusCode::SERVICE_UNAVAILABLE }
+                }).delete(move |Path(id): Path<String>| {
+                    let removed = removed.clone();
+                    async move {
+                        removed.lock().unwrap().push(id);
+                        StatusCode::NO_CONTENT
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            unsafe { std::env::set_var("CI_TEST_DAEMON", format!("http://{}", listener.local_addr().unwrap())); }
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let workspace = tempfile::tempdir().unwrap();
+            let d = test_dispatcher(workspace.path()).await;
+            let run = format!("capacity-{}", crate::vm::new_id());
+            let job = format!("{run}-job");
+            let cache = format!("{run}-cache");
+            let foreign = format!("{run}-foreign");
+            let runner = format!("{run}-runner");
+            sqlx::query("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES($1,'test','test.yml','success')")
+                .bind(&run).execute(d.store.pool()).await.unwrap();
+            sqlx::query("INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES($1,$2,$1,$1,$1,'success')")
+                .bind(&job).bind(&run).execute(d.store.pool()).await.unwrap();
+            for (id, runner) in [(&cache, runner.as_str()), (&foreign, "hd-other")] {
+                d.pool.register(id, runner, "old-fp", "test", None, &job, d.lease()).await.unwrap();
+                d.pool.release(id).await.unwrap();
+            }
+            let mut plan = plan_targeting(None);
+            plan.vm.reuse = false;
+            assert!(d.acquire_vm(&runner, &plan, "new-fp", &job, 1).await.is_err());
+            assert_eq!(creates.load(Ordering::SeqCst), expected_creates);
+            assert_eq!(deletes.lock().unwrap().len(), expected_deletes);
+            if expected_deletes == 1 { assert_eq!(*deletes.lock().unwrap(), vec![cache.clone()]); }
+            assert_eq!(d.pool.get(&cache).await.unwrap().is_none(), capacity && confirmed);
+            assert_eq!(d.pool.get(&foreign).await.unwrap().unwrap().status, "idle");
+            d.pool.forget(&cache).await.unwrap();
+            d.pool.forget(&foreign).await.unwrap();
+            server.abort();
+        }
+        unsafe { std::env::remove_var("CI_TEST_DAEMON"); }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL and CI_TEST_NATS_URL"]
     async fn disk_pressure_rechecks_space_and_stops_at_budget() {
         use axum::{Json, Router, extract::Path, http::StatusCode, routing::get};
         use std::sync::atomic::AtomicU64;
@@ -7015,9 +7118,15 @@ jobs:
         let workspace = tempfile::tempdir().unwrap();
         let d = test_dispatcher(workspace.path()).await;
         let runner = format!("pressure-{}", crate::vm::new_id());
+        let run = format!("run-{runner}");
+        sqlx::query("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES($1,'test','test.yml','success')")
+            .bind(&run).execute(d.store.pool()).await.unwrap();
         for (id, age) in [("new", 1.0), ("middle", 2.0), ("old", 3.0)] {
             let id = format!("{runner}-{id}");
-            d.pool.register(&id, &runner, "fp", "wf", None, "job", d.lease()).await.unwrap();
+            let job = format!("job-{id}");
+            sqlx::query("INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES($1,$2,$1,$1,$1,'success')")
+                .bind(&job).bind(&run).execute(d.store.pool()).await.unwrap();
+            d.pool.register(&id, &runner, "fp", "wf", None, &job, d.lease()).await.unwrap();
             d.pool.release(&id).await.unwrap();
             sqlx::query("UPDATE ci_vm_pool SET last_used_at = now() - make_interval(secs => $2) WHERE sandbox_id = $1")
                 .bind(id).bind(age).execute(d.store.pool()).await.unwrap();
