@@ -45,18 +45,24 @@ revision is `01a0d95802e8-00000059`, with Cloud validation
 
 Read-only diagnostics found healthy host memory/disk capacity and successful
 fresh database TCP/TLS handshakes, but established database connections suffered
-retransmissions. Paired header-only captures (`job-6a01b2fcdf11` on eu1 and
+retransmissions. Paired packet-header traces (`job-6a01b2fcdf11` on eu1 and
 `job-a150103facb0` on us3) showed packets leaving eu1 absent at us3's capture
 point, followed by successful retransmission seconds later. This localizes loss
 between capture points; it does not establish a provider or NIC root cause.
 No firewall, NIC, database, or service-restart workaround was applied.
 
+Broker inspection (`job-84e1aeadcc98`) also explained the unexpectedly long
+retry waits: NATS combines the explicit delayed NAK with the consumer's current
+BackOff entry minus its 60-second AckWait. The configured 5-minute and 15-minute
+delays therefore took approximately 9 and 29 minutes. The consumer had a waiting
+pull and two unacknowledged messages; broker state was not reset to hurry retry.
+
 The retry also encountered the existing 63-slot limit. Two additional idle,
 successful-run CI caches, `sb-20aa1a33` and `sb-0fa08d70`, were classified against
 service state, routes, metadata and owning runs, then destroyed through the
 owning-run CI API, which confirmed both deletions. Independent host inspection
-after the first deletion found both its sandbox and runtime directories absent
-and 62 reservations remaining. Candidate `sb-244b5380` was left untouched because
+(`job-a1f6db8c1636`) found both caches absent from sandbox/runtime/KVM storage and
+61 reservations remaining. Candidate `sb-244b5380` was left untouched because
 its recorded guest IP also appeared in a database-related firewall rule. This
 is bounded release-capacity recovery, not proof that automatic reclamation is
 installed. Temporary diagnostic deployment registrations were removed.
