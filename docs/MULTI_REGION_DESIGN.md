@@ -5,6 +5,43 @@ decisions and checklist below supersede conflicting next-step statements in the
 historical checkpoints. Existing capabilities are identified separately from new
 work. This document does not itself change running infrastructure.
 
+## IP capacity and failed-rollout recovery — 2026-09-25
+
+The existing /24 remains unchanged. Initial inventory found 63 reserved /30s
+and 18 running VMs on us3; eu1 had 53 reservations and 27 running VMs. Stopped
+service reservations are not free addresses. Three independently classified,
+terminal-run CI caches were destroyed through the owning run's cache API;
+no service/database VM was deleted. The blocked build subsequently allocated.
+
+Public release `01a0d737e492-00000050` deployed app-lb and Orchestrator to both
+regions with exact revision/readiness/predecessor-drain receipts. Its CI update
+did not execute: controller drain timed out and reopened submissions. Two older
+CI service operations still appeared running after app-lb had failed them.
+HTTP 502s were observed during eu1 ingress replacement; this is not a
+zero-failure acceptance result or independent regional CI availability.
+
+Public PR #122 adds durable failed-candidate reclamation and receipt-only CI
+reconciliation. A failed rollout alone cannot release drain: app-lb must prove
+candidate resources reclaimed, and CI must persist that exact settlement.
+Unknown creation outcomes, references to serving/source state and failed host
+verification remain fenced. Original run/job failure or cancellation is kept.
+Private PR #624 adds atomic subnet reservation ownership and a lifecycle-locked
+Firecracker reclamation verifier; its new endpoint performs no deletion.
+
+Executed local checks: 35 subnet tests from the earlier runtime revision;
+3 final Linux reclamation tests with real iproute2; 18 app-lb rollout tests,
+including 70 successive failures returning candidate capacity to baseline;
+5 CI service-rollout tests with disposable Postgres/HTTP/secret-store fixtures;
+and the Postgres handoff test rejecting unsettled legacy failure. These are
+not live reclamation or regional rollout acceptance.
+
+Full private submission `01a0d939621d-00000056` is active, with Cloud validation
+`01a0d939621a-00000054` and heyvm validation `01a0d939621c-00000055`. Initial
+runner-tunnel connection resets triggered automatic retries. Remaining order:
+deploy backend verification to both hosts; deploy public app-lb/CI; reconcile
+the old operations using verified receipts; then record live capacity and
+public health. No manual production database correction was performed.
+
 ## CI correction and release reconciliation — 2026-09-24
 
 The required outcome is one logical `ci` application with instances in us3 and
