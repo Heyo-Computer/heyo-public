@@ -137,6 +137,26 @@ real report bucket has been verified. Cloud validation `01a0d9b75b44-0000005e`
 ended in failure after four attempts; the final attempt was refused by host
 memory admission. No new regional deployment completed.
 
+After operator approval, created `heyo-ci-debug-677866966701` in `us-west-2`
+for private CI reports. All four S3 public-access blocks and AES256 default
+encryption were read back successfully; bucket policy denies non-TLS access.
+The dedicated IAM user `heyo-ci-debug-reports` grants only PutObject/GetObject
+on this bucket's `ci/*` prefix. Its shared regional credential and configuration
+are stored in HeyoSecret under `ci-reports/aws-access-key-id`,
+`ci-reports/aws-secret-access-key`, `ci-reports/bucket`, and `ci-reports/region`.
+No existing bucket was modified. A non-sensitive provisioning receipt was
+uploaded and downloaded byte-for-byte using the credential read from HeyoSecret;
+anonymous access returned 403. Initial upload encountered IAM propagation delay;
+the subsequent verification succeeded without creating another key.
+This verifies storage access, not an installed CI report or regional deployment.
+Managed CI still needs these secret references wired into its service environment.
+
+SDK 0.1.12 packaging and packaged-source compilation passed. Actual publication
+stopped before upload because Cargo has no crates.io token; HeyoSecret's listed
+metadata contains no Cargo/crates.io credential. Publication is authorized but
+requires registry access. Do not resubmit regional builds with the old SDK as a
+substitute for installing the connection fix.
+
 Read-only diagnostics found healthy host memory/disk capacity and successful
 fresh database TCP/TLS handshakes, but established database connections suffered
 retransmissions. Paired packet-header traces (`job-6a01b2fcdf11` on eu1 and
