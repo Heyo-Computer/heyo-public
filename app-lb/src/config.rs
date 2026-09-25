@@ -762,6 +762,11 @@ pub struct VmSpec {
     /// container from an OCI image). `libvirt` and `firecracker_containerd`
     /// are rejected at registration.
     pub driver: Driver,
+    /// Require durable heyvmd operation receipts for autoscaler allocations.
+    /// Requires an internal daemon credential and /sandbox-creations support;
+    /// unknown outcomes never fall back to legacy create or name matching.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub correlated_creates: bool,
     /// Defaults to `ubuntu:24.04` daemon-side when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -4729,6 +4734,9 @@ impl DeploymentSpec {
 
         // Blocks that describe heyvmd doing something Incus has no equivalent
         // for. Each is refused by name.
+        if vm.correlated_creates {
+            return Err(SpecError::NotForLxc("vm.correlated_creates"));
+        }
         if vm.workspace_archive.is_some() {
             return Err(SpecError::NotForLxc("vm.workspace_archive"));
         }
@@ -5580,6 +5588,7 @@ mod tests {
                 strip_prefix: false,
             }],
             vm: Some(VmSpec {
+                correlated_creates: false,
                 env_from: vec![],
                 workspace_archive: None,
                 image_download_url: None,

@@ -36,10 +36,21 @@ pub struct Request {
     pub targets:Vec<Target>,
 }
 
-#[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
+#[derive(Clone,Debug,Default,PartialEq,Serialize,Deserialize)]
 pub struct CreateAttempt {
     pub name:String,
     pub sandbox_id:Option<String>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub allocation:Option<crate::allocation::Intent>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub receipt:Option<crate::allocation::Receipt>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub seed_digest:Option<String>,
+    #[serde(default)]
+    pub seed_mount_index:usize,
+    /// Provisioning placeholders do not prove the queued create finished.
+    #[serde(default)]
+    pub runtime_observed:bool,
 }
 
 #[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
@@ -118,6 +129,10 @@ pub async fn advance(registry:&Registry,d:&Arc<Deployment>,backend:&impl Backend
     let state=d.state();
     let blocker=blocked.or_else(||state.create_attempts.iter().any(|a|a.sandbox_id.is_none())
         .then(||"allocation outcome is ambiguous; no retirement success is possible".into()))
+        .or_else(||state.create_attempts.iter().any(|a| a.allocation.as_ref().is_some_and(|intent|
+            !a.runtime_observed || a.receipt.as_ref().is_none_or(|receipt|
+                !intent.accepts(receipt) || a.sandbox_id.as_ref() != Some(&receipt.sandbox_id))))
+            .then(||"correlated allocation requires a matching receipt and observed runtime".into()))
         .or_else(||(!state.allocation_history_complete)
             .then(||"legacy allocation history is not authoritative, even after successful create; explicit reconciliation is required".into()))
         .or_else(||(!state.rollouts.is_empty() || state.route_handoff.is_some())
@@ -144,6 +159,53 @@ pub async fn advance(registry:&Registry,d:&Arc<Deployment>,backend:&impl Backend
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn correlated_retirement_requires_observed_runtime_and_matching_saved_receipt() {
+        struct ExactBackend(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl Backend for ExactBackend {
+            async fn status(&self, target:&Target)->Result<serde_json::Value,String> {
+                self.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!({"target":target,"state":"active"}))
+            }
+            async fn retire(&self, operation:&str,target:&Target)->Result<serde_json::Value,String> {
+                Ok(serde_json::json!({"request":{"operationId":operation,"target":target},
+                    "state":"retired","retiredAt":"2026-09-25T10:00:00Z"}))
+            }
+        }
+        for case in 0..5 {
+            let root=tempfile::tempdir().unwrap();
+            let registry=Registry::new(root.path().join("state.json"));
+            let d=registry.upsert(serde_json::from_value(serde_json::json!({
+                "id":"service","routes":[],"vm":{"driver":"kvm","port":8080,"correlated_creates":true},
+                "scaling":{"min_replicas":0,"warm_pool":0}
+            })).unwrap());
+            let id="sb-0123456789abcdef0123456789abcdef";
+            let intent=crate::allocation::Intent {operation_id:"create-1".into(),request_digest:"r".into(),
+                backend_request_digest:"b".into(),transport:"http://daemon".into()};
+            let mut receipt=crate::allocation::Receipt {operation_id:"create-1".into(),sandbox_id:id.into(),
+                request_digest:"r".into(),backend_request_digest:"b".into()};
+            if case==2 {receipt.request_digest="wrong".into();}
+            if case==3 {receipt.sandbox_id="sb-ffffffffffffffffffffffffffffffff".into();}
+            d.mutate_state(|s|s.create_attempts.push(CreateAttempt {sandbox_id:Some(id.into()),
+                allocation:Some(intent),receipt:(case!=1).then_some(receipt),runtime_observed:case!=0,
+                ..Default::default()}));
+            let request:Request=serde_json::from_value(serde_json::json!({
+                "operation_id":"retire-1","expected_revision":d.state().rollout_revision,
+                "expected_spec_sha256":crate::rollout::fingerprint(&d.spec),"targets":[{
+                    "backendServerId":"host-1","backendSandboxId":id,"createdAtUnixNanos":"12345",
+                    "libvirtConnectionUri":"qemu:///system","libvirtDomainUuid":"domain-1"
+                }]
+            })).unwrap();
+            freeze(&registry,&d,request).unwrap();
+            let backend=ExactBackend(std::sync::atomic::AtomicUsize::new(0));
+            let result=advance(&registry,&d,&backend,None).await.unwrap();
+            assert_eq!(backend.0.load(std::sync::atomic::Ordering::SeqCst),usize::from(case==4));
+            assert_eq!(result.state=="retired",case==4);
+            assert_eq!(result.unresolved.is_some(),case!=4);
+        }
+    }
 
     #[test]
     fn retirement_private_wire_uses_exact_decimal_u128_strings_never_numbers() {

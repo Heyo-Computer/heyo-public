@@ -286,6 +286,12 @@ impl Registry {
         self.change_lock.lock().await
     }
 
+    /// Autoscaling skips a busy registry instead of waiting while holding a
+    /// create permit that a replacement may itself be draining.
+    pub(crate) fn try_change_guard(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.change_lock.try_lock().ok()
+    }
+
     pub fn deployments(&self) -> Arc<HashMap<Arc<str>, Arc<Deployment>>> {
         self.deployments.load_full()
     }
@@ -296,6 +302,14 @@ impl Registry {
 
     pub fn retirement_frozen(&self, id: &str) -> bool {
         self.get(id).is_some_and(|d| d.state().retirement.is_some())
+    }
+
+    /// Unknown receipt identity cannot be excluded from any cleanup inventory.
+    /// Once recovered, retain only that allocation until its runtime is seen.
+    pub fn allocation_protects(&self, sandbox: &str) -> bool {
+        self.deployments().values().any(|d| d.state().create_attempts.iter().any(|a|
+            a.allocation.is_some() && !a.runtime_observed
+                && a.sandbox_id.as_deref().is_none_or(|id| id == sandbox)))
     }
 
     pub fn retirement_protects(&self, sandbox: &str, deployment: Option<&str>) -> bool {
@@ -645,6 +659,7 @@ impl Registry {
     pub fn remove(&self, id: &str) -> Option<Arc<Deployment>> {
         let removed = self.get(id)?;
         if removed.state().retirement.is_some() {return None;}
+        if removed.state().create_attempts.iter().any(|a| a.allocation.is_some()) {return None;}
         if removed.spec.discovery.is_some() {
             self.fence_discovery_removals(&removed, &[]);
         }
@@ -1022,6 +1037,7 @@ mod tests {
             id: id.into(),
             routes,
             vm: Some(VmSpec {
+                correlated_creates: false,
                 env_from: vec![],
                 workspace_archive: None,
                 image_download_url: None,

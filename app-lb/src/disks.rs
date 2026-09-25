@@ -983,6 +983,10 @@ impl DiskStore {
         force: bool,
     ) -> Result<PurgeOutcome, DiskError> {
         let _retirement=self.registry.retirement_gate.read().await;
+        if self.registry.allocation_protects(&disk.sandbox_id) {
+            return Err(DiskError::Held {sandbox_id:disk.sandbox_id,
+                reason:"correlated allocation is not reconciled",forceable:false});
+        }
         if self.registry.retirement_protects(&disk.sandbox_id,disk.deployment.as_deref())
             || self.workspaces.as_ref().is_some_and(|ws|ws.retirement_protects(&disk.sandbox_id)) {
             return Err(DiskError::Held {sandbox_id:disk.sandbox_id,

@@ -2047,6 +2047,30 @@ in the spec, and `auth` supplies a git credential the same way a build does. A
 managed (`vm`) deployment cannot declare `update`: its backends are microVMs, and
 a directory on this host would update nothing.
 
+### Durable autoscaler allocations
+
+`vm.correlated_creates: true` opts managed VM autoscaling into the authenticated
+heyvmd `/sandbox-creations/:operation_id` protocol. It defaults to false, is not
+supported for LXC, and requires a daemon that supports durable creation receipts
+plus app-lb's internal daemon credential. This is not a Cloud legacy-create
+compatibility fallback.
+
+Before dispatch, app-lb persists the operation identity, endpoint and request
+digests. It persists the matching receipt before publishing pending capacity.
+After a lost response or restart it only GETs that saved operation: it never
+re-POSTs, follows redirects, substitutes a name match or times out into another
+allocation. Unknown outcomes block ordinary deployment mutations and cleanup;
+receipt-backed pending allocations remain reserved until the exact runtime is
+observed running. Resolved request bodies and secrets are not written to the
+allocation journal. Deployment deletion cannot discard correlated receipts.
+
+This option covers **autoscaler creates only**, not rollout candidate creation.
+It does not repair historical allocation completeness or prove that old queued
+work at other ingresses has finished. Retirement still requires complete
+allocation history, matching receipts, runtime observation and its other
+existing reconciliation gates. Do not run older app-lb binaries against this
+state directory: they do not honor these allocation reservations.
+
 ### Seeding `/workspace` from an archive
 
 A pool of any size can start every replica from the same snapshot with

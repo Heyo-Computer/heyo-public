@@ -4090,6 +4090,9 @@ async fn uncordon_upstream(
 
 fn record_only_refusal(d: &Deployment, workspace_state: bool) -> Option<&'static str> {
     let state = d.state();
+    if state.create_attempts.iter().any(|a| a.allocation.is_some()) {
+        return Some("correlated allocation receipts must be retained");
+    }
     if !d.spec.routes.is_empty() {
         return Some("record-only removal requires a route-less deployment");
     }
@@ -4269,6 +4272,9 @@ async fn deregister_record(
 
 async fn deregister(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
     let change = state.registry.change_guard().await;
+    if state.registry.get(&id).is_some_and(|d| d.state().create_attempts.iter().any(|a| a.allocation.is_some())) {
+        return err(StatusCode::CONFLICT, "correlated allocation receipts must be retained").into_response();
+    }
     if state.registry.get(&id).is_some_and(|d| crate::rollout::reserved(&d) || !d.state().rollouts.is_empty()) {
         return err(StatusCode::CONFLICT, "rollout generations must be explicitly reconciled before deregistration").into_response();
     }
@@ -6436,7 +6442,7 @@ mod tests {
                 let d=f.registry.get("obsolete").unwrap();
                 d.set_pending(vec![PendingVm::new(target().backend_sandbox_id.clone())]);
                 d.mutate_state(|s|s.create_attempts.push(CreateAttempt {
-                    name:"applb-obsolete-000000000001".into(),sandbox_id:Some(target().backend_sandbox_id)}));
+                    name:"applb-obsolete-000000000001".into(),sandbox_id:Some(target().backend_sandbox_id),..Default::default()}));
                 f.registry.persist_one("obsolete").unwrap();
             }
 
@@ -6527,7 +6533,7 @@ mod tests {
                     r=approve(&f);
                     let d=f.registry.get("obsolete").unwrap();
                     d.mutate_state(|s|if legacy {s.allocation_history_complete=false;} else {
-                        s.create_attempts.push(CreateAttempt {name:"unknown-create".into(),sandbox_id:None});
+                        s.create_attempts.push(CreateAttempt {name:"unknown-create".into(),sandbox_id:None,..Default::default()});
                     });
                     let (status,result)=retire(&f,&r).await;
                     assert_eq!(status,StatusCode::ACCEPTED);
@@ -6580,7 +6586,7 @@ mod tests {
                 let mut spec=empty().spec.clone();spec.scaling.min_replicas=1;
                 let d=f.registry.upsert(spec);
                 // Known retained source plus one replacement currently allocating.
-                d.mutate_state(|s|s.create_attempts.push(CreateAttempt {name:"earlier".into(),sandbox_id:Some(target().backend_sandbox_id)}));
+                d.mutate_state(|s|s.create_attempts.push(CreateAttempt {name:"earlier".into(),sandbox_id:Some(target().backend_sandbox_id),..Default::default()}));
                 let r=approve(&f);
                 let scaler=f.state.autoscaler.clone();
                 let tick=tokio::spawn(async move {scaler.reconcile().await;});

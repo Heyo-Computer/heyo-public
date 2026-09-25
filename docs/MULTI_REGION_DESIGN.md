@@ -982,6 +982,44 @@ two ignored; the lockfile's package version was aligned with the existing
 `0.50.7` manifest, with no dependency changes. This is not a composed live test
 and does not connect app-lb's legacy creates to correlated creation yet.
 
+**Correlated autoscaler checkpoint (2026-09-25, local only):** the subsequent
+app-lb change adds opt-in `vm.correlated_creates`, default false, for direct
+heyvmd autoscaler allocations. It persists a random operation identity, exact
+transport and canonical request digests before POST; resolved secrets and request
+bodies remain in memory. A validated backend receipt is durable before pending
+capacity is published. Recovery only GETs the saved operation, never re-POSTs or
+uses name matching. Unknown identities pin cleanup globally; known receipts pin
+their exact sandbox until its runtime is observed running. Registry mutation,
+orphan cleanup, force-purge and record removal honor these reservations. Retirement
+also rejects missing/mismatched receipts and unobserved correlated runtimes.
+Legacy history remains incomplete; rollout candidate creation is still legacy.
+This does not establish historical ingress/queue closure or end-to-end CI ownership.
+
+Private heyvm now derives 15-byte TAP names for full correlated sandbox IDs,
+preserving existing short names and using a distinct shortened-name namespace.
+Setup/teardown serialize by interface name across processes sharing the heyvm
+data directory. Exact full-ID interface aliases prevent hash collisions from
+authorizing adoption or deletion. Inventory sweeps retain unknown shortened
+interfaces and their ambiguous IP rules. No privileged live TAP/VM lifecycle was
+exercised; these checks cover Rust code, protocol fixtures and sweep planning.
+
+Fresh final verification: public locked app-lb suite **908 passed, 6 ignored**;
+private locked serial Linux x86_64 library suite in disposable OrbStack container
+**367 passed, 2 ignored**; private locked serial macOS library suite **314 passed,
+2 ignored**. Schema golden was regenerated and the full public suite verifies it.
+New cases cover write-ahead persistence, lost response/reload, queued capacity,
+receipt mismatch/missing receipt without repost, persistence failure, registry
+contention, redirect traps, retirement refusal, and mixed legacy/shortened TAP
+cleanup. An earlier public run failed the unrelated random-token test whose
+`rsplit_once('_')` can select a suffix of the base64url secret; unchanged reruns
+passed. Earlier Linux runs hit the existing exact-runtime streaming test's
+one-second deadlines; the isolated test and final serial suite passed unchanged.
+These failures are retained as limitations, not erased by the green reruns.
+Changes are local: no push, deployment, shared migration, live retirement or
+service-data cleanup occurred. Historical admission closure, correlated rollout
+candidates, composed restart/rollback verification and all live acceptance gates
+remain outstanding.
+
 Composed actual CI/Orchestrator/Cloud/backend
 unhealthy-candidate/fresh-rollback and restart/lost-receipt sequences, plus all live
 acceptance gates, remain outstanding. Admission closure is not uninterrupted submission

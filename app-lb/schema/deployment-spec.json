@@ -1199,6 +1199,10 @@
       "description": "The VM template. Mirrors `SandboxCreateOptions`, minus the fields the LB owns\n(`name` is generated per-replica; `wait_for_ready` is always zero because the\nautoscaler polls readiness itself rather than blocking its reconcile loop).\n\nNote the SDK cannot express vcpu/memory directly — `size_class` is the only\nresource knob, and the daemon resolves it host-side. It cannot express\n`mounts` either, which is why [`crate::vm::VmManager::create`] builds the\ncreate body itself rather than handing the SDK a `SandboxCreateOptions`.\n`PartialEq` is load-bearing: an in-place edit keeps the running pool only\nwhen the VM *template* is unchanged, so the update path compares old and new\n`VmSpec`s to decide whether the VMs must be rebuilt.",
       "type": "object",
       "properties": {
+        "correlated_creates": {
+          "description": "Require durable heyvmd operation receipts for autoscaler allocations.\nRequires an internal daemon credential and /sandbox-creations support;\nunknown outcomes never fall back to legacy create or name matching.",
+          "type": "boolean"
+        },
         "disk_size_gb": {
           "description": "Size of the replica's persistent data disk, mounted at `/workspace`.\n\nSeparate from the rootfs, which is fixed when the image is built and\ncannot be grown afterwards — so this is not the knob for \"the image ran\nout of space\". The disk belongs to one sandbox: a rollout, a restart or\nany `vm` edit boots a replica with a fresh one, and only\n[`WorkspaceSpec`] carries contents across.",
           "type": [

@@ -67,6 +67,7 @@ impl Operation {
 pub fn reserved(d: &Deployment) -> bool {
     let state = d.state();
     state.retirement.is_some() || state.rollouts.iter().any(|o| matches!(o.status.as_str(), "running" | "reconciliation_required"))
+        || state.create_attempts.iter().any(|a| a.allocation.is_some() && !a.runtime_observed)
         || state.route_handoff.as_ref().is_some_and(|h| h.phase != crate::registry::RouteHandoffPhase::Committed)
 }
 
@@ -78,6 +79,7 @@ pub fn protected_ids(state: &DeploymentState) -> impl Iterator<Item = &String> {
 pub fn adoptable(d: &Deployment, name: &str, id: &str) -> bool {
     let state = d.state();
     if state.retirement.is_some() {return false;}
+    if state.create_attempts.iter().any(|a| a.allocation.is_some() && !a.runtime_observed) { return false; }
     if let Some(prefix) = &state.active_prefix {
         return name.starts_with(prefix);
     }

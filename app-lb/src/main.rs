@@ -41,6 +41,7 @@ mod namespaces;
 mod obs;
 mod proxy;
 mod registry;
+mod allocation;
 mod retirement;
 mod rollout;
 mod runtime;

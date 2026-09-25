@@ -460,6 +460,21 @@ impl VmManager {
         &self.transport
     }
 
+    pub(crate) fn prepare_allocation(&self, request: &DaemonCreateRequest, scope: &str) -> Result<crate::allocation::Prepared, VmError> {
+        if self.client.api_key().is_none_or(|key| key.is_empty()) {
+            return Err(VmError::Runtime("correlated creation requires internal service authentication".into()));
+        }
+        crate::allocation::prepare(request, &self.transport, scope).map_err(VmError::Runtime)
+    }
+
+    pub(crate) async fn submit_allocation(&self, prepared: &crate::allocation::Prepared) -> Result<crate::allocation::Receipt, VmError> {
+        crate::allocation::submit(&self.client, &self.transport, prepared).await.map_err(VmError::Runtime)
+    }
+
+    pub(crate) async fn recover_allocation(&self, intent: &crate::allocation::Intent) -> Result<crate::allocation::Receipt, VmError> {
+        crate::allocation::recover(&self.client, &self.transport, intent).await.map_err(VmError::Runtime)
+    }
+
     async fn retirement_request(&self,target:&crate::retirement::Target,operation:Option<&str>) -> Result<serde_json::Value,String> {
         let key=self.client.api_key().filter(|v|!v.is_empty()).ok_or("backend retirement requires service authentication")?;
         let mut builder=reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
@@ -580,6 +595,22 @@ impl VmManager {
         owner: &VmOwner,
         secret_env: HashMap<String, String>,
     ) -> Result<Sandbox, VmError> {
+        let req = self.prepare_create(spec, name, workspace, owner, secret_env).await?;
+        // Readiness is tracked across reconcile ticks, not by this request.
+        let created = self.daemon.create(&req).await?;
+        Ok(self.daemon.sandbox(&created.id))
+    }
+
+    /// Resolve mounts and secrets before choosing the allocation protocol.
+    /// This may upload immutable trees, but does not allocate a sandbox.
+    pub(crate) async fn prepare_create(
+        &self,
+        spec: &VmSpec,
+        name: String,
+        workspace: Option<&WorkspaceSeed>,
+        owner: &VmOwner,
+        secret_env: HashMap<String, String>,
+    ) -> Result<DaemonCreateRequest, VmError> {
         // `validate` refuses these at registration, so this is unreachable in
         // practice — but it was a `debug_assert` before, which compiled out in
         // release. Now that the type can say it, say it for real: creating a
@@ -623,13 +654,7 @@ impl VmManager {
         }
         let mounts: Vec<DaemonMount> = resolved.into_iter().map(|m| m.mount).collect();
 
-        let req = create_request(spec, name, open_ports, env_vars, mounts, owner);
-
-        // `POST /sandbox-deploy`. It answers `202` with the id of a sandbox
-        // that is still provisioning; readiness is tracked across reconcile
-        // ticks either way.
-        let created = self.daemon.create(&req).await?;
-        Ok(self.daemon.sandbox(&created.id))
+        Ok(create_request(spec, name, open_ports, env_vars, mounts, owner))
     }
 
     /// The daemon's `mounts` array for a spec: one host directory per guest
@@ -1113,6 +1138,7 @@ mod tests {
 
     fn spec_with(mounts: Vec<MountSpec>) -> VmSpec {
         VmSpec {
+            correlated_creates: false,
             env_from: vec![],
             workspace_archive: None,
             image_download_url: None,
