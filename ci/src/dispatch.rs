@@ -4415,6 +4415,7 @@ fn output_marker(step_id: &str) -> String {
 fn driver_name(driver: heyo_sdk::SandboxDriver) -> &'static str {
     match driver {
         heyo_sdk::SandboxDriver::Firecracker => "firecracker",
+        heyo_sdk::SandboxDriver::FirecrackerContainerd => "firecracker_containerd",
         heyo_sdk::SandboxDriver::Kvm => "kvm",
         heyo_sdk::SandboxDriver::Libvirt => "libvirt",
     }

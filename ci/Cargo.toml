@@ -6,15 +6,15 @@ default-run = "ci"
 
 [dependencies]
 # The heyvm boundary: networks, daemons, sandbox lifecycle, and the iroh tunnel
-# that lets us drive a remote runner. Same version app-lb and queue-fn pin, so
-# the three agree on SandboxInfo/SandboxStatus semantics.
+# that lets us drive a remote runner. The packaged SDK is checked in so our
+# internal builds do not wait for crates.io publication of our own fixes.
 #
 # Deliberately NOT the `mvm_ctrl` library crate: that one has path deps on
 # `local-proxy`/`kvmbind`/`avfbind` plus a `[patch.crates-io]` that only applies
 # from a workspace root, and it requires embedders to intercept a `kvm-run <id>`
 # re-exec in argv before their own arg parser runs. The SDK is the supported
 # surface; where it is missing a route we call the daemon through its client.
-heyo-sdk = "0.1.9"
+heyo-sdk = { version = "=0.1.12", path = "vendor/heyo-sdk" }
 
 # JetStream. Pinned to the version heyvm itself links (mvm-ctrl/Cargo.toml) so a
 # future decision to share a stream is a routing change, not a version upgrade.

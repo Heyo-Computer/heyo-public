@@ -173,6 +173,22 @@ VM-environment updates rebuild the active pool, so no such update was made to
 force S3 configuration before the CICD-managed replacement. Neither repository's
 GitHub secret names includes a Cargo/crates.io publishing credential either.
 
+Registry publication is no longer a prerequisite: CI now uses the exact
+`heyo-sdk` 0.1.12 Cargo package checked into `ci/vendor/heyo-sdk`. Its 29 files
+were compared byte-for-byte with the generated package; source revision and
+archive digest are recorded in `ci/README.md`. Cargo metadata resolves it as a
+local package with no registry source. The existing CI source filter and Docker
+copy include it. Offline CI tests passed: 462 CI tests and 46 submit-client
+tests; 112 environment-dependent tests were ignored. The SDK's added containerd
+driver variant required the corresponding CI capability spelling.
+
+The installed CI VM still had 1,016 descriptors against a soft limit of 1,024.
+Through app-lb managed exec, raised PID 421's soft limit to its existing hard
+limit of 4,096 and read it back. This is temporary recovery headroom so cleanup
+and corrective deployment can proceed, not a substitute for installing the
+connection fix and not an increase to the /24 address pool. No restart or direct
+app-lb pool replacement was performed.
+
 Read-only diagnostics found healthy host memory/disk capacity and successful
 fresh database TCP/TLS handshakes, but established database connections suffered
 retransmissions. Paired packet-header traces (`job-6a01b2fcdf11` on eu1 and

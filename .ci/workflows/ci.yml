@@ -33,13 +33,10 @@ name: ci
 on:
   submit:
     paths:
-      # The crate's subtree. `ci/Cargo.toml` declares only registry
-      # dependencies — `heyo-sdk` and `async-nats` come from crates.io — so
-      # unlike most of the private monorepo there is no sibling path dep to
-      # list beside it. That is a deliberate property of the crate, not luck:
-      # the manifest documents why it takes the published `heyo-sdk` instead of
-      # the `mvm_ctrl` library, whose path deps and `[patch.crates-io]` only
-      # work from its own workspace root.
+      # The crate's subtree includes our packaged SDK at ci/vendor/heyo-sdk.
+      # Its fixes travel with the submitted tree instead of waiting for a
+      # crates.io release or requiring a private sibling checkout. Other
+      # dependencies still resolve through the committed Cargo.lock.
       #
       # Not narrowed to `ci/src/**`. The artifact below also carries
       # `ci/migrations/*.sql` and `ci/deploy/supervisor/ci.conf`, so a change to
