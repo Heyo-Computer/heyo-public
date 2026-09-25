@@ -45,6 +45,9 @@ const DIRECTORY_HTML: &str = include_str!("directory.html");
 /// The security console at `GET /siem`.
 const SIEM_HTML: &str = include_str!("siem.html");
 
+/// The network topology console at `GET /network`.
+const NETWORK_HTML: &str = include_str!("network.html");
+
 /// The disk console at `GET /storage`.
 const DISKS_HTML: &str = include_str!("disks.html");
 
@@ -232,6 +235,8 @@ struct AdminState {
     disks: Option<Arc<crate::disks::DiskStore>>,
     /// The disk console, with the display name already substituted.
     disks_html: Arc<str>,
+    /// The network topology console, with the display name already substituted.
+    network_html: Arc<str>,
     /// How to turn a deployment's hostname into a link, given where the data
     /// plane actually listens.
     public_url: PublicUrl,
@@ -299,6 +304,8 @@ impl AdminApi {
         let siem_html: Arc<str> = Arc::from(SIEM_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
         let disks_html: Arc<str> =
             Arc::from(DISKS_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
+        let network_html: Arc<str> =
+            Arc::from(NETWORK_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
 
         // The gate turns on as soon as a password is set; the username is
         // optional and defaults to "admin", so one env var is enough to secure
@@ -353,6 +360,7 @@ impl AdminApi {
                 ui_cookies: Arc::new(crate::heyo_ui::CookieConfig::from_env("APP_LB")),
                 disks,
                 disks_html,
+                network_html,
                 public_url,
                 feed,
                 deploy_base_domain: deploy_base_domain
@@ -562,6 +570,7 @@ fn narrows_itself(matched: &str) -> bool {
             | "/security"
             | "/siem"
             | "/ingress"
+            | "/network"
             | "/namespaces"
             | "/auth-providers"
             | "/whoami"
@@ -2016,6 +2025,21 @@ async fn storage_console(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     Html(render_page(&state, &state.disks_html, &headers))
+}
+
+/// `GET /network` — the network topology console.
+///
+/// A 2D-canvas visualiser of the request path: ingress → hostnames →
+/// deployments → VMs, with traffic-flow animation. Reads the same
+/// `/metrics?summary=false` and `/ingress` endpoints the dashboard does and
+/// polls at the same 2s cadence, so the two never disagree about the fleet.
+/// View tier for the same reason the dashboard is: it renders `/metrics`, so
+/// it must work with whatever credentials the browser already has.
+async fn network_console(
+    State(state): State<AdminState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    Html(render_page(&state, &state.network_html, &headers))
 }
 
 // ---- the event feed -------------------------------------------------------
@@ -5610,7 +5634,11 @@ fn router(state: AdminState) -> Router {
         // put in the A record", which anyone who can read the directory of
         // hostnames may as well know.
         .route("/ingress", get(ingress))
-        .route("/storage", get(storage_console));
+        .route("/storage", get(storage_console))
+        // The network topology console. View tier, like the dashboard it sits
+        // beside: it renders `/metrics` and `/ingress`, so it must work with
+        // the browser's cached view credentials.
+        .route("/network", get(network_console));
 
     // The deployment CRUD API — register/edit/scale/delete/evict, plus the reads
     // that expose the spec (env vars can hold secrets). Gated too iff
@@ -6837,7 +6865,7 @@ mod tests {
     /// page, the other hands a scoped token a fleet-wide control.
     #[test]
     fn the_console_narrows_itself_and_the_rule_api_does_not() {
-        for view in ["/", "/metrics", "/dashboard", "/security", "/siem"] {
+        for view in ["/", "/metrics", "/dashboard", "/security", "/siem", "/ingress", "/network"] {
             assert!(narrows_itself(view), "{view} must narrow for a scoped token");
         }
         // A deployment-scoped token has no business arming a fleet-wide block,
@@ -7117,6 +7145,7 @@ mod tests {
                 ("directory", DIRECTORY_HTML),
                 ("siem", SIEM_HTML),
                 ("disks", DISKS_HTML),
+                ("network", NETWORK_HTML),
             ] {
                 assert!(page.contains("{{HTML_ATTRS}}"), "{name} lost the theme attributes");
                 assert!(page.contains("{{WHO}}"), "{name} lost the identity slot");
@@ -7131,7 +7160,7 @@ mod tests {
             }
         }
 
-        /// The four pages share one stylesheet, one script and one toggle, all
+        /// The five pages share one stylesheet, one script and one toggle, all
         /// served by this binary. A page that grew its own palette would drift
         /// from the other four apps the moment either changed.
         #[test]
@@ -7141,6 +7170,7 @@ mod tests {
                 ("directory", DIRECTORY_HTML),
                 ("siem", SIEM_HTML),
                 ("disks", DISKS_HTML),
+                ("network", NETWORK_HTML),
             ] {
                 assert!(page.contains(r#"href="/__ui/heyo.css""#), "{name} does not load the shared sheet");
                 assert!(page.contains(r#"src="/__ui/theme.js""#), "{name} does not load the shared toggle");
@@ -7330,18 +7360,46 @@ mod tests {
         }
     }
 
-    /// The four pages are separate `include_str!`d files with no build step to
+    /// The network topology console. Client-rendered against `/metrics` and
+    /// `/ingress`, like the dashboard is against `/metrics`, so the contract
+    /// worth pinning is the routes the page fetches and the states it draws.
+    mod network_console {
+        use super::*;
+
+        /// The page hard-codes the endpoints it polls, so a rename here has to
+        /// break a test rather than a browser.
+        #[test]
+        fn the_page_calls_the_routes_the_router_registers() {
+            // `summary=false` is what carries the per-VM rows the leaf column
+            // draws; a bare `metrics` would return an empty VM list.
+            assert!(NETWORK_HTML.contains("metrics?summary=false"), "page never polls /metrics");
+            assert!(NETWORK_HTML.contains("ingress"), "page never polls /ingress");
+        }
+
+        /// All five legend states must appear in the page, because the canvas
+        /// distinguishes them by colour and a missing label would mean a state
+        /// that can happen but is not drawn.
+        #[test]
+        fn every_vm_state_is_labelled_in_the_legend() {
+            for label in ["serving", "cold-booting", "draining", "down", "cold-idle"] {
+                assert!(NETWORK_HTML.contains(label), "legend never describes {label}");
+            }
+        }
+    }
+
+    /// The five pages are separate `include_str!`d files with no build step to
     /// share anything through, so what makes them one product is only ever
     /// convention. These pin the parts of that convention a user would notice.
     mod page_consistency {
         use super::*;
 
-        fn pages() -> [(&'static str, &'static str); 4] {
+        fn pages() -> [(&'static str, &'static str); 5] {
             [
                 ("dashboard", DASHBOARD_HTML),
                 ("directory", DIRECTORY_HTML),
                 ("siem", SIEM_HTML),
                 ("disks", DISKS_HTML),
+                ("network", NETWORK_HTML),
             ]
         }
 
@@ -7349,7 +7407,7 @@ mod tests {
         /// page may keep one of its own.
         ///
         /// The property the old localStorage test protected — follow a link
-        /// between these four pages and the theme survives — is the weaker half
+        /// between these five pages and the theme survives — is the weaker half
         /// of what a cookie gives: localStorage is per *origin*, so the choice
         /// stopped at app-lb. It now follows a person to ci, app-obs,
         /// heyosecret and artifacts as well, because all five read the same
@@ -7405,7 +7463,7 @@ mod tests {
             }
         }
 
-        /// One stylesheet for all four, served by this binary.
+        /// One stylesheet for all five, served by this binary.
         ///
         /// Not a CDN: these pages are read over SSH tunnels and from networks
         /// with no route out, where a remote stylesheet leaves an operator
