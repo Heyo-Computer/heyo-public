@@ -242,6 +242,9 @@ pub struct Registry {
     /// objects are replaceable, so a mutex stored on one object cannot protect
     /// a drain from racing a spec replacement.
     change_lock: tokio::sync::Mutex<()>,
+    /// Controller effects/read leases precede existing registry/rollout locks.
+    /// Retirement takes the write side through durable freeze and inventory.
+    pub(crate) retirement_gate: Arc<tokio::sync::RwLock<()>>,
     /// Every deployment uses a deterministic temporary filename. Serialize
     /// writes so concurrent background and admin persistence cannot clobber it.
     persist_lock: std::sync::Mutex<()>,
@@ -266,6 +269,7 @@ impl Registry {
             routes: ArcSwap::from_pointee(RouteTable::default()),
             persist_path: persist_path.into(),
             change_lock: tokio::sync::Mutex::new(()),
+            retirement_gate: Arc::new(tokio::sync::RwLock::new(())),
             persist_lock: std::sync::Mutex::new(()),
             retired_discovery: std::sync::Mutex::new(HashMap::new()),
             staged: std::sync::Mutex::new(HashMap::new()),
@@ -288,6 +292,48 @@ impl Registry {
 
     pub fn get(&self, id: &str) -> Option<Arc<Deployment>> {
         self.deployments().get(id).cloned()
+    }
+
+    pub fn retirement_frozen(&self, id: &str) -> bool {
+        self.get(id).is_some_and(|d| d.state().retirement.is_some())
+    }
+
+    pub fn retirement_protects(&self, sandbox: &str, deployment: Option<&str>) -> bool {
+        deployment.is_some_and(|id| self.retirement_frozen(id)) || self.deployments().values().any(|d|
+            d.state().retirement.as_ref().is_some_and(|o|
+                o.request.targets.iter().any(|t|t.backend_sandbox_id==sandbox)
+                || o.inventory.iter().any(|id|id==sandbox)
+                || d.state().create_attempts.iter().any(|a|a.sandbox_id.as_deref()==Some(sandbox))
+                || crate::rollout::protected_ids(&d.state()).any(|id|id==sandbox)))
+    }
+
+    /// One controller process per state directory, including across restarts.
+    /// Keep this descriptor for the daemon's whole lifetime; never unlink it.
+    pub fn controller_lock(&self) -> std::io::Result<std::fs::File> {
+        let dir=self.state_dir();
+        let mut missing=Vec::new();
+        let mut ancestor=dir.as_path();
+        while !ancestor.as_os_str().is_empty() && !ancestor.exists() {
+            missing.push(ancestor.to_path_buf());
+            let Some(parent)=ancestor.parent() else {break};
+            ancestor=parent;
+        }
+        std::fs::create_dir_all(&dir)?;
+        for created in missing.iter().rev() {
+            let parent=created.parent().filter(|p|!p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        let file=std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(dir.join("controller.lock"))?;
+        file.try_lock().map_err(std::io::Error::other)?;
+        Ok(file)
+    }
+
+    pub fn require_complete_load(&self) -> std::io::Result<()> {
+        if self.load_skipped.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("unreadable deployment state may contain retirement intent; controller startup refused"));
+        }
+        Ok(())
     }
 
     pub fn staged(&self, id: &str) -> Option<Arc<Deployment>> {
@@ -420,6 +466,7 @@ impl Registry {
     /// target back into service.
     pub fn upsert(&self, mut spec: DeploymentSpec) -> Arc<Deployment> {
         let previous = self.get(&spec.id);
+        if let Some(old)=previous.as_ref().filter(|d|d.state().retirement.is_some()) {return old.clone();}
         if previous.as_ref().is_some_and(|old|
             old.spec.discovery.as_ref().and_then(|d| d.region.as_ref())
                 != spec.discovery.as_ref().and_then(|d| d.region.as_ref()))
@@ -471,6 +518,8 @@ impl Registry {
         if let Some(previous) = &previous {
             deployment.mutate_state(|s| {
                 s.rollouts = previous.state().rollouts.clone();
+                s.create_attempts = previous.state().create_attempts.clone();
+                s.allocation_history_complete = previous.state().allocation_history_complete;
                 s.rollout_revision = crate::rollout::revision();
             });
         }
@@ -579,6 +628,7 @@ impl Registry {
     /// that decision.
     pub fn update(&self, spec: DeploymentSpec) -> Option<Arc<Deployment>> {
         let old = self.get(&spec.id)?;
+        if old.state().retirement.is_some() {return None;}
         let new = Arc::new(Deployment::new(spec));
         // Runtime state is carried for the same reason the pool is: an edit is
         // not a reset. Dropping it here would strand every sandbox this
@@ -594,6 +644,7 @@ impl Registry {
 
     pub fn remove(&self, id: &str) -> Option<Arc<Deployment>> {
         let removed = self.get(id)?;
+        if removed.state().retirement.is_some() {return None;}
         if removed.spec.discovery.is_some() {
             self.fence_discovery_removals(&removed, &[]);
         }
@@ -614,6 +665,7 @@ impl Registry {
     /// resolves an id always finds it — the reverse order has a window where the
     /// index names a deployment the map does not yet hold.
     pub(crate) fn publish(&self, deployment: Arc<Deployment>) {
+        if self.retirement_frozen(&deployment.spec.id) {return;}
         self.install(Some(deployment.clone()), &deployment.spec.id);
     }
 
@@ -727,6 +779,9 @@ impl Registry {
     /// Drop one deployment's file. A missing file is success — deregistering
     /// something that was never persisted is not an error.
     pub fn forget(&self, id: &str) -> std::io::Result<()> {
+        if self.retirement_frozen(id) {
+            return Err(std::io::Error::other("retirement preserves the deployment record"));
+        }
         match std::fs::remove_file(self.state_dir().join(state_file_name(id))) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -831,6 +886,8 @@ impl Registry {
                 skipped = true;
                 continue;
             }
+            // Reload cannot replace a local freeze with an older disk image.
+            if self.retirement_frozen(&record.spec.id) {loaded += 1; continue;}
             let d = self.upsert(record.spec);
             d.set_state(record.state);
             if let Some(handoff) = d.state().route_handoff.clone()

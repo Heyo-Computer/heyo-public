@@ -114,6 +114,9 @@ arc-swap = "1"
 axum = { version = "0.7", features = ["ws"] }
 serde.workspace = true
 serde_json.workspace = true
+# Parse authenticated retirement receipt timestamps without accepting an
+# arbitrary string as the backend's RFC3339 completion time.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Encoding the configured dashboard credentials into the expected Basic-auth
 # header once at startup. Already in the tree transitively (reqwest/pingora).
 base64.workspace = true

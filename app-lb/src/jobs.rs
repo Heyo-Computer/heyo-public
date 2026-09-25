@@ -1064,10 +1064,24 @@ impl Jobs {
         let job_id = record.id.clone();
         let deployment_id = deployment_id.to_string();
         tokio::spawn(async move {
+            let _retirement=jobs.registry.retirement_gate.read().await;
             let _slot = JobSlot {
                 jobs: jobs.clone(),
                 deployment: deployment_id.clone(),
             };
+            if jobs.registry.retirement_frozen(&deployment_id) {
+                jobs.finish(&job_id,JobStatus::Failed,Some("deployment permanently frozen for retirement".into()));
+                return;
+            }
+            // Arbitrary host jobs are not a complete allocation/effect ledger.
+            // Remember this across restart, not only in the bounded job history.
+            if let Some(d)=jobs.registry.get(&deployment_id) {
+                d.mutate_state(|s|s.allocation_history_complete=false);
+                if jobs.registry.persist_one(&deployment_id).is_err() {
+                    jobs.finish(&job_id,JobStatus::Failed,Some("cannot persist worker effect intent".into()));
+                    return;
+                }
+            }
             let started = std::time::Instant::now();
             match run(jobs.clone(), job_id.clone(), deployment_id.clone()).await {
                 Ok(outcome) => {

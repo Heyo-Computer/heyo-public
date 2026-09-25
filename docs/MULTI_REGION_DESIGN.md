@@ -896,6 +896,92 @@ separate-process exclusion, concurrent readers, storage errors and explicit unlo
 with inherited/duplicated descriptors. The first strengthened process test failed
 before explicit unlock was added; only the corrected rerun is counted here.
 This cross-process lock is not the durable retirement capability required above.
+
+**Public controller retirement checkpoint (2026-09-25, local only):** app-lb now
+offers authenticated namespace-admin `GET/POST /deployments/:id/retirement`.
+POST pins `operation_id`, `expected_revision`, `expected_spec_sha256`, and exact
+backend targets; it durably freezes ordinary mutations, allocation, adoption,
+rollouts and workspace workers before any backend retirement call. Admitted
+controller work and WebSocket shells hold read leases; retirement waits for
+them before taking its immutable inventory. Restart/reload retains the freeze;
+unreadable deployment state refuses controller startup. The process owns an
+exclusive state-directory file lock. Older binaries do not honor this protocol
+and must not run concurrently or be used as an operational rollback.
+
+The backend wire is unchanged: service-authenticated GET/POST
+`/sandboxes/{id}/retirement`, exact backend/server/sandbox/creation/Libvirt
+URI/UUID identity, no redirects or automatic retries, bounded JSON responses.
+`createdAtUnixNanos` is a canonical positive decimal **string** parsed as `u128`,
+matching the private backend, never a JSON number. Parent integration review
+caught the initial public `u64` mismatch; the corrected wire regression exercises
+values above `u64`, the `u128` maximum, and numeric/invalid/overflow rejection.
+Only an authenticated exact `state: retired` receipt completes a target. A lost
+reply replays the saved intent or recovers the exact receipt. `202`, unknown
+status, mismatched identity, and persistence errors never mean successful fencing.
+Retirement never deletes deployment records, disks, workspace snapshots or mount
+trees; force-purge cannot override its pins. Shared daemon-tree reclamation is
+conservatively suspended while retirement records exist because no complete
+cross-deployment tree-reference ledger exists. This is a controller primitive,
+not CI drain, state-authority evidence, or permission to initialize CI ownership.
+
+**Allocation closure is still missing, including for newly successful legacy
+creates.** Direct local app-lb/SDK creation sends one `/sandbox-deploy` request;
+the local daemon assigns one ID and queues one background create. It does not
+normally traverse Cloud JetStream. The Cloud route is a separate ingress: source
+inspection found Cloud `sandbox_queue.rs`
+`handle_create_message` executes each JetStream delivery and ACKs only after
+publishing its lifecycle event. Worker death or event-publication failure after
+backend allocation can redeliver. Only metadata `_orchestrationCreation` selects
+the correlated `/sandbox-creations` path; the legacy `/sandbox-deploy` path used
+by app-lb does not supply it. Replay can allocate a fresh backend ID through
+`/sandboxes` or `/sandboxes/from-archive`. Public request bodies contain replica
+names, account/user metering IDs and optional archive keys, not an authenticated
+deployment allocation epoch. Neither SDK success, matching names, nor inventory
+scans prove closure. Every legacy create dispatch therefore durably invalidates
+allocation completeness even when its returned ID is recorded. Unknown creates,
+historical records and arbitrary host jobs stay frozen/unresolved, with no
+override, timeout, inferred reconciliation or automatic target expansion.
+
+Required follow-through: integrate authoritative correlated allocation receipts
+for new creates; for historical closure, establish durable admission rejection
+at **every relevant ingress**, then quiesce/reconcile admitted queue deliveries
+and backend work without stopping unrelated workloads or deleting storage. Only
+an explicit proven closure may support a later controller completion protocol.
+Existing rollout/job/workspace obligations and host-update helpers also require
+reconciliation; this checkpoint does not invent their completion. Backend receipt
+replay tests use synthetic complete allocation histories, not evidence that the
+current legacy production create path can reach completed retirement.
+
+Public verification in the orb: `cargo test --locked --manifest-path
+app-lb/Cargo.toml` passed 899 tests, 6 ignored. Eight focused retirement tests
+exercise actual admin routing/SDK create/backend HTTP calls, in-flight creates,
+successful-but-incomplete legacy allocation, restart/lost response/exact replay,
+authentication, target mismatch, redirect refusal, frozen mutations, force-purge
+refusal, process locking, and persistence/corrupt-load failure. No live VM was
+retired. Parent separately reports private Linux 360/macOS 313 tests passed
+(2 ignored each), immutable retirement intent/receipt, reopened/cached lifecycle
+gates and storage retention; 11 virsh termination scenarios use subprocess
+doubles, not live VM retirement. Parent also reports the separate actual Wasmer
+replacement/replay/failed-start rollback test passed after exec/create locking.
+These private results are attributed, not rerun in this orb; later KVM-path fixes
+are now locally committed with parent-reported Linux 361 passed/2 ignored and
+serial macOS 313 passed/2 ignored. The parallel macOS run had one existing image
+eviction Busy-versus-Missing failure; the serial pass does not erase that limitation.
+No push, deploy, live migration or record deletion
+is authorized or performed by this controller checkpoint.
+
+**Local integration verification (2026-09-25):** imported the final v2 controller
+archive into `ci-app-registration` after verifying SHA-256
+`e721962f3452556f875e3a626f29f4495fa4884996fa56f54b96fd067a63bca4`.
+On this checkout, all eight retirement tests and the full locked app-lb suite
+passed (898 passed, six ignored). These are fresh local results, distinct from
+the orb count above. Private `ci-instance-http` now validates recovered creation
+receipt identities/fingerprints and re-establishes file/directory durability before
+returning a receipt. Its locked serial macOS library suite passed 314 tests,
+two ignored; the lockfile's package version was aligned with the existing
+`0.50.7` manifest, with no dependency changes. This is not a composed live test
+and does not connect app-lb's legacy creates to correlated creation yet.
+
 Composed actual CI/Orchestrator/Cloud/backend
 unhealthy-candidate/fresh-rollback and restart/lost-receipt sequences, plus all live
 acceptance gates, remain outstanding. Admission closure is not uninterrupted submission

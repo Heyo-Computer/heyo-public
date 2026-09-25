@@ -699,6 +699,20 @@ impl Workspaces {
             .any(|p| p.sandbox_id == sandbox_id)
     }
 
+    pub fn retirement_protects(&self, sandbox: &str) -> bool {
+        self.records.lock().unwrap().iter().any(|(id,r)|self.registry.retirement_frozen(id)
+            && (r.seeds.contains_key(sandbox) || r.captured_from.as_deref()==Some(sandbox)
+                || r.pending.iter().any(|p|p.sandbox_id==sandbox)
+                || r.recoveries.iter().any(|o|o.request.source_sandbox_id==sandbox)))
+    }
+
+    pub fn retirement_blocker(&self, id: &str) -> Option<String> {
+        let r=self.record(id);
+        (!r.pending.is_empty() || r.replacement_captures_remaining>0 || self.persist_failed(id)
+            || self.recovery_active(id))
+            .then(||"workspace effects require explicit reconciliation; storage remains pinned".into())
+    }
+
     /// Close the stale-seed window before a replacement is installed in the
     /// registry. The autoscaler holds its create permits while setting this,
     /// so an old-template create cannot slip between the fence and the swap.
@@ -868,6 +882,7 @@ impl Workspaces {
     /// One pass over every deployment's queues. Sequential on purpose: each
     /// item is gigabytes of disk or network I/O.
     async fn pass(&self) {
+        let _retirement=self.registry.retirement_gate.read().await;
         let _lifecycle = self.lifecycle_guard().await;
         let ids: Vec<String> = {
             let records = self.records.lock().unwrap();
@@ -887,6 +902,7 @@ impl Workspaces {
             ids
         };
         for id in ids {
+            if self.registry.retirement_frozen(&id) {continue;}
             let Some(d) = self.registry.get(&id) else {
                 // Deregistered. Captures still run — a deployment that is gone
                 // should still have its last state in the store — but there is
@@ -1249,7 +1265,15 @@ impl Workspaces {
                     // (`ws-<digest>`); let it go there too. Best-effort.
                     let vms = self.vms.clone();
                     let tree = format!("ws-{name}");
+                    let registry = self.registry.clone();
+                    let id = id.to_string();
                     tokio::spawn(async move {
+                        let _retirement=registry.retirement_gate.read().await;
+                        // Daemon trees are content-addressed and shared across
+                        // deployments. Without a complete reference ledger,
+                        // another deployment cannot reclaim a retired tree.
+                        if registry.retirement_frozen(&id)
+                            || registry.deployments().values().any(|d|d.state().retirement.is_some()) {return;}
                         if let Err(e) = vms.delete_tree(&tree).await {
                             tracing::debug!(tree = %tree, error = %e, "could not remove the pruned snapshot's tree on the daemon");
                         }

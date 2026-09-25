@@ -66,7 +66,7 @@ impl Operation {
 
 pub fn reserved(d: &Deployment) -> bool {
     let state = d.state();
-    state.rollouts.iter().any(|o| matches!(o.status.as_str(), "running" | "reconciliation_required"))
+    state.retirement.is_some() || state.rollouts.iter().any(|o| matches!(o.status.as_str(), "running" | "reconciliation_required"))
         || state.route_handoff.as_ref().is_some_and(|h| h.phase != crate::registry::RouteHandoffPhase::Committed)
 }
 
@@ -77,6 +77,7 @@ pub fn protected_ids(state: &DeploymentState) -> impl Iterator<Item = &String> {
 /// Both startup and continuous adoption must apply this before health or cleanup.
 pub fn adoptable(d: &Deployment, name: &str, id: &str) -> bool {
     let state = d.state();
+    if state.retirement.is_some() {return false;}
     if let Some(prefix) = &state.active_prefix {
         return name.starts_with(prefix);
     }
@@ -194,8 +195,10 @@ impl Rollouts {
     }
 
     pub async fn tick(&self) {
+        let _retirement=self.registry.retirement_gate.read().await;
         let mut retiring = self.worker.lock().await;
         for d in self.registry.deployments().values() {
+            if d.state().retirement.is_some() {continue;}
             if let Some(index) = d.state().rollouts.iter().position(|o| o.status == "running") {
                 if let Err(e) = self.advance(d.clone(), index, &mut retiring).await {
                     tracing::warn!(deployment=%d.spec.id, error=%e, "candidate rollout paused");

@@ -460,6 +460,28 @@ impl VmManager {
         &self.transport
     }
 
+    async fn retirement_request(&self,target:&crate::retirement::Target,operation:Option<&str>) -> Result<serde_json::Value,String> {
+        let key=self.client.api_key().filter(|v|!v.is_empty()).ok_or("backend retirement requires service authentication")?;
+        let mut builder=reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never()).timeout(std::time::Duration::from_secs(30));
+        #[cfg(unix)]
+        if let Some(socket)=self.client.socket_path() {builder=builder.unix_socket(socket.to_path_buf());}
+        let client=builder.build().map_err(|_|"cannot build exact retirement transport")?;
+        let url=format!("{}/sandboxes/{}/retirement",self.client.base_url().trim_end_matches('/'),target.backend_sandbox_id);
+        let request=match operation {
+            Some(id)=>client.post(&url).json(&serde_json::json!({"operationId":id,"target":target})),
+            None=>client.get(&url),
+        };
+        let mut response=request.bearer_auth(key).send().await.map_err(|_|"retirement transport outcome unknown")?;
+        if response.status()!=reqwest::StatusCode::OK {return Err("backend has not confirmed retirement".into());}
+        let mut bytes=Vec::new();
+        while let Some(chunk)=response.chunk().await.map_err(|_|"retirement response incomplete")? {
+            if bytes.len()+chunk.len()>65536 {return Err("retirement response exceeds limit".into());}
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_|"invalid retirement response".into())
+    }
+
     /// The tail of what a guest itself printed, as the daemon captured it.
     ///
     /// heyvmd starts vsock forwarders inside the guest before it runs the start
@@ -888,6 +910,16 @@ impl VmManager {
             "inactive sandbox listing did not terminate; treating it as complete",
         );
         Ok(out)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::retirement::Backend for VmManager {
+    async fn status(&self,target:&crate::retirement::Target)->Result<serde_json::Value,String> {
+        self.retirement_request(target,None).await
+    }
+    async fn retire(&self,operation:&str,target:&crate::retirement::Target)->Result<serde_json::Value,String> {
+        self.retirement_request(target,Some(operation)).await
     }
 }
 

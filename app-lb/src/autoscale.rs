@@ -267,6 +267,7 @@ impl Autoscaler {
     /// two that do not — the orphan sweeps, where the deployment is already
     /// gone — use [`crate::runtime::Runtime::kill_unknown`] instead.
     async fn kill_vm(&self, d: &Arc<Deployment>, sandbox_id: &str) -> Result<(), vm::VmError> {
+        if self.registry.retirement_protects(sandbox_id,Some(&d.spec.id)) || self.workspaces.retirement_protects(sandbox_id) {return Ok(());}
         if self.workspaces.recovery_pinned(sandbox_id) { return Ok(()); }
         if Self::has_workspace(d) && self.workspaces.source_retained(sandbox_id) {
             return self.vms().suspend(sandbox_id).await;
@@ -289,7 +290,7 @@ impl Autoscaler {
     fn is_live(&self, d: &Arc<Deployment>) -> bool {
         self.registry
             .get(&d.spec.id)
-            .is_some_and(|live| Arc::ptr_eq(&live, d))
+            .is_some_and(|live| Arc::ptr_eq(&live, d) && live.state().retirement.is_none())
     }
 
     /// Which of `ids` no live deployment is tracking any more.
@@ -404,6 +405,10 @@ impl Autoscaler {
             // Dated from the daemon's own uptime, not from now: this VM may have
             // been booting for minutes already, and starting its clock here
             // would hand it a fresh `boot_timeout_secs` on every adoption.
+            if !state.create_attempts.iter().any(|a|a.sandbox_id.as_ref()==Some(id)) {
+                d.mutate_state(|s|s.allocation_history_complete=false);
+                let _=self.registry.persist_one(&d.spec.id);
+            }
             let created_at = now_secs().saturating_sub(info.uptime_secs);
             adopted.push(PendingVm {
                 created_at,
@@ -441,7 +446,8 @@ impl Autoscaler {
     /// pass could outrun [`TICK`] entirely. Bounded by
     /// [`RECONCILE_CONCURRENCY`] so a large fleet cannot open thousands of
     /// simultaneous connections to the daemon.
-    async fn reconcile(&self) {
+    pub(crate) async fn reconcile(&self) {
+        let _retirement = self.registry.retirement_gate.read().await;
         let _rollout = self.rollout_gate.read().await;
         let deployments = self.registry.deployments();
         // Sites are excluded outright rather than partitioned: they have no VMs
@@ -1202,6 +1208,7 @@ impl Autoscaler {
     }
 
     async fn scale_up(&self, d: &Arc<Deployment>, count: usize) {
+        if !self.is_live(d) || d.state().create_attempts.iter().any(|a|a.sandbox_id.is_none()) {return;}
         tracing::info!(deployment = %d.spec.id, count, "scaling up");
         // Keep the slot until the resulting pending pool has been published,
         // not just until the daemon answered. A replacement draining these
@@ -1275,6 +1282,16 @@ impl Autoscaler {
                 .unwrap_or_else(|| vm::replica_name(&d.spec.id, self.next_nonce()));
             let seed = seeded.as_ref().map(|s| s.seed());
             let owner = vm::VmOwner::of(&d.spec);
+            let attempt=d.state().create_attempts.len();
+            let history_was_complete=d.state().allocation_history_complete;
+            d.mutate_state(|s| {
+                // The legacy response is not a durable operation receipt.
+                // The direct local path queues one create; Cloud ingress can
+                // also redeliver work. Neither proves historical closure here.
+                s.allocation_history_complete=false;
+                s.create_attempts.push(crate::retirement::CreateAttempt {name:name.clone(),sandbox_id:None});
+            });
+            if self.registry.persist_one(&d.spec.id).is_err() {break;}
             let created_vm = match self.secret_env(d.spec.vm_spec()) {
                 Ok(secret_env) => {
                     self.runtime
@@ -1285,6 +1302,12 @@ impl Autoscaler {
             };
             match created_vm {
                 Ok(sandbox_id) => {
+                    d.mutate_state(|s|s.create_attempts[attempt].sandbox_id=Some(sandbox_id.clone()));
+                    if self.registry.persist_one(&d.spec.id).is_err() {
+                        d.mutate_state(|s|s.create_attempts[attempt].sandbox_id=None);
+                        pending.push(PendingVm::new(sandbox_id));
+                        break;
+                    }
                     if let Some(seeded) = &seeded {
                         self.workspaces.note_seeded(
                             &d.spec.id,
@@ -1298,6 +1321,13 @@ impl Autoscaler {
                 }
                 Err(e) => {
                     tracing::error!(deployment = %d.spec.id, error = %e, "failed to create VM");
+                    // These errors are raised locally before any sandbox
+                    // create request. A network/SDK error remains ambiguous.
+                    if matches!(e, vm::VmError::SecretUnresolved {..} | vm::VmError::MountNotPulled {..}
+                        | vm::VmError::WrongRuntime {..} | vm::VmError::RuntimeUnavailable {..}) {
+                        d.mutate_state(|s| {s.create_attempts.remove(attempt);s.allocation_history_complete=history_was_complete;});
+                        let _=self.registry.persist_one(&d.spec.id);
+                    }
                     // Counted *and* kept verbatim. Before this the only trace of
                     // a refused create was this log line, so a pool stuck at
                     // `ready: 0` showed `vms_created: 0, scale_up_events: 0,
@@ -1648,7 +1678,8 @@ impl Autoscaler {
     /// Only sandboxes named `applb-<deployment>-<nonce>` are touched, and only
     /// when their deployment either does not exist or does not list them. A
     /// sandbox somebody else made is never destroyed.
-    async fn sweep_suspended(&self) {
+    pub(crate) async fn sweep_suspended(&self) {
+        let _retirement = self.registry.retirement_gate.read().await;
         let _rollout = self.rollout_gate.read().await;
         // Both listings, because *where* a stopped sandbox turns up depends on
         // the backend. mvm-ctrl re-adds every persisted **KVM** sandbox to
@@ -1700,6 +1731,7 @@ impl Autoscaler {
         let mut seen: HashSet<String> = HashSet::new();
 
         for info in stopped {
+            if self.registry.retirement_protects(&info.id,vm::owner_of(&info.name)) || self.workspaces.retirement_protects(&info.id) {continue;}
             let Some(owner) = vm::owner_of(&info.name) else {
                 continue; // not ours
             };
@@ -1805,6 +1837,7 @@ impl Autoscaler {
     /// Without this, a restart would leave old VMs running while booting a fresh
     /// set — the orphans would only die when their TTL expired.
     pub async fn adopt_existing(&self) {
+        let _retirement = self.registry.retirement_gate.read().await;
         let _rollout = self.rollout_gate.read().await;
         let fleet = match self.vms().list().await {
             Ok(list) => list,
@@ -1819,6 +1852,7 @@ impl Autoscaler {
         let mut orphans = Vec::new();
 
         for info in &fleet {
+            if self.registry.retirement_protects(&info.id,vm::owner_of(&info.name)) || self.workspaces.retirement_protects(&info.id) {continue;}
             if self.workspaces.recovery_pinned(&info.id) { continue; }
             let Some(owner) = vm::owner_of(&info.name) else {
                 continue; // not ours; leave it alone
@@ -1834,6 +1868,10 @@ impl Autoscaler {
                 // VM was created; neither owns VMs, so this sandbox is an orphan.
                 orphans.push(info.id.clone());
                 continue;
+            }
+            if !d.state().create_attempts.iter().any(|a|a.sandbox_id.as_ref()==Some(&info.id)) {
+                d.mutate_state(|s|s.allocation_history_complete=false);
+                let _=self.registry.persist_one(&d.spec.id);
             }
             // A VM this deployment deliberately suspended is neither adoptable
             // nor an orphan: it is stopped on purpose and its data disk *is* the

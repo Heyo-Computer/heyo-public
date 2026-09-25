@@ -982,6 +982,12 @@ impl DiskStore {
         complete: bool,
         force: bool,
     ) -> Result<PurgeOutcome, DiskError> {
+        let _retirement=self.registry.retirement_gate.read().await;
+        if self.registry.retirement_protects(&disk.sandbox_id,disk.deployment.as_deref())
+            || self.workspaces.as_ref().is_some_and(|ws|ws.retirement_protects(&disk.sandbox_id)) {
+            return Err(DiskError::Held {sandbox_id:disk.sandbox_id,
+                reason:"permanent deployment retirement preserves all storage",forceable:false});
+        }
         // Share admission's lock: a stale sweep inventory cannot race a newly
         // persisted recovery pin. No force flag overrides the selected source.
         let _recovery = match &self.workspaces { Some(ws) => Some(ws.lifecycle_guard().await), None => None };
@@ -1968,6 +1974,45 @@ mod tests {
 
     mod policy {
         use super::*;
+
+        #[tokio::test]
+        async fn retirement_refuses_forced_purge_from_stale_unclaimed_inventory() {
+            use std::sync::atomic::{AtomicUsize,Ordering};
+            let root=tempfile::tempdir().unwrap();
+            let deletes=Arc::new(AtomicUsize::new(0));
+            let count=deletes.clone();
+            let backend=axum::Router::new().fallback(move |request:axum::extract::Request| {
+                let count=count.clone();async move {
+                    if request.method()==axum::http::Method::DELETE {count.fetch_add(1,Ordering::SeqCst);}
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            });
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url=format!("http://{}",listener.local_addr().unwrap());
+            tokio::spawn(async move {axum::serve(listener,backend).await.unwrap();});
+            let registry=Arc::new(Registry::new(root.path().join("state.json")));
+            let d=registry.upsert(serde_json::from_value(serde_json::json!({
+                "id":"service","routes":[],"vm":{"driver":"kvm","port":8080}
+            })).unwrap());
+            d.set_pending(vec![crate::deployment::PendingVm::new("sb-1".into())]);
+            crate::retirement::freeze(&registry,&d,serde_json::from_value(serde_json::json!({
+                "operation_id":"retire-1","expected_revision":d.state().rollout_revision,
+                "expected_spec_sha256":crate::rollout::fingerprint(&d.spec),"targets":[{
+                    "backendServerId":"host","backendSandboxId":"sb-1","createdAtUnixNanos":"1780000000000000001",
+                    "libvirtConnectionUri":"qemu:///system","libvirtDomainUuid":"00000000-0000-0000-0000-000000000001"
+                }]
+            })).unwrap()).unwrap();
+            let vm=VmManager::new(Some(url),None,crate::mounts::MountStore::new(root.path().join("mounts"),0)).unwrap();
+            let store=DiskStore::new(cfg_at(root.path()),vm,registry);
+            // No claimed/deployment/retain hints: the immutable retirement pin
+            // must outrank a stale sweep and the explicit force flag alike.
+            let stale=disk(DiskState::Orphan,false,false,0);
+            for force in [false,true] {
+                assert!(matches!(store.purge_resolved(stale.clone(),true,force).await,
+                    Err(DiskError::Held {forceable:false,..})));
+            }
+            assert_eq!(deletes.load(Ordering::SeqCst),0);
+        }
 
         fn store(root: &Path) -> DiskStore {
             DiskStore::new(

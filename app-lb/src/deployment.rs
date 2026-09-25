@@ -341,6 +341,19 @@ pub struct UpstreamDrain {
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct DeploymentState {
+    /// Irreversible controller freeze; neither reload nor ordinary updates clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement: Option<crate::retirement::Operation>,
+    /// Write-ahead evidence for ordinary allocation attempts. Unknown outcomes
+    /// remain here across restart and prevent a retirement success receipt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub create_attempts: Vec<crate::retirement::CreateAttempt>,
+    /// False for old records, any legacy create dispatch, unjournaled adoption
+    /// or arbitrary host worker. Success on /sandbox-deploy cannot prove an
+    /// exactly-once allocation because its queue delivery may be replayed.
+    /// No API or timeout can promote this bit back to true.
+    #[serde(default)]
+    pub allocation_history_complete: bool,
     #[serde(default = "crate::rollout::revision")]
     pub rollout_revision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -426,7 +439,7 @@ impl Deployment {
         Self {
             regional: spec.discovery.as_ref().and_then(|d| d.regional.as_ref()).map(|_| Arc::new(crate::regional::Router::new())),
             spec,
-            state: ArcSwap::from_pointee(DeploymentState { rollout_revision: crate::rollout::revision(), ..Default::default() }),
+            state: ArcSwap::from_pointee(DeploymentState { allocation_history_complete:true, rollout_revision: crate::rollout::revision(), ..Default::default() }),
             backends: ArcSwap::from_pointee(backends),
             pending: ArcSwap::from_pointee(Vec::new()),
             waiters: AtomicUsize::new(0),

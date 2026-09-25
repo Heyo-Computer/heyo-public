@@ -3278,6 +3278,9 @@ async fn register(
     // from booting until teardown's final old-state capture has published.
     let change = state.registry.change_guard().await;
     let old = state.registry.get(&id);
+    if state.registry.retirement_frozen(&id) {
+        return err(StatusCode::CONFLICT,"deployment permanently frozen for retirement").into_response();
+    }
     if create_only && old.is_some() {
         return err(StatusCode::PRECONDITION_FAILED, "deployment already exists").into_response();
     }
@@ -4124,6 +4127,57 @@ fn record_only_refusal(d: &Deployment, workspace_state: bool) -> Option<&'static
     None
 }
 
+// Inside the auth layer, but also present on intentionally ungated CRUD.
+// Shells own a read lease through WebSocket EOF in their handler instead.
+async fn retirement_admission(State(state):State<AdminState>,req:Request,next:Next)->Response {
+    let matched=req.extensions().get::<MatchedPath>().map(|m|m.as_str());
+    let mutation=matched.is_some_and(|m|m=="/deployments" || m.starts_with("/deployments/:id"))
+        && matched!=Some("/deployments/:id/retirement")
+        && !matches!(*req.method(),axum::http::Method::GET|axum::http::Method::HEAD);
+    let _lease=if mutation {Some(state.registry.retirement_gate.read().await)} else {None};
+    if mutation && matched.and_then(|m|deployment_of(m,req.uri().path()))
+        .is_some_and(|id|state.registry.retirement_frozen(id)) {
+        return err(StatusCode::CONFLICT,"deployment permanently frozen for retirement").into_response();
+    }
+    next.run(req).await
+}
+
+async fn retirement_status(State(state):State<AdminState>, axum::Extension(caller):axum::Extension<Caller>,Path(id):Path<String>) -> Response {
+    let Some(d)=state.registry.get(&id) else {return StatusCode::NOT_FOUND.into_response()};
+    if !recovery_authorized(&caller,&d.spec) {return forbidden("authenticated namespace admin required");}
+    Json(serde_json::json!({"deployment":id,"revision":d.state().rollout_revision,
+        "spec_sha256":crate::rollout::fingerprint(&d.spec),"retirement":d.state().retirement})).into_response()
+}
+
+async fn retire_deployment(State(state):State<AdminState>,axum::Extension(caller):axum::Extension<Caller>,Path(id):Path<String>,
+    Json(request):Json<crate::retirement::Request>) -> Response {
+    let Some(d)=state.registry.get(&id) else {return StatusCode::NOT_FOUND.into_response()};
+    if !recovery_authorized(&caller,&d.spec) {return forbidden("authenticated namespace admin required");}
+    let _retirement=state.registry.retirement_gate.write().await;
+    let _rollout=state.autoscaler.rollout_guard().await;
+    let _change=state.registry.change_guard().await;
+    let _creates=state.autoscaler.workspace_recovery_guard().await;
+    let _workspace=state.autoscaler.workspaces().lifecycle_guard().await;
+    let Some(d)=state.registry.get(&id) else {return StatusCode::NOT_FOUND.into_response()};
+    if !recovery_authorized(&caller,&d.spec) {return forbidden("authenticated namespace admin required");}
+    if let Err(error)=crate::retirement::freeze(&state.registry,&d,request) {
+        return err(StatusCode::CONFLICT,error).into_response();
+    }
+    // History may represent an interrupted worker, not proof of no effects.
+    // No historical failure is silently converted to completed retirement.
+    let blocker=(!state.jobs.records(Some(&id)).is_empty())
+        .then(||"job history requires explicit effect reconciliation".to_string())
+        .or_else(|| (d.spec.update.is_some() || std::env::var_os("APP_LB_HOST_UPDATE_CONFIG").is_some()
+            && crate::host_update::configured().map_or(true,|(_,c)|c.deployment==id))
+            .then(||"host update helper requires explicit effect reconciliation".into()))
+        .or_else(||state.autoscaler.workspaces().retirement_blocker(&id));
+    match crate::retirement::advance(&state.registry,&d,state.autoscaler.vms(),blocker).await {
+        Ok(op)=>(if op.state=="retired" {StatusCode::OK} else {StatusCode::ACCEPTED},Json(op)).into_response(),
+        Err(error)=>{tracing::warn!(deployment=%id,%error,"retirement remains frozen");
+            (StatusCode::ACCEPTED,Json(serde_json::json!({"retirement":d.state().retirement,"pending":true}))).into_response()}
+    }
+}
+
 async fn deregister_record(
     State(state): State<AdminState>,
     Path(id): Path<String>,
@@ -4623,6 +4677,10 @@ async fn shell(
     // Everything that can fail with a status code has to fail *before* the
     // upgrade: once the socket is a WebSocket, a client sees a close frame with
     // no explanation instead of a 404.
+    let retirement=state.registry.retirement_gate.clone().read_owned().await;
+    if state.registry.retirement_frozen(&id) {
+        return err(StatusCode::CONFLICT,"deployment permanently frozen for retirement").into_response();
+    }
     let slot = match hold_a_vm(&state, &id, q.wake, q.sandbox_id.as_deref()).await {
         Ok(slot) => slot,
         Err(response) => return response,
@@ -4649,6 +4707,7 @@ async fn shell(
 
     tracing::info!(deployment = %id, sandbox = %sandbox_id, "shell session opened");
     ws.on_upgrade(move |socket| async move {
+        let _retirement=retirement;
         // `slot` moves in here, so the VM is held for the life of the session
         // and released however it ends.
         pump_shell(socket, session, sandbox_id.clone(), slot).await;
@@ -5639,7 +5698,8 @@ fn router(state: AdminState) -> Router {
         .route(
             "/tokens/:id",
             get(get_token).patch(patch_token).delete(revoke_token),
-        );
+        )
+        .route_layer(middleware::from_fn_with_state(state.clone(),retirement_admission));
 
     // `route_layer` runs the auth middleware only for the routes it wraps, so a
     // 404 elsewhere never triggers a challenge. `/healthz` is always open.
@@ -5677,8 +5737,10 @@ fn router(state: AdminState) -> Router {
 
     // Unlike legacy CRUD, explicit data recovery is never available ungated.
     let recovery = Router::new()
+        .route("/deployments/:id/retirement", get(retirement_status).post(retire_deployment))
         .route("/deployments/:id/workspace/recoveries", post(recover_workspace))
         .route("/deployments/:id/workspace/recoveries/:operation_id", get(get_workspace_recovery))
+        .route_layer(middleware::from_fn_with_state(state.clone(),retirement_admission))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
 
     let regional = Router::new()
@@ -5686,6 +5748,7 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/regional-active-probe",post(regional_active_probe))
         .route("/deployments/:id/route-handoff",post(prepare_route_handoff).get(inspect_route_handoff))
         .route("/deployments/:id/route-handoff/commit",post(commit_route_handoff))
+        .route_layer(middleware::from_fn_with_state(state.clone(),retirement_admission))
         .route_layer(middleware::from_fn_with_state(state.clone(),require_crud_auth));
 
     let fleet = Router::new()
@@ -6218,10 +6281,15 @@ mod tests {
         }
 
         async fn fixture(inventory_available: bool) -> Fixture {
-            let root = std::env::temp_dir().join(format!(
+            fixture_with_backend(inventory_available,Router::new(),None).await
+        }
+
+        async fn fixture_with_backend(inventory_available: bool, extra:Router, restore:Option<PathBuf>) -> Fixture {
+            let reload=restore.is_some();
+            let root = restore.unwrap_or_else(||std::env::temp_dir().join(format!(
                 "app-lb-record-handler-{}-{}", std::process::id(),
                 FIXTURE.fetch_add(1, Ordering::Relaxed),
-            ));
+            )));
             std::fs::create_dir_all(&root).unwrap();
             let mutations = Arc::new(AtomicUsize::new(0));
             let mutation_count = mutations.clone();
@@ -6239,6 +6307,7 @@ mod tests {
                         "free_bytes": 10, "total_bytes": 20, "sandboxes": []
                     }))
                 }))
+                .merge(extra)
                 .fallback(move |request: Request<Body>| {
                     let mutation_count = mutation_count.clone();
                     async move {
@@ -6253,10 +6322,12 @@ mod tests {
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
             let registry = Arc::new(Registry::new(root.join("deployments.json")));
-            registry.upsert(empty().spec.clone());
-            registry.persist_one("obsolete").unwrap();
+            if reload {registry.load().unwrap(); registry.require_complete_load().unwrap();} else {
+                registry.upsert(empty().spec.clone());
+                registry.persist_one("obsolete").unwrap();
+            }
             let mounts = crate::mounts::MountStore::new(root.join("mounts"), 0);
-            let vms = crate::vm::VmManager::new(Some(daemon_url), None, mounts.clone()).unwrap();
+            let vms = crate::vm::VmManager::new(Some(daemon_url), Some("retirement-test-key".into()), mounts.clone()).unwrap();
             let secrets = Arc::new(crate::secrets::SecretStore::new(root.join("secrets.json"), None));
             let workspaces = Arc::new(crate::workspace::Workspaces::new(
                 crate::workspace::WorkspaceConfig {
@@ -6296,6 +6367,238 @@ mod tests {
                 feed, &[], None,
             );
             Fixture { state: api.state, registry, root, mutations }
+        }
+
+        mod retirement_tests {
+            use super::*;
+            use crate::retirement::{CreateAttempt,Request as RetirementRequest,Target};
+            use serde_json::{Value,json};
+            use std::sync::Mutex;
+            use std::time::Duration;
+
+            #[derive(Default)]
+            struct Backend {
+                mode: AtomicUsize,
+                posts: AtomicUsize,
+                reads: AtomicUsize,
+                receipt: Mutex<Option<Value>>,
+                requests: Mutex<Vec<Value>>,
+            }
+
+            fn target() -> Target {
+                Target {backend_server_id:"host-us3".into(),backend_sandbox_id:"sb-12345678".into(),
+                    created_at_unix_nanos:"1780000000123456789".into(),libvirt_connection_uri:"qemu:///system".into(),
+                    libvirt_domain_uuid:"3a7bfa82-b791-4e9d-8be4-4a0bef8c4470".into()}
+            }
+
+            fn backend_router(b:Arc<Backend>) -> Router {
+                let read=b.clone();
+                Router::new().route("/sandboxes/:id/retirement",get(move |headers:axum::http::HeaderMap| {
+                    let b=read.clone(); async move {
+                        assert_eq!(headers[header::AUTHORIZATION],"Bearer retirement-test-key");
+                        b.reads.fetch_add(1,Ordering::SeqCst);
+                        let mut t=target();
+                        if b.mode.load(Ordering::SeqCst)==3 {t.created_at_unix_nanos="1780000000123456790".into();}
+                        let receipt=b.receipt.lock().unwrap().clone();
+                        Json(json!({"target":t,"state":if receipt.is_some() {"retired"} else {"active"},"receipt":receipt}))
+                    }
+                }).post(move |headers:axum::http::HeaderMap,Json(request):Json<Value>| {
+                    let b=b.clone(); async move {
+                        assert_eq!(headers[header::AUTHORIZATION],"Bearer retirement-test-key");
+                        b.posts.fetch_add(1,Ordering::SeqCst);
+                        b.requests.lock().unwrap().push(request.clone());
+                        match b.mode.load(Ordering::SeqCst) {
+                            1=>return (StatusCode::ACCEPTED,Json(json!({"target":target(),"state":"retiring","receipt":null}))).into_response(),
+                            5=>return (StatusCode::TEMPORARY_REDIRECT,[(header::LOCATION,"/must-not-follow")]).into_response(),
+                            _=>{}
+                        }
+                        let mut record=json!({"request":request,"state":"retired","retiredAt":"2026-09-25T10:00:00Z"});
+                        if b.mode.load(Ordering::SeqCst)==4 {record["request"]["operationId"]=json!("different-operation");}
+                        *b.receipt.lock().unwrap()=Some(record.clone());
+                        if b.mode.load(Ordering::SeqCst)==2 {return StatusCode::SERVICE_UNAVAILABLE.into_response();}
+                        Json(record).into_response()
+                    }
+                }))
+            }
+
+            fn auth(f:&mut Fixture) {
+                f.state.auth=Some(Arc::new(DashboardAuth::new("operator","password")));
+                f.state.gate_admin=true;
+            }
+
+            fn approve(f:&Fixture) -> RetirementRequest {
+                let d=f.registry.get("obsolete").unwrap();
+                RetirementRequest {operation_id:"retire-1".into(),expected_revision:d.state().rollout_revision.clone(),
+                    expected_spec_sha256:crate::rollout::fingerprint(&d.spec),targets:vec![target()]}
+            }
+
+            fn tracked(f:&Fixture) {
+                let d=f.registry.get("obsolete").unwrap();
+                d.set_pending(vec![PendingVm::new(target().backend_sandbox_id.clone())]);
+                d.mutate_state(|s|s.create_attempts.push(CreateAttempt {
+                    name:"applb-obsolete-000000000001".into(),sandbox_id:Some(target().backend_sandbox_id)}));
+                f.registry.persist_one("obsolete").unwrap();
+            }
+
+            async fn call(f:&Fixture,method:&str,path:&str,body:Value,credential:bool) -> (StatusCode,Value) {
+                let mut req=Request::builder().method(method).uri(path).header(header::CONTENT_TYPE,"application/json");
+                if credential {req=req.header(header::AUTHORIZATION,"Basic b3BlcmF0b3I6cGFzc3dvcmQ=");}
+                let mut app=router(f.state.clone());
+                std::future::poll_fn(|cx|<Router as Service<Request<Body>>>::poll_ready(&mut app,cx)).await.unwrap();
+                let response=app.call(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                let status=response.status();
+                let bytes=axum::body::to_bytes(response.into_body(),1<<20).await.unwrap();
+                (status,serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+            }
+
+            async fn retire(f:&Fixture,r:&RetirementRequest)->(StatusCode,Value) {
+                call(f,"POST","/deployments/obsolete/retirement",serde_json::to_value(r).unwrap(),true).await
+            }
+
+            #[tokio::test]
+            async fn lost_receipt_restart_replay_and_controller_mutations_preserve_state() {
+                let b=Arc::new(Backend::default()); b.mode.store(2,Ordering::SeqCst);
+                let mut f=fixture_with_backend(true,backend_router(b.clone()),None).await;
+                auth(&mut f); tracked(&f);
+                let r=approve(&f);
+                let preserved=f.root.join("retained-workspace.ext4");
+                std::fs::write(&preserved,b"retained bytes").unwrap();
+                assert_eq!(retire(&f,&r).await.0,StatusCode::ACCEPTED);
+                assert_eq!(b.posts.load(Ordering::SeqCst),1);
+                assert_eq!(f.registry.get("obsolete").unwrap().state().retirement.as_ref().unwrap().state,"retiring");
+                // Reconstruct controller, workers and registry from the actual files.
+                let mut restarted=fixture_with_backend(true,backend_router(b.clone()),Some(f.root.clone())).await;
+                auth(&mut restarted);
+                let (status,result)=retire(&restarted,&r).await;
+                assert_eq!(status,StatusCode::OK,"{result}");
+                assert_eq!(result["state"],"retired");
+                assert_eq!(b.posts.load(Ordering::SeqCst),1,"lost response must be recovered by exact receipt, not another POST");
+                assert_eq!(retire(&restarted,&r).await.1,result);
+                let mut changed=r.clone(); changed.targets[0].libvirt_domain_uuid.push('0');
+                assert_eq!(retire(&restarted,&changed).await.0,StatusCode::CONFLICT);
+                for (method,path) in [("DELETE","/deployments/obsolete"),("DELETE","/deployments/obsolete/record"),
+                    ("POST","/deployments/obsolete/update"),("POST","/deployments/obsolete/build"),
+                    ("POST","/deployments/obsolete/exec"),("PATCH","/deployments/obsolete")] {
+                    assert_eq!(call(&restarted,method,path,json!({}),true).await.0,StatusCode::CONFLICT,"{method} {path}");
+                }
+                // An intentionally ungated legacy CRUD listener must also refuse.
+                restarted.state.gate_admin=false;
+                assert_eq!(call(&restarted,"DELETE","/deployments/obsolete",json!({}),false).await.0,StatusCode::CONFLICT);
+                assert_eq!(call(&restarted,"POST","/deployments",serde_json::to_value(empty().spec.clone()).unwrap(),false).await.0,StatusCode::CONFLICT);
+                restarted.state.autoscaler.adopt_existing().await;
+                restarted.state.autoscaler.reconcile().await;
+                restarted.state.autoscaler.sweep_suspended().await;
+                restarted.state.rollouts.tick().await;
+                assert_eq!(std::fs::read(&preserved).unwrap(),b"retained bytes");
+                assert!(persisted(&restarted.registry.state_dir()));
+                assert_eq!(restarted.mutations.load(Ordering::SeqCst),0,"no create, stop, DELETE or storage mutation");
+                assert_eq!(b.posts.load(Ordering::SeqCst),1);
+            }
+
+            #[tokio::test]
+            async fn pending_replays_exact_request_and_identity_mismatch_never_retargets() {
+                for mode in [1,3,4,5] {
+                    let b=Arc::new(Backend::default()); b.mode.store(mode,Ordering::SeqCst);
+                    let mut f=fixture_with_backend(true,backend_router(b.clone()),None).await;
+                    auth(&mut f); tracked(&f); let r=approve(&f);
+                    assert_eq!(retire(&f,&r).await.0,StatusCode::ACCEPTED);
+                    assert_ne!(f.registry.get("obsolete").unwrap().state().retirement.as_ref().unwrap().state,"retired");
+                    assert_eq!(retire(&f,&r).await.0,StatusCode::ACCEPTED);
+                    let requests=b.requests.lock().unwrap();
+                    assert!(requests.iter().all(|v|*v==json!({"operationId":"retire-1","target":target()})));
+                    if mode==3 {assert_eq!(requests.len(),0,"wrong backend creation identity must never receive retirement POST");}
+                    if mode==1 {assert_eq!(requests.len(),2,"only explicit retries may replay pending intent");}
+                    assert_eq!(f.mutations.load(Ordering::SeqCst),0,"redirects must not be followed");
+                }
+            }
+
+            #[tokio::test]
+            async fn authentication_stale_spec_legacy_history_and_unknown_create_fail_closed() {
+                for legacy in [false,true] {
+                    let b=Arc::new(Backend::default());
+                    let mut f=fixture_with_backend(true,backend_router(b.clone()),None).await;
+                    tracked(&f); let mut r=approve(&f);
+                    assert_eq!(retire(&f,&r).await.0,StatusCode::FORBIDDEN,"ungated is not authorization to retire");
+                    auth(&mut f);
+                    assert_eq!(call(&f,"POST","/deployments/obsolete/retirement",serde_json::to_value(&r).unwrap(),false).await.0,StatusCode::UNAUTHORIZED);
+                    r.expected_spec_sha256="0".repeat(64);
+                    assert_eq!(retire(&f,&r).await.0,StatusCode::CONFLICT);
+                    assert!(!f.registry.retirement_frozen("obsolete"));
+                    r=approve(&f);
+                    let d=f.registry.get("obsolete").unwrap();
+                    d.mutate_state(|s|if legacy {s.allocation_history_complete=false;} else {
+                        s.create_attempts.push(CreateAttempt {name:"unknown-create".into(),sandbox_id:None});
+                    });
+                    let (status,result)=retire(&f,&r).await;
+                    assert_eq!(status,StatusCode::ACCEPTED);
+                    assert!(result["unresolved"].as_str().unwrap().contains(if legacy {"legacy"} else {"ambiguous"}));
+                    assert_eq!(b.reads.load(Ordering::SeqCst),0);
+                    assert_eq!(b.posts.load(Ordering::SeqCst),0);
+                    let mut restarted=fixture_with_backend(true,backend_router(b.clone()),Some(f.root.clone())).await;
+                    auth(&mut restarted);
+                    assert_eq!(retire(&restarted,&r).await.1,result);
+                }
+            }
+
+            #[tokio::test]
+            async fn successful_legacy_create_is_not_an_exactly_once_allocation_receipt() {
+                let b=Arc::new(Backend::default());
+                let extra=backend_router(b.clone()).route("/sandbox-deploy",post(||async {
+                    (StatusCode::ACCEPTED,Json(json!({"id":"sb-12345678","status":"provisioning"})))
+                }));
+                let mut f=fixture_with_backend(true,extra,None).await;auth(&mut f);
+                let mut spec=empty().spec.clone();spec.scaling.min_replicas=1;
+                let d=f.registry.upsert(spec);
+                f.state.autoscaler.reconcile().await;
+                assert_eq!(d.pending().len(),1,"exercise successful SDK create through the real controller");
+                assert_eq!(d.state().create_attempts[0].sandbox_id.as_deref(),Some("sb-12345678"));
+                assert!(!d.state().allocation_history_complete,"queue redelivery could still create another sandbox");
+                let r=approve(&f);
+                let (status,result)=retire(&f,&r).await;
+                assert_eq!(status,StatusCode::ACCEPTED);
+                assert!(result["unresolved"].as_str().unwrap().contains("even after successful create"));
+                assert_eq!(b.posts.load(Ordering::SeqCst),0,"do not fabricate inventory closure before backend fencing");
+                let mut restarted=fixture_with_backend(true,backend_router(b.clone()),Some(f.root.clone())).await;
+                auth(&mut restarted);
+                assert_eq!(retire(&restarted,&r).await.1,result);
+            }
+
+            #[tokio::test]
+            async fn in_flight_create_finishes_before_inventory_freeze_and_unknown_outcome_stays_blocked() {
+                let entered=Arc::new(tokio::sync::Notify::new());
+                let release=Arc::new(tokio::sync::Semaphore::new(0));
+                let count=Arc::new(AtomicUsize::new(0));
+                let (e,s,c)=(entered.clone(),release.clone(),count.clone());
+                let extra=Router::new().route("/sandbox-deploy",post(move || {
+                    let (e,s,c)=(e.clone(),s.clone(),c.clone()); async move {
+                        c.fetch_add(1,Ordering::SeqCst);e.notify_one();
+                        let _permit=s.acquire().await.unwrap();
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }));
+                let mut f=fixture_with_backend(true,extra,None).await;auth(&mut f);
+                let mut spec=empty().spec.clone();spec.scaling.min_replicas=1;
+                let d=f.registry.upsert(spec);
+                // Known retained source plus one replacement currently allocating.
+                d.mutate_state(|s|s.create_attempts.push(CreateAttempt {name:"earlier".into(),sandbox_id:Some(target().backend_sandbox_id)}));
+                let r=approve(&f);
+                let scaler=f.state.autoscaler.clone();
+                let tick=tokio::spawn(async move {scaler.reconcile().await;});
+                tokio::time::timeout(Duration::from_secs(3),entered.notified()).await.unwrap();
+                let future=retire(&f,&r);tokio::pin!(future);
+                assert!(tokio::time::timeout(Duration::from_millis(30),&mut future).await.is_err());
+                assert!(!f.registry.retirement_frozen("obsolete"),"wait for the admitted allocation before snapshot");
+                release.add_permits(1);tick.await.unwrap();
+                let (status,result)=tokio::time::timeout(Duration::from_secs(3),&mut future).await.unwrap();
+                assert_eq!(status,StatusCode::ACCEPTED,"{result}");
+                assert!(result["unresolved"].as_str().unwrap().contains("ambiguous"));
+                f.state.autoscaler.reconcile().await;
+                assert_eq!(count.load(Ordering::SeqCst),1,"ambiguous create must not be repeated");
+                let mut restarted=fixture_with_backend(true,Router::new(),Some(f.root.clone())).await;auth(&mut restarted);
+                assert_eq!(retire(&restarted,&r).await.1,result);
+                restarted.state.autoscaler.reconcile().await;
+                assert_eq!(restarted.mutations.load(Ordering::SeqCst),0);
+            }
         }
 
         fn persisted(root: &FsPath) -> bool { root.join("obsolete.json").exists() }
