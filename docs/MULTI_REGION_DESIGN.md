@@ -35,12 +35,36 @@ including 70 successive failures returning candidate capacity to baseline;
 and the Postgres handoff test rejecting unsettled legacy failure. These are
 not live reclamation or regional rollout acceptance.
 
-Full private submission `01a0d939621d-00000056` is active, with Cloud validation
-`01a0d939621a-00000054` and heyvm validation `01a0d939621c-00000055`. Initial
-runner-tunnel connection resets triggered automatic retries. Remaining order:
-deploy backend verification to both hosts; deploy public app-lb/CI; reconcile
-the old operations using verified receipts; then record live capacity and
-public health. No manual production database correction was performed.
+Private submission `01a0d939621d-00000056` failed before deployment. Both remote
+compile operations completed with exit code 0, confirmed in the backend's
+persisted execution records, but CI lost its runner connection and encountered
+database pool timeouts while retrieving results. That is not successful CI
+validation, and no result was rewritten. A full retry of the same private
+revision is `01a0d95802e8-00000059`, with Cloud validation
+`01a0d95802e4-00000057` and heyvm validation `01a0d95802e6-00000058`.
+
+Read-only diagnostics found healthy host memory/disk capacity and successful
+fresh database TCP/TLS handshakes, but established database connections suffered
+retransmissions. Paired header-only captures (`job-6a01b2fcdf11` on eu1 and
+`job-a150103facb0` on us3) showed packets leaving eu1 absent at us3's capture
+point, followed by successful retransmission seconds later. This localizes loss
+between capture points; it does not establish a provider or NIC root cause.
+No firewall, NIC, database, or service-restart workaround was applied.
+
+The retry also encountered the existing 63-slot limit. Two additional idle,
+successful-run CI caches, `sb-20aa1a33` and `sb-0fa08d70`, were classified against
+service state, routes, metadata and owning runs, then destroyed through the
+owning-run CI API, which confirmed both deletions. Independent host inspection
+after the first deletion found both its sandbox and runtime directories absent
+and 62 reservations remaining. Candidate `sb-244b5380` was left untouched because
+its recorded guest IP also appeared in a database-related firewall rule. This
+is bounded release-capacity recovery, not proof that automatic reclamation is
+installed. Temporary diagnostic deployment registrations were removed.
+
+Remaining order: finish backend deployment to both hosts; deploy public
+app-lb/CI; reconcile the old operations using verified receipts; then record
+live capacity and public health. No manual production database correction was
+performed. The new reclamation protocol is not yet deployed.
 
 ## CI correction and release reconciliation — 2026-09-24
 
