@@ -173,7 +173,7 @@ VM-environment updates rebuild the active pool, so no such update was made to
 force S3 configuration before the CICD-managed replacement. Neither repository's
 GitHub secret names includes a Cargo/crates.io publishing credential either.
 
-Registry publication is no longer a prerequisite: CI now uses the exact
+Before registry access was available, CI used the exact
 `heyo-sdk` 0.1.12 Cargo package checked into `ci/vendor/heyo-sdk`. Its 29 files
 were compared byte-for-byte with the generated package; source revision and
 archive digest are recorded in `ci/README.md`. Cargo metadata resolves it as a
@@ -181,6 +181,24 @@ local package with no registry source. The existing CI source filter and Docker
 copy include it. Offline CI tests passed: 462 CI tests and 46 submit-client
 tests; 112 environment-dependent tests were ignored. The SDK's added containerd
 driver variant required the corresponding CI capability spelling.
+
+Publication subsequently succeeded with the operator-provided credential.
+The registry checksum matches the verified package exactly:
+`880dffb6c86fab2a1b0a98efab9cb38f5a193c67a47a8037445ca9f21fcf8344`.
+CI now pins the public `=0.1.12` package and removes the temporary source copy.
+Locked offline tests against the published package passed: 462 CI tests and
+46 submit-client tests, with 112 environment-dependent tests ignored.
+No publishing credential is required to consume this package.
+
+The canonical `ci-reports` values have delivery copies in both regional app-lb
+secret stores. Eu1 reports encrypted storage; us3 does not. This is not proof
+that the running CI processes have the report environment configured.
+Validation runs `01a0da95cd12-00000061` (cloud) and
+`01a0da95cd15-00000062` (heyvm) succeeded. Operator debug reports for both were
+uploaded to the private bucket and downloaded byte-for-byte. Their VMs have not
+yet been confirmed reclaimed. Full backend release `01a0da95cd16-00000063`
+is in progress; both regional cloud jobs succeeded, but backend completion and
+live resource reclamation acceptance remain outstanding.
 
 The installed CI VM still had 1,016 descriptors against a soft limit of 1,024.
 Through app-lb managed exec, raised PID 421's soft limit to its existing hard

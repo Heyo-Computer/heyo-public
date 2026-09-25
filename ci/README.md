@@ -22,23 +22,18 @@ workflow's worth of them per commit.
 - Optionally **app-lb** for workflow objects and sign-in, **heyosecret** for
   secrets, and the **artifacts** store.
 
-### Our SDK does not require a registry release
+### SDK package
 
-`ci/vendor/heyo-sdk` contains the complete Cargo package for our SDK 0.1.12,
-including the proxy connection-lifecycle fix. CI uses it as a version-checked
-path dependency. The normal source checkout, submission path filter and Docker
-`COPY ci/` already include it; no crates.io publishing token or private sibling
-checkout is needed. Other third-party crates still use their locked registry
-versions.
+CI pins our public `heyo-sdk` 0.1.12 release, including the proxy
+connection-lifecycle fix. Downloading it requires no publishing token or private
+sibling checkout. Its source is maintained in `sdk-rs` in the Heyo repository;
+CI does not carry a second source copy.
 
-This package was produced with `cargo package --locked --no-verify --manifest-path sdk-rs/Cargo.toml`
-from [SDK source revision 4fd3e85](https://github.com/Heyo-Computer/heyo/commit/4fd3e85fb0d12d4537b4448824b8b43dc18827c6).
-The resulting `.crate` SHA256 is
+The published package comes from
+[SDK source revision 4fd3e85](https://github.com/Heyo-Computer/heyo/commit/4fd3e85fb0d12d4537b4448824b8b43dc18827c6).
+Its registry SHA256 matches the package verified before publication:
 `880dffb6c86fab2a1b0a98efab9cb38f5a193c67a47a8037445ca9f21fcf8344`.
-Its contents are unchanged, including Cargo's normalized manifest and
-`.cargo_vcs_info.json`. Update the owning SDK source, regenerate the package,
-replace this directory, and update CI's version/lockfile together; do not patch
-the copied source independently.
+Cargo enforces that checksum through `ci/Cargo.lock`.
 
 ## Run
 
