@@ -71,6 +71,21 @@ use vm::Vms;
 async fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !args.is_empty() {
+        if args[0] == "--reconcile-service-rollout" && args.len() == 3 {
+            let result: anyhow::Result<()> = async {
+                let config = Config::from_env()?;
+                let store = Store::connect(&config.database_url, config.log_dir.clone(), config.db_statement_timeout).await?;
+                service_rollout::recover(&store, &secrets::Secrets::new(&config), &args[1], &args[2]).await
+            }.await;
+            match result {
+                Ok(()) => println!("Service rollout receipt checked; original run and job history preserved."),
+                Err(_) => {
+                    eprintln!("Service rollout recovery unresolved; drain fence retained.");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         if args[0] == "--deliver-host-bootstrap" && matches!(args.len(), 6 | 7) {
             let targets = std::env::var("CI_HOST_APP_LB_TARGETS").ok();
             let token = std::env::var("CI_HOST_APP_LB_TOKEN").unwrap_or_default();
@@ -369,6 +384,7 @@ async fn main() {
     dispatcher.clone().spawn_consumers();
     application_lifecycle::spawn(dispatcher.clone());
     controller_rollout::spawn(dispatcher.clone());
+    service_rollout::spawn(dispatcher.clone());
     managed_update::spawn(dispatcher.clone());
     host_maintenance::spawn(dispatcher.clone());
     host_heyvm_bootstrap_coordinator::spawn(dispatcher.clone());

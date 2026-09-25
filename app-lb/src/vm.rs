@@ -497,6 +497,25 @@ impl VmManager {
         serde_json::from_slice(&bytes).map_err(|_|"invalid retirement response".into())
     }
 
+    /// Require the lifecycle-locked host receipt; ordinary NotFound is not
+    /// evidence that all Firecracker state was reclaimed.
+    pub async fn firecracker_reclaimed(&self, sandbox_id: &str) -> Result<bool, String> {
+        if !crate::disks::valid_sandbox_id(sandbox_id) { return Err("invalid sandbox identity".into()); }
+        let key = self.client.api_key().filter(|v| !v.is_empty()).ok_or("reclamation receipt requires service authentication")?;
+        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never()).timeout(Duration::from_secs(10));
+        #[cfg(unix)]
+        if let Some(socket) = self.client.socket_path() { builder = builder.unix_socket(socket.to_path_buf()); }
+        let client = builder.build().map_err(|_| "cannot build exact reclamation transport")?;
+        let url = format!("{}/sandboxes/{}/firecracker-reclamation", self.client.base_url().trim_end_matches('/'), sandbox_id);
+        let response = client.get(url).bearer_auth(key).send().await.map_err(|_| "reclamation receipt unavailable")?;
+        if response.status() != reqwest::StatusCode::OK { return Err("reclamation receipt unavailable".into()); }
+        #[derive(serde::Deserialize)]
+        struct Receipt { protocol: String, sandbox_id: String, reclaimed: bool }
+        let receipt: Receipt = response.json().await.map_err(|_| "invalid reclamation receipt")?;
+        Ok(receipt.protocol == "firecracker-reclamation-v1" && receipt.sandbox_id == sandbox_id && receipt.reclaimed)
+    }
+
     /// The tail of what a guest itself printed, as the daemon captured it.
     ///
     /// heyvmd starts vsock forwarders inside the guest before it runs the start

@@ -35,7 +35,7 @@ impl Lifecycle {
         // These ledgers explicitly retain fences after a reported failure.
         // Never interpret a failed run or a polling timeout as remote teardown.
         let retained: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE phase NOT IN ('passed','superseded')) OR EXISTS(SELECT 1 FROM ci_service_deployment s WHERE s.status<>'passed' AND (EXISTS(SELECT 1 FROM ci_service_rollout r WHERE r.id=s.id) OR EXISTS(SELECT 1 FROM ci_host_app_lb h WHERE h.id=s.id)))"
+            "SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE phase NOT IN ('passed','superseded')) OR EXISTS(SELECT 1 FROM ci_service_deployment s WHERE s.status<>'passed' AND ((EXISTS(SELECT 1 FROM ci_service_rollout r WHERE r.id=s.id) AND (s.status<>'failed' OR s.phase IS DISTINCT FROM 'settled_failure')) OR EXISTS(SELECT 1 FROM ci_host_app_lb h WHERE h.id=s.id)))"
         ).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
         if blocked || retained { return Err("durable external-effect obligations remain".into()); }
         tx.commit().await.map_err(|e| e.to_string())
@@ -146,7 +146,7 @@ impl Lifecycle {
         // remote execution ended. Keep native and host-work obligations until
         // their owner has positively completed or handed off cleanup.
         let blocked: bool = sqlx::query(
-            "SELECT EXISTS(SELECT 1 FROM ci_job j JOIN ci_run r ON r.id=j.run_id WHERE j.status='running' OR (j.status IN ('pending','queued') AND r.status NOT IN ('success','failure','cancelled'))) AS jobs, (EXISTS(SELECT 1 FROM ci_vm_pool WHERE status IN ('claimed','building')) OR EXISTS(SELECT 1 FROM ci_host_work)) AS vms, EXISTS(SELECT 1 FROM ci_native_job WHERE state='leased') AS native, EXISTS(SELECT 1 FROM ci_service_deployment WHERE id<>$1 AND status NOT IN ('passed','failed')) AS effects"
+            "SELECT EXISTS(SELECT 1 FROM ci_job j JOIN ci_run r ON r.id=j.run_id WHERE j.status='running' OR (j.status IN ('pending','queued') AND r.status NOT IN ('success','failure','cancelled'))) AS jobs, (EXISTS(SELECT 1 FROM ci_vm_pool WHERE status IN ('claimed','building')) OR EXISTS(SELECT 1 FROM ci_host_work)) AS vms, EXISTS(SELECT 1 FROM ci_native_job WHERE state='leased') AS native, EXISTS(SELECT 1 FROM ci_service_deployment s WHERE id<>$1 AND (status NOT IN ('passed','failed') OR (status='failed' AND phase IS DISTINCT FROM 'settled_failure' AND EXISTS(SELECT 1 FROM ci_service_rollout r WHERE r.id=s.id)))) AS effects"
         ).bind(id).fetch_one(&mut *tx).await.map_err(|e|e.to_string())
         .map(|r| r.get::<bool,_>("jobs") || r.get::<bool,_>("vms") || r.get::<bool,_>("native") || r.get::<bool,_>("effects"))?;
         if blocked { tx.rollback().await.map_err(|e|e.to_string())?; return Ok(false); }

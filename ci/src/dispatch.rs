@@ -2790,6 +2790,8 @@ impl Dispatcher {
                     .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
             }
             "ci/rollout-service" => {
+                crate::host_maintenance::token_secret(step.with.get("token").map(String::as_str).unwrap_or(""))
+                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
                 let mount_path = required("mount-path")?;
                 let target = crate::service_rollout::Target {
                     url: required("url")?, deployment: required("deployment")?, namespace: required("namespace")?,

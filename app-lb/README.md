@@ -179,6 +179,13 @@ stage/status codes, not remote response bodies or credentials. Old operation
 records without this field remain readable. A failed preparation never creates
 a candidate or retires the serving generation.
 
+Failed pre-cutover rollouts remain reserved until every attempted Firecracker
+candidate has an authenticated host reclamation receipt. After cleanup progress
+and final settlement are durable, GET adds `failure_settlement` with protocol
+`failed-rollout-reclamation-v1` and the exact `reclaimed_candidate_ids`. A
+missing field means cleanup is unresolved; older hosts without the receipt API
+therefore retain the admission fence.
+
 `target_spec_sha256` hashes compact JSON of the **requested normalized spec**, with
 all object keys recursively sorted and array order preserved. A spec copied from
 GET is already normalized (including secret-reference namespaces). Rootfs import

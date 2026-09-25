@@ -53,20 +53,30 @@ pub struct Operation {
     pub stopped: Vec<String>,
     pub deadline: u64,
     pub drain_deadline: Option<u64>,
+    #[serde(default)]
+    pub reclaimed_candidate_ids: Vec<String>,
+    #[serde(default)]
+    pub failure_settled: bool,
 }
 
 impl Operation {
     pub fn view(&self) -> serde_json::Value {
-        serde_json::json!({"operation_id":self.operation_id,"deployment":self.deployment,
+        let mut view = serde_json::json!({"operation_id":self.operation_id,"deployment":self.deployment,
             "source_revision":self.source_revision,"target_spec_sha256":self.target_spec_sha256,
             "status":self.status,"phase":self.phase,"readiness_verified":self.readiness_verified,
-            "previous_stopped":self.previous_stopped,"error":self.error,"preparation_stage":self.preparation_stage})
+            "previous_stopped":self.previous_stopped,"error":self.error,"preparation_stage":self.preparation_stage});
+        if self.failure_settled {
+            view["failure_settlement"] = serde_json::json!({"protocol":"failed-rollout-reclamation-v1",
+                "reclaimed_candidate_ids":self.reclaimed_candidate_ids});
+        }
+        view
     }
 }
 
 pub fn reserved(d: &Deployment) -> bool {
     let state = d.state();
-    state.retirement.is_some() || state.rollouts.iter().any(|o| matches!(o.status.as_str(), "running" | "reconciliation_required"))
+    state.retirement.is_some() || state.rollouts.iter().any(|o| matches!(o.status.as_str(), "running" | "reconciliation_required")
+        || o.status == "failed" && !o.failure_settled)
         || state.create_attempts.iter().any(|a| a.allocation.is_some() && !a.runtime_observed)
         || state.route_handoff.as_ref().is_some_and(|h| h.phase != crate::registry::RouteHandoffPhase::Committed)
 }
@@ -126,6 +136,7 @@ pub trait Runtime: Send + Sync {
     async fn create(&self, spec: &DeploymentSpec, name: &str) -> Result<String, String>;
     async fn healthy(&self, info: &heyo_sdk::SandboxInfo, spec: &DeploymentSpec) -> Option<std::net::SocketAddr>;
     async fn stop(&self, id: &str) -> Result<(), String>;
+    async fn reclaim(&self, id: &str, name: &str) -> Result<bool, String>;
 }
 
 struct Live { scaler: Arc<crate::autoscale::Autoscaler>, jobs: Arc<crate::jobs::Jobs> }
@@ -139,6 +150,18 @@ impl Runtime for Live {
         crate::health::probe(addr, &spec.health).await.then_some(addr)
     }
     async fn stop(&self, id: &str) -> Result<(), String> { self.scaler.vms().suspend(id).await.map_err(|e| e.to_string()) }
+    async fn reclaim(&self, id: &str, name: &str) -> Result<bool, String> {
+        let vms = self.scaler.vms();
+        // Also checks capability before deletion on an older backend, and
+        // recovers a lost delete response without relying on a missing listing.
+        if vms.firecracker_reclaimed(id).await? { return Ok(true); }
+        let info = vms.connect(id.into()).map_err(|e| e.to_string())?.info().await.map_err(|e| e.to_string())?;
+        if info.id != id || info.name != name { return Err("candidate runtime identity mismatch".into()); }
+        if matches!(info.status, heyo_sdk::SandboxStatus::Provisioning | heyo_sdk::SandboxStatus::Unknown) { return Ok(false); }
+        if !vms.binds(id).await.map_err(|e| e.to_string())?.is_empty() { return Err("candidate has external proxy references".into()); }
+        vms.kill(id).await.map_err(|e| e.to_string())?;
+        vms.firecracker_reclaimed(id).await
+    }
 }
 
 pub struct Rollouts {
@@ -177,7 +200,8 @@ impl Rollouts {
             target_spec_sha256: hash, status: "running".into(), phase: "preparing".into(), readiness_verified: false, previous_stopped: false,
             error: None, preparation_stage: None, prefix: prefix.clone(), allocations: (0..count).map(|i| Allocation { name: format!("{prefix}{i:08x}"), sandbox_id: None, attempted: false }).collect(),
             previous: d.backends().iter().map(|b| b.sandbox_id.clone()).chain(d.state().suspended.iter().cloned()).collect(), stopped: vec![],
-            deadline: now_secs() + request.spec.scaling.boot_timeout_secs.max(30).min(1800), drain_deadline: None, spec: request.spec, prepared: None };
+            deadline: now_secs() + request.spec.scaling.boot_timeout_secs.max(30).min(1800), drain_deadline: None, spec: request.spec, prepared: None,
+            reclaimed_candidate_ids: vec![], failure_settled: false };
         let mut state = (*d.state()).clone(); state.rollouts.push(o.clone());
         self.save(d, state)?;
         Ok(o)
@@ -188,7 +212,17 @@ impl Rollouts {
             // Rename may already have happened. Freeze in memory, preserve all
             // allocation evidence, and let restart read the durable authority.
             if let Some(o) = state.rollouts.last_mut() {
-                o.status = "reconciliation_required".into(); o.error = Some(format!("persistence outcome uncertain: {e}"));
+                if o.status != "failed" { o.status = "reconciliation_required".into(); }
+                o.error = Some(format!("persistence outcome uncertain: {e}"));
+            }
+            let before = d.state();
+            for op in &mut state.rollouts {
+                if let Some(old) = before.rollouts.iter().find(|old| old.operation_id == op.operation_id) {
+                    if op.status == "failed" {
+                        op.failure_settled = old.failure_settled;
+                        op.reclaimed_candidate_ids = old.reclaimed_candidate_ids.clone();
+                    }
+                }
             }
             d.set_state(state);
             return Err(e.to_string());
@@ -201,7 +235,8 @@ impl Rollouts {
         let mut retiring = self.worker.lock().await;
         for d in self.registry.deployments().values() {
             if d.state().retirement.is_some() {continue;}
-            if let Some(index) = d.state().rollouts.iter().position(|o| o.status == "running") {
+            if let Some(index) = d.state().rollouts.iter().position(|o| o.status == "running"
+                || o.status == "failed" && !o.failure_settled) {
                 if let Err(e) = self.advance(d.clone(), index, &mut retiring).await {
                     tracing::warn!(deployment=%d.spec.id, error=%e, "candidate rollout paused");
                 }
@@ -218,6 +253,9 @@ impl Rollouts {
 
     async fn advance(&self, d: Arc<Deployment>, index: usize, retiring: &mut HashMap<String, Vec<Arc<VmBackend>>>) -> Result<(), String> {
         let mut o = d.state().rollouts[index].clone();
+        if o.status == "failed" && !o.failure_settled {
+            return self.settle_failure(&d, index, o).await;
+        }
         if o.phase != "draining" && now_secs() >= o.deadline {
             o.status = "failed".into();
             o.error = Some(if o.phase == "preparing" {
@@ -367,6 +405,56 @@ impl Rollouts {
         }
         Ok(())
     }
+
+    async fn settle_failure(&self, d: &Arc<Deployment>, index: usize, mut o: Operation) -> Result<(), String> {
+        if o.readiness_verified || !matches!(o.phase.as_str(), "preparing" | "creating" | "verifying") { return Ok(()); }
+        validate(&o.spec, &o.spec)?;
+        let _lifecycle = match &self.scaler { Some(s) => Some(s.rollout_guard().await), None => None };
+        let _change = self.registry.change_guard().await;
+        if !self.registry.get(&d.spec.id).is_some_and(|live| Arc::ptr_eq(&live, d)) { return Err("deployment changed".into()); }
+        let fleet = self.runtime.list().await?;
+        for allocation_index in 0..o.allocations.len() {
+            if !o.allocations[allocation_index].attempted {
+                if o.allocations[allocation_index].sandbox_id.is_some() { return Err("unattempted allocation has runtime identity".into()); }
+                continue;
+            }
+            if o.allocations[allocation_index].sandbox_id.is_none() {
+                let matches: Vec<_> = fleet.iter().filter(|info| info.name == o.allocations[allocation_index].name).collect();
+                if matches.len() != 1 || matches!(matches[0].status, heyo_sdk::SandboxStatus::Provisioning | heyo_sdk::SandboxStatus::Unknown) { return Ok(()); }
+                o.allocations[allocation_index].sandbox_id = Some(matches[0].id.clone());
+                let mut state = (*d.state()).clone(); state.rollouts[index] = o.clone(); self.save(d, state)?;
+            }
+            let allocation = &o.allocations[allocation_index];
+            let id = allocation.sandbox_id.as_ref().unwrap().clone();
+            if o.reclaimed_candidate_ids.contains(&id) { continue; }
+            if let Some(info) = fleet.iter().find(|info| info.id == id) {
+                if info.name != allocation.name { return Err("candidate runtime identity mismatch".into()); }
+            }
+            if self.reclamation_protected(&o.deployment, &o.operation_id, &id, &allocation.name) { return Ok(()); }
+            if !self.runtime.reclaim(&id, &allocation.name).await? { return Ok(()); }
+            o.reclaimed_candidate_ids.push(id);
+            let mut state = (*d.state()).clone(); state.rollouts[index] = o.clone(); self.save(d, state)?;
+        }
+        o.failure_settled = true;
+        let mut state = (*d.state()).clone(); state.rollouts[index] = o; self.save(d, state)
+    }
+
+    fn reclamation_protected(&self, deployment: &str, operation_id: &str, id: &str, name: &str) -> bool {
+        self.registry.deployments().values().any(|d| {
+            let state = d.state();
+            d.backends().iter().any(|b| b.sandbox_id == id) || d.pending().iter().any(|p| p.sandbox_id == id)
+                || state.suspended.iter().any(|v| v == id)
+                || state.active_prefix.as_ref().is_some_and(|prefix| name.starts_with(prefix))
+                || state.route_handoff.is_some()
+                || self.registry.allocation_protects(id)
+                || state.create_attempts.iter().any(|a| a.sandbox_id.as_deref() == Some(id))
+                || state.retirement.as_ref().is_some_and(|r| r.inventory.iter().any(|v| v == id)
+                    || r.request.targets.iter().any(|t| t.backend_sandbox_id == id))
+                || state.rollouts.iter().any(|other| other.previous.iter().any(|v| v == id)
+                    || (other.operation_id != operation_id || d.spec.id != deployment)
+                        && other.allocations.iter().any(|a| a.sandbox_id.as_deref() == Some(id)))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -377,11 +465,13 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         created: Mutex<Vec<(String, String)>>,
+        sequence: std::sync::atomic::AtomicUsize,
         stopped: Mutex<Vec<String>>,
         healthy: AtomicBool,
         lose_response: AtomicBool,
         hide: AtomicBool,
         stop_failure: AtomicBool,
+        reclaim_lose_response: AtomicBool,
         prepare_delay: Mutex<Duration>,
         prepare_failure: AtomicBool,
     }
@@ -408,7 +498,7 @@ mod tests {
         async fn create(&self, spec: &DeploymentSpec, name: &str) -> Result<String, String> {
             assert_eq!(spec.vm_spec().image.as_deref(), Some("verified-rootfs"));
             let mut created = self.created.lock().unwrap();
-            let id = format!("candidate-{}", created.len()); created.push((id.clone(), name.into()));
+            let id = format!("candidate-{}", self.sequence.fetch_add(1, Ordering::SeqCst)); created.push((id.clone(), name.into()));
             if self.lose_response.swap(false, Ordering::SeqCst) { Err("lost response".into()) } else { Ok(id) }
         }
         async fn healthy(&self, _: &heyo_sdk::SandboxInfo, _: &DeploymentSpec) -> Option<std::net::SocketAddr> {
@@ -417,6 +507,12 @@ mod tests {
         async fn stop(&self, id: &str) -> Result<(), String> {
             if self.stop_failure.load(Ordering::SeqCst) { return Err("stop failed".into()); }
             self.stopped.lock().unwrap().push(id.into()); Ok(())
+        }
+        async fn reclaim(&self, id: &str, _: &str) -> Result<bool, String> {
+            if self.stop_failure.load(Ordering::SeqCst) { return Err("delete or receipt failed".into()); }
+            self.created.lock().unwrap().retain(|(candidate, _)| candidate != id);
+            if self.reclaim_lose_response.swap(false, Ordering::SeqCst) { return Err("lost delete response".into()); }
+            self.stopped.lock().unwrap().push(id.into()); Ok(true)
         }
     }
     fn spec() -> DeploymentSpec {
@@ -654,5 +750,89 @@ mod tests {
         let e = engine(restarted.clone(), runtime.clone()); e.tick().await;
         assert_eq!(restarted.get("svc").unwrap().state().rollouts[0].status, "reconciliation_required");
         assert!(runtime.created.lock().unwrap().is_empty(), "unknown pre-create crash cannot be retried safely");
+    }
+
+    #[tokio::test]
+    async fn failed_candidates_are_reclaimed_and_zero_create_failure_settles() {
+        let (_dir, _registry, d, runtime, e, request) = setup();
+        for attempt in 0..70 {
+            let mut request = request.clone(); request.operation_id = format!("failure-{attempt}");
+            e.admit(&d, request).unwrap(); to_verifying(&e).await;
+            d.mutate_state(|s| s.rollouts[attempt].deadline = 0);
+            e.tick().await; e.tick().await;
+            let op = &d.state().rollouts[attempt];
+            assert!(op.failure_settled); assert_eq!(op.reclaimed_candidate_ids, vec![format!("candidate-{attempt}")]);
+            assert!(runtime.created.lock().unwrap().is_empty()); assert!(!reserved(&d));
+            assert_eq!(d.backends()[0].sandbox_id, "old-exact-id");
+        }
+
+        let (_dir, _registry, d, runtime, e, request) = setup();
+        runtime.prepare_failure.store(true, Ordering::SeqCst);
+        e.admit(&d, request).unwrap(); e.tick().await; e.tick().await;
+        assert!(d.state().rollouts[0].failure_settled);
+        assert!(d.state().rollouts[0].reclaimed_candidate_ids.is_empty());
+        assert!(runtime.created.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_reclamation_stays_reserved_and_lost_delete_response_recovers_after_restart() {
+        let (dir, _registry, d, runtime, e, request) = setup();
+        e.admit(&d, request).unwrap(); to_verifying(&e).await;
+        d.mutate_state(|s| s.rollouts[0].deadline = 0); e.tick().await;
+        runtime.stop_failure.store(true, Ordering::SeqCst); e.tick().await;
+        assert!(reserved(&d)); assert_eq!(runtime.created.lock().unwrap().len(), 1);
+        runtime.stop_failure.store(false, Ordering::SeqCst);
+        runtime.reclaim_lose_response.store(true, Ordering::SeqCst); e.tick().await;
+        assert!(reserved(&d)); assert!(!d.state().rollouts[0].failure_settled);
+        let restarted = Arc::new(Registry::new(dir.path().join("state.json"))); restarted.load().unwrap();
+        let e = engine(restarted.clone(), runtime.clone()); e.tick().await;
+        let current = restarted.get("svc").unwrap();
+        assert!(current.state().rollouts[0].failure_settled);
+        assert_eq!(runtime.created.lock().unwrap().len(), 0, "cleanup never recreates a candidate");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_or_referenced_failed_candidate_is_never_deleted() {
+        let (_dir, _registry, d, runtime, e, request) = setup();
+        runtime.lose_response.store(true, Ordering::SeqCst); runtime.hide.store(true, Ordering::SeqCst);
+        e.admit(&d, request).unwrap(); e.tick().await; e.tick().await;
+        d.mutate_state(|s| { s.rollouts[0].status = "failed".into(); s.rollouts[0].phase = "creating".into(); });
+        e.tick().await;
+        assert!(reserved(&d)); assert!(runtime.stopped.lock().unwrap().is_empty());
+
+        let (_dir, _registry, d, runtime, e, request) = setup();
+        e.admit(&d, request).unwrap(); to_verifying(&e).await;
+        let id = d.state().rollouts[0].allocations[0].sandbox_id.clone().unwrap();
+        d.mutate_state(|s| { s.rollouts[0].status = "failed".into(); s.rollouts[0].phase = "verifying".into(); });
+        d.set_backends(vec![Arc::new(VmBackend::new(id, "127.0.0.1:1234".parse().unwrap()))]);
+        e.tick().await;
+        assert!(!d.state().rollouts[0].failure_settled);
+        assert!(runtime.stopped.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_failed_operation_is_unsettled_and_has_no_public_receipt() {
+        let (_dir, _registry, d, _runtime, e, request) = setup();
+        let mut op = e.admit(&d, request).unwrap(); op.status = "failed".into();
+        let mut value = serde_json::to_value(&op).unwrap();
+        value.as_object_mut().unwrap().remove("failure_settled");
+        value.as_object_mut().unwrap().remove("reclaimed_candidate_ids");
+        let legacy: Operation = serde_json::from_value(value).unwrap();
+        assert!(!legacy.failure_settled);
+        assert!(legacy.view().get("failure_settlement").is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_settlement_persistence_does_not_publish_a_receipt() {
+        let (dir, registry, d, runtime, e, request) = setup();
+        runtime.prepare_failure.store(true, Ordering::SeqCst);
+        e.admit(&d, request).unwrap(); e.tick().await;
+        registry.fail_after_rename.store(true, Ordering::SeqCst); e.tick().await;
+        assert!(reserved(&d));
+        assert!(d.state().rollouts[0].view().get("failure_settlement").is_none());
+        let restarted = Arc::new(Registry::new(dir.path().join("state.json"))); restarted.load().unwrap();
+        let restored = restarted.get("svc").unwrap();
+        assert!(restored.state().rollouts[0].failure_settled);
+        assert!(runtime.stopped.lock().unwrap().is_empty());
     }
 }

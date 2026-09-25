@@ -1981,6 +1981,22 @@ slashes). Existing mount credentials are preserved. A different store needs an
 explicitly configured release-mount auth reference; credentials are never copied
 across stores. Only secret references, not their values, enter the rollout intent.
 
+The token must be a direct `${{ secrets.NAME }}` reference. After cancellation,
+deadline expiry, or controller restart, CI keeps polling the exact persisted
+operation using the original job's workflow/environment secret scope, including
+while draining. Only a matching terminal app-lb receipt releases the drain fence;
+failed operations additionally require a durable `failed-rollout-reclamation-v1`
+settlement proving candidate resource reclamation. CI records that evidence in
+the deployment event and `settled_failure` phase; a legacy `failed` status alone
+does not satisfy handoff. This requires backend reclamation support before
+app-lb can settle failures with candidate allocations.
+Missing operations, authentication failures, identity mismatches and ambiguous
+remote outcomes remain unresolved. Recovery never starts a candidate or rewrites
+the original run/job result. An operator upgrading a controller that predates this
+reconciler can run `ci --reconcile-service-rollout RUN_ID OPERATION_ID` with the
+controller's configured database and HeyoSecret bindings. This uses the same
+receipt-only recovery path, without migrations, job admission or broker startup.
+
 This action requires app-lb's conditional candidate rollout API, a pinned
 rootfs artifact, pinned read-only mounts and an HTTP readiness path. Catalog
 image names alone cannot prove rootfs identity. Workspace/writable deployments

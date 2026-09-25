@@ -826,5 +826,12 @@ mod tests {
         sqlx::query("UPDATE ci_host_maintenance SET phase='passed' WHERE id='maintenance'")
             .execute(f.store.pool()).await.unwrap();
         lifecycle.verify_handoff_quiesced(&f.store, "op").await.unwrap();
+        sqlx::query("INSERT INTO ci_service_rollout(id,intent,deadline) VALUES('maintenance','{}',now())")
+            .execute(f.store.pool()).await.unwrap();
+        assert!(lifecycle.verify_handoff_quiesced(&f.store, "op").await.is_err(),
+            "legacy failed service rollout has no reclamation receipt");
+        sqlx::query("UPDATE ci_service_deployment SET phase='settled_failure' WHERE id='maintenance'")
+            .execute(f.store.pool()).await.unwrap();
+        lifecycle.verify_handoff_quiesced(&f.store, "op").await.unwrap();
     }
 }
