@@ -197,8 +197,26 @@ Validation runs `01a0da95cd12-00000061` (cloud) and
 `01a0da95cd15-00000062` (heyvm) succeeded. Operator debug reports for both were
 uploaded to the private bucket and downloaded byte-for-byte. Their VMs have not
 yet been confirmed reclaimed. Full backend release `01a0da95cd16-00000063`
-is in progress; both regional cloud jobs succeeded, but backend completion and
-live resource reclamation acceptance remain outstanding.
+failed at 23:15 UTC: both regional cloud jobs succeeded, but us3 backend
+maintenance timed out in CI drain before backend submission. Eu1 backend and
+both heyvmd jobs were skipped. The us3 maintenance fence remains retained.
+
+Read-only recovery inventory (`job-793f4634c1a7`) found 35 host-work rows:
+34 on us3 associated with terminal jobs, plus one separate running native
+Windows job. Several rows represent earlier attempts whose sandbox association
+was overwritten by later attempts. The two claimed VMs are `sb-57d61813` and
+`sb-aa42ec19`; there are no durable `ci_vm_cleanup` handoffs. The database has
+no `ci_executor_owner` table, so the installed controller cannot be assumed to
+participate in the newer non-expiring execution-ownership protocol.
+
+Terminal job status does not prove that earlier remote commands or creates
+settled. The recovery must first fence the legacy executor against further
+effects, preserve shared data and diagnostics, and then reconcile exact attempt
+resources and receipts. Deleting host-work rows, assigning every historical
+attempt the current job sandbox, or ignoring the drain would erase uncertainty,
+not recover resources. No database writes, executor shutdown, credential
+revocation, or VM deletion were performed by this inventory. The temporary
+diagnostic command configuration was restored and read back exactly.
 
 The installed CI VM still had 1,016 descriptors against a soft limit of 1,024.
 Through app-lb managed exec, raised PID 421's soft limit to its existing hard
