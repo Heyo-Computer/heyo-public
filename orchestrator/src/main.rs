@@ -227,6 +227,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(handlers::application_update::create),
         )
         .route(
+            "/orchestration/services/{service_id}/managed-updates",
+            post(handlers::managed_update::create),
+        )
+        .route(
+            "/orchestration/services/{service_id}/managed-updates/{operation_id}",
+            get(handlers::managed_update::get),
+        )
+        .route(
             "/orchestration/services/{service_id}/instances/{deployment_id}/http-request",
             post(handlers::instance_http::forward).layer(DefaultBodyLimit::disable()),
         )

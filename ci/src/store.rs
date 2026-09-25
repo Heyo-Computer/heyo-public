@@ -1238,7 +1238,7 @@ impl Store {
             status = RunStatus::Cancelled;
         } else if matches!(status, RunStatus::Success) {
             let deployments: Vec<String> = sqlx::query_scalar(
-                "SELECT s.status FROM ci_service_deployment s JOIN ci_controller_rollout c ON c.id=s.id WHERE s.run_id=$1",
+                "SELECT s.status FROM ci_service_deployment s JOIN ci_controller_rollout c ON c.id=s.id WHERE s.run_id=$1 UNION ALL SELECT COALESCE(result,'running') FROM ci_managed_update WHERE run_id=$1",
             ).bind(run_id).fetch_all(&mut **tx).await.map_err(StoreError::sql)?;
             if deployments.iter().any(|s| s == "failed") {
                 status = RunStatus::Failure;
@@ -2940,6 +2940,32 @@ jobs:
             store.roll_up_run(&run_id).await.unwrap(),
             RunStatus::Failure
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL; no VM execution"]
+    async fn managed_update_completion_controls_run_result_and_preserves_cancellation() {
+        let store = test_store().await;
+        for outcome in ["passed", "failed", "cancelled"] {
+            let run = crate::vm::new_id();
+            store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+            for key in ["build-x86_64", "build-aarch64", "deploy"] {
+                store.set_job_status(&job_id(&run,key), JobStatus::Success, None).await.unwrap();
+            }
+            let job = job_id(&run,"deploy");
+            let step = format!("{job}:managed-update");
+            sqlx::query("INSERT INTO ci_step(id,job_id,idx,name,status) VALUES($1,$2,99,'managed-update','success')")
+                .bind(&step).bind(&job).execute(store.pool()).await.unwrap();
+            sqlx::query("INSERT INTO ci_managed_update(operation_id,step_id,run_id,job_id,service_id,request) VALUES($1,$2,$1,$3,$1,'{}')")
+                .bind(&run).bind(&step).bind(&job).execute(store.pool()).await.unwrap();
+            assert_eq!(store.roll_up_run(&run).await.unwrap(),RunStatus::Running);
+            assert!(store.get_run(&run).await.unwrap().unwrap().finished_at.is_none());
+            if outcome=="cancelled" {store.cancel_run(&run).await.unwrap();}
+            sqlx::query("UPDATE ci_managed_update SET result=$2 WHERE operation_id=$1")
+                .bind(&run).bind(if outcome=="failed" {"failed"} else {"passed"}).execute(store.pool()).await.unwrap();
+            assert_eq!(store.roll_up_run(&run).await.unwrap(),match outcome {
+                "passed"=>RunStatus::Success,"failed"=>RunStatus::Failure,_=>RunStatus::Cancelled});
+        }
     }
 
     /// A skipped job must not make the run fail — that is how a conditional

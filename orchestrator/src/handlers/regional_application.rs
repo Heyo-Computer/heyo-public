@@ -1,5 +1,4 @@
-//! V3 application lifecycle primitives. Public admission and automatic execution
-//! remain closed until the complete restore/bake/rollback program is integrated.
+//! V3 application lifecycle, restore/bake and fresh-identity rollback execution.
 use anyhow::{Context, Result};
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use serde_json::Value;
@@ -32,16 +31,15 @@ async fn dispatch_phase(db: &sea_orm::DatabaseConnection, service: &str, operati
     Ok(Some(phase))
 }
 
-/// Internal integration path only. Public admission and the background runner
-/// stay fenced until full candidate lifecycle and failure acceptance is proven.
+/// Dispatch the persisted application cursor without reinterpreting legacy plans.
 pub(super) async fn tick(state: &crate::AppState, db: &sea_orm::DatabaseConnection, service: &str, operation: &str) -> Result<()> {
     let Some(phase) = dispatch_phase(db,service,operation).await? else {return Ok(())};
     match phase.as_str() {
         "preflight" | "rollback_entry" => {preflight(state,db,service,operation).await?;}
-        "publish_policy" => {publish_policy(db,service,operation).await?;}
+        "publish_policy" => {publish_with_lifecycle(state,db,service,operation).await?;}
         "wait_policy_prepared" | "activate_policy" | "wait_policy_adopted" | "wait_assignments_drained"
             | "close_peer_admission" | "wait_admission_drained" => regional_reports::reconcile(state,db,service,operation).await?,
-        "create_candidate" => super::regional_candidates::create_or_recover(state,db,service,operation).await?,
+        "create_candidate" | "create_baseline" => super::regional_candidates::create_or_recover(state,db,service,operation).await?,
         "probe_candidates" | "probe_retained" => probe_and_stage(state,db,service,operation).await?,
         "bake" | "verify" | "verify_baseline" => {verify_serving(state,db,service,operation).await?;}
         _ => anyhow::bail!("unsupported application execution phase: {phase}"),
@@ -104,9 +102,40 @@ fn publication_policy(baseline: &super::regional_policy::RegionalPolicy, active:
 /// under the same lifecycle lock and active-predecessor CAS as the item journal.
 pub(super) async fn publish_policy(db: &sea_orm::DatabaseConnection, service: &str, operation: &str) -> Result<i64> {
     let tx = service_deploy::try_service_lifecycle_lock(db,service).await?.context("service lifecycle busy")?;
+    let row=tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT baseline_state FROM regional_service_rollouts WHERE operation_id=$1",[operation.into()])).await?.context("operation missing")?;
+    let baseline:Value=row.try_get("","baseline_state")?;
+    anyhow::ensure!(super::instance_http::Contract::from_metadata(&baseline["activeMetadata"]["source"])?.is_none(),
+        "lifecycle publication requires exact-instance retirement");
     let generation = publish_policy_in(&tx,service,operation).await?;
     tx.commit().await?;
     Ok(generation)
+}
+
+async fn publish_with_lifecycle(state:&crate::AppState, db:&sea_orm::DatabaseConnection,service:&str,operation:&str) -> Result<()> {
+    let lock=service_deploy::try_service_lifecycle_lock(db,service).await?.context("service lifecycle busy")?;
+    let row=lock.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT plan,region_index,slot_index,baseline_state FROM regional_service_rollouts
+         WHERE service_id=$1 AND operation_id=$2 AND phase='publish_policy' AND status='running'",
+        [service.into(),operation.into()])).await?.context("publication cursor changed")?;
+    let plan:Plan=serde_json::from_value(row.try_get("","plan")?)?;
+    let step=plan.step("publish_policy",row.try_get::<i32>("","region_index")?.try_into()?,row.try_get::<i32>("","slot_index")?.try_into()?)?;
+    if let Some(region)=&step.region {
+        let baseline:Value=row.try_get("","baseline_state")?;
+        let snapshot=service_discovery::read_snapshot_in(&lock,service,true).await?.context("discovery missing")?;
+        // A rollback may start after forward withdrawal, before any candidate
+        // became eligible. There is then no boot in this region to retire.
+        if (step.slot_index != 2 || snapshot.endpoints.iter().any(|e|e.region.as_deref()==Some(region) && !e.draining))
+            && !super::regional_lifecycle::before_withdrawal(state,db,operation,&step.id,service,region,
+                &baseline["activeMetadata"]["source"],&snapshot).await? {
+            lock.commit().await?; return Ok(());
+        }
+    }
+    // Barrier writes use the autocommit connection while this lifecycle lock
+    // remains held, so a lost reply cannot erase the pinned target set.
+    publish_policy_in(&lock,service,operation).await?;
+    lock.commit().await?;
+    Ok(())
 }
 
 async fn publish_policy_in(tx: &sea_orm::DatabaseTransaction, service: &str, operation: &str) -> Result<i64> {
@@ -272,6 +301,32 @@ pub(super) async fn preflight(state: &crate::AppState, db: &sea_orm::DatabaseCon
     Ok(advanced)
 }
 
+pub(super) async fn rollback_endpoints(db:&impl ConnectionTrait,operation:&str,baseline:&Value,regions:&[String]) -> Result<Vec<PinnedEndpoint>> {
+    let originals:Vec<PinnedEndpoint>=serde_json::from_value(baseline["regionalRetained"].clone())?;
+    let mut result=Vec::new();
+    for original in originals.into_iter().filter(|e|regions.contains(&e.region)) {
+        let Some(fresh)=baseline["regionalFreshBaseline"].as_array() else {result.push(original); continue};
+        let entry=fresh.iter().find(|e|e["originalDeploymentId"]==original.deployment_id).context("baseline recipe absent")?;
+        let entered=db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT 1 FROM regional_service_rollouts r CROSS JOIN LATERAL jsonb_array_elements(r.plan->'steps') s
+             JOIN regional_rollout_items i ON i.operation_id=r.operation_id AND i.step_id=s->>'id'
+             WHERE r.operation_id=$1 AND s->>'phase'='preflight' AND s->>'region'=$2 AND i.started_at IS NOT NULL",
+            [operation.into(),original.region.clone().into()])).await?.is_some();
+        if !entered {result.push(original); continue;}
+        let id=entry["deploymentId"].as_str().context("fresh identity absent")?;
+        let row=db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT intent,receipt FROM regional_candidate_creations WHERE operation_id=$1 AND deployment_id=$2",
+            [operation.into(),id.into()])).await?.context("fresh baseline creation missing; retained boot cannot be restored")?;
+        let intent:super::regional_candidates::Intent=serde_json::from_value(row.try_get("","intent")?)?;
+        let binding:super::regional_candidates::Binding=serde_json::from_value(row.try_get("","receipt")?)?;
+        anyhow::ensure!(intent.runtime_revision == original.revision && intent.region == original.region
+            && intent.archive_sha256 == entry["recipe"]["archiveSha256"],"fresh baseline provenance mismatch");
+        result.push(PinnedEndpoint {deployment_id:id.into(),backend_server_id:binding.backend_server_id,
+            region:original.region,revision:original.revision,url:binding.host_local_url});
+    }
+    Ok(result)
+}
+
 /// Probe every desired member through all pinned gateways, then change regional
 /// eligibility and complete the probe item atomically. No cached/caller-supplied
 /// receipt can authorize restoration, and no policy weight changes here.
@@ -296,9 +351,8 @@ pub(super) async fn probe_and_stage(state: &crate::AppState, db: &sea_orm::Datab
         "probe successor is not its policy restoration");
     let targets: Vec<(String,String)> = if phase == "probe_retained" {
         let baseline: Value = row.try_get("","baseline_state")?;
-        let retained: Vec<PinnedEndpoint> = serde_json::from_value(
-            baseline.get("regionalRetained").context("rollback has no retained baseline")?.clone())?;
-        retained.into_iter().filter(|e| e.region == region).map(|e| (e.deployment_id,e.revision)).collect()
+        rollback_endpoints(&lock,operation,&baseline,&[region.into()]).await?
+            .into_iter().map(|e| (e.deployment_id,e.revision)).collect()
     } else {
         let input: Value = row.try_get("","deployment_request")?;
         let revision = input["expectedRuntimeRevision"].as_str().filter(|s| !s.is_empty()).context("application revision missing")?;
@@ -394,9 +448,8 @@ async fn claim_serving_probe(db: &sea_orm::DatabaseConnection, service: &str,
         else {serde_json::from_value(row.try_get("","regions")?)?};
     let mut members: Vec<(String,String,String)> = if step.slot_index == 3 {
         let baseline: Value = row.try_get("","baseline_state")?;
-        let retained: Vec<PinnedEndpoint> = serde_json::from_value(
-            baseline.get("regionalRetained").context("rollback has no retained baseline")?.clone())?;
-        retained.into_iter().map(|e| (e.deployment_id,e.revision,e.region)).collect()
+        rollback_endpoints(&lock,operation,&baseline,&regions).await?
+            .into_iter().map(|e| (e.deployment_id,e.revision,e.region)).collect()
     } else {
         let input: Value = row.try_get("","deployment_request")?;
         let revision = input["expectedRuntimeRevision"].as_str().filter(|s| !s.is_empty()).context("application revision missing")?;
@@ -432,7 +485,7 @@ async fn complete_service_state(db: &sea_orm::DatabaseTransaction, service: &str
     row: &sea_orm::QueryResult, plan: &Plan, rollback: bool) -> Result<()> {
     let baseline: Value = row.try_get("","baseline_state")?;
     let retained: Vec<PinnedEndpoint> = serde_json::from_value(baseline.get("regionalRetained").context("retained baseline missing")?.clone())?;
-    let mut completed: service_deploy::ServiceDeploymentState = serde_json::from_value(baseline)?;
+    let mut completed: service_deploy::ServiceDeploymentState = serde_json::from_value(baseline.clone())?;
     anyhow::ensure!(completed.service_id == service && completed.route.is_some()
         && completed.ingress_backend_url.as_ref().is_some_and(|url| !url.is_empty()), "application has no pinned service ingress baseline");
     if !rollback {
@@ -468,6 +521,24 @@ async fn complete_service_state(db: &sea_orm::DatabaseTransaction, service: &str
             "deploymentId":completed.active_deployment_id,"archiveId":completed.active_archive_id,
             "archiveSha256":row.try_get::<String>("","target_revision")?,"source":request.metadata,
             "runtime":{"healthPath":request.health_path,"replicaRegions":completed.replica_regions},"regionalReplicas":replicas});
+    } else if baseline["regionalFreshBaseline"].is_array() {
+        let regions:Vec<String>=serde_json::from_value(row.try_get("","regions")?)?;
+        let endpoints=rollback_endpoints(db,operation,&baseline,&regions).await?;
+        let mut replicas=Vec::new();
+        for endpoint in &endpoints {
+            let recipe=super::service_recipe::load(db,service,&endpoint.deployment_id).await?;
+            replicas.push(serde_json::json!({"deploymentId":endpoint.deployment_id,"region":endpoint.region,
+                "revision":endpoint.revision,"archiveId":recipe.request.archive_id,"backendServerId":endpoint.backend_server_id,
+                "backendUrl":endpoint.url}));
+        }
+        let primary=replicas.first().context("rollback capacity missing")?;
+        completed.active_deployment_id=Some(primary["deploymentId"].as_str().unwrap().into());
+        completed.active_archive_id=Some(primary["archiveId"].as_str().context("rollback archive missing")?.into());
+        completed.active_backend_url=Some(primary["backendUrl"].as_str().unwrap().into());
+        completed.active_metadata["regionalReplicas"]=serde_json::json!(replicas);
+        completed.active_metadata["deploymentId"]=serde_json::json!(completed.active_deployment_id);
+        completed.active_metadata["archiveId"]=serde_json::json!(completed.active_archive_id);
+        completed.active_metadata["regionalOperationId"]=serde_json::json!(operation);
     }
     // Releasing regional ownership must not revive a historical cleanup intent
     // for the retained baseline, including after a successful forward rollout.
@@ -639,7 +710,9 @@ mod tests {
             include_str!("../../migrations/033_add_service_replica_placement.sql"),include_str!("../../migrations/035_add_regional_service_rollouts.sql"),
             include_str!("../../migrations/037_add_regional_routing_policy.sql"),include_str!("../../migrations/038_add_regional_policy_proposals.sql"),
             include_str!("../../migrations/039_add_regional_candidate_receipts.sql"),include_str!("../../migrations/040_add_application_plan_journal.sql"),
-            include_str!("../../migrations/041_add_application_probe_claims.sql")] {db.execute_unprepared(migration).await?;}
+            include_str!("../../migrations/041_add_application_probe_claims.sql"),
+            include_str!("../../migrations/044_regional_lifecycle_barriers.sql"),
+            include_str!("../../migrations/045_service_creation_recipes.sql")] {db.execute_unprepared(migration).await?;}
         let plan = Plan::application(&["eu1".into(),"us3".into()],&[("eu1".into(),"eu-new".into()),("us3".into(),"us-new".into())])?;
         let participants: Vec<_> = ["eu1","us3"].into_iter().map(|region| regional_reports::Participant {
             gateway_id:region.into(),region:region.into(),boot_id:uuid::Uuid::new_v4().to_string()}).collect();

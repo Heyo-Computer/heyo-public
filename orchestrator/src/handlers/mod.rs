@@ -1,6 +1,7 @@
 pub mod internal;
 pub mod application_update;
 pub mod instance_http;
+pub mod managed_update;
 mod host_ingress;
 pub mod orchestration;
 mod regional_admission;
@@ -17,4 +18,5 @@ pub mod regional_rollout;
 pub mod service_adoption;
 pub mod service_deploy;
 pub mod service_discovery;
+mod service_recipe;
 pub mod service_spec;

@@ -504,6 +504,10 @@ async fn deploy_service_inner(
     super::service_adoption::ensure_managed(&_guard, &service_id).await?;
     super::regional_rollout::ensure_no_regional_rollout(db::get_db()?, &service_id).await?;
     super::regional_policy::require_legacy_topology(db::get_db()?, &service_id).await?;
+    let baseline = read_service_state(&state,&service_id).await?;
+    anyhow::ensure!(!request.retire_previous
+        || super::instance_http::Contract::from_metadata(&baseline.active_metadata["source"])?.is_none(),
+        "application lifecycle replacement requires a managed regional operation");
     bind_deployment_environment_identity(
         &state,
         &service_id,
@@ -1461,8 +1465,9 @@ pub(super) async fn prepare_cloud_candidate(
     request: &mut ServiceDeployRequest,
     deployment_id: &str,
     excluded_backend_server_ids: Vec<String>,
-) -> Result<(CreateDeploymentRequest, String, Vec<ResolvedSecretRef>)> {
+) -> Result<(CreateDeploymentRequest, String, Vec<ResolvedSecretRef>, super::service_recipe::Recipe)> {
     let service_id = sanitize_service_id(&request.service_id)?;
+    let mut source = request.clone();
     let archive_bytes = load_archive_bytes(state, request).await?;
     let archive_sha256 = format!("{:x}", Sha256::digest(&archive_bytes));
     let archive_bytes = if request.archive_id.is_some() && request.archive_bytes_base64.is_none() {
@@ -1477,11 +1482,16 @@ pub(super) async fn prepare_cloud_candidate(
         request.ports.clone()
     };
     let resolved_secrets = resolve_env_refs(state, request).await?;
+    source.env_refs = resolved_secrets.iter().map(|s| format!("{}=heyosecret://{}@{}",s.env,s.path,s.version)).collect();
+    // The bound archive ID, not a mutable name or duplicated archive payload,
+    // supplies bytes on a future fresh-boot rollback.
+    source.archive_bytes_base64 = None;
     if super::instance_http::Contract::from_metadata(request.metadata.as_ref().unwrap_or(&serde_json::Value::Null))?.is_some() {
         let env = request.env.get_or_insert_with(HashMap::new);
         env.insert("HEYO_SERVICE_ID".into(), service_id.clone());
         env.insert("HEYO_DEPLOYMENT_ID".into(), deployment_id.into());
         env.insert("HEYO_REGION".into(), request.region.clone());
+        env.entry("HEYO_REVISION".into()).or_insert_with(||archive_sha256.clone());
     }
     let cloud_request = CreateDeploymentRequest {
         deployment_id: deployment_id.into(),
@@ -1512,7 +1522,11 @@ pub(super) async fn prepare_cloud_candidate(
         allowed_backend_server_ids: None,
         metadata: request.metadata.clone(),
     };
-    Ok((cloud_request, archive_sha256, resolved_secrets))
+    let guest_port = super::instance_http::Contract::from_metadata(source.metadata.as_ref().unwrap_or(&serde_json::Value::Null))?
+        .map(|c|c.port).or_else(||cloud_request.ports.first().copied())
+        .or_else(||cloud_request.port_mappings.first().map(|p|p.container)).context("creation recipe has no guest port")?;
+    let recipe = super::service_recipe::Recipe {request:source,archive_sha256:archive_sha256.clone(),guest_port};
+    Ok((cloud_request, archive_sha256, resolved_secrets, recipe))
 }
 
 async fn deploy_service_candidate(
@@ -1536,9 +1550,11 @@ async fn deploy_service_candidate(
         .clone()
         .unwrap_or_else(|| format!("svc-{service_id}-{}", Uuid::new_v4()));
 
-    let (cloud_request, archive_sha256, resolved_secrets) = prepare_cloud_candidate(
+    let (cloud_request, archive_sha256, resolved_secrets, recipe) = prepare_cloud_candidate(
         &state, &mut request, &deployment_id, excluded_backend_server_ids,
     ).await?;
+    super::service_recipe::record(db::get_db()?, &recipe, &cloud_request).await?;
+    let creation_digest = cloud_client::deployment_request_digest(&cloud_request)?;
 
     record_service_deployment_event(
         &state,
@@ -1746,6 +1762,11 @@ async fn deploy_service_candidate(
         )
         .await?;
 
+        let receipt = cloud_client::recover_deployment(&state,&deployment_id,&creation_digest,Some(recipe.guest_port)).await?;
+        verify_applied_placement(request.deployment_environment.as_deref(),request.placement_pool.as_deref(),
+            &request.region,&receipt.deployment)?;
+        super::service_recipe::bind(db::get_db()?,&deployment_id,serde_json::to_value(&receipt.deployment)?).await?;
+
         let previous_deployment_id = current_state.active_deployment_id.clone();
         let previous_archive_id = current_state.active_archive_id.clone();
         let previous_metadata = Some(current_state.active_metadata.clone());
@@ -1834,7 +1855,9 @@ async fn deploy_service_candidate(
             &deployment_id,
             create_response.backend_server_id.as_deref(),
             Some(&request.region),
-            Some(&archive_sha256),
+            Some(if super::instance_http::Contract::from_metadata(request.metadata.as_ref().unwrap_or(&serde_json::Value::Null))?.is_some() {
+                request.env.as_ref().and_then(|e|e.get("HEYO_REVISION")).map(String::as_str).unwrap_or(&archive_sha256)
+            } else { &archive_sha256 }),
             &backend_url,
             request.retire_previous,
         )

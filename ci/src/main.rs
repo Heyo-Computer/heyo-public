@@ -35,6 +35,7 @@ mod host_maintenance;
 mod heyo_ui;
 mod image;
 mod lifecycle;
+mod managed_update;
 mod nats_auth;
 mod native;
 mod objects;
@@ -317,12 +318,14 @@ async fn main() {
         (Some(id), Some(base)) => format!("{}/deployments/{id}", base.trim_end_matches('/')),
         _ => config.instance_id.clone(),
     });
+    let executor = if config.managed_deployment.is_some() {
+        executor::ExecutorOwner::register_managed(store.pool().clone(),&executor_identity).await
+    } else {
+        executor::ExecutorOwner::register(store.pool().clone(),&executor_identity).await
+    };
     let dispatcher = Arc::new(Dispatcher {
         lifecycle: Arc::new(lifecycle::Lifecycle::default()),
-        executor: Arc::new(match executor::ExecutorOwner::register(
-            store.pool().clone(),
-            &executor_identity,
-        ).await {
+        executor: Arc::new(match executor {
             Ok(owner) => owner,
             Err(e) => { eprintln!("ci: refusing to start — {e}"); std::process::exit(1); }
         }),
@@ -366,6 +369,7 @@ async fn main() {
     dispatcher.clone().spawn_consumers();
     application_lifecycle::spawn(dispatcher.clone());
     controller_rollout::spawn(dispatcher.clone());
+    managed_update::spawn(dispatcher.clone());
     host_maintenance::spawn(dispatcher.clone());
     host_heyvm_bootstrap_coordinator::spawn(dispatcher.clone());
     vm_cleanup::spawn(dispatcher.clone());

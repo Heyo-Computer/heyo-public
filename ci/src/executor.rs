@@ -64,16 +64,30 @@ impl ExecutorOwner {
     /// Register this unique process boot. The first registration initializes
     /// ownership; every later registration is a standby and cannot steal it.
     pub async fn register(pool: PgPool, deployment_id: &str) -> Result<Self, String> {
+        Self::register_in(pool,deployment_id,true).await
+    }
+
+    /// An empty table does not prove that an older, non-participating executor
+    /// has stopped. Managed bootstrap requires a separately verified cutover;
+    /// there is deliberately no environment switch to assert fencing here.
+    pub async fn register_managed(pool: PgPool, deployment_id: &str) -> Result<Self, String> {
+        Self::register_in(pool,deployment_id,false).await
+    }
+
+    async fn register_in(pool: PgPool, deployment_id: &str, initialize: bool) -> Result<Self, String> {
         if deployment_id.is_empty() { return Err("executor deployment identity must not be empty".into()); }
         let boot_id = Uuid::new_v4();
         let mut tx = pool.begin().await.map_err(db)?;
         sqlx::query("INSERT INTO ci_executor_boot(boot_id,deployment_id) VALUES($1,$2)")
             .bind(boot_id).bind(deployment_id).execute(&mut *tx).await.map_err(db)?;
-        sqlx::query("INSERT INTO ci_executor_owner(singleton,boot_id) VALUES(TRUE,$1) ON CONFLICT(singleton) DO NOTHING")
-            .bind(boot_id).execute(&mut *tx).await.map_err(db)?;
+        if initialize {
+            sqlx::query("INSERT INTO ci_executor_owner(singleton,boot_id) VALUES(TRUE,$1) ON CONFLICT(singleton) DO NOTHING")
+                .bind(boot_id).execute(&mut *tx).await.map_err(db)?;
+        }
         let (owner, owner_deployment): (Uuid, String) = sqlx::query_as(
             "SELECT o.boot_id,b.deployment_id FROM ci_executor_owner o JOIN ci_executor_boot b ON b.boot_id=o.boot_id WHERE o.singleton=TRUE",
-        ).fetch_one(&mut *tx).await.map_err(db)?;
+        ).fetch_optional(&mut *tx).await.map_err(db)?.ok_or_else(||
+            "managed CI bootstrap requires verified legacy-executor fencing and preserved shared state; empty ownership is not permission to schedule".to_owned())?;
         if owner != boot_id && owner_deployment == deployment_id {
             return Err("another boot of this deployment still owns execution; refusing readiness because an ordinary replacement would strand non-expiring ownership".into());
         }
@@ -269,6 +283,19 @@ mod tests {
         sqlx::raw_sql(include_str!("../migrations/034_executor_owner.sql"))
             .execute(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL"]
+    async fn managed_bootstrap_does_not_claim_empty_ownership() {
+        let pool=fixture().await;
+        assert!(ExecutorOwner::register_managed(pool.clone(),"managed-us").await.is_err());
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM ci_executor_owner").fetch_one(&pool).await.unwrap(),0);
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM ci_executor_boot").fetch_one(&pool).await.unwrap(),0);
+        let owner=ExecutorOwner::register(pool.clone(),"protocol-owner").await.unwrap();
+        let standby=ExecutorOwner::register_managed(pool.clone(),"managed-us").await.unwrap();
+        assert!(owner.effect_permit().await.is_ok());
+        assert!(standby.effect_permit().await.is_err());
     }
 
     #[tokio::test]

@@ -105,6 +105,27 @@ impl Plan {
         Ok(plan)
     }
 
+    /// Lifecycle-aware rollback creates new identities; historical retained
+    /// boots are evidence, never eligible rollback capacity.
+    pub fn fresh_rollback(&mut self, regions: &[String], slots: &[(String,String)]) -> Result<()> {
+        anyhow::ensure!(self.version == 3 && regions.iter().all(|r|slots.iter().any(|(s,_)|s==r)),
+            "fresh rollback requires a baseline candidate in every region");
+        self.rollback_steps.clear();
+        for (index,region) in regions.iter().enumerate().rev() {
+            push(&mut self.rollback_steps,"rollback_entry",Some(region.clone()),index,2,None);
+            policy_steps(&mut self.rollback_steps,Some(region.clone()),index,2);
+            for (slot,(_,id)) in slots.iter().filter(|(r,_)|r==region).enumerate() {
+                push(&mut self.rollback_steps,"create_baseline",Some(region.clone()),index,slot,Some(id.clone()));
+            }
+            push(&mut self.rollback_steps,"probe_retained",Some(region.clone()),index,2,None);
+            policy_steps(&mut self.rollback_steps,None,index,3);
+            push(&mut self.rollback_steps,"bake",Some(region.clone()),index,3,None);
+        }
+        push(&mut self.rollback_steps,"verify_baseline",Some(regions[0].clone()),0,3,None);
+        push(&mut self.rollback_steps,"rolled_back",Some(regions[0].clone()),0,3,None);
+        Ok(())
+    }
+
     pub fn step(&self, phase: &str, region: usize, slot: usize) -> Result<&Step> {
         if !matches!(self.version, 1..=3) {
             bail!("unsupported regional plan version {}; refusing to reinterpret it", self.version);
@@ -297,6 +318,40 @@ mod tests {
                 assert_eq!(untouched.try_get::<String>("","status")?,"pending","rollback must not enter an untouched future region");
             }
         }
+        let mut fresh = plan.clone();
+        fresh.fresh_rollback(&["us3".into(),"eu1".into()],&[
+            ("us3".into(),"fresh-us".into()),("eu1".into(),"fresh-eu-a".into()),("eu1".into(),"fresh-eu-b".into())])?;
+        insert(&db,"fresh-baseline",&fresh).await?;
+        let frontier=fresh.steps.iter().position(|s|s.id=="1:probe_candidates:0").unwrap();
+        for step in fresh.steps.iter().skip(1).take(frontier) {move_to(&db,"fresh-baseline",step).await?;}
+        move_to(&db,"fresh-baseline",fresh.step("rollback_entry",1,2)?).await?;
+        let first=fresh.rollback_steps.iter().position(|s|s.id=="1:create_baseline:0").unwrap();
+        for step in fresh.rollback_steps.iter().skip(1).take(first-1) {move_to(&db,"fresh-baseline",step).await?;}
+        assert!(move_to(&db,"fresh-baseline",fresh.step("probe_retained",1,2)?).await.is_err(),
+            "rollback cannot restore before fresh creation");
+        let restarted=sea_orm::Database::connect(options.clone()).await?;
+        for step in fresh.rollback_steps.iter().skip(first) {move_to(&restarted,"fresh-baseline",step).await?;}
+        assert!(move_to(&db,"fresh-baseline",fresh.step("create_baseline",1,0)?).await.is_err(),
+            "restart cannot create another baseline after completion");
+        db.execute_unprepared(include_str!("../../migrations/039_add_regional_candidate_receipts.sql")).await?;
+        let baseline=serde_json::json!({"regionalRetained":[{"deploymentId":"retired-eu","backendServerId":"old-host",
+            "region":"eu1","revision":"old-revision","url":"http://127.0.0.1:8001/"}],
+            "regionalFreshBaseline":[{"originalDeploymentId":"retired-eu","deploymentId":"fresh-eu-a",
+                "recipe":{"archiveSha256":"a".repeat(64)}}]});
+        assert!(super::super::regional_application::rollback_endpoints(&db,"fresh-baseline",&baseline,&["eu1".into()]).await.is_err(),
+            "missing fresh receipt must never fall back to retired identity");
+        let intent=serde_json::json!({"deploymentId":"fresh-eu-a","requestDigest":"digest","archiveSha256":"a".repeat(64),
+            "archiveId":"old-archive","runtimeRevision":"old-revision","region":"eu1","environment":"test",
+            "placementPool":"shared","guestPort":8080,"withdrawalGeneration":8,"allowedBackendIds":["fresh-host"]});
+        let binding=serde_json::json!({"backendServerId":"fresh-host","nodeId":"node","backendSandboxId":"fresh-runtime",
+            "archiveId":"old-archive","hostLocalUrl":"http://127.0.0.1:8002/"});
+        db.execute(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO regional_candidate_creations(operation_id,step_id,deployment_id,intent,receipt) VALUES('fresh-baseline','1:create_baseline:0','fresh-eu-a',$1,$2)",
+            [intent.into(),binding.into()])).await?;
+        let restored=super::super::regional_application::rollback_endpoints(&restarted,"fresh-baseline",&baseline,&["eu1".into()]).await?;
+        assert_eq!(restored[0].deployment_id,"fresh-eu-a");
+        assert_eq!(restored[0].backend_server_id,"fresh-host");
+        assert_eq!(restored[0].revision,"old-revision");
         let mut invalid = plan.clone();
         invalid.rollback_steps[0].id = invalid.steps[0].id.clone();
         assert!(insert(&db,"duplicate-identities",&invalid).await.is_err());

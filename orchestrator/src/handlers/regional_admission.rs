@@ -376,6 +376,18 @@ async fn application_baseline(db: &impl ConnectionTrait, request: &Request, regi
         && route.path_prefix.as_deref().is_none_or(|p| p == "/"),"baseline requires the same whole-host route");
     let mut value = serde_json::to_value(baseline)?;
     value["regionalPolicy"] = json!(policy);
+    if super::instance_http::Contract::from_metadata(&value["activeMetadata"]["source"])?.is_some() {
+        let mut fresh=Vec::new();
+        for (index,endpoint) in retained.iter().enumerate() {
+            let recipe=super::service_recipe::load(db,&request.service_id,&endpoint.deployment_id).await?;
+            anyhow::ensure!(recipe.request.region == endpoint.region
+                && recipe.request.deployment_environment.as_deref() == Some(&request.environment),
+                "baseline creation recipe placement differs from endpoint");
+            fresh.push(json!({"deploymentId":super::regional_rollout::candidate_id(&format!("{}-baseline",request.operation_id),index),
+                "originalDeploymentId":endpoint.deployment_id,"region":endpoint.region,"revision":endpoint.revision,"recipe":recipe}));
+        }
+        value["regionalFreshBaseline"]=json!(fresh);
+    }
     value["regionalRetained"] = json!(retained);
     Ok(value)
 }
@@ -421,9 +433,9 @@ pub(super) fn admit_application<'a>(state: &'a crate::AppState, db: &'a sea_orm:
     super::service_adoption::ensure_managed(&tx,&scope.service_id).await?;
     if application_exists(&tx,request,&hash).await? { return Ok(false); }
     let mut baseline = application_baseline(&tx,&scope,&regions,rollout.minimum_serving_replicas.into()).await?;
-    anyhow::ensure!(super::instance_http::Contract::from_metadata(&baseline["activeMetadata"]["source"])?.is_none()
-        && super::instance_http::Contract::from_metadata(deployment.metadata.as_ref().unwrap_or(&Value::Null))?.is_none(),
-        "hierarchical application lifecycle retirement is not integrated; refusing an unbarriered rollout");
+    anyhow::ensure!(baseline["activeMetadata"]["source"]["applicationLifecycle"]
+        == deployment.metadata.as_ref().unwrap_or(&Value::Null)["applicationLifecycle"],
+        "application lifecycle contract changes require a separate verified migration");
     tx.commit().await?;
     let active: RegionalPolicy = serde_json::from_value(baseline["regionalPolicy"].clone())?;
     for region in &regions {
@@ -435,6 +447,10 @@ pub(super) fn admit_application<'a>(state: &'a crate::AppState, db: &'a sea_orm:
             "pinned regional fleet cannot place distinct candidate slots");
     }
     let target = service_deploy::regional_revision(state,deployment).await?;
+    if let Some(command)=deployment.metadata.as_ref().and_then(|m|m.get("managedUpdate")) {
+        anyhow::ensure!(command["archiveSha256"]==target && command["runtimeRevision"]==request.runtime_revision
+            && command["archiveId"].as_str()==deployment.archive_id.as_deref(),"managed archive differs from verified release intent");
+    }
     let observed = Instant::now();
     let fleet = inspect_fleet(state,&scope,&active).await?;
     let participants: Vec<_> = fleet.iter().map(|p| p.participant.clone()).collect();
@@ -459,7 +475,40 @@ pub(super) fn admit_application<'a>(state: &'a crate::AppState, db: &'a sea_orm:
     }
     let candidates: Vec<_> = deployment.replica_regions.iter().enumerate().map(|(i,r)|
         (r.clone(),regional_rollout::candidate_id(&rollout.operation_id,i))).collect();
-    let plan = super::regional_plan::Plan::application(&regions,&candidates)?;
+    let mut plan = super::regional_plan::Plan::application(&regions,&candidates)?;
+    if let Some(fresh)=baseline["regionalFreshBaseline"].as_array() {
+        let slots=fresh.iter().map(|e| Ok((e["region"].as_str().context("baseline region missing")?.to_owned(),
+            e["deploymentId"].as_str().context("baseline candidate missing")?.to_owned()))).collect::<Result<Vec<_>>>()?;
+        plan.fresh_rollback(&regions,&slots)?;
+        let mut targets=Vec::new();
+        for region in &regions {
+            let originals:Vec<_>=fresh.iter().filter(|e|e["region"]==*region).collect();
+            let replacements:Vec<_>=candidates.iter().filter(|(r,_)|r==region).collect();
+            anyhow::ensure!(originals.len()==replacements.len(),"lifecycle revision update must preserve regional replica counts");
+            for (old,(_,id)) in originals.iter().zip(replacements) {
+                let mut recipe:super::service_recipe::Recipe=serde_json::from_value(old["recipe"].clone())?;
+                // App-scoped self-release only replaces revision bytes. An
+                // operator's ordinary managed update still owns its requested
+                // configuration and explicit per-region runtime overrides.
+                if deployment.metadata.as_ref().and_then(|m|m.get("managedUpdate")).is_none() {
+                    recipe.request=deployment.clone();
+                    recipe.request.region=region.clone();
+                    recipe.guest_port=request.guest_port;
+                    if let Some(runtime)=rollout.runtime_by_region.get(region) {
+                        recipe.request.driver=runtime.driver.clone();
+                        recipe.request.image=runtime.image.clone();
+                        recipe.request.size_class=runtime.size_class.clone();
+                    }
+                }
+                recipe.request.archive_id=deployment.archive_id.clone();
+                recipe.request.archive_bytes_base64=deployment.archive_bytes_base64.clone();
+                recipe.request.metadata=deployment.metadata.clone();
+                recipe.archive_sha256=target.clone();
+                targets.push(json!({"deploymentId":id,"region":region,"revision":request.runtime_revision,"recipe":recipe}));
+            }
+        }
+        baseline["regionalTargetRecipes"]=json!(targets);
+    }
     let slots: Vec<_> = candidates.iter().enumerate().map(|(i,(region,id))| json!({"index":i,"region":region,
         "candidateId":id,"runtime":rollout.runtime_by_region.get(region)})).collect();
     baseline["regionalFleet"] = json!(fleet);

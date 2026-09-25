@@ -359,8 +359,7 @@ pub(super) async fn probe_candidate(state: &AppState, db: &sea_orm::DatabaseConn
     if phase == "probe_retained" || (status == "running" && serving && slot_index == 3) {
         anyhow::ensure!(plan.version == 3, "retained probes require an application rollback plan");
         let baseline: serde_json::Value = row.try_get("","baseline_state")?;
-        let retained: Vec<super::regional_admission::PinnedEndpoint> = serde_json::from_value(
-            baseline.get("regionalRetained").context("rollback has no pinned retained baseline")?.clone())?;
+        let retained = super::regional_application::rollback_endpoints(&lock,operation,&baseline,&[region.into()]).await?;
         anyhow::ensure!(retained.iter().filter(|p| p.deployment_id == candidate).count() == 1
             && retained.iter().any(|p| p.matches(endpoint)), "rollback discovery differs from the pinned retained baseline");
     } else if status == "running" {

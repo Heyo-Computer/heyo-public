@@ -2764,8 +2764,13 @@ impl Dispatcher {
                     .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
             }
             "ci/deploy-controller" => {
-                crate::controller_rollout::request(self, msg, sid, &required("artifact")?, with("workflow").as_deref()).await
-                    .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
+                if self.config.managed_deployment.is_some() {
+                    crate::managed_update::request(self,msg,sid,&required("archive-id")?).await
+                        .map(|note|(note,json!({}))).map_err(|e|DispatchError::StepFailed(e.to_string()))
+                } else {
+                    crate::controller_rollout::request(self, msg, sid, &required("artifact")?, with("workflow").as_deref()).await
+                        .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
+                }
             }
             "ci/host-heyvm-maintenance" => {
                 required("token")?;
@@ -6407,6 +6412,83 @@ mod tests {
         d.lifecycle.verify_handoff_quiesced(&d.store, "op").await.unwrap();
         assert_eq!(d.store.get_job("job").await.unwrap().unwrap().status, "success");
         drop(fence);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; run alone; no VM execution"]
+    async fn managed_release_reconciles_after_job_exit_and_replays_uncertain_submission() {
+        use axum::{routing::{get,post},Router,Json,http::{HeaderMap,StatusCode}};
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let command=serde_json::json!({"operationId":"release","archiveId":"archive-v2",
+            "archiveSha256":"a".repeat(64),"runtimeRevision":"revision-v2"});
+        let posts=Arc::new(AtomicUsize::new(0));
+        let mode=Arc::new(AtomicUsize::new(0));
+        let receipt=serde_json::json!({"operationId":"release","serviceId":"ci","request":command,
+            "status":"running","verified":false,"targets":[
+                {"deploymentId":"new-us","region":"us3","revision":"revision-v2"},
+                {"deploymentId":"new-eu","region":"eu1","revision":"revision-v2"}]});
+        let p=posts.clone(); let expected=command.clone(); let submitted=receipt.clone();
+        let m=mode.clone(); let mut completed=receipt.clone();
+        completed["status"]=serde_json::json!("passed"); completed["verified"]=serde_json::json!(true);
+        for t in completed["targets"].as_array_mut().unwrap() {
+            t["bootId"]=serde_json::json!(uuid::Uuid::new_v4());
+            t["backendServerId"]=serde_json::json!(format!("host-{}",t["region"]));
+            t["backendSandboxId"]=t["deploymentId"].clone();
+        }
+        let api=Router::new().route("/orchestration/services/ci/managed-updates",post(move |headers:HeaderMap,Json(body):Json<serde_json::Value>| {
+            let p=p.clone(); let expected=expected.clone(); let response=submitted.clone(); async move {
+                assert_eq!(headers["authorization"],"Bearer lifecycle-test"); assert_eq!(body,expected);
+                if p.fetch_add(1,Ordering::SeqCst)==0 {(StatusCode::SERVICE_UNAVAILABLE,Json(serde_json::Value::Null))}
+                else {(StatusCode::ACCEPTED,Json(response))}
+            }
+        })).route("/orchestration/services/ci/managed-updates/release",get(move || {
+            let mode=m.load(Ordering::SeqCst); let mut response=completed.clone(); async move {
+                if mode==0 {response["targets"][1]["deploymentId"]=serde_json::json!("wrong-eu");}
+                Json(response)
+            }
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {axum::serve(listener,api).await.unwrap()});
+        let base=std::env::var("CI_TEST_DATABASE_URL").unwrap();
+        let admin=sqlx::PgPool::connect(&base).await.unwrap();
+        let schema=format!("managed_release_{}",uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&admin).await.unwrap();
+        let mut url=reqwest::Url::parse(&base).unwrap();
+        url.query_pairs_mut().append_pair("options",&format!("-c search_path={schema}"));
+        unsafe {
+            std::env::set_var("CI_TEST_DATABASE_URL",url.as_str());
+            std::env::set_var("HEYO_DEPLOYMENT_ID","old-us");
+            std::env::set_var("HEYO_SERVICE_ID","ci");
+            std::env::set_var("CI_APPLICATION_ORCHESTRATOR_URL",address);
+            std::env::set_var("CI_APPLICATION_LIFECYCLE_TOKEN","lifecycle-test");
+        }
+        let root=tempfile::tempdir().unwrap(); let d=test_dispatcher(root.path()).await;
+        unsafe {
+            std::env::set_var("CI_TEST_DATABASE_URL",base);
+            for key in ["HEYO_DEPLOYMENT_ID","HEYO_SERVICE_ID","CI_APPLICATION_ORCHESTRATOR_URL","CI_APPLICATION_LIFECYCLE_TOKEN"] {std::env::remove_var(key);}
+        }
+        sqlx::raw_sql("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES('run','test','ci.yml','running');
+            INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES('job','run','deploy','deploy','Deploy','running');
+            INSERT INTO ci_step(id,job_id,idx,name,status) VALUES('step','job',0,'Request','success');")
+            .execute(d.store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_managed_update(operation_id,step_id,run_id,job_id,service_id,request) VALUES('release','step','run','job','ci',$1)")
+            .bind(&command).execute(d.store.pool()).await.unwrap();
+        crate::managed_update::reconcile(&d).await.unwrap(); assert_eq!(posts.load(Ordering::SeqCst),0);
+        d.store.set_job_status("job",crate::store::JobStatus::Success,None).await.unwrap();
+        assert!(crate::managed_update::reconcile(&d).await.is_err());
+        assert_eq!(posts.load(Ordering::SeqCst),1);
+        // The failed HTTP observation must not retain the local effect permit.
+        drop(tokio::time::timeout(Duration::from_secs(1),d.executor.handoff_fence()).await.unwrap().unwrap());
+        crate::managed_update::reconcile(&d).await.unwrap(); assert_eq!(posts.load(Ordering::SeqCst),2);
+        assert_eq!(d.store.get_run("run").await.unwrap().unwrap().status,"running");
+        assert!(crate::managed_update::reconcile(&d).await.is_err(),"changed regional identity cannot complete the release");
+        mode.store(1,Ordering::SeqCst);
+        crate::managed_update::reconcile(&d).await.unwrap();
+        assert_eq!(d.store.get_run("run").await.unwrap().unwrap().status,"success");
+        crate::managed_update::reconcile(&d).await.unwrap(); assert_eq!(posts.load(Ordering::SeqCst),2);
+        server.abort();
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
     }
 
     #[tokio::test]

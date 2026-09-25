@@ -1401,15 +1401,31 @@ raw streaming bodies and base64url-no-pad metadata capped at 16KiB; this is not 
 limit. Full large-artifact transport parity has not been tested.
 
 **This is not a completed or deployed managed two-region application.** The
-legacy managed regional controller has the pre-withdrawal barrier; hierarchical
-application plans reject lifecycle contracts until integrated. Lifecycle rollback
-is blocked: it must create a fresh baseline-revision boot from a proven exact
-recipe, not reactivate retained retired boots. Scalar previous metadata and
-`envRefCount` are not that recipe. Managed self-release currently refuses direct
-app-lb replacement; asynchronous platform submission and verification of both
-regional target identities remain unimplemented. The old external-service
-adoption binding still represents one deployment and must not label a singleton
-as a two-region CI service.
+legacy and v3 hierarchical managed controllers execute the pre-withdrawal barrier.
+New managed deployments capture immutable per-endpoint creation recipes with
+versioned secret references before creation and bind authenticated runtime receipts.
+Lifecycle rollback creates fresh baseline identities; it cannot reactivate retained
+retired boots. Existing endpoints without proven recipes fail closed. Scalar
+previous metadata and `envRefCount` are not a creation recipe.
+
+Managed `ci/deploy-controller` requires `with.archive-id` from the existing
+publish/promote-service-archive path for the confirmed release SHA. It records an
+intent, lets the release job finish, then asynchronously submits the ordinary
+Orchestrator managed update. The CI run remains pending until platform bake and
+exact boot/runtime verification of every regional target complete. An uncertain
+submission replays the same operation and command. This does not use the old
+direct app-lb self-replacement dispatcher. Composed full-stack acceptance remains
+outstanding; the external-service binding is still single-deployment and must not
+be used to label the singleton as a two-region service.
+
+**Initial managed CI startup fails closed on an empty executor-owner table.** An
+older singleton can still schedule without participating in this protocol. Empty
+ownership, empty Orchestrator discovery, or a successful stop with unknown runtime
+status do not prove it fenced. There is no bootstrap bypass flag. A supported
+legacy cutover must first establish authoritative non-restarting runtime fencing,
+preserve and reconcile shared database/job/source/log/artifact state, and provide
+a durable verified initial-owner handoff. That cutover/initialization capability is
+not implemented; do not initialize the owner table manually to bypass this gate.
 
 The exact-runtime Cloud transport must never wake stopped instances, retry, follow
 redirects or silently substitute another backend. The public client checks echoed

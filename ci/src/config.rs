@@ -662,7 +662,7 @@ impl Config {
             managed_deployment: opt("HEYO_DEPLOYMENT_ID"),
             application_orchestrator_url: opt("CI_APPLICATION_ORCHESTRATOR_URL").map(|u| u.trim_end_matches('/').to_string()),
             application_lifecycle_token: opt("CI_APPLICATION_LIFECYCLE_TOKEN"),
-            expected_sha: opt("CI_EXPECTED_SHA"),
+            expected_sha: opt("HEYO_REVISION").or_else(||opt("CI_EXPECTED_SHA")),
             host_maintenance_targets: opt("CI_HOST_MAINTENANCE_TARGETS"),
             host_app_lb_targets: opt("CI_HOST_APP_LB_TARGETS"),
             host_heyvm_bootstrap_targets: opt("CI_HOST_HEYVM_BOOTSTRAP_TARGETS"),

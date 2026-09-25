@@ -1,5 +1,5 @@
 //! Candidate creation evidence owned by the regional plan, not a second queue.
-//! Admission/executor wiring remains closed until the complete lifecycle exists.
+//! Forward and fresh-baseline candidates share immutable intents and recovery.
 use anyhow::{Context, Result};
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use serde::{Deserialize, Serialize};
@@ -32,22 +32,36 @@ pub(super) struct Binding {
     pub host_local_url: String,
 }
 
+fn creation_input(row:&sea_orm::QueryResult, step:&super::regional_plan::Step) -> Result<(serde_json::Value,String)> {
+    let baseline:serde_json::Value=row.try_get("","baseline_state")?;
+    let key=if step.phase=="create_baseline" {"regionalFreshBaseline"} else {"regionalTargetRecipes"};
+    if step.phase == "create_baseline" || baseline[key].is_array() {
+        let entry=baseline[key].as_array().context("creation recipes missing")?.iter()
+            .find(|e|e["deploymentId"].as_str()==step.candidate_id.as_deref()).context("fresh baseline recipe missing")?;
+        let recipe:super::service_recipe::Recipe=serde_json::from_value(entry["recipe"].clone())?;
+        let mut input=serde_json::to_value(recipe.request)?;
+        input["expectedRuntimeRevision"]=entry["revision"].clone();
+        input["guestPort"]=serde_json::json!(recipe.guest_port);
+        Ok((input,recipe.archive_sha256))
+    } else { Ok((row.try_get("","deployment_request")?,row.try_get("","target_revision")?)) }
+}
+
 /// Execute the persisted candidate item. Once an intent exists, recovery never
 /// reloads archives/secrets and never POSTs again, even after an uncertain create.
 pub(super) async fn create_or_recover(state: &AppState, db: &sea_orm::DatabaseConnection,
     service: &str, operation: &str) -> Result<()> {
     let row = db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
-        "SELECT r.plan,r.region_index,r.slot_index,r.deployment_request,r.slots,c.intent
+        "SELECT r.plan,r.phase,r.region_index,r.slot_index,r.deployment_request,r.target_revision,r.baseline_state,r.slots,c.intent
          FROM regional_service_rollouts r LEFT JOIN regional_candidate_creations c
          ON c.operation_id=r.operation_id AND c.step_id=r.region_index || ':' || r.phase || ':' || r.slot_index
-         WHERE r.service_id=$1 AND r.operation_id=$2 AND r.status='running' AND r.phase='create_candidate'",
+         WHERE r.service_id=$1 AND r.operation_id=$2 AND r.status='running' AND r.phase IN ('create_candidate','create_baseline')",
         [service.into(),operation.into()])).await?.context("candidate has no owning create item")?;
     let plan: Plan = serde_json::from_value(row.try_get("","plan")?)?;
     anyhow::ensure!(plan.version == 3, "candidate execution requires an application plan");
-    let item = plan.step("create_candidate",row.try_get::<i32>("","region_index")?.try_into()?,
+    let item = plan.step(&row.try_get::<String>("","phase")?,row.try_get::<i32>("","region_index")?.try_into()?,
         row.try_get::<i32>("","slot_index")?.try_into()?)?;
     if row.try_get::<Option<serde_json::Value>>("","intent")?.is_none() {
-        let input: serde_json::Value = row.try_get("","deployment_request")?;
+        let (input,expected_archive) = creation_input(&row,item)?;
         let revision = input["expectedRuntimeRevision"].as_str().filter(|v| !v.is_empty()).context("runtime revision missing")?;
         let port = input["guestPort"].as_u64().and_then(|v| u16::try_from(v).ok()).filter(|v| *v > 0)
             .context("application probe port missing")?;
@@ -55,13 +69,15 @@ pub(super) async fn create_or_recover(state: &AppState, db: &sea_orm::DatabaseCo
         anyhow::ensure!(request.service_id == service, "candidate service differs from owner");
         let deployment = item.candidate_id.as_deref().context("candidate ID missing")?;
         request.region = item.region.clone().context("candidate region missing")?;
-        let slots: serde_json::Value = row.try_get("","slots")?;
-        let slot = slots.as_array().context("invalid application slots")?.iter()
-            .find(|s| s["candidateId"].as_str() == Some(deployment)).context("candidate slot missing")?;
-        anyhow::ensure!(slot["region"].as_str() == Some(&request.region), "candidate slot region differs from plan");
-        if let Some(runtime) = slot.get("runtime").filter(|v| !v.is_null()) {
-            let runtime: super::regional_rollout::RegionalRuntime = serde_json::from_value(runtime.clone())?;
-            request.driver = runtime.driver; request.image = runtime.image; request.size_class = runtime.size_class;
+        if item.phase == "create_candidate" && !row.try_get::<serde_json::Value>("","baseline_state")?["regionalTargetRecipes"].is_array() {
+            let slots: serde_json::Value = row.try_get("","slots")?;
+            let slot = slots.as_array().context("invalid application slots")?.iter()
+                .find(|s| s["candidateId"].as_str() == Some(deployment)).context("candidate slot missing")?;
+            anyhow::ensure!(slot["region"].as_str() == Some(&request.region), "candidate slot region differs from plan");
+            if let Some(runtime) = slot.get("runtime").filter(|v| !v.is_null()) {
+                let runtime: super::regional_rollout::RegionalRuntime = serde_json::from_value(runtime.clone())?;
+                request.driver = runtime.driver; request.image = runtime.image; request.size_class = runtime.size_class;
+            }
         }
         let (_,policy) = withdrawal(db,service,operation,&request.region).await?;
         let mut hosts: Vec<_> = policy.regions.iter().filter(|r| r.region == request.region)
@@ -69,11 +85,16 @@ pub(super) async fn create_or_recover(state: &AppState, db: &sea_orm::DatabaseCo
         hosts.sort(); hosts.dedup();
         let excluded = db.query_all(Statement::from_sql_and_values(DbBackend::Postgres,
             "SELECT receipt->>'backendServerId' AS host FROM regional_candidate_creations
-             WHERE operation_id=$1 AND intent->>'region'=$2 AND receipt IS NOT NULL ORDER BY step_id",
-            [operation.into(),request.region.clone().into()])).await?.into_iter()
+             WHERE operation_id=$1 AND intent->>'region'=$2 AND split_part(step_id,':',2)=$3 AND receipt IS NOT NULL ORDER BY step_id",
+            [operation.into(),request.region.clone().into(),item.phase.clone().into()])).await?.into_iter()
             .map(|r| r.try_get::<String>("","host")).collect::<std::result::Result<Vec<_>,_>>()?;
-        let (mut prepared,archive,_) = service_deploy::prepare_cloud_candidate(state,&mut request,deployment,excluded).await?;
+        if super::instance_http::Contract::from_metadata(request.metadata.as_ref().unwrap_or(&serde_json::Value::Null))?.is_some() {
+            request.env.get_or_insert_with(Default::default).insert("HEYO_REVISION".into(),revision.into());
+        }
+        let (mut prepared,archive,_,recipe) = service_deploy::prepare_cloud_candidate(state,&mut request,deployment,excluded).await?;
+        anyhow::ensure!(archive == expected_archive,"candidate archive changed from immutable recipe");
         prepared.allowed_backend_server_ids = Some(hosts);
+        super::service_recipe::record(db,&recipe,&prepared).await?;
         let (_,send) = claim(db,service,operation,&prepared,&archive,revision,port).await?;
         if send { cloud_client::create_deployment(state,&prepared).await?; }
     }
@@ -89,21 +110,21 @@ pub(super) async fn claim(
 ) -> Result<(Intent, bool)> {
     let tx = service_deploy::try_service_lifecycle_lock(db, service).await?.context("service lifecycle busy")?;
     let row = tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
-        "SELECT plan,region_index,slot_index,phase,target_revision,deployment_request
+        "SELECT plan,region_index,slot_index,phase,target_revision,deployment_request,baseline_state
          FROM regional_service_rollouts WHERE service_id=$1 AND operation_id=$2 AND status='running' FOR UPDATE",
         [service.into(), operation.into()])).await?.context("candidate has no running owner")?;
     let plan: Plan = serde_json::from_value(row.try_get("", "plan")?)?;
     let step = plan.step(&row.try_get::<String>("", "phase")?,
         row.try_get::<i32>("", "region_index")?.try_into()?, row.try_get::<i32>("", "slot_index")?.try_into()?)?;
-    anyhow::ensure!(step.phase == "create_candidate" && step.candidate_id.as_deref() == Some(&request.deployment_id)
+    anyhow::ensure!(matches!(step.phase.as_str(),"create_candidate"|"create_baseline") && step.candidate_id.as_deref() == Some(&request.deployment_id)
         && step.region.as_deref() == Some(&request.region), "candidate differs from persisted plan item");
-    let input: serde_json::Value = row.try_get("", "deployment_request")?;
+    let (input,expected_archive) = creation_input(&row,step)?;
     let environment = request.deployment_environment.as_deref().filter(|v| !v.is_empty()).context("candidate environment missing")?;
     let pool = request.placement_pool.as_deref().filter(|v| !v.is_empty()).context("candidate placement pool missing")?;
     anyhow::ensure!(input["deploymentEnvironment"].as_str() == Some(environment)
         && input["placementPool"].as_str() == Some(pool), "candidate placement differs from admitted request");
     anyhow::ensure!(archive_sha256.len() == 64 && archive_sha256.bytes().all(|b| b.is_ascii_hexdigit())
-        && row.try_get::<String>("", "target_revision")? == archive_sha256, "candidate archive differs from admitted revision");
+        && expected_archive == archive_sha256, "candidate archive differs from admitted revision");
     anyhow::ensure!(!runtime_revision.is_empty() && input["expectedRuntimeRevision"].as_str() == Some(runtime_revision) && guest_port > 0
         && (request.ports.contains(&guest_port) || request.port_mappings.iter().any(|p| p.container == guest_port)),
         "candidate requires an explicit application revision and exposed probe port");
@@ -196,6 +217,7 @@ pub(super) async fn recover(
     tx.execute(Statement::from_sql_and_values(DbBackend::Postgres,
         "UPDATE regional_candidate_creations SET receipt=$3,observed_at=clock_timestamp() WHERE operation_id=$1 AND step_id=$2",
         vec![operation.into(), step_id.into(), serde_json::to_value(&binding)?.into()])).await?;
+    super::service_recipe::bind(&tx,&intent.deployment_id,serde_json::to_value(&binding)?).await?;
     tx.commit().await?;
     Ok(binding)
 }
@@ -208,23 +230,23 @@ pub(super) async fn publish(
 ) -> Result<()> {
     let tx = service_deploy::try_service_lifecycle_lock(db, service).await?.context("service lifecycle busy")?;
     let row = tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
-        "SELECT r.plan,r.region_index,r.slot_index,c.step_id,c.intent,c.receipt
+        "SELECT r.plan,r.phase,r.region_index,r.slot_index,c.step_id,c.intent,c.receipt
          FROM regional_service_rollouts r JOIN regional_candidate_creations c USING(operation_id)
-         WHERE r.service_id=$1 AND r.operation_id=$2 AND r.status='running' AND r.phase='create_candidate'
+         WHERE r.service_id=$1 AND r.operation_id=$2 AND r.status='running' AND r.phase IN ('create_candidate','create_baseline')
          AND c.step_id=r.region_index || ':' || r.phase || ':' || r.slot_index FOR UPDATE OF r",
         [service.into(), operation.into()])).await?.context("candidate publication has no owning item")?;
     let intent: Intent = serde_json::from_value(row.try_get("", "intent")?)?;
     let receipt: Binding = serde_json::from_value(row.try_get::<Option<serde_json::Value>>("", "receipt")?
         .context("candidate has no validated runtime receipt")?)?;
     let plan: Plan = serde_json::from_value(row.try_get("", "plan")?)?;
-    let item = plan.step("create_candidate", row.try_get::<i32>("", "region_index")?.try_into()?,
+    let item = plan.step(&row.try_get::<String>("","phase")?, row.try_get::<i32>("", "region_index")?.try_into()?,
         row.try_get::<i32>("", "slot_index")?.try_into()?)?;
     anyhow::ensure!(item.candidate_id.as_deref() == Some(&intent.deployment_id)
         && item.region.as_deref() == Some(&intent.region), "candidate publication differs from plan");
     let (generation, _) = withdrawal(&tx, service, operation, &intent.region).await?;
     anyhow::ensure!(generation == intent.withdrawal_generation, "candidate publication no longer owns withdrawal");
-    let next = plan.steps.iter().find(|s| s.depends_on.as_deref() == Some(&item.id)).context("candidate has no successor")?;
-    anyhow::ensure!(matches!(next.phase.as_str(), "create_candidate" | "probe_candidates"), "candidate publication cannot bypass probing");
+    let next = plan.successor(&item.id)?;
+    anyhow::ensure!(matches!(next.phase.as_str(), "create_candidate" | "probe_candidates" | "create_baseline" | "probe_retained"), "candidate publication cannot bypass probing");
     tx.execute(Statement::from_sql_and_values(DbBackend::Postgres,
         "INSERT INTO service_discovery_endpoints(service_id,deployment_id,backend_server_id,region,revision,backend_url,health_status,draining)
          VALUES($1,$2,$3,$4,$5,$6,'unknown',TRUE)",
@@ -313,6 +335,7 @@ mod tests {
             include_str!("../../migrations/038_add_regional_policy_proposals.sql"),
             include_str!("../../migrations/039_add_regional_candidate_receipts.sql"),
             include_str!("../../migrations/039_add_regional_candidate_receipts.sql"),
+            include_str!("../../migrations/045_service_creation_recipes.sql"),
         ] { db.execute_unprepared(migration).await?; }
         // The fixture adds an internal candidate item; production still only
         // admits routing-only plans and cannot reach this item.

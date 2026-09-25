@@ -33,7 +33,7 @@ async fn call(state: &AppState, contract: &Contract, token: &str, target: &Value
     Ok((metadata.status,serde_json::from_slice(&body).unwrap_or(Value::Null)))
 }
 
-async fn identify(state: &AppState, contract: &Contract, token: &str, service: &str,
+pub(super) async fn identify(state: &AppState, contract: &Contract, token: &str, service: &str,
     endpoint: &super::service_discovery::ServiceDiscoveryEndpoint) -> Result<Value> {
     let binding = cloud_client::observe_retained_deployment(state,&endpoint.deployment_id,contract.port).await?;
     anyhow::ensure!(endpoint.backend_server_id.as_deref() == Some(&binding.backend_server_id)
@@ -42,6 +42,7 @@ async fn identify(state: &AppState, contract: &Contract, token: &str, service: &
         "backendSandboxId":binding.backend_sandbox_id,"region":binding.region});
     let (status, identity) = call(state,contract,token,&target,"GET","/api/lifecycle".into(),Value::Null).await?;
     anyhow::ensure!(status == 200 && identity["applicationId"] == service && identity["deploymentId"] == target["deploymentId"]
+        && endpoint.revision.as_deref().is_some_and(|r|identity["revision"]==r)
         && identity["capabilities"].as_array().is_some_and(|v|v.iter().any(|c|c == "managed-retirement-v1")),
         "application exact-instance lifecycle capability unavailable");
     let boot: uuid::Uuid = identity["bootId"].as_str().context("application boot missing")?.parse()?;
@@ -62,23 +63,48 @@ pub(super) async fn before_withdrawal(state: &AppState, db: &impl ConnectionTrai
     let (contract, commands, mut receipts): (Contract, Vec<Value>, Value) = if let Some(row) = existing {
         (serde_json::from_value(row.try_get("","contract")?)?,serde_json::from_value(row.try_get("","commands")?)?,row.try_get("","receipts")?)
     } else {
+        // A previous step may have lost the successful hook reply. Resolve its
+        // exact command first, rather than minting a second retirement command.
+        let pending=db.query_all(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT step_id FROM regional_lifecycle_barriers b WHERE operation_id=$1 AND step_id<>$2
+             AND EXISTS(SELECT 1 FROM jsonb_array_elements(b.commands) c
+                 WHERE c->'request'->'target'->>'region'=$3 AND NOT b.receipts ? (c->'request'->>'commandId'))",
+            [operation.into(),step.into(),region.into()])).await?;
+        for prior in pending {
+            let prior:String=prior.try_get("","step_id")?;
+            if !Box::pin(before_withdrawal(state,db,operation,&prior,service,region,metadata,snapshot)).await? {return Ok(false);}
+        }
         let token = contract.token(state).await?;
         let mut targets = Vec::new(); let mut survivors = Vec::new();
+        let previous=db.query_all(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT receipts FROM regional_lifecycle_barriers WHERE operation_id=$1",[operation.into()])).await?;
+        let previous=previous.into_iter().map(|row|row.try_get::<Value>("","receipts"))
+            .collect::<std::result::Result<Vec<_>,_>>()?;
+        let mut reused=serde_json::Map::new();
         for endpoint in snapshot.endpoints.iter().filter(|e| !e.draining) {
             let identity = identify(state,&contract,&token,service,endpoint).await?;
+            // Rollback can interrupt after retirement but before HTTP withdrawal.
+            // That exact boot cannot acknowledge another command. Reuse its
+            // already-verified durable receipt, never a deployment-name match.
+            if let Some((id,receipt))=previous.iter().filter_map(Value::as_object).flat_map(|m|m.iter())
+                .find(|(_,r)|r["target"]==identity && r["operationId"]==operation && r["serviceId"]==service) {
+                if endpoint.region.as_deref()==Some(region) {reused.insert(id.clone(),receipt.clone());}
+                continue; // retired boots are not successor candidates either
+            }
             if endpoint.region.as_deref() == Some(region) {targets.push(identity);} else {survivors.push(identity);}
         }
-        anyhow::ensure!(!targets.is_empty() && !survivors.is_empty(), "lifecycle barrier has no retiring or surviving instances");
+        anyhow::ensure!((!targets.is_empty() || !reused.is_empty()) && !survivors.is_empty(), "lifecycle barrier has no retiring or surviving instances");
         let commands = targets.into_iter().map(|target| -> Result<Value> {
             let id = hash(&json!([operation,step,target]))?;
             let request = json!({"commandId":id,"operationId":operation,"stepId":step,"serviceId":service,
                 "target":target,"survivors":survivors});
             Ok(json!({"requestHash":hash(&request)?,"request":request}))
         }).collect::<Result<Vec<_>>>()?;
+        let reused=Value::Object(reused);
         db.execute(Statement::from_sql_and_values(DbBackend::Postgres,
-            "INSERT INTO regional_lifecycle_barriers(operation_id,step_id,contract,commands) VALUES($1,$2,$3,$4)",
-            vec![operation.into(),step.into(),serde_json::to_value(&contract)?.into(),serde_json::to_value(&commands)?.into()])).await?;
-        (contract,commands,json!({}))
+            "INSERT INTO regional_lifecycle_barriers(operation_id,step_id,contract,commands,receipts) VALUES($1,$2,$3,$4,$5)",
+            vec![operation.into(),step.into(),serde_json::to_value(&contract)?.into(),serde_json::to_value(&commands)?.into(),reused.clone().into()])).await?;
+        (contract,commands,reused)
     };
     let token = contract.token(state).await?;
     for command in &commands {
@@ -165,7 +191,7 @@ mod tests {
                         assert_eq!(meta["headers"][0],json!(["authorization","Bearer app-token"]));
                         let path=meta["path"].as_str().unwrap();
                         let (status,response)=if path == "/api/lifecycle" {
-                            (200,json!({"applicationId":"ci","deploymentId":id,"bootId":boots[&id],"capabilities":["managed-retirement-v1"]}))
+                            (200,json!({"applicationId":"ci","deploymentId":id,"bootId":boots[&id],"revision":"revision","capabilities":["managed-retirement-v1"]}))
                         } else if meta["method"] == "POST" {
                             let command:Value=serde_json::from_slice(&body).unwrap();
                             let request=&command["request"]; let key=request["commandId"].as_str().unwrap().to_owned();
@@ -200,9 +226,16 @@ mod tests {
             endpoints:vec![endpoint("us-old","us3"),endpoint("eu-old","eu1")],updated_at:chrono::Utc::now()};
         let metadata=json!({"applicationLifecycle":{"port":8080,"tokenSecretPath":"apps/ci/lifecycle"}});
         assert!(!before_withdrawal(&make_state(),&db,"op","us-step","ci","us3",&metadata,&snapshot).await?);
+        assert!(before_withdrawal(&make_state(),&db,"op","us-rollback","ci","us3",&metadata,&snapshot).await?,
+            "rollback must first recover the prior step's lost retirement reply");
         // A changed inventory after restart must not replace the pinned set.
         snapshot.endpoints.push(endpoint("must-not-be-selected","us3"));
         assert!(before_withdrawal(&make_state(),&db,"op","us-step","ci","us3",&metadata,&snapshot).await?);
+        snapshot.endpoints=vec![endpoint("us-old","us3"),endpoint("eu-old","eu1")];
+        assert!(before_withdrawal(&make_state(),&db,"op","us-rollback","ci","us3",&metadata,&snapshot).await?,
+            "rollback after retirement but before withdrawal reuses the exact boot receipt");
+        assert!(before_withdrawal(&make_state(),&db,"op","us-rollback","ci","us3",&metadata,&snapshot).await?);
+        assert_eq!(posts.lock().unwrap().len(),1,"retired boot must not receive another command");
         snapshot.endpoints=vec![endpoint("us-new","us3"),endpoint("eu-old","eu1")];
         assert!(!before_withdrawal(&make_state(),&db,"op","eu-step","ci","eu1",&metadata,&snapshot).await?);
         assert!(before_withdrawal(&make_state(),&db,"op","eu-step","ci","eu1",&metadata,&snapshot).await?);

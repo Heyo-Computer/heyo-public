@@ -35,8 +35,8 @@ async fn reach(state: &crate::AppState, db: &sea_orm::DatabaseConnection, operat
     anyhow::bail!("did not reach {expected}: phase={} last error={last}", phase(db, operation).await?)
 }
 
-// Exercise the internal v3 dispatcher while public admission/background execution
-// remain closed. Cloud is a fixture, not a complete VM lifecycle acceptance test.
+// Exercise the production v3 dispatcher. Cloud is a fixture, not a complete VM
+// lifecycle acceptance test.
 async fn reach_application_policy(state: &crate::AppState, db: &sea_orm::DatabaseConnection,
     operation: &str, expected: &str) -> Result<()> {
     let mut last = String::new();
@@ -45,7 +45,7 @@ async fn reach_application_policy(state: &crate::AppState, db: &sea_orm::Databas
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     while std::time::Instant::now() < deadline {
         if phase(db,operation).await? == expected { return Ok(()); }
-        if let Err(error) = super::regional_application::tick(state,db,"smoke",operation).await { last = format!("{error:#}"); }
+        if let Err(error) = regional_rollout::tick_in(state,db,operation).await { last = format!("{error:#}"); }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     anyhow::bail!("application policy did not reach {expected}: phase={} last error={last}",phase(db,operation).await?)
@@ -120,7 +120,9 @@ async fn two_real_gateways_scenario() -> Result<()> {
         include_str!("../../migrations/039_add_regional_candidate_receipts.sql"), include_str!("../../migrations/040_add_application_plan_journal.sql"),
         include_str!("../../migrations/041_add_application_probe_claims.sql"), include_str!("../../migrations/041_add_application_probe_claims.sql"),
         include_str!("../../migrations/042_add_external_service_bindings.sql"),
-        include_str!("../../migrations/043_application_updates.sql")] {
+        include_str!("../../migrations/043_application_updates.sql"),
+        include_str!("../../migrations/044_regional_lifecycle_barriers.sql"),
+        include_str!("../../migrations/045_service_creation_recipes.sql")] {
         db.execute_unprepared(migration).await?;
     }
     db.execute_unprepared("INSERT INTO service_discovery_sets(service_id) VALUES('smoke')").await?;
@@ -499,7 +501,7 @@ async fn two_real_gateways_scenario() -> Result<()> {
                 "deploymentEnvironment":"test","placementPool":"shared","expectedRuntimeRevision":"fixture-v2"}).into(),archive_sha.clone().into(),
             baseline_value.into(),json!(regions).into(),
             json!([{"candidateId":"new-eu-owned","region":"eu1","runtime":{"driver":"libvirt","image":"fixture-image","sizeClass":"small"}}]).into()])).await?;
-    assert!(regional_rollout::tick_in(&state,&db,"probe-owned").await.unwrap_err().to_string().contains("refusing legacy fallback"));
+    assert_eq!(phase(&db,"probe-owned").await?,"preflight");
     assert!(db.execute_unprepared("UPDATE regional_service_rollouts SET baseline_state='{}' WHERE operation_id='probe-owned'").await.is_err());
     for replace_claim in [false,true] {
         hold_preflight.store(1,Ordering::SeqCst);

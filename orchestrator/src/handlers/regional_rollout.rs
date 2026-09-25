@@ -568,7 +568,10 @@ pub(super) async fn tick_in(state: &AppState, db: &sea_orm::DatabaseConnection, 
         // A routing-only request must never be deserialized as a VM deployment.
         return super::regional_reports::reconcile(state, db, &header.try_get::<String>("", "service_id")?, operation).await;
     }
-    anyhow::ensure!(plan.version == 1, "application-plan execution is not enabled; refusing legacy fallback");
+    if plan.version == 3 {
+        return super::regional_application::tick(state,db,&header.try_get::<String>("","service_id")?,operation).await;
+    }
+    anyhow::ensure!(plan.version == 1, "unknown application plan; refusing legacy fallback");
     let Some(r) = load(Some(db), operation).await? else {
         return Ok(());
     };

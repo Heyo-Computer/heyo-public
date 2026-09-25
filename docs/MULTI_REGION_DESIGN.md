@@ -755,7 +755,7 @@ references until ownership-safe cleanup is separately performed.
 | [ ] app-lb update | Continuous public and peer requests plus held stream during old/new switch; no failures; crash helper after switch intent and reconcile exact instance | Current updater restarts in place; replacement/handoff missing |
 | [ ] Overload / partition | Alternate region cannot meet budget; block planned drain. Stale observer cannot authorize maintenance; no forwarding loops under split views | Not live-proven |
 | [ ] Whole-host maintenance | Withdraw external origin and regional capacity, drain, stop target ingress/host, verify normal hostname and dependencies through survivor, restore | External entry and stateful dependency failover not established |
-| [ ] CI as one app | Shared run state, one job owner, controller/worker restart and regional evacuation without duplicate action | Local shared-state/executor tests pass; generic lifecycle barrier and owner forwarding are drafts, not deployed capability. Fresh-boot rollback, hierarchical integration, managed self-release and composed acceptance remain incomplete |
+| [ ] CI as one app | Shared run state, one job owner, controller/worker restart and regional evacuation without duplicate action | Public lifecycle, owner forwarding, v3 integration, fresh recipe replay and asynchronous self-release implemented locally. Initial legacy cutover and composed/live acceptance remain blocked; not deployed capability |
 
 Local managed-CI checkpoint, 2026-09-24 (unpublished; no live state changed):
 
@@ -796,25 +796,94 @@ Orchestrator filter `lifecycle_barrier_pins_targets_and_recovers_lost_reply_afte
 it temporarily scopes its database environment. Do not run all ignored CI tests:
 some invoke real heyvm.
 
-Remaining gates are explicit safety refusals, not completed implementation:
-hierarchical application plans reject lifecycle contracts; managed self-release
-rejects direct app-lb replacement until asynchronous platform submission and
-both-region completion verification exist; lifecycle rollback refuses retained
-boot reactivation. Fresh rollback requires a proven per-endpoint immutable archive,
-runtime, command, mount, configuration and secret-reference recipe. Ordinary
-`service_deployment_runs.request` retains `envRefCount`, not those references;
-scalar previous metadata is not per-endpoint provenance. Prior regional operation
-requests/slots or exact candidate intents are possible evidence, not assumed facts.
-No live baseline IDs or authoritative recipes were established in this orb.
+Local continuation, 2026-09-25 (unpublished, includes Sam's merged PR120/121):
+
+- V3 execution now runs the generic barrier before withdrawal. Managed CI release
+  intent outlives the finished job; an owner reconciler submits/replays the normal
+  managed platform operation and verifies all regional target boots after bake.
+  It does not inherit the old direct app-lb replacement dispatcher.
+  The barrier regression also passes rollback after retirement but before HTTP
+  withdrawal, including recovery of a lost reply from the interrupted forward
+  step. It reuses that exact boot's receipt without issuing a second retirement.
+- Migration045 captures immutable per-endpoint creation recipes, exact versioned
+  secret references, request digests and authenticated creation bindings. The v3
+  rollback program creates fresh baseline identities through the same durable
+  candidate journal, probes and restores them; it never resets retired flags.
+  Existing endpoints without recipes fail closed. Initial platform enrollment is
+  not refused merely because no old managed endpoint/recipe exists.
+- Default suites: 458 CI +46 native-agent passed (110 CI integrations ignored);
+  108 Orchestrator +7 provider passed (17/3 ignored). No formatter was run.
+- Disposable PostgreSQL17: 10 executor tests passed, including managed startup
+  refusing empty ownership and leaving no boot/owner rows. Candidate restart and
+  recovery, immutable creation-recipe binding, fresh rollback journal ordering and
+  receipt-based endpoint selection each passed. Missing fresh receipts cannot
+  fall back to retired endpoint identity. CI run completion/cancellation passed.
+- Disposable PostgreSQL/JetStream: the production CI managed-release reconciler
+  waits for job exit, replays an uncertain submission with the same command,
+  releases its effect permit, rejects a changed regional target and completes only
+  on verified target identities. Its platform HTTP responses are a fixture; this
+  does not prove composed Orchestrator/Cloud/backend behavior.
+- `two_real_gateways_drain_through_authenticated_durable_barriers` passed through
+  the production v3 dispatcher (272 seconds, actual app-lb binaries). It covers
+  the no-hook generic-app path, HTTP withdrawal/drain, candidate recovery, rollback
+  and bake. Cloud remains a fixture; this is not live VM lifecycle acceptance.
+
+Parent-reported authenticated read-only live inventory, 2026-09-25:
+`GET https://orchestrator.{us3,eu1}.heyo.work/orchestration/services` returns empty
+`services` in both regions. `/orchestration/services/ci` reports null active and
+previous IDs (possibly a default response), and `/orchestration/services/ci/discovery`
+returns 404 in both. No managed CI baseline is advertised. This does not prove
+shared authority: deployed Orchestrator envRefs differ, despite a canonical
+`orchestrator/database-url` secret existing. The eu1 `ci-eu1` singleton still serves
+`sb-eee79af6` with retained workspace; us3 `ci-eu1-forward` points to it. Neither is
+obsolete. Zero VM rows for `ci-us3`, `ci-us3-browser`, `ci-us3-candidate` and
+`ci-us3-trial` do not prove absence of retained disks/global references;
+`ci-us3-next` has retained workspace. No deletion is authorized by these facts.
+app-lb deployment APIs expose normalized stored `env_from` references; secret
+APIs return summaries, not values. References resolve at VM creation. These reads
+cannot establish the resolved database authority of the running legacy process.
+
+**Initial CI cutover remains unsupported and fails closed.** The old singleton
+does not participate in executor ownership. `register_managed` cannot initialize
+an empty owner table; it may register only as standby to an existing protocol
+owner. No bypass flag or manual owner-table write is a supported cutover. Required
+missing capabilities/evidence, in order:
+
+1. Bind both managed CI replicas to the preserved authoritative CI database and
+   job stream; verify run/source/log/artifact and pending/native/external-effect
+   inventory before cutover. Bind both Orchestrators to one rollout authority.
+   Equal endpoint responses or matching database names are insufficient.
+2. A supported legacy admission-close/drain operation must stop new deliveries,
+   finish or explicitly reconcile admitted work and remote obligations, and
+   persist progress while retaining all workspaces, disks and database state.
+   The new boot cannot assert this on the old process's behalf.
+3. Obtain a durable platform fencing receipt for the exact legacy runtime/boot,
+   preventing restart through exec/proxy and controller reconciliation. Unknown
+   stop status, an observation-before-exec check, or a timeout is not that proof.
+   The non-starting HTTP transport alone does not supply a fencing operation.
+4. Implement an authenticated, idempotent initial-owner transaction consuming that
+   receipt plus the preserved-state reconciliation result, naming the exact first
+   managed boot and atomically opening shared admission. Lost responses must replay
+   the same result. Neither this initializer nor its runtime-fence authority exists
+   in the public checkpoint; startup therefore remains refused rather than silently
+   scheduling alongside the legacy singleton.
 
 Owner crash before handoff, or successor crash after it, remains blocked pending
 authoritative runtime fencing and reconciliation. A successful stop with unknown
 runtime status is not fencing, and timeout takeover remains prohibited. Private
 transport must pin deployment/backend identities through the stream lifetime and
 prove the runtime is already running without waking it; CI must also validate the
-application boot. Private safety tests, unhealthy-candidate/fresh-rollback tests,
-the combined real-process restart/lost-receipt sequence, and all live acceptance
-gates remain outstanding. Admission closure is not uninterrupted submission
+application boot. Parent reports private shared-row/read-lease streaming tests,
+concurrent request/stop-wait/EOF-drop coverage and 512MiB streaming passed; those
+were not executed in this orb. Parent also reports 344 passing Linux transport
+tests, 350 passing combined WASIX/transport Linux tests (including update/replay
+waiting on a streaming lifecycle read lease), and an actual Wasmer revision,
+replay-PID, incompatible-update and failed-start rollback test passed in47.71s.
+The private integration branch is committed locally, not pushed. These results
+do not establish public/private composition or deployed capability.
+Composed actual CI/Orchestrator/Cloud/backend
+unhealthy-candidate/fresh-rollback and restart/lost-receipt sequences, plus all live
+acceptance gates, remain outstanding. Admission closure is not uninterrupted submission
 availability. PR119, production registrations, databases, workspaces and disks
 were not changed by this checkpoint.
 
