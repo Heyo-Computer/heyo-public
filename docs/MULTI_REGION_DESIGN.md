@@ -51,8 +51,36 @@ HeyoSecret dashboard read returned HTTP 500; eu1 returned an error reporting
 that its database peer closed the TLS connection without `close_notify`.
 Public eu1 HeyoSecret `/health` and Cloud `/health` still returned 200, so those
 health checks did not establish working secret access. No replacement
-management credential was scraped from process state. Restoring HeyoSecret
-database connectivity is required before further authenticated deployment.
+management credential was scraped from process state. At 17:08 UTC, authenticated
+secret reads succeeded through both regional public endpoints without a restart
+or configuration change. The intermittent database-connectivity cause remains
+unresolved; a successful credential read does not prove the whole release path.
+
+Full private retry `01a0d98b3847-0000005c` failed before deployment. Cloud run
+`01a0d98b3843-0000005a` completed build, tests and artifact upload successfully;
+heyvm run `01a0d98b3845-0000005b` failed checkout with `Could not resolve host:
+github.com`. Host inspection found both reused CI VMs, `sb-823c73e7` and
+`sb-9bcddf88`, persisted at `10.88.0.206`. The failed VM's stop removed the
+shared outbound MASQUERADE rule while the other VM still had its TAP. Inventory
+found 64 reservation records but only 62 unique addresses, including a separate
+`.210` collision between `sb-4c20ed52` and `sb-25c5ff0e` (app-lb CI promotion
+preflight VMs). Those preflight VMs were not changed or deleted.
+
+The private fix now also rejects legacy duplicate ownership before restart,
+port publication or teardown, preserves the handle after refused restart, and
+fails closed on unreadable or malformed reservation inventory. Address checks
+span network names because host IP-keyed rules share one namespace. TAP removal
+must be confirmed before stop/delete or cancelled-boot reservation release.
+
+After both CI jobs finished and their processes/TAPs were absent, the two `.206`
+caches were classified against host service state, proxy/link records, routes,
+database registry and both public app-lb deployment lists. Their owning-run
+cleanup requests returned 503; neither deletion is claimed complete. CI logs
+showed durable eviction retries repeatedly using the same reset runner tunnel.
+The public fix makes failed cache eviction discard that runner's cached tunnel,
+matching the existing job and run-owned cleanup recovery paths. Active operations
+retain their own connection ownership. No manual host deletion or firewall repair
+was used to bypass these failures.
 
 Read-only diagnostics found healthy host memory/disk capacity and successful
 fresh database TCP/TLS handshakes, but established database connections suffered

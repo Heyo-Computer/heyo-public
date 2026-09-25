@@ -4069,6 +4069,10 @@ impl Dispatcher {
                 }
                 Ok(false) => {}
                 Err(e) => {
+                    // Keep the durable eviction, but do not retry forever on
+                    // the same dead loopback tunnel. Existing VM operations
+                    // retain their own connection, just as in vm_cleanup.
+                    self.runners.evict(&vm.runner_hd_id).await;
                     tracing::warn!(vm = %vm.sandbox_id, "could not destroy: {e}");
                     failed.push(format!("{}: {e}", vm.sandbox_id));
                 }
@@ -7120,6 +7124,12 @@ jobs:
         let workspace = tempfile::tempdir().unwrap();
         let d = test_dispatcher(workspace.path()).await;
         let runner = format!("pressure-{}", crate::vm::new_id());
+        let cached = heyo_sdk::HeyoClient::new(heyo_sdk::HeyoClientOptions {
+            base_url: Some(std::env::var("CI_TEST_DAEMON").unwrap()),
+            api_key: None, timeout: None,
+        }).unwrap();
+        d.runners.tunnel_cache_for_test().await.insert(runner.clone(), cached.clone());
+        d.runners.tunnel_cache_for_test().await.insert("unrelated-runner".into(), cached);
         let run = format!("run-{runner}");
         sqlx::query("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES($1,'test','test.yml','success')")
             .bind(&run).execute(d.store.pool()).await.unwrap();
@@ -7137,11 +7147,14 @@ jobs:
         assert!(deleted.lock().unwrap().is_empty(), "exactly enough space must not evict");
         assert_eq!(d.reclaim_disk_space(&runner, 100).await.unwrap(), 100);
         assert_eq!(*deleted.lock().unwrap(), vec![format!("{runner}-old"), format!("{runner}-middle")]);
+        assert!(d.runners.tunnel_cache_for_test().await.contains_key(&runner));
         assert!(d.pool.get(&format!("{runner}-old")).await.unwrap().is_none());
         assert_eq!(d.pool.get(&format!("{runner}-new")).await.unwrap().unwrap().status, "idle");
         // Failure must retain ownership and stop rather than deleting more caches.
         fail.store(true, Ordering::SeqCst);
         assert!(d.reclaim_disk_space(&runner, 101).await.is_err());
+        assert!(!d.runners.tunnel_cache_for_test().await.contains_key(&runner), "failed eviction must reconnect on retry");
+        assert!(d.runners.tunnel_cache_for_test().await.contains_key("unrelated-runner"));
         assert_eq!(d.pool.get(&format!("{runner}-new")).await.unwrap().unwrap().status, "draining");
         let error = d.reclaim_disk_space(&runner, 101).await.unwrap_err();
         assert!(error.to_string().contains("no idle caches left"), "{error}");

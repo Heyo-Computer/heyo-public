@@ -987,7 +987,10 @@ VM creation. Claimed, building, and already-draining VMs are never victims;
 only CI pool rows on that host qualify. A failed deletion stays tracked as
 draining and stops that cleanup attempt. An explicit, persisted eviction intent
 makes the lease-loop sweep retry it after failures or controller restarts, even
-if its fingerprint is still wanted. Deletion holds a database row lock across
+if its fingerprint is still wanted. A failed eviction also discards that runner's
+cached tunnel so the next attempt reconnects instead of reusing a dead loopback
+connection indefinitely. Other runners and connections held by active VM
+operations are unaffected. Deletion holds a database row lock across
 the bounded daemon call and requires a follow-up not-found response before
 forgetting the pool row. Resize operations also use `draining`, but carry no
 eviction intent and are never selected for deletion. Pre-existing ambiguous
