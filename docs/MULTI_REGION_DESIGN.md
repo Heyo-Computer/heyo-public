@@ -157,6 +157,22 @@ metadata contains no Cargo/crates.io credential. Publication is authorized but
 requires registry access. Do not resubmit regional builds with the old SDK as a
 substitute for installing the connection fix.
 
+The next private PR #624 change adds a request-bound, durable Firecracker
+creation-cancellation endpoint. Cancel-before-admission and queued work are
+fenced; active execution must leave its operation lock before cancellation
+returns. The receipt identifies the sandbox but does not claim resource absence.
+Six tests of the actual creation module passed in a disposable harness, and the
+full macOS backend library check passed. Full linked tests initially exhausted
+local disk during OpenSSL compilation; 2.8 GiB of disposable SDK build output and
+the temporary harness were removed. Linux/runtime cancellation remains unverified.
+CI-scoped access and durable CI create-intent recovery are still not integrated.
+
+Both deployed CI specs were readable. The us3 admin secret's metadata names
+`heyo`, not `admin`; the earlier Basic 401 was not a bad password. Direct app-lb
+VM-environment updates rebuild the active pool, so no such update was made to
+force S3 configuration before the CICD-managed replacement. Neither repository's
+GitHub secret names includes a Cargo/crates.io publishing credential either.
+
 Read-only diagnostics found healthy host memory/disk capacity and successful
 fresh database TCP/TLS handshakes, but established database connections suffered
 retransmissions. Paired packet-header traces (`job-6a01b2fcdf11` on eu1 and
