@@ -42,6 +42,17 @@ database pool timeouts while retrieving results. That is not successful CI
 validation, and no result was rewritten. A full retry of the same private
 revision is `01a0d95802e8-00000059`, with Cloud validation
 `01a0d95802e4-00000057` and heyvm validation `01a0d95802e6-00000058`.
+That retry also failed before merge/deployment: its final attempts allocated
+VMs and reached checkout, then could not resolve the checkout credential from
+`https://heyosecret.eu1.heyo.work/v1/secrets?prefix=ci%2Fheyo%2Fdefault`.
+
+At approximately 17:00 UTC, operator secret reads also failed: the us3
+HeyoSecret dashboard read returned HTTP 500; eu1 returned an error reporting
+that its database peer closed the TLS connection without `close_notify`.
+Public eu1 HeyoSecret `/health` and Cloud `/health` still returned 200, so those
+health checks did not establish working secret access. No replacement
+management credential was scraped from process state. Restoring HeyoSecret
+database connectivity is required before further authenticated deployment.
 
 Read-only diagnostics found healthy host memory/disk capacity and successful
 fresh database TCP/TLS handshakes, but established database connections suffered
