@@ -1547,6 +1547,13 @@ The practical cost: **a replicated database holds RAM and disk on both hosts,
 permanently**. It never ages out. Pinned VMs are also warmed at pooler startup,
 before the untracked-VM reaper's first pass could stop them.
 
+A failed pairing releases its live-VM pin, but retains its PostgreSQL replication
+settings on subsequent bring-up. Failure does not remove slots or subscriptions;
+downgrading a primary to minimal WAL while a logical slot remains prevents
+PostgreSQL from starting. Retaining these settings does not mark replication
+healthy or retry it. Detach or promote through the replication API to remove
+the pairing's database objects before reverting to ordinary settings.
+
 #### Configuration
 
 | var | default | meaning |
