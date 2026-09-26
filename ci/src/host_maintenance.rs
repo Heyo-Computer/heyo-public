@@ -189,7 +189,8 @@ fn verify(body: &Value, request: &Request) -> Result<bool> {
         ("artifactArchiveId","artifactArchiveId"), ("artifactUserId","artifactUserId")] {
         ensure!(body[remote] == request.body[local], "Cloud maintenance identity/provenance mismatch: {remote}");
     }
-    ensure!(body["operationType"] == "host_heyvm_upgrade", "wrong maintenance operation type");
+    ensure!(matches!(body["operationType"].as_str(), Some("host_heyvm_upgrade" | "host_heyvm_upgrade_receipt_v1")),
+        "wrong maintenance operation type");
     match body["status"].as_str() {
         Some("completed") => { ensure!(body["completedAt"].as_str().is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()), "completed maintenance lacks completion timestamp"); Ok(true) }
         Some("failed") => bail!("Cloud host upgrade failed; runner remains cordoned"),
@@ -354,6 +355,73 @@ pub fn spawn(d: Arc<Dispatcher>) {
     });
 }
 
+/// Reconcile an exact completed operation, never POST another upgrade. Only
+/// untouched skipped jobs resume; the failed outcome remains in the event log.
+pub async fn recover(d: &Dispatcher, run_id: &str, id: &str) -> Result<Value> {
+    let _effect = d.executor.effect_permit().await.map_err(anyhow::Error::msg)?;
+    let mut tx = d.store.pool().begin().await?;
+    let runner: String = sqlx::query_scalar("SELECT h.runner_hd_id FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.id=$1 AND s.run_id=$2")
+        .bind(id).bind(run_id).fetch_one(&mut *tx).await?;
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1,222))")
+        .bind(&runner).fetch_one(&mut *tx).await?;
+    ensure!(locked, "another operation owns the runner");
+    let status: String = sqlx::query_scalar("SELECT status FROM ci_run WHERE id=$1 FOR UPDATE")
+        .bind(run_id).fetch_one(&mut *tx).await?;
+    let jobs = sqlx::query("SELECT id,status,error FROM ci_job WHERE run_id=$1 ORDER BY id FOR UPDATE")
+        .bind(run_id).fetch_all(&mut *tx).await?;
+    let row = sqlx::query("SELECT h.*,s.job_id,s.step_id FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.id=$1 AND s.run_id=$2 FOR UPDATE OF h")
+        .bind(id).bind(run_id).fetch_one(&mut *tx).await?;
+    if row.get::<String,_>("phase") == "passed" {
+        return Ok(json!({"operation_id":id,"status":"already_passed"}));
+    }
+    ensure!(status == "failure" && row.get::<String,_>("phase") == "failed", "only failed maintenance can be recovered");
+    let job_id: String = row.get("job_id");
+    ensure!(jobs.iter().all(|j| if j.get::<String,_>("id") == job_id {
+        j.get::<String,_>("status") == "failure"
+    } else { matches!(j.get::<String,_>("status").as_str(), "success" | "skipped") }),
+        "another job is active, cancelled or failed");
+    let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND id<>$2 AND phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase NOT IN ('passed','superseded')) OR EXISTS(SELECT 1 FROM ci_host_work w JOIN ci_job j ON j.id=w.job_id WHERE j.run_id=$3) OR EXISTS(SELECT 1 FROM ci_job j WHERE j.run_id=$3 AND j.status='skipped' AND (j.sandbox_id IS NOT NULL OR j.started_at IS NOT NULL OR EXISTS(SELECT 1 FROM ci_step s WHERE s.job_id=j.id)))")
+        .bind(&runner).bind(id).bind(run_id).fetch_one(&mut *tx).await?;
+    ensure!(!blocked, "unresolved work or previously executed skipped job blocks recovery");
+    let request: Request = serde_json::from_value(row.get("request"))?;
+    ensure!(request.body["maintenanceId"] == id && request.target.runner_hd_id == runner, "stored operation differs");
+    ensure!(trusted_target(d, &request.alias).await? == request.target, "trusted mapping changed");
+    let run = d.store.get_run(run_id).await?.ok_or_else(|| anyhow::anyhow!("missing run"))?;
+    ensure!(crate::repos::same_repo(&request.target.repository, &run.repo_url), "repository does not own target");
+    crate::submission::authorize_publication(&d.store, run_id).await.map_err(anyhow::Error::msg)?;
+    let release = crate::release::get(&d.store, run_id).await.map_err(anyhow::Error::msg)?
+        .ok_or_else(|| anyhow::anyhow!("missing release"))?;
+    ensure!(release.status == "published" && release.prepared.release_sha == request.sha, "release provenance changed");
+    let job = d.store.get_job(&job_id).await?.ok_or_else(|| anyhow::anyhow!("missing job"))?;
+    let plan: JobPlan = serde_json::from_value(job.plan)?;
+    let prefix = crate::secrets::Secrets::prefix(&run.workflow_id, plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default"));
+    let resolved = d.secrets.resolve(&prefix).await?;
+    let token = resolved.secrets.get(&request.token_secret).filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("maintenance credential unavailable"))?;
+    let response = client()?.get(format!("{}/internal/mvm-ctrl/backend-servers/host-heyvm/upgrade/{id}", endpoint(&request.target.cloud_url)?))
+        .bearer_auth(token).send().await?;
+    ensure!(response.status().is_success(), "Cloud receipt unavailable");
+    let receipt: Value = response.json().await?;
+    ensure!(verify(&receipt, &request)?, "Cloud operation is not completed");
+    ensure!(trusted_target(d, &request.alias).await? == request.target, "trusted mapping changed during recovery");
+    let note = json!({"operation_id":id,"original_error":job.error,"receipt":receipt}).to_string();
+    Store::add_event(&mut tx, run_id, Some(&job_id), None, None,
+        "ci.host.maintenance.recovered.v1", "recovered", Some(&note)).await?;
+    // The only failed job is proven complete, and no skipped job has executed.
+    // Keep attempt IDs, logs, publication and prior status events intact.
+    sqlx::query("UPDATE ci_job SET status='pending',finished_at=NULL,error=NULL WHERE run_id=$1 AND status='skipped'")
+        .bind(run_id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE ci_run SET status='running',finished_at=NULL,error=NULL WHERE id=$1")
+        .bind(run_id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE ci_job SET status='running' WHERE id=$1").bind(&job_id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE ci_host_maintenance SET phase='polling' WHERE id=$1").bind(id).execute(&mut *tx).await?;
+    finish(&mut tx, id, run_id, &job_id, &row.get::<String,_>("step_id"), true,
+        "Recovered from exact completed Cloud receipt; resumed untouched jobs without repeating maintenance.").await?;
+    tx.commit().await?;
+    d.advance_run(run_id).await?;
+    Ok(json!({"operation_id":id,"status":"recovered","run_id":run_id}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +438,11 @@ mod tests {
             "target":"stage-eu1-host-heyvm","requestedBy":"operation","targetSha256":"binary-digest",
             "artifactArchiveId":"archive","artifactUserId":"owner","status":"completed","completedAt":"2026-09-16T00:00:00Z"});
         assert!(verify(&body, &request).unwrap());
+        let mut versioned = body.clone();
+        versioned["operationType"] = json!("host_heyvm_upgrade_receipt_v1");
+        assert!(verify(&versioned, &request).unwrap());
+        versioned["targetSha256"] = json!("another-binary");
+        assert!(verify(&versioned, &request).is_err());
         for key in ["maintenanceId","backendServerId","operationType","target","requestedBy","targetSha256","artifactArchiveId","artifactUserId","completedAt"] {
             let mut wrong = body.clone(); wrong[key] = json!("different");
             assert!(verify(&wrong, &request).is_err(), "{key}");

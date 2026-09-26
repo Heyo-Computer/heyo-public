@@ -1657,6 +1657,8 @@ to accelerate drain. Queued work retains its delivery and retry budget; unpinned
 work can select another runner. The step, job and run do not succeed on admission.
 Only an exact `completed` operation with matching backend, target, archive owner,
 archive ID, executable digest and operation identity releases the fence.
+Both `host_heyvm_upgrade` and Cloud's operation-bound
+`host_heyvm_upgrade_receipt_v1` receipts use these checks; unknown types fail closed.
 
 Cancellation, timeout, missing identity, changed configuration and terminal
 failure **retain the CI cordon**, even if Cloud uncordons its own backend. An
@@ -1668,6 +1670,18 @@ Cancelled VM acquisition, interrupted delivery, or failed stop can leave durable
 drain evidence requiring operator reconciliation; terminal job status alone is
 not proof that host work stopped. Retries cannot clear another delivery's record.
 Deadlines include VM release and drain, survive restart, and cap HTTP retries.
+
+When Cloud completed an upgrade but CI rejected its receipt, a repository submit
+bearer can POST `/api/runs/{run_id}/maintenance/{operation_id}/recover`.
+Recovery GETs the original Cloud operation, checks every identity and the trusted
+mapping, and requires the original published release. It never POSTs an upgrade.
+Only a failed run with this one failed job and no unresolved execution is eligible;
+cancelled runs or skipped jobs that previously executed are refused. Recovery
+records the original error and receipt in `ci.host.maintenance.recovered.v1`,
+marks the proven operation successful, releases its fence and resumes untouched
+skipped jobs in the same run. Existing logs, attempt IDs and status events remain.
+A repeated call does not repeat maintenance or recovery. This is distinct from
+`rerun-failed`, which cannot authorize a release.
 
 Deploy the new Cloud endpoint **and every Cloud worker's cross-instance operation
 locking** before enabling this action. Older Cloud cannot execute the plural POST,

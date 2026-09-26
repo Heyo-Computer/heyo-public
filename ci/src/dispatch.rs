@@ -6848,6 +6848,10 @@ jobs:
         struct Remote { posts: Vec<Value>, stops: Vec<String>, status: String, wrong: bool, lost: bool, hidden: bool, old: bool, stop_failure: bool }
         let remote = Arc::new(std::sync::Mutex::new(Remote::default()));
         let app = Router::new()
+            .route("/v1/secrets", get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String,String>>| async move {
+                Json(json!({"secrets":[{"path":format!("{}/CLOUD_KEY",q["prefix"])}]}))
+            }))
+            .route("/v1/secrets/read", post(|| async { Json(json!({"valueBase64":"ZmFrZS1rZXk="})) }))
             .route("/storage", get(|| async { Json(json!({"free_bytes":1u64 << 50})) }))
             .route("/capabilities", get(|| async { Json(json!({"supportedDrivers":["firecracker","kvm","avf"]})) }))
             .route("/sandbox/{id}/stop", post(|State(remote): State<Arc<std::sync::Mutex<Remote>>>, Path(id): Path<String>| async move {
@@ -6876,7 +6880,7 @@ jobs:
                     let r = remote.lock().unwrap();
                     if r.hidden || r.posts.is_empty() { return StatusCode::NOT_FOUND.into_response(); }
                     let p = &r.posts[0]; assert_eq!(id, p["maintenanceId"]);
-                    Json(json!({"maintenanceId":id,"backendServerId":p["backendServerId"],"operationType":"host_heyvm_upgrade",
+                    Json(json!({"maintenanceId":id,"backendServerId":p["backendServerId"],"operationType":"host_heyvm_upgrade_receipt_v1",
                         "target":p["target"],"requestedBy":p["requestedBy"],"targetSha256":if r.wrong { json!("wrong") } else { p["sha256"].clone() },
                         "artifactArchiveId":p["artifactArchiveId"],"artifactUserId":p["artifactUserId"],"status":r.status,
                         "completedAt":if matches!(r.status.as_str(), "completed" | "failed") { json!("2026-09-16T00:00:00Z") } else { Value::Null }})).into_response()
@@ -6890,6 +6894,8 @@ jobs:
         unsafe {
             std::env::set_var("CI_TEST_DAEMON", &base);
             std::env::set_var("CI_HOST_MAINTENANCE_TARGETS", json!({"selected":target}).to_string());
+            std::env::set_var("CI_HEYOSECRET_URL", &base);
+            std::env::set_var("CI_HEYOSECRET_TOKEN", "test-only");
         }
         let workspace = tempfile::tempdir().unwrap();
         let d = test_dispatcher(workspace.path()).await;
@@ -7035,11 +7041,36 @@ jobs:
             maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
             assert_eq!(remote.lock().unwrap().posts.len(), posts);
             assert_eq!(maintenance::cordoned(&d.store, "hd-local").await.unwrap(), !success, "failure must be sticky");
+            if scenario == "identity" {
+                assert!(maintenance::recover(&d, "wrong-run", &id).await.is_err());
+                assert!(maintenance::recover(&d, &run, &id).await.is_err(), "foreign receipt cannot release fence");
+                remote.lock().unwrap().wrong = false;
+                // An executed skipped job must not be reset, even with a valid receipt.
+                sqlx::query("UPDATE ci_job SET status='skipped' WHERE id=$1").bind(&existing.id).execute(d.store.pool()).await.unwrap();
+                assert!(maintenance::recover(&d, &run, &id).await.is_err());
+                sqlx::query("UPDATE ci_job SET status='success' WHERE id=$1").bind(&existing.id).execute(d.store.pool()).await.unwrap();
+                sqlx::query("UPDATE ci_job SET status='skipped',started_at=NULL,queued_at=NULL,sandbox_id=NULL WHERE id=$1")
+                    .bind(&waiting.id).execute(d.store.pool()).await.unwrap();
+                let result = maintenance::recover(&d, &run, &id).await.unwrap();
+                assert_eq!(result["status"], "recovered");
+                assert!(!maintenance::cordoned(&d.store, "hd-local").await.unwrap());
+                assert_eq!(d.store.get_job(&job.id).await.unwrap().unwrap().status, "success");
+                assert_eq!(d.store.get_job(&waiting.id).await.unwrap().unwrap().status, "queued");
+                assert_eq!(remote.lock().unwrap().posts.len(), posts, "recovery must never re-POST upgrade");
+                assert_eq!(maintenance::recover(&d, &run, &id).await.unwrap()["status"], "already_passed");
+                let events: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_event_outbox WHERE run_id=$1 AND event_type='ci.host.maintenance.recovered.v1'")
+                    .bind(&run).fetch_one(d.store.pool()).await.unwrap();
+                assert_eq!(events, 1, "recovery is idempotent and audited");
+            }
             // Disposable fixture cleanup only; production has no automatic uncordon.
             sqlx::query("DELETE FROM ci_host_maintenance WHERE id=$1").bind(&id).execute(d.store.pool()).await.unwrap();
             d.pool.forget(&sandbox).await.unwrap();
         }
         server.abort();
+        unsafe {
+            std::env::remove_var("CI_HEYOSECRET_URL");
+            std::env::remove_var("CI_HEYOSECRET_TOKEN");
+        }
     }
 
     #[tokio::test]
