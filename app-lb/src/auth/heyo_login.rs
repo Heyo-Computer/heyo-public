@@ -15,8 +15,14 @@ impl Authenticator {
         if !req.secure {
             return Response::text(403, "Browser sign-in requires HTTPS.\n");
         }
+        // Keep the browser's CSRF nonce stable across tabs and reloads. A new
+        // nonce on every page invalidates any form that is already open.
+        let nonce = cookie_values(&req.cookies, FLOW_COOKIE).iter()
+            .filter_map(|v| self.verify(v)).filter_map(|b| Flow::decode(&b))
+            .find(|f| f.exp > now_secs() && f.deployment == deployment && f.verifier.is_empty())
+            .map(|f| f.nonce).unwrap_or_else(random_token);
         let flow = Flow {
-            nonce: random_token(), verifier: String::new(),
+            nonce, verifier: String::new(),
             deployment: deployment.into(), return_to: safe_return_path(return_to),
             exp: now_secs() + FLOW_TTL.as_secs(),
         };
@@ -37,13 +43,15 @@ input,button {{ font:inherit; padding:.75rem; }} p {{ color:var(--text-muted); }
 <p>Use your existing account at {issuer}.</p>
 <form method="post" action="{action}">
 <input type="hidden" name="state" value="{nonce}">
+<input type="hidden" name="return_to" value="{return_to}">
 <label>Email<input name="email" type="email" autocomplete="username" required maxlength="320"></label>
 <label>Password<input name="password" type="password" autocomplete="current-password" required maxlength="4096"></label>
 <button type="submit">Sign in</button></form>
 <p>Your password is verified by Heyo Auth, not stored by this control panel.</p>
 </main></body></html>"#,
                 css = include_str!("../../../ui/heyo.css"), issuer = escape(&issuer),
-                action = escape(&gate.login_path()), nonce = escape(&flow.nonce)),
+                action = escape(&gate.login_path()), nonce = escape(&flow.nonce),
+                return_to = escape(&flow.return_to)),
         }
     }
 
@@ -110,7 +118,9 @@ input,button {{ font:inherit; padding:.75rem; }} p {{ color:var(--text-muted); }
             return Response::text(403, "This account is not permitted to access this application.\n");
         }
         let lifetime = value.pointer("/data/tokens/expiresIn").and_then(|v| v.as_u64()).unwrap_or(3600).min(86400);
-        Response::redirect(safe_return_path(&flow.return_to), vec![
+        // The destination belongs to the submitted tab, not the last tab to
+        // refresh the shared cookie. Restrict it to a local path as usual.
+        Response::redirect(safe_return_path(field("return_to").unwrap_or(&flow.return_to)), vec![
             set_cookie(cookie, token, true, Some(lifetime), None),
             clear_cookie(FLOW_COOKIE, true, None),
         ])

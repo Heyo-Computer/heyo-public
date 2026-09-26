@@ -3136,6 +3136,8 @@ JWT against the same issuer, audience, signature and `require` policy before
 setting a host-only Secure/HttpOnly cookie. The form requires HTTPS, same-origin
 POST and signed, short-lived login state. Passwords and refresh tokens are not
 persisted; endpoint redirects are refused. Logout clears the access cookie.
+Opening another sign-in page reuses the browser's unexpired CSRF nonce rather
+than invalidating an open form. Each form retains its own local return path.
 Machine clients still receive 401 and continue using their existing credentials.
 An Auth service requiring CAPTCHA or another interactive challenge cannot use
 this password form; those requirements are not bypassed. This is not Google SSO
