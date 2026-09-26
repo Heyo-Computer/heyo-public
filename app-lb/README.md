@@ -1954,9 +1954,15 @@ result.
 Rules and caveats, each of which the spec validation enforces or the docs
 above imply:
 
-- `scaling.max_replicas` must be `1` and `warm_pool` must be `0`: one
+- `scaling.max_replicas` must be at most `1` and `warm_pool` must be `0`: one
   directory, one writer. Two replicas would each capture a divergent copy and
   the last to land would win.
+- For a maintenance pause, set both `min_replicas` and `max_replicas` to `0`
+  with `idle_action: retain` through the scaling API. This drains and stops the
+  replica for workspace capture; incoming requests cannot wake it. Keep the
+  deployment registered. Restore a ceiling of `1` to permit resume. A successful
+  scaling response records the policy, not proof of a stopped executor: verify
+  the exact runtime has stopped and workspace capture has settled before recovery.
 - `driver` must be `firecracker`. The KVM driver syncs a writable mount back
   into the shared host tree itself when the VM stops, which is a different
   feature with different semantics.

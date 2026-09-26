@@ -1046,6 +1046,27 @@ mod tests {
         assert_eq!(d.desired_replicas(), 0);
     }
 
+    #[test]
+    fn zero_ceiling_prevents_wake_despite_in_flight_requests_and_waiters() {
+        let d = Arc::new(deployment(ScalingPolicy {
+            min_replicas: 0,
+            max_replicas: 0,
+            warm_pool: 0,
+            ..Default::default()
+        }));
+        let a = backend("10.0.0.1:80");
+        a.acquire();
+        d.set_backends(vec![a]);
+        let _waiter = d.track_waiter();
+        assert_eq!(d.demand(), 2);
+        assert_eq!(d.desired_replicas(), 0);
+        assert!(!d.can_grow());
+        d.set_backends(vec![]);
+        assert_eq!(d.demand(), 1);
+        assert_eq!(d.desired_replicas(), 0);
+        assert!(!d.can_grow(), "a request cannot wake the paused pool");
+    }
+
     /// Regression: a request waiting on a scaled-to-zero deployment holds no
     /// in-flight slot, so the pool looked idle and stayed at zero — the waiting
     /// request then blocked until its cold-start timeout and 500'd.
