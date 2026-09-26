@@ -817,7 +817,11 @@ impl SchemaRegistry {
             replication: self
                 .replication
                 .get(schema)
-                .filter(|r| r.state.pins())
+                // Failed replication still owns PostgreSQL objects. In
+                // particular, even an invalidated logical slot prevents a
+                // primary from starting with minimal WAL. Releasing the VM
+                // pin must not erase its durable role or downgrade settings.
+                .filter(|r| r.state.pins() || r.state == crate::replication::State::Failed)
                 .map(|r| r.role),
             repl_login,
             // Maintenance bring-ups wait as long as it takes; only a client
@@ -6881,6 +6885,42 @@ fn used_pct(used: u64, avail: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_pairings_keep_bringup_settings_without_becoming_live() {
+        use crate::replication::{ReplRecord, Role, State};
+        let dir = std::env::temp_dir().join(format!("pgfc-failed-role-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::from_env().unwrap();
+        cfg.state_file = dir.join("registry.tsv");
+        cfg.dedicated_file = dir.join("dedicated.tsv");
+        cfg.peers_file = dir.join("peers.tsv");
+        cfg.replication_file = dir.join("replication.tsv");
+        let registry = SchemaRegistry::new(cfg).unwrap();
+        for (database, role) in [("publisher", Role::Primary), ("subscriber", Role::Replica)] {
+            registry.replication.create(
+                ReplRecord::new(database, role, "peer", "replpassword12"),
+                &|_| false,
+            ).unwrap();
+            for (state, expected) in [
+                (State::Pending, None),
+                (State::Syncing, Some(role)),
+                (State::Active, Some(role)),
+                (State::Failed, Some(role)),
+                (State::Detached, None),
+                (State::Promoted, None),
+            ] {
+                registry.replication.set_state(database, state, "test transition").unwrap();
+                assert_eq!(registry.bring_up_for(database, None, None).replication, expected);
+                assert_eq!(registry.replication.get(database).unwrap().state, state);
+                if state == State::Failed {
+                    assert!(!registry.replication.is_pinned(database));
+                }
+            }
+        }
+        assert_eq!(registry.bring_up_for("unpaired", None, None).replication, None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn owned_claim_checkout_progresses_while_ordinary_checkout_waits() {
