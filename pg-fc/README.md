@@ -206,7 +206,7 @@ Config via env (all optional):
 | `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (2GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
 | `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
 | `PG_VM_POOL_DISK_GROW_PCT` | unset (off) | guest-filesystem used% at or above which a schema's data **device** is grown (doubled, offline). Setting it is the on/off switch for device growth — see "Growing the device" |
-| `PG_VM_POOL_DISK_GROW_URGENT_PCT` | `95` | used% at or above which a **warm** VM's device is grown without waiting for it to go idle — stop, resize, and let the next connect boot it, dropping the sessions it had. Must be >= `PG_VM_POOL_DISK_GROW_PCT`; `0` disables the online path. Without it a schema whose write load never pauses can never grow — see "Growing the device" |
+| `PG_VM_POOL_DISK_GROW_URGENT_PCT` | `95` | used% at or above which a **warm** VM's device is grown without waiting for it to go idle — online under the running VM when heyvmd has the online resize route, otherwise stop, resize, and let the next connect boot it, dropping the sessions it had. Once every host's heyvmd has the route, 70–80 grows early at no cost. Must be >= `PG_VM_POOL_DISK_GROW_PCT`; `0` disables the online path. Without it a schema whose write load never pauses can never grow — see "Growing the device" |
 | `PG_VM_POOL_DISK_MAX_GB` | `100` | ceiling device growth never passes (the daemon itself caps at 250) |
 | `PG_VM_POOL_ADMIT_TIMEOUT_SECS` | `30` | how long a client waits for a free connection slot on its schema's VM before the pooler errors it; `0` fails immediately when full |
 | `PG_VM_POOL_MAX_CONCURRENT_BRINGUPS` | `3` | max VM deploys/boots in flight against heyvmd; the excess queues FIFO in the pooler (an unbounded burst can wedge the daemon, whose watchdog restart then kills every running VM); `0` disables |
@@ -728,8 +728,13 @@ is not enough:
   stopping the VM anyway, so the offline resize is free: no client is
   disturbed. This handles every schema that goes quiet.
 - **While warm** (`PG_VM_POOL_DISK_GROW_URGENT_PCT`, default 95). The pooler
-  stops the VM *itself*, resizes, and leaves it for the next connect to boot —
-  dropping whatever sessions it had.
+  asks heyvmd to grow the device *online* (`POST /sandboxes/{id}/resize-online`):
+  heyvmd extends the disk under the running VM, grows the guest filesystem and
+  verifies both, and no session is dropped. When that is unavailable — an
+  older heyvmd without the route (404), a VM that is not running (409), or a
+  failure partway (5xx) — it falls back to stopping the VM *itself*, resizing
+  offline, and leaving it for the next connect to boot, dropping whatever
+  sessions it had.
 
 The second trigger exists because the first one cannot reach the schemas that
 need it most. Growing a device is offline-only (the daemon fscks and cold-boots
@@ -741,14 +746,16 @@ and *stay* that way until its traffic happened to pause for a whole
 `PG_VM_POOL_IDLE_TIMEOUT_SECS`. The busiest schemas were precisely the ones
 that could not grow.
 
-Hence the higher threshold on the online path: the free idle-stop grow keeps
-handling everything that does go idle, and the expensive one only fires on what
-it misses — a filesystem genuinely at the wall. It samples the warm set once a
-minute, resizes at most 4 devices per pass (each costs a schema its live
-sessions, so a busy pass trickles rather than restarting everything at once),
-and backs off per-schema on failure. It claims the schema the same way an
-offload does, so clients arriving mid-resize queue at the pooler instead of
-racing the stop/start, and it logs the stop at `warn` with the session count.
+Hence the higher default threshold on the warm path: the free idle-stop grow
+keeps handling everything that does go idle, and the offline fallback only
+fires on what it misses — a filesystem genuinely at the wall. It samples the
+warm set once a minute, does at most 4 *offline* grows per pass (each costs a
+schema its live sessions, so a busy pass trickles rather than restarting
+everything at once; online grows are not capped), and backs off per-schema on
+failure. The offline fallback claims the schema the same way an offload does,
+so clients arriving mid-resize queue at the pooler instead of racing the
+stop/start, and it logs the stop at `warn` with the session count. Once every
+host's heyvmd serves the online route, the threshold can come down to 70–80.
 
 When a full filesystem already spans a device at `PG_VM_POOL_DISK_MAX_GB`,
 growth has nothing left to give: that is logged at **error** level (and to the
