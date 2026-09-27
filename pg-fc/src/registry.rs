@@ -602,6 +602,9 @@ pub struct SchemaRegistry {
     physical: Arc<crate::replication::PhysicalStore>,
     physical_sources: Arc<crate::replication::PhysicalSourceStore>,
     replication_ops: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    // The knobs `PUT /api/config` may change while the pooler runs. The loops
+    // that use them read here on every pass rather than off `cfg`.
+    runtime: Arc<crate::runtime_config::RuntimeConfig>,
 }
 
 impl SchemaRegistry {
@@ -614,8 +617,12 @@ impl SchemaRegistry {
             .reclaim
             .as_ref()
             .map(|r| Arc::new(Reclaimer::new(r.cmd.clone(), cfg.run_dir.clone())));
-        let spares = (cfg.warm_spares > 0)
-            .then(|| Arc::new(SparePool::new(cfg.warm_spares, cfg.chilled_vehicles)));
+        let runtime = Arc::new(crate::runtime_config::RuntimeConfig::load(&cfg));
+        let spares = (cfg.warm_spares > 0).then(|| {
+            // A persisted override outranks the env's count from the first pass.
+            let target = runtime.warm_spares().unwrap_or(cfg.warm_spares);
+            Arc::new(SparePool::new(target, cfg.chilled_vehicles))
+        });
         // The dump server has two consumers: the frozen tier (freeze + thaw)
         // and the S3 archive tier, whose dumps *stream* through it so they
         // never touch the guest's data disk. Either one enables it.
@@ -651,7 +658,23 @@ impl SchemaRegistry {
             replication_ops: StdMutex::new(HashMap::new()),
             repl_status: StdMutex::new(HashMap::new()),
             repl_inactive: StdMutex::new(HashMap::new()),
+            runtime,
         })
+    }
+
+    /// The runtime-mutable knobs and where each came from.
+    pub fn runtime(&self) -> &Arc<crate::runtime_config::RuntimeConfig> {
+        &self.runtime
+    }
+
+    /// Apply a `PUT /api/config` patch and push the parts that live outside
+    /// the knob store (the spare pool's target) to where they are read.
+    pub fn apply_runtime(&self, patch: pg_fc_api::RuntimeKnobs) -> Result<pg_fc_api::RuntimeKnobs, String> {
+        let eff = self.runtime.apply(patch)?;
+        if let (Some(pool), Some(n)) = (&self.spares, eff.warm_spares) {
+            pool.set_target(n);
+        }
+        Ok(eff)
     }
 
     /// The trusted peer nodes — what the replication API and dashboard mutate.
@@ -1244,7 +1267,7 @@ impl SchemaRegistry {
     /// The configured idle-reaping timeout (`None` when reaping is disabled), so
     /// a dashboard can label how close a warm VM is to being stopped.
     pub fn idle_timeout(&self) -> Option<Duration> {
-        self.cfg.idle_timeout
+        self.runtime.idle_timeout()
     }
 
     /// Whether the S3 eviction tier is configured — gates the dashboard's manual
@@ -1380,8 +1403,8 @@ impl SchemaRegistry {
                     free_slots: e.free_slots(),
                     slot_limit: e.slot_limit(),
                     idle_secs: e.idle_for().as_secs(),
-                    idle_budget_secs: self.cfg.idle_timeout.map(|t| {
-                        e.idle_budget(t, self.cfg.idle_timeout_fast, self.cfg.fast_bringup)
+                    idle_budget_secs: self.runtime.idle_timeout().map(|t| {
+                        e.idle_budget(t, self.runtime.idle_timeout_fast(), self.cfg.fast_bringup)
                             .as_secs()
                     }),
                     bringup_ms: e.bringup_took.as_millis(),
@@ -2082,9 +2105,14 @@ impl SchemaRegistry {
             ),
         }
         // Reaper `tick` is already short, so first pass and steady state match.
+        // The timeouts are re-read every pass so `PUT /api/config` takes
+        // effect without a restart; the tick stays as paced at boot.
         tokio::spawn(supervise("idle-reaper", tick, tick, move || {
             let registry = registry.clone();
-            async move { registry.reap_idle(timeout, tick).await }
+            async move {
+                let timeout = registry.runtime.idle_timeout().unwrap_or(timeout);
+                registry.reap_idle(timeout, tick).await
+            }
         }));
     }
 
@@ -2111,7 +2139,7 @@ impl SchemaRegistry {
     ///
     /// Returns how many VMs were stopped, for the supervisor's heartbeat.
     async fn reap_idle(self: &Arc<Self>, timeout: Duration, tick: Duration) -> usize {
-        let fast = self.cfg.idle_timeout_fast;
+        let fast = self.runtime.idle_timeout_fast();
         let fast_bringup = self.cfg.fast_bringup;
         // Sized from the durable live-tier count, not the warm map: see
         // [`drain_allowance`] for why the divisor must not shrink mid-drain.
@@ -2639,9 +2667,10 @@ impl SchemaRegistry {
     /// Routine housekeeping: the configured thresholds, cheapest job first.
     fn offload_policy(&self) -> OffloadPolicy {
         OffloadPolicy {
-            compact_after: self.cfg.compact.as_ref().map(|c| c.compact_after.as_secs()),
-            freeze_after: self.cfg.freeze.as_ref().map(|f| f.freeze_after.as_secs()),
-            archive_after: self.cfg.archive.as_ref().map(|a| a.archive_after.as_secs()),
+            // Runtime knobs: `None` exactly when the tier is not configured.
+            compact_after: self.runtime.compact_after().map(|d| d.as_secs()),
+            freeze_after: self.runtime.freeze_after().map(|d| d.as_secs()),
+            archive_after: self.runtime.archive_after().map(|d| d.as_secs()),
             image_archive: self.image_archive_enabled(),
             no_boot: false,
             mode: OffloadMode::Routine,
@@ -2703,7 +2732,7 @@ impl SchemaRegistry {
         };
         info!(
             "warm-spare pool: keeping {} pre-booted VM(s) ready for claiming",
-            self.cfg.warm_spares.min(crate::spares::MAX_SPARES)
+            pool.target()
         );
         let registry = self.clone();
         // Claiming (or failure-killing) a spare pokes the wake handle, so the
@@ -3402,7 +3431,7 @@ impl SchemaRegistry {
             bail!("an eviction sweep is already running");
         }
         let registry = self.clone();
-        let after = archive.archive_after;
+        let after = self.runtime.archive_after().unwrap_or(archive.archive_after);
         tokio::spawn(async move {
             let n = registry.sweep_archive(after).await;
             info!("manual eviction sweep finished: archived {n} schema(s)");

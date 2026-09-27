@@ -1091,3 +1091,20 @@ export interface FeedEvent {
 export interface MintedToken extends TokenSummary {
   token: string;
 }
+
+/** `GET /api/plugins` — a built-in plugin, its stored record and its live status. */
+export interface PluginView {
+  id: string;
+  name: string;
+  description: string;
+  /** JSON Schema for `config`. Advisory; app-lb validates on write. */
+  config_schema: unknown;
+  enabled: boolean;
+  /** Kept while disabled, so re-enabling does not lose it. */
+  config: unknown;
+  updated_at: number;
+  /** Why the last apply failed. A plugin can be enabled *and* failing. */
+  last_error?: string;
+  /** Whatever the plugin reports about itself; the shape is per plugin. */
+  status: unknown;
+}

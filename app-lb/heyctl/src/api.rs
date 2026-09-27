@@ -872,6 +872,36 @@ impl Client {
             .await
     }
 
+    // -- plugins ------------------------------------------------------------
+
+    /// Every built-in plugin, whether or not it is enabled.
+    pub async fn plugins(&self) -> Result<Vec<PluginView>> {
+        self.read(Request::new(Method::Get, "/api/plugins"), "plugin", "").await
+    }
+
+    pub async fn plugin(&self, id: &str) -> Result<PluginView> {
+        self.read(Request::new(Method::Get, format!("/api/plugins/{}", seg(id))), "plugin", id)
+            .await
+    }
+
+    /// Write a plugin's record. `config: None` keeps the stored configuration.
+    ///
+    /// Succeeds when the record was saved, even if applying it failed — check
+    /// `last_error` on the result, which is how app-lb reports "enabled, but
+    /// could not start".
+    pub async fn set_plugin(&self, id: &str, enabled: bool, config: Option<&Value>) -> Result<PluginView> {
+        let mut body = json!({ "enabled": enabled });
+        if let Some(c) = config {
+            body["config"] = c.clone();
+        }
+        self.read(
+            Request::new(Method::Put, format!("/api/plugins/{}", seg(id))).json(body),
+            "plugin",
+            id,
+        )
+        .await
+    }
+
     pub(crate) fn ws(&self) -> Option<&Arc<WsConfig>> {
         self.ws.as_ref()
     }
@@ -987,6 +1017,7 @@ impl Raw<'_> {
         feeds       => "feed",       "/feeds";
         namespaces  => "namespace",  "/namespaces";
         disks       => "disk",       "/disks";
+        plugins     => "plugin",     "/api/plugins";
     }
 
     /// Deployments in one namespace, as app-lb sent them.
