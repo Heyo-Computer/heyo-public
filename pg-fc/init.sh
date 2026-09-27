@@ -425,7 +425,8 @@ autovac_mem_mb=$((maint_mem_mb / 4)); [ "$autovac_mem_mb" -gt 256 ] && autovac_m
 # the same proportional budget, one checkpoint-frequency notch tighter.)
 # Both are derived from the *current filesystem* size, not the device: under
 # thin provisioning the fs starts small and grows, and the grow watcher (below)
-# recomputes + SIGHUPs these on every growth step, so they track the space that
+# recomputes + SIGHUPs these whenever the filesystem changes size — its own
+# growth steps and heyvmd's online resize alike — so they track the space that
 # actually exists. Shared helpers so boot and watcher can't drift apart.
 wal_mb_for() {
     v=$(($1 / 8))
@@ -473,6 +474,23 @@ if [ -b "$DATA_DEV" ] && mountpoint -q "$WORKSPACE" 2>/dev/null; then
     temp_limit_mb=$(temp_mb_for "$disk_mb")
     slot_keep_mb=$(slot_keep_mb_for "$disk_mb")
 fi
+# Rewrite the disk-derived knobs in the generated tuning file for the
+# filesystem as it is now, sized exactly as boot sizes them (df -Pm of the
+# mount), and SIGHUP Postgres to apply them. All three are reload-safe. A
+# no-op before Postgres has written its pid file: boot tuning already matches.
+retune_disk_knobs() {
+    _mb=$(df -Pm "$WORKSPACE" 2>/dev/null | awk 'NR==2 {print $2}')
+    [ -n "$_mb" ] || return 1
+    sed -i \
+        -e "s/^max_wal_size = .*/max_wal_size = $(wal_mb_for "$_mb")MB/" \
+        -e "s/^temp_file_limit = .*/temp_file_limit = $(temp_mb_for "$_mb")MB/" \
+        -e "s/^max_slot_wal_keep_size = .*/max_slot_wal_keep_size = $(slot_keep_mb_for "$_mb")MB/" \
+        "$PGDATA/heyvm-tuning.conf" 2>/dev/null
+    chown postgres:postgres "$PGDATA/heyvm-tuning.conf" 2>/dev/null
+    _pg_pid=$(head -n1 "$PGDATA/postmaster.pid" 2>/dev/null)
+    [ -n "$_pg_pid" ] && kill -HUP "$_pg_pid" 2>/dev/null
+    return 0
+}
 
 # --- replication role (durable, per-VM) --------------------------------------
 # The pooler enables cross-host logical replication for this VM by writing one
@@ -729,25 +747,47 @@ fi
 # outruns it anyway the damage is one query's disk-full error, and the next poll
 # still grows the filesystem (WAL keeps 256MB+ of budget, so the PANIC path
 # stays guarded). After each step the disk-derived Postgres knobs are recomputed
-# and reloaded (both are SIGHUP-safe). Exits once the filesystem spans the
-# device — immediately on legacy disks formatted before thin provisioning.
+# and reloaded (both are SIGHUP-safe).
+#
+# The watcher never exits. The host can grow the device under a running guest
+# (heyvmd's online resize: PATCH /drives, then resize2fs in the guest), so the
+# device size is re-read every pass, and a filesystem that changed size without
+# this loop growing it is retuned. Once the filesystem spans the device —
+# immediately on legacy disks formatted before thin provisioning — it idles on
+# a 60s cadence: one blockdev and one tune2fs -l a minute. If an online resize
+# grows the device but not the filesystem, the normal growth path above takes
+# over from the next pass.
 if [ -b "$DATA_DEV" ] && mountpoint -q "$WORKSPACE" 2>/dev/null; then
     (
         set +e   # a transient df/tune2fs hiccup must not kill the watcher
-        dev_b=$(blockdev --getsize64 "$DATA_DEV")
+        tuned_b=""
+        spanned=0
         while :; do
+            dev_b=$(blockdev --getsize64 "$DATA_DEV" 2>/dev/null)
             geom=$(tune2fs -l "$DATA_DEV" 2>/dev/null)
             bs=$(echo "$geom" | awk -F: '/^Block size:/ {gsub(/ /,"",$2); print $2}')
             blocks=$(echo "$geom" | awk -F: '/^Block count:/ {gsub(/ /,"",$2); print $2}')
-            if [ -z "$bs" ] || [ -z "$blocks" ]; then
+            if [ -z "$dev_b" ] || [ -z "$bs" ] || [ -z "$blocks" ]; then
                 sleep 60
                 continue
             fi
             fs_b=$((blocks * bs))
-            if [ "$fs_b" -ge "$dev_b" ]; then
-                echo "[grow] filesystem spans $DATA_DEV; watcher done"
-                exit 0
+            # Boot tuned for the first size seen. After that, a size this loop
+            # did not produce means something else grew the filesystem.
+            if [ -n "$tuned_b" ] && [ "$fs_b" -ne "$tuned_b" ]; then
+                echo "[grow] filesystem is now $((fs_b / 1048576))MB (grown outside this watcher); retuning"
+                retune_disk_knobs
             fi
+            tuned_b=$fs_b
+            if [ "$fs_b" -ge "$dev_b" ]; then
+                if [ "$spanned" -eq 0 ]; then
+                    echo "[grow] filesystem spans $DATA_DEV; idling until it changes"
+                    spanned=1
+                fi
+                sleep 60
+                continue
+            fi
+            spanned=0
             free_kb=$(df -Pk "$WORKSPACE" | awk 'NR==2 {print $4}')
             min_free_kb=$((fs_b / 1024 / 8))
             [ "$min_free_kb" -lt 1048576 ] && min_free_kb=1048576
@@ -756,15 +796,10 @@ if [ -b "$DATA_DEV" ] && mountpoint -q "$WORKSPACE" 2>/dev/null; then
                 [ "$new_b" -gt "$dev_b" ] && new_b="$dev_b"
                 echo "[grow] $WORKSPACE has ${free_kb}K free (< ${min_free_kb}K): growing filesystem $((fs_b / 1048576))MB -> $((new_b / 1048576))MB"
                 if resize2fs "$DATA_DEV" $((new_b / bs)) >/dev/null 2>&1; then
-                    new_mb=$((new_b / 1048576))
-                    sed -i \
-                        -e "s/^max_wal_size = .*/max_wal_size = $(wal_mb_for "$new_mb")MB/" \
-                        -e "s/^temp_file_limit = .*/temp_file_limit = $(temp_mb_for "$new_mb")MB/" \
-                        -e "s/^max_slot_wal_keep_size = .*/max_slot_wal_keep_size = $(slot_keep_mb_for "$new_mb")MB/" \
-                        "$PGDATA/heyvm-tuning.conf" 2>/dev/null
-                    chown postgres:postgres "$PGDATA/heyvm-tuning.conf" 2>/dev/null
-                    pg_pid=$(head -n1 "$PGDATA/postmaster.pid" 2>/dev/null)
-                    [ -n "$pg_pid" ] && kill -HUP "$pg_pid" 2>/dev/null
+                    retune_disk_knobs
+                    # This loop's own step: already tuned, so the next pass
+                    # must not read it as an outside grow.
+                    tuned_b=$(((new_b / bs) * bs))
                 else
                     echo "[grow] WARNING: resize2fs $DATA_DEV to $((new_b / 1048576))MB failed; retrying in 60s"
                     sleep 60
