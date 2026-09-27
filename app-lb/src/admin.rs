@@ -4234,11 +4234,13 @@ async fn deregister_record(
 
 async fn deregister_retired_record(
     State(state): State<AdminState>,
-    axum::Extension(caller): axum::Extension<Caller>,
+    caller: Option<axum::Extension<Caller>>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    if !fleet_handoff_authorized(&caller) { return forbidden("authenticated fleet admin required"); }
+    if caller.as_ref().is_none_or(|caller| !fleet_handoff_authorized(&caller.0)) {
+        return forbidden("authenticated fleet admin required");
+    }
     remove_deployment_record(state, id, headers, true).await
 }
 
