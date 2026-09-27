@@ -43,7 +43,8 @@ jobs:
         with:
           url: https://admin.us3.heyo.work
           token: ${{ secrets.APP_LB_US3_TOKEN }}
-          deployment: orchestrator-us3-next
+          # Service identity stays fixed; rollouts create unique VM generations.
+          deployment: orchestrator-us3
           namespace: default
           # Reuse the registered release mount and its private-store credential.
           mount-path: /opt/orchestrator-release
