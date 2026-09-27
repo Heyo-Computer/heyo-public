@@ -561,14 +561,14 @@ impl Vms {
         })
     }
 
-    /// Create a VM on a runner and wait for it to be genuinely runnable.
+    /// Allocate a VM identity. Persist ownership before calling ensure_running:
+    /// boot failure must not discard the only cleanup handle.
     pub async fn create(
         &self,
         options: impl Into<crate::runners::Connection>,
         name: &str,
         spec: &VmSpec,
         ttl: Duration,
-        boot_timeout: Duration,
     ) -> Result<Vm, VmError> {
         let connection = options.into();
         let opts = SandboxCreateOptions {
@@ -586,7 +586,9 @@ impl Vms {
             }),
             setup_hooks: (!spec.setup_hooks.is_empty()).then(|| spec.setup_hooks.clone()),
             ttl_seconds: Some(spec.ttl_seconds.unwrap_or(ttl.as_secs())),
-            wait_for_ready: Some(boot_timeout),
+            // Return the identity before polling boot. The dispatcher must
+            // persist ownership before a failed boot can discard the handle.
+            wait_for_ready: Some(Duration::ZERO),
             ..Default::default()
         };
 
@@ -605,9 +607,6 @@ impl Vms {
         let id = sandbox.sandbox_id().to_string();
         let lock = self.lock_for(&id).await;
         let vm = Vm { sandbox, id, lock, _connection: connection };
-        // `create` already waited, but waiting is not the same as running — see
-        // trap 1. Assert before handing the VM to a job.
-        vm.ensure_running(boot_timeout).await?;
         Ok(vm)
     }
 }
@@ -642,7 +641,8 @@ impl Vm {
         let info = self.info().await?;
         match info.status {
             SandboxStatus::Running => return Ok(()),
-            SandboxStatus::Stopped | SandboxStatus::Paused => {}
+            SandboxStatus::Stopped | SandboxStatus::Paused |
+            SandboxStatus::Provisioning | SandboxStatus::Unknown => {}
             other => {
                 return Err(VmError::NotRunnable {
                     sandbox: self.id.clone(),
@@ -654,7 +654,7 @@ impl Vm {
 
         // Serialized: `start` takes the handle out of the manager's map exactly
         // as `execute` does.
-        {
+        if matches!(info.status, SandboxStatus::Stopped | SandboxStatus::Paused) {
             let _guard = self.lock.lock().await;
             self.sandbox.start().await.map_err(|e| VmError::Daemon {
                 sandbox: self.id.clone(),
@@ -1311,16 +1311,17 @@ pub fn valid_operation_id(id: &str) -> bool {
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Mint an id usable as both an `operationId` and a NATS subject token:
-/// `<epoch_ms:012x>-<seq:08x>`.
+/// `<epoch_ms:012x>-<seq:08x>-<random_uuid:032x>`.
 ///
-/// Hex and dash only, and time-ordered so a sorted listing reads
-/// chronologically. Same scheme queue-fn uses for invocation ids.
+/// The timestamp and local counter retain ordering within a process. Random
+/// identity prevents two regional processes starting their counters in the
+/// same millisecond from creating the same run or external operation.
 pub fn new_id() -> String {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{:012x}-{:08x}", ms, seq & 0xffff_ffff)
+    format!("{:012x}-{:08x}-{}", ms, seq & 0xffff_ffff, uuid::Uuid::new_v4().simple())
 }
 
 /// Sandbox name for a pooled VM: `ci-<workflow>-<fingerprint>-<nonce>`.
@@ -1616,6 +1617,30 @@ impl VmError {
             _ => false,
         }
     }
+
+    /// The daemon explicitly rejected a create because its Firecracker TAP
+    /// subnet pool is full. Keep this deliberately narrower than a generic
+    /// create failure: only this backend verdict makes deleting a warm cache a
+    /// safe and useful recovery action.
+    pub fn is_subnet_capacity(&self) -> bool {
+        const VERDICT: &str = "has no usable /30 TAP subnet";
+        match self {
+            Self::Create {
+                source: HeyoError::Api { status, message, body },
+                ..
+            } if *status != 0 => {
+                message.contains(VERDICT)
+                    || body
+                        .as_ref()
+                        .is_some_and(|value| value.to_string().contains(VERDICT))
+            }
+            Self::Create {
+                source: HeyoError::SandboxFailed { reason, .. },
+                ..
+            } => reason.contains(VERDICT),
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for VmError {
@@ -1822,6 +1847,34 @@ mod log_render_tests {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn failed_boot_still_returns_a_cleanup_identity() {
+        use super::*;
+        use axum::{Json, Router, routing::{get, post}};
+        let probes = Arc::new(AtomicU64::new(0));
+        let reads = probes.clone();
+        let app = Router::new()
+            .route("/sandbox-deploy", post(|| async { Json(serde_json::json!({"id":"sb-failed-boot"})) }))
+            .route("/deployed-sandboxes/{id}", get(move || {
+                let reads = reads.clone();
+                async move {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({"id":"sb-failed-boot","status":"failed","status_changed_at":"2026-09-25T00:00:00Z","error_message":"boot failed"}))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let spec = VmSpec::default();
+        let vm = Vms::new().create(HeyoClientOptions { base_url: Some(base), api_key: None, timeout: None },
+            "job", &spec, Duration::from_secs(600)).await.unwrap();
+        assert_eq!(vm.id(), "sb-failed-boot");
+        assert_eq!(probes.load(Ordering::SeqCst), 0, "boot must not be polled before ownership is persisted");
+        assert!(vm.ensure_running(Duration::from_secs(1)).await.is_err());
+        assert_eq!(vm.id(), "sb-failed-boot", "failed boot must retain the deletion handle");
+        server.abort();
+    }
+
     #[test]
     fn a_vm_size_is_labelled_from_whatever_the_daemon_gave() {
         let full = VmSize {
@@ -1951,6 +2004,38 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn only_explicit_subnet_capacity_rejections_are_destructive() {
+        let capacity = VmError::Create {
+            name: "new".into(),
+            source: HeyoError::Api {
+                status: 500,
+                message: "Firecracker virtual network fc has no usable /30 TAP subnet in \
+                          10.0.0.0/24 after retained reservations"
+                    .into(),
+                body: None,
+            },
+        };
+        assert!(capacity.is_subnet_capacity());
+
+        let transport = VmError::Create {
+            name: "new".into(),
+            source: HeyoError::Api {
+                status: 0,
+                message: "network error calling /sandbox-deploy".into(),
+                body: None,
+            },
+        };
+        assert!(!transport.is_subnet_capacity());
+        assert!(transport.is_transport());
+
+        let unknown = VmError::Create {
+            name: "new".into(),
+            source: HeyoError::Timeout(Duration::from_secs(1), "create timed out".into()),
+        };
+        assert!(!unknown.is_subnet_capacity());
+    }
 
     /// A daemon stand-in on a local port that answers one HTTP request per
     /// connection: the POST with `queued`, the *first* poll with nothing —
@@ -2195,7 +2280,10 @@ mod tests {
             assert!(valid_operation_id(id), "{id}");
             // Also usable as a NATS subject token — no dots.
             assert!(crate::config::is_subject_token(id), "{id}");
+            let random = uuid::Uuid::parse_str(id.rsplit('-').next().unwrap()).unwrap();
+            assert_eq!(random.get_version_num(), 4, "identity must not rely on the process-local counter");
         }
+        assert_ne!(a.rsplit('-').next(), b.rsplit('-').next(), "each id has its own random identity");
         assert!(a < b, "ids must sort chronologically");
     }
 
@@ -2481,7 +2569,6 @@ mod tests {
                 &sandbox_name("selftest", "000000000000", 1),
                 &spec,
                 Duration::from_secs(900),
-                Duration::from_secs(240),
             )
             .await
             .expect("VM boots");
@@ -2497,6 +2584,7 @@ mod tests {
     }
 
     async fn run_local_daemon_checks(vm: &Vm) -> Result<(), String> {
+        vm.ensure_running(Duration::from_secs(240)).await.map_err(|e| e.to_string())?;
         let env = HashMap::new();
 
         let out = vm

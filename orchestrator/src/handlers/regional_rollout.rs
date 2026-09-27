@@ -400,6 +400,7 @@ pub(super) fn ordered_regions(slots: &[String]) -> Vec<String> {
 async fn admit(state: &AppState, request: RegionalRolloutRequest) -> Result<(Rollout, bool)> {
     let hash = payload_hash(&request)?;
     let db = db::get_db()?;
+    super::service_adoption::ensure_managed(db, &request.deployment.service_id).await?;
     if let Some(existing) = load(Some(db), &request.operation_id).await? {
         let stored = db
             .query_one(Statement::from_sql_and_values(
@@ -418,6 +419,7 @@ async fn admit(state: &AppState, request: RegionalRolloutRequest) -> Result<(Rol
     let lock = service_deploy::try_service_lifecycle_lock(db, &request.deployment.service_id)
         .await?
         .context("service lifecycle is busy")?;
+    super::service_adoption::ensure_managed(&lock, &request.deployment.service_id).await?;
     // Close the admission race after taking the same lock used by ordinary
     // deploy/retire operations.
     if let Some(existing) = load(Some(db), &request.operation_id).await? {
@@ -566,7 +568,10 @@ pub(super) async fn tick_in(state: &AppState, db: &sea_orm::DatabaseConnection, 
         // A routing-only request must never be deserialized as a VM deployment.
         return super::regional_reports::reconcile(state, db, &header.try_get::<String>("", "service_id")?, operation).await;
     }
-    anyhow::ensure!(plan.version == 1, "application-plan execution is not enabled; refusing legacy fallback");
+    if plan.version == 3 {
+        return super::regional_application::tick(state,db,&header.try_get::<String>("","service_id")?,operation).await;
+    }
+    anyhow::ensure!(plan.version == 1, "unknown application plan; refusing legacy fallback");
     let Some(r) = load(Some(db), operation).await? else {
         return Ok(());
     };
@@ -632,6 +637,10 @@ async fn step(state: &AppState, db: &impl ConnectionTrait, mut r: Rollout) -> Re
         "exclude_region" => {
             let before = snapshot(&r.service_id).await?;
             probe_survivors(state, &r, &before, &region).await?;
+            if !super::regional_lifecycle::before_withdrawal(state, db, &r.operation_id, &item.id,
+                &r.service_id, &region, &r.baseline.active_metadata["source"], &before).await? {
+                return Ok(());
+            }
             service_discovery::set_region_draining(&r.service_id, &region, true).await?;
             let s = snapshot(&r.service_id).await?;
             update(
@@ -894,6 +903,8 @@ async fn verify_complete(state: &AppState, db: &impl ConnectionTrait, r: &Rollou
 }
 
 async fn rollback_step(state: &AppState, db: &impl ConnectionTrait, r: &Rollout) -> Result<()> {
+    anyhow::ensure!(super::instance_http::Contract::from_metadata(&r.baseline.active_metadata["source"])?.is_none(),
+        "lifecycle-managed rollback requires fresh baseline candidates; retained boot reactivation is forbidden");
     let Some(region) = r.regions.get(r.region_index) else {
         service_deploy::restore_regional_baseline(state, &r.baseline).await?;
         db.execute(Statement::from_sql_and_values(DbBackend::Postgres,

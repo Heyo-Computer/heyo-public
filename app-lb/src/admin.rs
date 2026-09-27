@@ -8,7 +8,7 @@
 use crate::autoscale::{Autoscaler, EvictOutcome};
 use crate::config::DeploymentSpec;
 use crate::jobs::{Jobs, StartError};
-use crate::deployment::{UpstreamDrain, now_secs};
+use crate::deployment::{Deployment, UpstreamDrain, now_secs};
 use crate::metrics::{DeploymentMetricsSnapshot, HostSandboxView, HostUsageSnapshot, Metrics};
 use crate::registry::Registry;
 use crate::secrets::{SecretSpec, SecretStore};
@@ -44,6 +44,9 @@ const DIRECTORY_HTML: &str = include_str!("directory.html");
 
 /// The security console at `GET /siem`.
 const SIEM_HTML: &str = include_str!("siem.html");
+
+/// The network topology console at `GET /network`.
+const NETWORK_HTML: &str = include_str!("network.html");
 
 /// The disk console at `GET /storage`.
 const DISKS_HTML: &str = include_str!("disks.html");
@@ -240,6 +243,8 @@ struct AdminState {
     plugins: Arc<crate::plugins::PluginHost>,
     /// The plugin console, with the display name already substituted.
     plugins_html: Arc<str>,
+    /// The network topology console, with the display name already substituted.
+    network_html: Arc<str>,
     /// How to turn a deployment's hostname into a link, given where the data
     /// plane actually listens.
     public_url: PublicUrl,
@@ -310,6 +315,8 @@ impl AdminApi {
             Arc::from(DISKS_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
         let plugins_html: Arc<str> =
             Arc::from(PLUGINS_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
+        let network_html: Arc<str> =
+            Arc::from(NETWORK_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
 
         // The gate turns on as soon as a password is set; the username is
         // optional and defaults to "admin", so one env var is enough to secure
@@ -366,6 +373,7 @@ impl AdminApi {
                 disks_html,
                 plugins,
                 plugins_html,
+                network_html,
                 public_url,
                 feed,
                 deploy_base_domain: deploy_base_domain
@@ -575,6 +583,7 @@ fn narrows_itself(matched: &str) -> bool {
             | "/security"
             | "/siem"
             | "/ingress"
+            | "/network"
             | "/namespaces"
             | "/auth-providers"
             | "/whoami"
@@ -2102,6 +2111,21 @@ async fn set_plugin(
     }
 }
 
+/// `GET /network` — the network topology console.
+///
+/// A 2D-canvas visualiser of the request path: ingress → hostnames →
+/// deployments → VMs, with traffic-flow animation. Reads the same
+/// `/metrics?summary=false` and `/ingress` endpoints the dashboard does and
+/// polls at the same 2s cadence, so the two never disagree about the fleet.
+/// View tier for the same reason the dashboard is: it renders `/metrics`, so
+/// it must work with whatever credentials the browser already has.
+async fn network_console(
+    State(state): State<AdminState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    Html(render_page(&state, &state.network_html, &headers))
+}
+
 // ---- the event feed -------------------------------------------------------
 
 #[derive(Serialize)]
@@ -3362,6 +3386,9 @@ async fn register(
     // from booting until teardown's final old-state capture has published.
     let change = state.registry.change_guard().await;
     let old = state.registry.get(&id);
+    if state.registry.retirement_frozen(&id) {
+        return err(StatusCode::CONFLICT,"deployment permanently frozen for retirement").into_response();
+    }
     if create_only && old.is_some() {
         return err(StatusCode::PRECONDITION_FAILED, "deployment already exists").into_response();
     }
@@ -3708,7 +3735,15 @@ fn discovery_status_locked(
     registry: &Registry,
     id: &str,
 ) -> Result<DiscoveryStatusResponse, Response> {
-    let Some(deployment) = registry.get(id) else {
+    discovery_target_status_locked(registry, id, false)
+}
+
+fn discovery_target_status_locked(
+    registry: &Registry,
+    id: &str,
+    staged: bool,
+) -> Result<DiscoveryStatusResponse, Response> {
+    let Some(deployment) = (if staged { registry.staged(id) } else { registry.get(id) }) else {
         return Err(
             err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response(),
         );
@@ -3721,7 +3756,8 @@ fn discovery_status_locked(
         .into_response());
     };
     let mut upstreams: BTreeMap<String, (bool, usize)> = BTreeMap::new();
-    for backend in registry.discovery_backends(id) {
+    let backends = if staged { deployment.backends().iter().cloned().collect() } else { registry.discovery_backends(id) };
+    for backend in backends {
         let value = upstreams.entry(backend.peer.clone()).or_insert((true, 0));
         value.0 &= backend.is_draining();
         value.1 += backend.in_flight();
@@ -3755,11 +3791,19 @@ fn discovery_status_locked(
 
 /// Observed discovery state. The registry mutation gate makes the durable
 /// version and all live/retired generation counters one coherent observation.
-async fn discovery_status(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+#[derive(Default, Deserialize)]
+struct DiscoveryTarget {
+    #[serde(default)]
+    staged: bool,
+}
+
+async fn discovery_status(State(state): State<AdminState>, Path(id): Path<String>, Query(target): Query<DiscoveryTarget>) -> Response {
     let _change = state.registry.change_guard().await;
-    match discovery_status_locked(&state.registry, &id) {
+    let status = if target.staged { discovery_target_status_locked(&state.registry, &id, true) }
+        else { discovery_status_locked(&state.registry, &id) };
+    match status {
         Ok(mut status) => {
-            if let Some(deployment) = state.registry.get(&id) {
+            if let Some(deployment) = (if target.staged { state.registry.staged(&id) } else { state.registry.get(&id) }) {
                 if let Some(spec) = deployment.spec.discovery.as_ref().and_then(|d| d.regional.as_ref()) {
                     let ready = state.secrets.resolve(&spec.auth).is_ok_and(|token|
                         !token.is_empty() && http::HeaderValue::from_str(&token).is_ok())
@@ -3823,6 +3867,74 @@ async fn regional_active_probe(State(state): State<AdminState>, axum::Extension(
             "sourceGatewayId":spec.gateway_id,"sourceBootId":router.boot_id,"destination":receipt}))).into_response(),
         Err(code) => err(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),"active capacity probe refused or unhealthy").into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PrepareRouteHandoff {
+    operation_id: String,
+    expected_predecessor_fingerprint: String,
+    staged_spec: DeploymentSpec,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommitRouteHandoff { operation_id: String }
+
+fn handoff_response(result: Result<crate::registry::RouteHandoffRecord, crate::registry::HandoffError>) -> Response {
+    match result {
+        Ok(receipt) => ([(header::CACHE_CONTROL,"no-store")], Json(receipt)).into_response(),
+        Err(crate::registry::HandoffError::NotFound) => err(StatusCode::NOT_FOUND,"deployment not found").into_response(),
+        Err(crate::registry::HandoffError::Conflict(message)) => err(StatusCode::CONFLICT,message).into_response(),
+        Err(crate::registry::HandoffError::Io(error)) => {
+            tracing::error!(%error,"failed to persist route handoff");
+            err(StatusCode::SERVICE_UNAVAILABLE,"could not durably record route handoff").into_response()
+        }
+    }
+}
+
+fn fleet_handoff_authorized(caller: &Caller) -> bool {
+    !matches!(caller, Caller::Ungated) && caller.covers_fleet()
+        && caller.satisfies_in(crate::tokens::AdminScope::Admin, None)
+}
+
+async fn prepare_route_handoff(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path(id): Path<String>, Json(mut request): Json<PrepareRouteHandoff>) -> Response {
+    if !fleet_handoff_authorized(&caller) { return forbidden("authenticated fleet admin required"); }
+    if request.operation_id.is_empty() || request.operation_id.len() > 256 {
+        return err(StatusCode::BAD_REQUEST,"operationId must be a bounded non-empty identity").into_response();
+    }
+    request.staged_spec.id = id.clone();
+    request.staged_spec.normalize();
+    let _change = state.registry.change_guard().await;
+    let result = state.registry.prepare_handoff(&request.operation_id,
+        &request.expected_predecessor_fingerprint, request.staged_spec);
+    if result.is_ok() {
+        // A retry after discovery has prepared the hidden runtime upgrades the
+        // durable receipt. Failure means it remains safely in preparing.
+        if state.registry.staged(&id).and_then(|d| d.regional.as_ref()
+            .and_then(|r| r.preparation(!d.spec.maintenance))).is_some_and(|p| p.prepared && p.adopted) {
+            return handoff_response(state.registry.mark_handoff_prepared(&id));
+        }
+    }
+    handoff_response(result)
+}
+
+async fn inspect_route_handoff(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path(id): Path<String>) -> Response {
+    if !fleet_handoff_authorized(&caller) { return forbidden("authenticated fleet admin required"); }
+    let _change = state.registry.change_guard().await;
+    match state.registry.inspect_handoff(&id) {
+        Some(receipt) => ([(header::CACHE_CONTROL,"no-store")],Json(receipt)).into_response(),
+        None => err(StatusCode::NOT_FOUND,"route handoff not found").into_response(),
+    }
+}
+
+async fn commit_route_handoff(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    Path(id): Path<String>, Json(request): Json<CommitRouteHandoff>) -> Response {
+    if !fleet_handoff_authorized(&caller) { return forbidden("authenticated fleet admin required"); }
+    let _change = state.registry.change_guard().await;
+    handoff_response(state.registry.commit_handoff(&id,&request.operation_id))
 }
 
 const MAX_DRAIN_REASON_LEN: usize = 512;
@@ -4084,8 +4196,255 @@ async fn uncordon_upstream(
     Json(upstream_traffic_status(&deployment, &upstream)).into_response()
 }
 
+#[cfg(test)]
+fn record_only_refusal(d: &Deployment, workspace_state: bool) -> Option<&'static str> {
+    record_removal_refusal(d, workspace_state, false)
+}
+
+fn record_removal_refusal(d: &Deployment, workspace_state: bool, archive_history: bool) -> Option<&'static str> {
+    let state = d.state();
+    if archive_history && d.spec.vm.as_ref().is_none_or(|vm| vm.driver != crate::config::Driver::Firecracker) {
+        return Some("retired record archival requires a managed Firecracker deployment");
+    }
+    if state.create_attempts.iter().any(|a| a.allocation.is_some()) {
+        return Some("correlated allocation receipts must be retained");
+    }
+    if archive_history && state.create_attempts.iter().any(|a| !a.runtime_observed) {
+        return Some("unobserved allocation attempts require reconciliation");
+    }
+    if !d.spec.routes.is_empty() {
+        return Some("record-only removal requires a route-less deployment");
+    }
+    if d.desired_replicas() != 0 {
+        return Some("record-only removal requires zero desired replicas");
+    }
+    if !d.backends().is_empty() {
+        return Some("record-only removal requires zero live backends");
+    }
+    if !d.pending().is_empty() {
+        return Some("record-only removal requires zero pending or provisioning VMs");
+    }
+    if !state.suspended.is_empty() {
+        return Some("record-only removal requires zero suspended VMs");
+    }
+    if crate::rollout::reserved(d) || (!archive_history && (state.active_prefix.is_some() || !state.rollouts.is_empty())) {
+        return Some("record-only removal requires no retained rollout generations");
+    }
+    if archive_history && state.rollouts.iter().any(|op| match op.status.as_str() {
+        "succeeded" => !op.readiness_verified || !op.previous_stopped,
+        "failed" => !op.failure_settled,
+        _ => true,
+    }) {
+        return Some("only settled terminal rollout history can be archived");
+    }
+    if d.spec.vm.as_ref().is_some_and(|vm| vm.workspace.is_some()) || workspace_state {
+        return Some("record-only removal requires no workspace configuration or retained workspace state");
+    }
+    if d.spec.build.is_some() || d.spec.artifact.is_some() || d.spec.update.is_some()
+        || d.spec.vm.as_ref().is_some_and(|vm| vm.workspace_archive.is_some()
+            || vm.mounts.iter().any(|mount| !archive_history || !mount.read_only))
+    {
+        return Some("record-only removal requires no build, artifact, host-update or mount job configuration");
+    }
+    if d.spec.discovery.is_some()
+        || !state.upstream_drains.is_empty()
+        || state.discovery_version.is_some()
+        || state.discovery_source_url.is_some()
+        || state.route_handoff.is_some()
+    {
+        return Some("record-only removal requires no retained service state");
+    }
+    None
+}
+
+// Inside the auth layer, but also present on intentionally ungated CRUD.
+// Shells own a read lease through WebSocket EOF in their handler instead.
+async fn retirement_admission(State(state):State<AdminState>,req:Request,next:Next)->Response {
+    let matched=req.extensions().get::<MatchedPath>().map(|m|m.as_str());
+    let mutation=matched.is_some_and(|m|m=="/deployments" || m.starts_with("/deployments/:id"))
+        && matched!=Some("/deployments/:id/retirement")
+        && !matches!(*req.method(),axum::http::Method::GET|axum::http::Method::HEAD);
+    let _lease=if mutation {Some(state.registry.retirement_gate.read().await)} else {None};
+    if mutation && matched.and_then(|m|deployment_of(m,req.uri().path()))
+        .is_some_and(|id|state.registry.retirement_frozen(id)) {
+        return err(StatusCode::CONFLICT,"deployment permanently frozen for retirement").into_response();
+    }
+    next.run(req).await
+}
+
+async fn retirement_status(State(state):State<AdminState>, axum::Extension(caller):axum::Extension<Caller>,Path(id):Path<String>) -> Response {
+    let Some(d)=state.registry.get(&id) else {return StatusCode::NOT_FOUND.into_response()};
+    if !recovery_authorized(&caller,&d.spec) {return forbidden("authenticated namespace admin required");}
+    Json(serde_json::json!({"deployment":id,"revision":d.state().rollout_revision,
+        "spec_sha256":crate::rollout::fingerprint(&d.spec),"retirement":d.state().retirement})).into_response()
+}
+
+async fn retire_deployment(State(state):State<AdminState>,axum::Extension(caller):axum::Extension<Caller>,Path(id):Path<String>,
+    Json(request):Json<crate::retirement::Request>) -> Response {
+    let Some(d)=state.registry.get(&id) else {return StatusCode::NOT_FOUND.into_response()};
+    if !recovery_authorized(&caller,&d.spec) {return forbidden("authenticated namespace admin required");}
+    let _retirement=state.registry.retirement_gate.write().await;
+    let _rollout=state.autoscaler.rollout_guard().await;
+    let _change=state.registry.change_guard().await;
+    let _creates=state.autoscaler.workspace_recovery_guard().await;
+    let _workspace=state.autoscaler.workspaces().lifecycle_guard().await;
+    let Some(d)=state.registry.get(&id) else {return StatusCode::NOT_FOUND.into_response()};
+    if !recovery_authorized(&caller,&d.spec) {return forbidden("authenticated namespace admin required");}
+    if let Err(error)=crate::retirement::freeze(&state.registry,&d,request) {
+        return err(StatusCode::CONFLICT,error).into_response();
+    }
+    // History may represent an interrupted worker, not proof of no effects.
+    // No historical failure is silently converted to completed retirement.
+    let blocker=(!state.jobs.records(Some(&id)).is_empty())
+        .then(||"job history requires explicit effect reconciliation".to_string())
+        .or_else(|| (d.spec.update.is_some() || std::env::var_os("APP_LB_HOST_UPDATE_CONFIG").is_some()
+            && crate::host_update::configured().map_or(true,|(_,c)|c.deployment==id))
+            .then(||"host update helper requires explicit effect reconciliation".into()))
+        .or_else(||state.autoscaler.workspaces().retirement_blocker(&id));
+    match crate::retirement::advance(&state.registry,&d,state.autoscaler.vms(),blocker).await {
+        Ok(op)=>(if op.state=="retired" {StatusCode::OK} else {StatusCode::ACCEPTED},Json(op)).into_response(),
+        Err(error)=>{tracing::warn!(deployment=%id,%error,"retirement remains frozen");
+            (StatusCode::ACCEPTED,Json(serde_json::json!({"retirement":d.state().retirement,"pending":true}))).into_response()}
+    }
+}
+
+async fn deregister_record(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    remove_deployment_record(state, id, headers, false).await
+}
+
+async fn deregister_retired_record(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if caller.as_ref().is_none_or(|caller| !fleet_handoff_authorized(&caller.0)) {
+        return forbidden("authenticated fleet admin required");
+    }
+    remove_deployment_record(state, id, headers, true).await
+}
+
+async fn remove_deployment_record(
+    state: AdminState,
+    id: String,
+    headers: axum::http::HeaderMap,
+    archive_history: bool,
+) -> Response {
+    // Match rollout cutover's lock order and wait out adoption/promotion and
+    // orphan sweeps, not just allocations. A separate endpoint makes an old
+    // server reject this request instead of ignoring a query flag and tearing down.
+    let _reconcile = state.autoscaler.rollout_guard().await;
+    let _change = state.registry.change_guard().await;
+    {
+        let expected_etag = match if_match(&headers) {
+            Ok(value) => value.map(str::to_owned),
+            Err(response) => return response,
+        };
+        let Some(expected_etag) = expected_etag.as_deref() else {
+            return err(StatusCode::PRECONDITION_REQUIRED, "record-only removal requires If-Match from GET /deployments/:id").into_response();
+        };
+        // This waits for create/boot completion while the registry writer is
+        // held. A completing boot must publish its pending/backend state before
+        // releasing the permit; no later boot can pass its is_live check after
+        // the record is removed.
+        let _allocations = state.autoscaler.workspace_recovery_guard().await;
+        let _workspace_lifecycle = state.autoscaler.workspaces().lifecycle_guard().await;
+        let Some(d) = state.registry.get(&id) else {
+            return err(StatusCode::NOT_FOUND, format!("no deployment {id:?}")).into_response();
+        };
+        if let Err(status) = check_etag_precondition(Some(expected_etag), &d.spec) {
+            let message = if status == StatusCode::PRECONDITION_FAILED {
+                "If-Match does not match the current deployment spec"
+            } else {
+                "failed to serialize deployment ETag"
+            };
+            return err(status, message).into_response();
+        }
+        if let Some(message) = record_removal_refusal(
+            &d,
+            state.autoscaler.workspaces().has_retained_state(&id),
+            archive_history,
+        ) {
+            return err(StatusCode::CONFLICT, message).into_response();
+        }
+        if !state.jobs.records(Some(&id)).is_empty() {
+            return err(StatusCode::CONFLICT, "job history still references this deployment").into_response();
+        }
+        if std::env::var_os("APP_LB_HOST_UPDATE_CONFIG").is_some() {
+            match crate::host_update::configured() {
+                Ok((_, config)) if config.deployment != id => {}
+                Ok(_) => return err(StatusCode::CONFLICT, "host update mapping still references this deployment").into_response(),
+                Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "host update mapping could not be verified").into_response(),
+            }
+        }
+        match state.autoscaler.has_owned_resources(&id).await {
+            Ok(false) => {}
+            Ok(true) => return err(StatusCode::CONFLICT, "runtime still reports resources owned by this deployment").into_response(),
+            Err(error) => {
+                tracing::warn!(deployment = %id, %error, "record-only inventory unavailable");
+                return err(StatusCode::SERVICE_UNAVAILABLE, "complete runtime inventory is required for record-only removal").into_response();
+            }
+        }
+        let Some(disks) = state.disks.as_ref() else {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "disk inventory is required for record-only removal").into_response();
+        };
+        let inventory = disks.inventory().await;
+        if !inventory.complete {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "complete disk inventory is required for record-only removal").into_response();
+        }
+        let saved = d.state();
+        let historical_ids: std::collections::HashSet<&String> = crate::rollout::protected_ids(&saved)
+            .chain(saved.create_attempts.iter().filter_map(|attempt| attempt.sandbox_id.as_ref())).collect();
+        if inventory.disks.iter().any(|disk| disk.deployment.as_deref() == Some(id.as_str())
+            || historical_ids.contains(&disk.sandbox_id)) {
+            return err(StatusCode::CONFLICT, "retained disks still reference this deployment").into_response();
+        }
+        if archive_history {
+            // Names may have changed outside this controller. Check historical
+            // IDs as well as ownership, including stopped runtimes with no disks.
+            let vms = state.autoscaler.vms();
+            match (vms.list().await, vms.list_inactive().await) {
+                (Ok(active), Ok(inactive)) => {
+                    if active.iter().chain(inactive.iter()).any(|vm| historical_ids.contains(&vm.id)) {
+                        return err(StatusCode::CONFLICT, "runtime still references a historical sandbox ID").into_response();
+                    }
+                }
+                _ => return err(StatusCode::SERVICE_UNAVAILABLE, "historical runtime inventory unavailable").into_response(),
+            }
+            if let Err(error) = state.registry.archive_record(&d) {
+                tracing::error!(deployment = %id, %error, "failed to archive retired deployment");
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "deployment history was not archived; record retained").into_response();
+            }
+        }
+        // Unlink first. A failure leaves the live registry untouched; a crash
+        // between unlink and the in-memory removal merely keeps the record
+        // until restart. This path deliberately never invokes teardown.
+        if let Err(error) = state.registry.forget(&id) {
+            tracing::error!(deployment = %id, %error, "failed record-only deregistration");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("deployment record was not removed: {error}")).into_response();
+        }
+        let d = state.registry.remove(&id).expect("deployment remained under registry mutation gate");
+        state.metrics.retire(&id);
+        tracing::info!(deployment = %id, "removed empty deployment record only");
+        state.feed.announce(
+            &d.spec,
+            crate::feed::FeedEventKind::Removed,
+            "the empty deployment record was removed without resource cleanup".to_string(),
+            now_secs(),
+        );
+        return StatusCode::NO_CONTENT.into_response();
+    }
+}
+
 async fn deregister(State(state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
     let change = state.registry.change_guard().await;
+    if state.registry.get(&id).is_some_and(|d| d.state().create_attempts.iter().any(|a| a.allocation.is_some())) {
+        return err(StatusCode::CONFLICT, "correlated allocation receipts must be retained").into_response();
+    }
     if state.registry.get(&id).is_some_and(|d| crate::rollout::reserved(&d) || !d.state().rollouts.is_empty()) {
         return err(StatusCode::CONFLICT, "rollout generations must be explicitly reconciled before deregistration").into_response();
     }
@@ -4494,6 +4853,10 @@ async fn shell(
     // Everything that can fail with a status code has to fail *before* the
     // upgrade: once the socket is a WebSocket, a client sees a close frame with
     // no explanation instead of a 404.
+    let retirement=state.registry.retirement_gate.clone().read_owned().await;
+    if state.registry.retirement_frozen(&id) {
+        return err(StatusCode::CONFLICT,"deployment permanently frozen for retirement").into_response();
+    }
     let slot = match hold_a_vm(&state, &id, q.wake, q.sandbox_id.as_deref()).await {
         Ok(slot) => slot,
         Err(response) => return response,
@@ -4520,6 +4883,7 @@ async fn shell(
 
     tracing::info!(deployment = %id, sandbox = %sandbox_id, "shell session opened");
     ws.on_upgrade(move |socket| async move {
+        let _retirement=retirement;
         // `slot` moves in here, so the VM is held for the life of the session
         // and released however it ends.
         pump_shell(socket, session, sandbox_id.clone(), slot).await;
@@ -5422,7 +5786,11 @@ fn router(state: AdminState) -> Router {
         // deployment's.
         .route("/plugins", get(plugins_console))
         .route("/api/plugins", get(list_plugins))
-        .route("/api/plugins/:id", get(get_plugin));
+        .route("/api/plugins/:id", get(get_plugin))
+        // The network topology console. View tier, like the dashboard it sits
+        // beside: it renders `/metrics` and `/ingress`, so it must work with
+        // the browser's cached view credentials.
+        .route("/network", get(network_console));
 
     // The deployment CRUD API — register/edit/scale/delete/evict, plus the reads
     // that expose the spec (env vars can hold secrets). Gated too iff
@@ -5432,6 +5800,8 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/rollouts", post(start_rollout))
         .route("/deployments/:id/rollouts/:operation", get(get_rollout))
         .route("/deployments/:id", get(get_one).put(update).delete(deregister))
+        .route("/deployments/:id/record", axum::routing::delete(deregister_record))
+        .route("/deployments/:id/retired-record", axum::routing::delete(deregister_retired_record))
         .route("/deployments/:id/discovery-status", get(discovery_status))
         .route("/deployments/:id/scaling", patch(scale))
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
@@ -5521,7 +5891,8 @@ fn router(state: AdminState) -> Router {
         .route(
             "/tokens/:id",
             get(get_token).patch(patch_token).delete(revoke_token),
-        );
+        )
+        .route_layer(middleware::from_fn_with_state(state.clone(),retirement_admission));
 
     // `route_layer` runs the auth middleware only for the routes it wraps, so a
     // 404 elsewhere never triggers a challenge. `/healthz` is always open.
@@ -5559,13 +5930,18 @@ fn router(state: AdminState) -> Router {
 
     // Unlike legacy CRUD, explicit data recovery is never available ungated.
     let recovery = Router::new()
+        .route("/deployments/:id/retirement", get(retirement_status).post(retire_deployment))
         .route("/deployments/:id/workspace/recoveries", post(recover_workspace))
         .route("/deployments/:id/workspace/recoveries/:operation_id", get(get_workspace_recovery))
+        .route_layer(middleware::from_fn_with_state(state.clone(),retirement_admission))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
 
     let regional = Router::new()
         .route("/deployments/:id/regional-probe",post(regional_probe))
         .route("/deployments/:id/regional-active-probe",post(regional_active_probe))
+        .route("/deployments/:id/route-handoff",post(prepare_route_handoff).get(inspect_route_handoff))
+        .route("/deployments/:id/route-handoff/commit",post(commit_route_handoff))
+        .route_layer(middleware::from_fn_with_state(state.clone(),retirement_admission))
         .route_layer(middleware::from_fn_with_state(state.clone(),require_crud_auth));
 
     let fleet = Router::new()
@@ -6093,6 +6469,572 @@ mod tests {
         }
     }
 
+    mod record_only_deregistration {
+        use super::*;
+        use crate::deployment::PendingVm;
+        use axum::{Json, body::Body, http::Request, routing::get};
+        use std::path::{Path as FsPath, PathBuf};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use tower_service::Service;
+
+        static FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+        struct Fixture {
+            state: AdminState,
+            registry: Arc<Registry>,
+            root: PathBuf,
+            mutations: Arc<AtomicUsize>,
+            inactive: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.root); }
+        }
+
+        async fn fixture(inventory_available: bool) -> Fixture {
+            fixture_with_backend(inventory_available,Router::new(),None).await
+        }
+
+        async fn fixture_with_backend(inventory_available: bool, extra:Router, restore:Option<PathBuf>) -> Fixture {
+            let reload=restore.is_some();
+            let root = restore.unwrap_or_else(||std::env::temp_dir().join(format!(
+                "app-lb-record-handler-{}-{}", std::process::id(),
+                FIXTURE.fetch_add(1, Ordering::Relaxed),
+            )));
+            std::fs::create_dir_all(&root).unwrap();
+            let mutations = Arc::new(AtomicUsize::new(0));
+            let mutation_count = mutations.clone();
+            let inactive = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let inactive_rows = inactive.clone();
+            let app = Router::new()
+                .route("/deployed-sandboxes", get(move || async move {
+                    if inventory_available { Json(serde_json::json!([])).into_response() }
+                    else { StatusCode::SERVICE_UNAVAILABLE.into_response() }
+                }))
+                .route("/sandboxes/inactive", get(move || {
+                    let rows = inactive_rows.lock().unwrap().clone();
+                    async move { Json(serde_json::json!({"sandboxes": rows, "next_cursor": null})) }
+                }))
+                .route("/storage", get(|| async {
+                    Json(serde_json::json!({
+                        "data_dir": "/data", "tmp_dir": "/tmp",
+                        "free_bytes": 10, "total_bytes": 20, "sandboxes": []
+                    }))
+                }))
+                .merge(extra)
+                .fallback(move |request: Request<Body>| {
+                    let mutation_count = mutation_count.clone();
+                    async move {
+                        if request.method() != axum::http::Method::GET {
+                            mutation_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        StatusCode::NOT_FOUND
+                    }
+                });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let daemon_url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let registry = Arc::new(Registry::new(root.join("deployments.json")));
+            if reload {registry.load().unwrap(); registry.require_complete_load().unwrap();} else {
+                registry.upsert(empty().spec.clone());
+                registry.persist_one("obsolete").unwrap();
+            }
+            let mounts = crate::mounts::MountStore::new(root.join("mounts"), 0);
+            let vms = crate::vm::VmManager::new(Some(daemon_url), Some("retirement-test-key".into()), mounts.clone()).unwrap();
+            let secrets = Arc::new(crate::secrets::SecretStore::new(root.join("secrets.json"), None));
+            let workspaces = Arc::new(crate::workspace::Workspaces::new(
+                crate::workspace::WorkspaceConfig {
+                    root: root.join("workspaces"), tar_bin: "tar".into(), aws_bin: "aws".into(),
+                    art_bin: "art".into(), s3_endpoint: None, home: None,
+                    timeout: std::time::Duration::from_secs(1),
+                }, vms.clone(), registry.clone(), secrets.clone(),
+            ));
+            let metrics = Arc::new(Metrics::new());
+            let feed = Arc::new(crate::feed::Feed::new());
+            let autoscaler = Arc::new(Autoscaler::new(
+                registry.clone(),
+                crate::runtime::Runtime::new(vms.clone(), crate::config::LxcConfig { enabled: false, ..Default::default() }),
+                metrics.clone(), feed.clone(), workspaces, secrets.clone(),
+            ));
+            let jobs = Arc::new(Jobs::new(crate::jobs::JobConfig {
+                work_dir: root.join("jobs"), heyvm_bin: "heyvm".into(), art_bin: "art".into(),
+                images_dir: root.join("images"), git_bin: "git".into(), mounts,
+                shell: "sh".into(), timeout: std::time::Duration::ZERO, home: None,
+            }, registry.clone(), autoscaler.clone(), secrets.clone(), None));
+            let disks = Arc::new(crate::disks::DiskStore::new(crate::disks::DiskConfig {
+                state_path: root.join("disks.json"), ttl_secs: 0, sweep_secs: 60,
+                aws_bin: "aws".into(), bucket: None, prefix: "test".into(), endpoint: None,
+                archive_on_expire: false, archive_timeout: std::time::Duration::from_secs(60),
+                orphan_ttl_secs: 0,
+            }, vms, registry.clone()));
+            let api = AdminApi::new(
+                "127.0.0.1:0".into(), registry.clone(), autoscaler, metrics, "test".into(),
+                None, None, false, false, None,
+                Arc::new(crate::tls::CertStore::new(root.join("certs"), None)), None, secrets,
+                Arc::new(crate::workflows::WorkflowStore::new(root.join("workflows"))),
+                Arc::new(crate::namespaces::NamespaceStore::new(root.join("namespaces"))),
+                Arc::new(crate::auth_providers::AuthProviderStore::new(root.join("providers"))),
+                Arc::new(crate::tokens::TokenStore::new(root.join("tokens.json"))), jobs,
+                None, None, Arc::new(crate::guard::Guard::new(root.join("guard.json"), false)),
+                Some(disks), PublicUrl::from_config(false, "127.0.0.1:80", "127.0.0.1:443"),
+                feed, &[], None,
+                Arc::new(crate::plugins::PluginHost::new(
+                    Vec::new(),
+                    crate::plugins::PluginStore::new(root.join("plugins")),
+                )),
+            );
+            Fixture { state: api.state, registry, root, mutations, inactive }
+        }
+
+        mod retirement_tests {
+            use super::*;
+            use crate::retirement::{CreateAttempt,Request as RetirementRequest,Target};
+            use serde_json::{Value,json};
+            use std::sync::Mutex;
+            use std::time::Duration;
+
+            #[derive(Default)]
+            struct Backend {
+                mode: AtomicUsize,
+                posts: AtomicUsize,
+                reads: AtomicUsize,
+                receipt: Mutex<Option<Value>>,
+                requests: Mutex<Vec<Value>>,
+            }
+
+            fn target() -> Target {
+                Target {backend_server_id:"host-us3".into(),backend_sandbox_id:"sb-12345678".into(),
+                    created_at_unix_nanos:"1780000000123456789".into(),libvirt_connection_uri:"qemu:///system".into(),
+                    libvirt_domain_uuid:"3a7bfa82-b791-4e9d-8be4-4a0bef8c4470".into()}
+            }
+
+            fn backend_router(b:Arc<Backend>) -> Router {
+                let read=b.clone();
+                Router::new().route("/sandboxes/:id/retirement",get(move |headers:axum::http::HeaderMap| {
+                    let b=read.clone(); async move {
+                        assert_eq!(headers[header::AUTHORIZATION],"Bearer retirement-test-key");
+                        b.reads.fetch_add(1,Ordering::SeqCst);
+                        let mut t=target();
+                        if b.mode.load(Ordering::SeqCst)==3 {t.created_at_unix_nanos="1780000000123456790".into();}
+                        let receipt=b.receipt.lock().unwrap().clone();
+                        Json(json!({"target":t,"state":if receipt.is_some() {"retired"} else {"active"},"receipt":receipt}))
+                    }
+                }).post(move |headers:axum::http::HeaderMap,Json(request):Json<Value>| {
+                    let b=b.clone(); async move {
+                        assert_eq!(headers[header::AUTHORIZATION],"Bearer retirement-test-key");
+                        b.posts.fetch_add(1,Ordering::SeqCst);
+                        b.requests.lock().unwrap().push(request.clone());
+                        match b.mode.load(Ordering::SeqCst) {
+                            1=>return (StatusCode::ACCEPTED,Json(json!({"target":target(),"state":"retiring","receipt":null}))).into_response(),
+                            5=>return (StatusCode::TEMPORARY_REDIRECT,[(header::LOCATION,"/must-not-follow")]).into_response(),
+                            _=>{}
+                        }
+                        let mut record=json!({"request":request,"state":"retired","retiredAt":"2026-09-25T10:00:00Z"});
+                        if b.mode.load(Ordering::SeqCst)==4 {record["request"]["operationId"]=json!("different-operation");}
+                        *b.receipt.lock().unwrap()=Some(record.clone());
+                        if b.mode.load(Ordering::SeqCst)==2 {return StatusCode::SERVICE_UNAVAILABLE.into_response();}
+                        Json(record).into_response()
+                    }
+                }))
+            }
+
+            fn auth(f:&mut Fixture) {
+                f.state.auth=Some(Arc::new(DashboardAuth::new("operator","password")));
+                f.state.gate_admin=true;
+            }
+
+            fn approve(f:&Fixture) -> RetirementRequest {
+                let d=f.registry.get("obsolete").unwrap();
+                RetirementRequest {operation_id:"retire-1".into(),expected_revision:d.state().rollout_revision.clone(),
+                    expected_spec_sha256:crate::rollout::fingerprint(&d.spec),targets:vec![target()]}
+            }
+
+            fn tracked(f:&Fixture) {
+                let d=f.registry.get("obsolete").unwrap();
+                d.set_pending(vec![PendingVm::new(target().backend_sandbox_id.clone())]);
+                d.mutate_state(|s|s.create_attempts.push(CreateAttempt {
+                    name:"applb-obsolete-000000000001".into(),sandbox_id:Some(target().backend_sandbox_id),..Default::default()}));
+                f.registry.persist_one("obsolete").unwrap();
+            }
+
+            async fn call(f:&Fixture,method:&str,path:&str,body:Value,credential:bool) -> (StatusCode,Value) {
+                let mut req=Request::builder().method(method).uri(path).header(header::CONTENT_TYPE,"application/json");
+                if credential {req=req.header(header::AUTHORIZATION,"Basic b3BlcmF0b3I6cGFzc3dvcmQ=");}
+                let mut app=router(f.state.clone());
+                std::future::poll_fn(|cx|<Router as Service<Request<Body>>>::poll_ready(&mut app,cx)).await.unwrap();
+                let response=app.call(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                let status=response.status();
+                let bytes=axum::body::to_bytes(response.into_body(),1<<20).await.unwrap();
+                (status,serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+            }
+
+            async fn retire(f:&Fixture,r:&RetirementRequest)->(StatusCode,Value) {
+                call(f,"POST","/deployments/obsolete/retirement",serde_json::to_value(r).unwrap(),true).await
+            }
+
+            #[tokio::test]
+            async fn lost_receipt_restart_replay_and_controller_mutations_preserve_state() {
+                let b=Arc::new(Backend::default()); b.mode.store(2,Ordering::SeqCst);
+                let mut f=fixture_with_backend(true,backend_router(b.clone()),None).await;
+                auth(&mut f); tracked(&f);
+                let r=approve(&f);
+                let preserved=f.root.join("retained-workspace.ext4");
+                std::fs::write(&preserved,b"retained bytes").unwrap();
+                assert_eq!(retire(&f,&r).await.0,StatusCode::ACCEPTED);
+                assert_eq!(b.posts.load(Ordering::SeqCst),1);
+                assert_eq!(f.registry.get("obsolete").unwrap().state().retirement.as_ref().unwrap().state,"retiring");
+                // Reconstruct controller, workers and registry from the actual files.
+                let mut restarted=fixture_with_backend(true,backend_router(b.clone()),Some(f.root.clone())).await;
+                auth(&mut restarted);
+                let (status,result)=retire(&restarted,&r).await;
+                assert_eq!(status,StatusCode::OK,"{result}");
+                assert_eq!(result["state"],"retired");
+                assert_eq!(b.posts.load(Ordering::SeqCst),1,"lost response must be recovered by exact receipt, not another POST");
+                assert_eq!(retire(&restarted,&r).await.1,result);
+                let mut changed=r.clone(); changed.targets[0].libvirt_domain_uuid.push('0');
+                assert_eq!(retire(&restarted,&changed).await.0,StatusCode::CONFLICT);
+                for (method,path) in [("DELETE","/deployments/obsolete"),("DELETE","/deployments/obsolete/record"),
+                    ("POST","/deployments/obsolete/update"),("POST","/deployments/obsolete/build"),
+                    ("POST","/deployments/obsolete/exec"),("PATCH","/deployments/obsolete")] {
+                    assert_eq!(call(&restarted,method,path,json!({}),true).await.0,StatusCode::CONFLICT,"{method} {path}");
+                }
+                // An intentionally ungated legacy CRUD listener must also refuse.
+                restarted.state.gate_admin=false;
+                assert_eq!(call(&restarted,"DELETE","/deployments/obsolete",json!({}),false).await.0,StatusCode::CONFLICT);
+                assert_eq!(call(&restarted,"POST","/deployments",serde_json::to_value(empty().spec.clone()).unwrap(),false).await.0,StatusCode::CONFLICT);
+                restarted.state.autoscaler.adopt_existing().await;
+                restarted.state.autoscaler.reconcile().await;
+                restarted.state.autoscaler.sweep_suspended().await;
+                restarted.state.rollouts.tick().await;
+                assert_eq!(std::fs::read(&preserved).unwrap(),b"retained bytes");
+                assert!(persisted(&restarted.registry.state_dir()));
+                assert_eq!(restarted.mutations.load(Ordering::SeqCst),0,"no create, stop, DELETE or storage mutation");
+                assert_eq!(b.posts.load(Ordering::SeqCst),1);
+            }
+
+            #[tokio::test]
+            async fn pending_replays_exact_request_and_identity_mismatch_never_retargets() {
+                for mode in [1,3,4,5] {
+                    let b=Arc::new(Backend::default()); b.mode.store(mode,Ordering::SeqCst);
+                    let mut f=fixture_with_backend(true,backend_router(b.clone()),None).await;
+                    auth(&mut f); tracked(&f); let r=approve(&f);
+                    assert_eq!(retire(&f,&r).await.0,StatusCode::ACCEPTED);
+                    assert_ne!(f.registry.get("obsolete").unwrap().state().retirement.as_ref().unwrap().state,"retired");
+                    assert_eq!(retire(&f,&r).await.0,StatusCode::ACCEPTED);
+                    let requests=b.requests.lock().unwrap();
+                    assert!(requests.iter().all(|v|*v==json!({"operationId":"retire-1","target":target()})));
+                    if mode==3 {assert_eq!(requests.len(),0,"wrong backend creation identity must never receive retirement POST");}
+                    if mode==1 {assert_eq!(requests.len(),2,"only explicit retries may replay pending intent");}
+                    assert_eq!(f.mutations.load(Ordering::SeqCst),0,"redirects must not be followed");
+                }
+            }
+
+            #[tokio::test]
+            async fn authentication_stale_spec_legacy_history_and_unknown_create_fail_closed() {
+                for legacy in [false,true] {
+                    let b=Arc::new(Backend::default());
+                    let mut f=fixture_with_backend(true,backend_router(b.clone()),None).await;
+                    tracked(&f); let mut r=approve(&f);
+                    assert_eq!(retire(&f,&r).await.0,StatusCode::FORBIDDEN,"ungated is not authorization to retire");
+                    auth(&mut f);
+                    assert_eq!(call(&f,"POST","/deployments/obsolete/retirement",serde_json::to_value(&r).unwrap(),false).await.0,StatusCode::UNAUTHORIZED);
+                    r.expected_spec_sha256="0".repeat(64);
+                    assert_eq!(retire(&f,&r).await.0,StatusCode::CONFLICT);
+                    assert!(!f.registry.retirement_frozen("obsolete"));
+                    r=approve(&f);
+                    let d=f.registry.get("obsolete").unwrap();
+                    d.mutate_state(|s|if legacy {s.allocation_history_complete=false;} else {
+                        s.create_attempts.push(CreateAttempt {name:"unknown-create".into(),sandbox_id:None,..Default::default()});
+                    });
+                    let (status,result)=retire(&f,&r).await;
+                    assert_eq!(status,StatusCode::ACCEPTED);
+                    assert!(result["unresolved"].as_str().unwrap().contains(if legacy {"legacy"} else {"ambiguous"}));
+                    assert_eq!(b.reads.load(Ordering::SeqCst),0);
+                    assert_eq!(b.posts.load(Ordering::SeqCst),0);
+                    let mut restarted=fixture_with_backend(true,backend_router(b.clone()),Some(f.root.clone())).await;
+                    auth(&mut restarted);
+                    assert_eq!(retire(&restarted,&r).await.1,result);
+                }
+            }
+
+            #[tokio::test]
+            async fn successful_legacy_create_is_not_an_exactly_once_allocation_receipt() {
+                let b=Arc::new(Backend::default());
+                let extra=backend_router(b.clone()).route("/sandbox-deploy",post(||async {
+                    (StatusCode::ACCEPTED,Json(json!({"id":"sb-12345678","status":"provisioning"})))
+                }));
+                let mut f=fixture_with_backend(true,extra,None).await;auth(&mut f);
+                let mut spec=empty().spec.clone();spec.scaling.min_replicas=1;
+                let d=f.registry.upsert(spec);
+                f.state.autoscaler.reconcile().await;
+                assert_eq!(d.pending().len(),1,"exercise successful SDK create through the real controller");
+                assert_eq!(d.state().create_attempts[0].sandbox_id.as_deref(),Some("sb-12345678"));
+                assert!(!d.state().allocation_history_complete,"queue redelivery could still create another sandbox");
+                let r=approve(&f);
+                let (status,result)=retire(&f,&r).await;
+                assert_eq!(status,StatusCode::ACCEPTED);
+                assert!(result["unresolved"].as_str().unwrap().contains("even after successful create"));
+                assert_eq!(b.posts.load(Ordering::SeqCst),0,"do not fabricate inventory closure before backend fencing");
+                let mut restarted=fixture_with_backend(true,backend_router(b.clone()),Some(f.root.clone())).await;
+                auth(&mut restarted);
+                assert_eq!(retire(&restarted,&r).await.1,result);
+            }
+
+            #[tokio::test]
+            async fn in_flight_create_finishes_before_inventory_freeze_and_unknown_outcome_stays_blocked() {
+                let entered=Arc::new(tokio::sync::Notify::new());
+                let release=Arc::new(tokio::sync::Semaphore::new(0));
+                let count=Arc::new(AtomicUsize::new(0));
+                let (e,s,c)=(entered.clone(),release.clone(),count.clone());
+                let extra=Router::new().route("/sandbox-deploy",post(move || {
+                    let (e,s,c)=(e.clone(),s.clone(),c.clone()); async move {
+                        c.fetch_add(1,Ordering::SeqCst);e.notify_one();
+                        let _permit=s.acquire().await.unwrap();
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }));
+                let mut f=fixture_with_backend(true,extra,None).await;auth(&mut f);
+                let mut spec=empty().spec.clone();spec.scaling.min_replicas=1;
+                let d=f.registry.upsert(spec);
+                // Known retained source plus one replacement currently allocating.
+                d.mutate_state(|s|s.create_attempts.push(CreateAttempt {name:"earlier".into(),sandbox_id:Some(target().backend_sandbox_id),..Default::default()}));
+                let r=approve(&f);
+                let scaler=f.state.autoscaler.clone();
+                let tick=tokio::spawn(async move {scaler.reconcile().await;});
+                tokio::time::timeout(Duration::from_secs(3),entered.notified()).await.unwrap();
+                let future=retire(&f,&r);tokio::pin!(future);
+                assert!(tokio::time::timeout(Duration::from_millis(30),&mut future).await.is_err());
+                assert!(!f.registry.retirement_frozen("obsolete"),"wait for the admitted allocation before snapshot");
+                release.add_permits(1);tick.await.unwrap();
+                let (status,result)=tokio::time::timeout(Duration::from_secs(3),&mut future).await.unwrap();
+                assert_eq!(status,StatusCode::ACCEPTED,"{result}");
+                assert!(result["unresolved"].as_str().unwrap().contains("ambiguous"));
+                f.state.autoscaler.reconcile().await;
+                assert_eq!(count.load(Ordering::SeqCst),1,"ambiguous create must not be repeated");
+                let mut restarted=fixture_with_backend(true,Router::new(),Some(f.root.clone())).await;auth(&mut restarted);
+                assert_eq!(retire(&restarted,&r).await.1,result);
+                restarted.state.autoscaler.reconcile().await;
+                assert_eq!(restarted.mutations.load(Ordering::SeqCst),0);
+            }
+        }
+
+        fn persisted(root: &FsPath) -> bool { root.join("obsolete.json").exists() }
+
+        async fn remove(f: &Fixture, etag: Option<&str>) -> StatusCode {
+            let mut request = Request::builder().method("DELETE").uri("/deployments/obsolete/record");
+            if let Some(etag) = etag { request = request.header(header::IF_MATCH, etag); }
+            let mut app = router(f.state.clone());
+            std::future::poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)).await.unwrap();
+            app.call(request.body(Body::empty()).unwrap()).await.unwrap().status()
+        }
+
+        fn empty() -> Arc<Deployment> {
+            Arc::new(Deployment::new(serde_json::from_value(serde_json::json!({
+                "id": "obsolete",
+                "routes": [],
+                "vm": {"driver": "firecracker", "port": 8080},
+                "scaling": {"min_replicas": 0, "warm_pool": 0}
+            })).unwrap()))
+        }
+
+        fn completed_history(d: &Deployment) {
+            let op = crate::rollout::Operation {
+                operation_id: "finished-1".into(), deployment: d.spec.id.clone(),
+                source_revision: "before".into(), target_spec_sha256: crate::rollout::fingerprint(&d.spec),
+                status: "succeeded".into(), phase: "complete".into(), readiness_verified: true,
+                previous_stopped: true, error: None, preparation_stage: None,
+                spec: d.spec.clone(), prepared: None, prefix: "applb-obsolete-r123-".into(),
+                allocations: vec![crate::rollout::Allocation { name: "applb-obsolete-r123-0".into(),
+                    sandbox_id: Some("sb-retired".into()), attempted: true }],
+                previous: vec!["sb-predecessor".into()], stopped: vec!["sb-predecessor".into()],
+                deadline: 1, drain_deadline: Some(1), reclaimed_candidate_ids: vec![], failure_settled: false,
+            };
+            d.mutate_state(|s| {s.active_prefix = Some(op.prefix.clone()); s.rollouts = vec![op];});
+        }
+
+        #[test]
+        fn retired_record_requires_settled_history_without_relaxing_normal_delete() {
+            let d = empty();
+            completed_history(&d);
+            assert!(record_only_refusal(&d, false).is_some());
+            assert_eq!(record_removal_refusal(&d, false, true), None);
+            for (status, settled, ready, stopped, permitted) in [
+                ("failed", false, true, true, false), ("failed", true, false, false, true),
+                ("running", true, true, true, false), ("reconciliation_required", true, true, true, false),
+                ("unknown", true, true, true, false), ("succeeded", false, false, true, false),
+                ("succeeded", false, true, false, false), ("succeeded", false, true, true, true),
+            ] {
+                d.mutate_state(|s| {let op = &mut s.rollouts[0]; op.status = status.into();
+                    op.failure_settled = settled; op.readiness_verified = ready; op.previous_stopped = stopped;});
+                assert_eq!(record_removal_refusal(&d, false, true).is_none(), permitted, "{status}/{settled}/{ready}/{stopped}");
+            }
+        }
+
+        #[tokio::test]
+        async fn retired_record_archives_exact_history_and_does_not_resurrect_on_restart() {
+            let f = fixture(true).await;
+            let d = f.registry.get("obsolete").unwrap();
+            completed_history(&d);
+            let saved = (*d.state()).clone();
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::IF_MATCH, deployment_etag(&d.spec).unwrap().parse().unwrap());
+            assert_eq!(remove_deployment_record(f.state.clone(), "obsolete".into(), headers, true).await.status(), StatusCode::NO_CONTENT);
+            let files: Vec<_> = std::fs::read_dir(f.registry.state_dir().join("retired")).unwrap().map(Result::unwrap).collect();
+            assert_eq!(files.len(), 1);
+            let report: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path()).unwrap()).unwrap();
+            assert_eq!(report["state"], serde_json::to_value(saved).unwrap());
+            assert_eq!(report["spec"], serde_json::to_value(&d.spec).unwrap());
+            let restarted = Registry::new(f.root.join("deployments.json"));
+            restarted.load().unwrap();
+            restarted.require_complete_load().unwrap();
+            assert!(restarted.get("obsolete").is_none());
+            assert_eq!(f.mutations.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn retired_record_archive_failure_keeps_registration_and_history() {
+            let f = fixture(true).await;
+            let d = f.registry.get("obsolete").unwrap();
+            completed_history(&d);
+            let saved = (*d.state()).clone();
+            std::fs::write(f.registry.state_dir().join("retired"), b"not a directory").unwrap();
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::IF_MATCH, deployment_etag(&d.spec).unwrap().parse().unwrap());
+            assert_eq!(remove_deployment_record(f.state.clone(), "obsolete".into(), headers, true).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(f.registry.get("obsolete").is_some());
+            assert!(persisted(&f.registry.state_dir()));
+            assert_eq!(*d.state(), saved);
+            assert_eq!(f.mutations.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn retired_record_refuses_renamed_historical_runtime_and_missing_inventory() {
+            for available in [true, false] {
+                let f = fixture(available).await;
+                let d = f.registry.get("obsolete").unwrap();
+                completed_history(&d);
+                if available {
+                    f.inactive.lock().unwrap().push(serde_json::json!({
+                        "id":"sb-retired", "name":"applb-other-000000000001", "status":"stopped",
+                        "image":"artifacts", "uptime_secs":0, "is_deployed":true, "status_changed_at":"", "urls":[]
+                    }));
+                }
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(header::IF_MATCH, deployment_etag(&d.spec).unwrap().parse().unwrap());
+                let result = remove_deployment_record(f.state.clone(), "obsolete".into(), headers, true).await;
+                assert_eq!(result.status(), if available {StatusCode::CONFLICT} else {StatusCode::SERVICE_UNAVAILABLE});
+                assert!(f.registry.get("obsolete").is_some());
+                assert!(!f.registry.state_dir().join("retired").exists());
+                assert_eq!(f.mutations.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn retired_record_requires_authentication_even_on_ungated_crud() {
+            let f = fixture(true).await;
+            let request = Request::builder().method("DELETE").uri("/deployments/obsolete/retired-record")
+                .body(Body::empty()).unwrap();
+            let mut app = router(f.state.clone());
+            std::future::poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)).await.unwrap();
+            assert_eq!(app.call(request).await.unwrap().status(), StatusCode::FORBIDDEN);
+            assert!(f.registry.get("obsolete").is_some());
+        }
+
+        #[test]
+        fn empty_route_less_zero_desired_record_is_removable() {
+            let d = empty();
+            assert_eq!(d.desired_replicas(), 0);
+            assert_eq!(record_only_refusal(&d, false), None);
+        }
+
+        #[test]
+        fn host_job_configuration_is_not_an_empty_record() {
+            let mut spec = empty().spec.clone();
+            spec.update = Some(serde_json::from_value(serde_json::json!({
+                "working_dir": "/protected-service", "commands": ["service-update"]
+            })).unwrap());
+            let d = Deployment::new(spec);
+            assert!(record_only_refusal(&d, false).unwrap().contains("host-update"));
+        }
+
+        #[test]
+        fn exact_revision_is_required_and_a_stale_revision_fails() {
+            let d = empty();
+            let current = deployment_etag(&d.spec).unwrap();
+            assert!(check_etag_precondition(Some(&current), &d.spec).is_ok());
+            assert_eq!(
+                check_etag_precondition(
+                    Some("\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""),
+                    &d.spec,
+                ),
+                Err(StatusCode::PRECONDITION_FAILED),
+            );
+            assert!(if_match(&axum::http::HeaderMap::new()).unwrap().is_none());
+        }
+
+        #[test]
+        fn invisible_pending_suspended_and_workspace_state_are_not_empty() {
+            let pending = empty();
+            pending.set_pending(vec![PendingVm::new("sb-booting".into())]);
+            assert!(record_only_refusal(&pending, false).unwrap().contains("pending"));
+
+            let suspended = empty();
+            suspended.mutate_state(|state| state.suspended.push("sb-stopped".into()));
+            assert!(record_only_refusal(&suspended, false).unwrap().contains("suspended"));
+
+            assert!(record_only_refusal(&empty(), true).unwrap().contains("workspace"));
+        }
+
+        #[test]
+        fn active_routes_and_retained_rollout_generations_are_not_empty() {
+            let mut routed_spec = empty().spec.clone();
+            routed_spec.routes.push(crate::config::RouteRule {
+                host: Some("obsolete.example.com".into()),
+                ..Default::default()
+            });
+            let routed = Deployment::new(routed_spec);
+            assert!(record_only_refusal(&routed, false).unwrap().contains("route-less"));
+
+            let rollout = empty();
+            rollout.mutate_state(|state| state.active_prefix = Some("candidate-".into()));
+            assert!(record_only_refusal(&rollout, false).unwrap().contains("rollout"));
+        }
+
+        #[tokio::test]
+        async fn handler_fails_closed_and_never_mutates_retained_records_or_resources() {
+            let f = fixture(true).await;
+            assert_eq!(remove(&f, None).await, StatusCode::PRECONDITION_REQUIRED);
+            assert_eq!(remove(&f, Some("\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"")).await, StatusCode::PRECONDITION_FAILED);
+            let current = deployment_etag(&f.registry.get("obsolete").unwrap().spec).unwrap();
+            f.registry.get("obsolete").unwrap().set_pending(vec![PendingVm::new("sb-live".into())]);
+            assert_eq!(remove(&f, Some(&current)).await, StatusCode::CONFLICT);
+            assert!(f.registry.get("obsolete").is_some());
+            assert!(persisted(&f.registry.state_dir()));
+            assert_eq!(f.mutations.load(Ordering::SeqCst), 0, "no stop, destroy or disk cleanup request");
+        }
+
+        #[tokio::test]
+        async fn handler_unlinks_only_an_empty_record_without_runtime_cleanup() {
+            let f = fixture(true).await;
+            let current = deployment_etag(&f.registry.get("obsolete").unwrap().spec).unwrap();
+            assert_eq!(remove(&f, Some(&current)).await, StatusCode::NO_CONTENT);
+            assert!(f.registry.get("obsolete").is_none());
+            assert!(!persisted(&f.registry.state_dir()));
+            assert_eq!(f.mutations.load(Ordering::SeqCst), 0, "record cleanup must not call teardown or disk purge");
+        }
+
+        #[tokio::test]
+        async fn handler_keeps_live_and_persisted_record_when_inventory_is_unavailable() {
+            let f = fixture(false).await;
+            let current = deployment_etag(&f.registry.get("obsolete").unwrap().spec).unwrap();
+            assert_eq!(remove(&f, Some(&current)).await, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(f.registry.get("obsolete").is_some());
+            assert!(persisted(&f.registry.state_dir()));
+            assert_eq!(f.mutations.load(Ordering::SeqCst), 0);
+        }
+    }
+
     mod upstream_drains {
         use super::*;
 
@@ -6210,7 +7152,7 @@ mod tests {
     /// page, the other hands a scoped token a fleet-wide control.
     #[test]
     fn the_console_narrows_itself_and_the_rule_api_does_not() {
-        for view in ["/", "/metrics", "/dashboard", "/security", "/siem"] {
+        for view in ["/", "/metrics", "/dashboard", "/security", "/siem", "/ingress", "/network"] {
             assert!(narrows_itself(view), "{view} must narrow for a scoped token");
         }
         // A deployment-scoped token has no business arming a fleet-wide block,
@@ -6490,6 +7432,7 @@ mod tests {
                 ("directory", DIRECTORY_HTML),
                 ("siem", SIEM_HTML),
                 ("disks", DISKS_HTML),
+                ("network", NETWORK_HTML),
             ] {
                 assert!(page.contains("{{HTML_ATTRS}}"), "{name} lost the theme attributes");
                 assert!(page.contains("{{WHO}}"), "{name} lost the identity slot");
@@ -6504,7 +7447,7 @@ mod tests {
             }
         }
 
-        /// The four pages share one stylesheet, one script and one toggle, all
+        /// The five pages share one stylesheet, one script and one toggle, all
         /// served by this binary. A page that grew its own palette would drift
         /// from the other four apps the moment either changed.
         #[test]
@@ -6514,6 +7457,7 @@ mod tests {
                 ("directory", DIRECTORY_HTML),
                 ("siem", SIEM_HTML),
                 ("disks", DISKS_HTML),
+                ("network", NETWORK_HTML),
             ] {
                 assert!(page.contains(r#"href="/__ui/heyo.css""#), "{name} does not load the shared sheet");
                 assert!(page.contains(r#"src="/__ui/theme.js""#), "{name} does not load the shared toggle");
@@ -6703,19 +7647,47 @@ mod tests {
         }
     }
 
-    /// The four pages are separate `include_str!`d files with no build step to
+    /// The network topology console. Client-rendered against `/metrics` and
+    /// `/ingress`, like the dashboard is against `/metrics`, so the contract
+    /// worth pinning is the routes the page fetches and the states it draws.
+    mod network_console {
+        use super::*;
+
+        /// The page hard-codes the endpoints it polls, so a rename here has to
+        /// break a test rather than a browser.
+        #[test]
+        fn the_page_calls_the_routes_the_router_registers() {
+            // `summary=false` is what carries the per-VM rows the leaf column
+            // draws; a bare `metrics` would return an empty VM list.
+            assert!(NETWORK_HTML.contains("metrics?summary=false"), "page never polls /metrics");
+            assert!(NETWORK_HTML.contains("ingress"), "page never polls /ingress");
+        }
+
+        /// All five legend states must appear in the page, because the canvas
+        /// distinguishes them by colour and a missing label would mean a state
+        /// that can happen but is not drawn.
+        #[test]
+        fn every_vm_state_is_labelled_in_the_legend() {
+            for label in ["serving", "cold-booting", "draining", "down", "cold-idle"] {
+                assert!(NETWORK_HTML.contains(label), "legend never describes {label}");
+            }
+        }
+    }
+
+    /// The five pages are separate `include_str!`d files with no build step to
     /// share anything through, so what makes them one product is only ever
     /// convention. These pin the parts of that convention a user would notice.
     mod page_consistency {
         use super::*;
 
-        fn pages() -> [(&'static str, &'static str); 5] {
+        fn pages() -> [(&'static str, &'static str); 6] {
             [
                 ("dashboard", DASHBOARD_HTML),
                 ("directory", DIRECTORY_HTML),
                 ("siem", SIEM_HTML),
                 ("disks", DISKS_HTML),
                 ("plugins", PLUGINS_HTML),
+                ("network", NETWORK_HTML),
             ]
         }
 
@@ -6737,7 +7709,7 @@ mod tests {
         /// page may keep one of its own.
         ///
         /// The property the old localStorage test protected — follow a link
-        /// between these four pages and the theme survives — is the weaker half
+        /// between these five pages and the theme survives — is the weaker half
         /// of what a cookie gives: localStorage is per *origin*, so the choice
         /// stopped at app-lb. It now follows a person to ci, app-obs,
         /// heyosecret and artifacts as well, because all five read the same
@@ -6793,7 +7765,7 @@ mod tests {
             }
         }
 
-        /// One stylesheet for all four, served by this binary.
+        /// One stylesheet for all five, served by this binary.
         ///
         /// Not a CDN: these pages are read over SSH tunnels and from networks
         /// with no route out, where a remote stylesheet leaves an operator

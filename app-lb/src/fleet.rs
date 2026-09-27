@@ -184,6 +184,31 @@ struct Service {
     discovery_version: Option<u64>,
     endpoints: Option<Vec<Endpoint>>,
     rollout: Option<Rollout>,
+    external: Option<ExternalService>,
+    update: Option<ApplicationUpdate>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplicationUpdate {
+    operation_id: String,
+    status: String,
+    target_revision: String,
+    run_id: String,
+    phase: Option<String>,
+    observed_at: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalService {
+    externally_managed: bool,
+    lifecycle_owner: String,
+    deployment_id: String,
+    region: String,
+    observed_at: String,
+    capabilities: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -514,7 +539,12 @@ mod tests {
                     assert_eq!(query.get("after").unwrap(),"a&b");
                     count.fetch_add(1,Ordering::SeqCst);
                     axum::Json(serde_json::json!({"services":[{"serviceId":"global-app","desiredReplicas":2,
-                        "replicaRegions":["US","eu1"],"discoveryVersion":8,"endpoints":[],"rollout":null}],"nextCursor":null}))
+                        "replicaRegions":["US","eu1"],"discoveryVersion":8,"endpoints":[],"rollout":null},
+                        {"serviceId":"ci","update":{"operationId":"op-1","status":"running","targetRevision":"revision-2","runId":"run-3",
+                        "phase":"draining","observedAt":null,"error":null,"unexpectedSecret":"must-not-forward"},
+                        "external":{"externallyManaged":false,"lifecycleOwner":"orchestrator",
+                        "deploymentId":"ci-eu1","region":"eu1","observedAt":"2026-09-24T17:24:48Z",
+                        "capabilities":["release-update"],"unexpectedSecret":"must-not-forward"}}],"nextCursor":null}))
                 }
             }))).await.unwrap();
         });
@@ -528,6 +558,13 @@ mod tests {
             client:reqwest::Client::builder().timeout(Duration::from_secs(1)).build().unwrap() };
         let inventory = fleet.inventory(Some("a&b")).await.unwrap();
         assert_eq!(inventory.services[0].service_id,"global-app");
+        assert_eq!(inventory.services[1].external.as_ref().unwrap().deployment_id,"ci-eu1");
+        let wire = serde_json::to_value(&inventory).unwrap();
+        assert_eq!(wire["services"][1]["external"]["lifecycleOwner"],"orchestrator");
+        assert_eq!(wire["services"][1]["external"]["capabilities"],serde_json::json!(["release-update"]));
+        assert_eq!(wire["services"][1]["update"]["phase"],"draining");
+        assert!(wire["services"][1]["update"].get("unexpectedSecret").is_none());
+        assert!(wire["services"][1]["external"].get("unexpectedSecret").is_none());
         assert_eq!(hits.load(Ordering::SeqCst),1);
         status.store(401,Ordering::SeqCst);
         assert_eq!(fleet.inventory(Some("a&b")).await.err(),Some("gateway rejected observation"));

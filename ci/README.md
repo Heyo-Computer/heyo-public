@@ -22,6 +22,19 @@ workflow's worth of them per commit.
 - Optionally **app-lb** for workflow objects and sign-in, **heyosecret** for
   secrets, and the **artifacts** store.
 
+### SDK package
+
+CI pins our public `heyo-sdk` 0.1.12 release, including the proxy
+connection-lifecycle fix. Downloading it requires no publishing token or private
+sibling checkout. Its source is maintained in `sdk-rs` in the Heyo repository;
+CI does not carry a second source copy.
+
+The published package comes from
+[SDK source revision 4fd3e85](https://github.com/Heyo-Computer/heyo/commit/4fd3e85fb0d12d4537b4448824b8b43dc18827c6).
+Its registry SHA256 matches the package verified before publication:
+`880dffb6c86fab2a1b0a98efab9cb38f5a193c67a47a8037445ca9f21fcf8344`.
+Cargo enforces that checksum through `ci/Cargo.lock`.
+
 ## Run
 
 ```bash
@@ -128,8 +141,10 @@ deploys sequentially to us3, eu1, and finally the CI controller. The merge uses
 the registered HeyoSecret `GIT_AUTH_TOKEN`, with no version bump or tags. The
 captured trunk must still match at publication; a moved trunk requires revalidation.
 
-CI runtime changes also require `ci/deploy-controller`. It records a durable
-rollout, closes new submissions (HTTP 503), and lets existing jobs finish before
+CI runtime changes also require `ci/deploy-controller`. It prepares a durable
+release intent and obtains acceptance from Orchestrator's shared application
+update API. Only Orchestrator's authenticated activation can advance a prepared
+intent into a rollout. CI then closes new submissions (HTTP 503) and lets existing jobs finish before
 replacing the controller. The requesting job finishes first; the **run remains
 running** until the replacement resumes reconciliation and its public health
 endpoint identifies the expected revision and executable SHA256. Documentation
@@ -144,12 +159,28 @@ configuration before enabling the workflow:
 
 - `CI_CONTROLLER_DEPLOYMENT`: the app-lb deployment ID of this controller.
 - `CI_CONTROLLER_REPOSITORY`: the only repository allowed to replace it.
+- `CI_APPLICATION_ID`: the adopted shared application identity, normally `ci`.
+- `CI_APPLICATION_ORCHESTRATOR_URL`: the shared application authority origin.
+- `CI_APPLICATION_LIFECYCLE_TOKEN`: a HeyoSecret-backed credential scoped to
+  this application's update exchange. Orchestrator's binding references the same
+  credential. It is not the app-lb admin, repository submit or native runner token.
 - `CI_CONTROLLER_APP_LB_URL` and `CI_CONTROLLER_APP_LB_TOKEN`: its app-lb admin
   endpoint and a credential restricted to that deployment. These are separate
   from `CI_APP_LB_URL/TOKEN`, which enable workflow-object discovery; enabling
   self-deployment must not change how existing repositories find workflows.
 - `CI_PUBLIC_URL`: must match the deployment's configured public URL.
 - `CI_EXPECTED_SHA`: set by promotion; health also hashes the running executable.
+
+Expose `/api/lifecycle` and its descendants through app-lb's public machine
+paths. These endpoints require `CI_APPLICATION_LIFECYCLE_TOKEN` themselves:
+`GET /api/lifecycle` advertises the configured identity, and
+`GET/POST /api/lifecycle/updates/{id}` reads/activates a previously prepared
+release intent. POST takes `{intentHash}` and cannot invent a release or artifact.
+Orchestrator persists acceptance before calling POST; both acceptance and
+activation reject changed replays. A prepared intent permits normal work and
+cannot mutate app-lb without activation. Cancellation and the existing drain
+deadline still apply. In-flight updates from an older binary retain their phase
+and finish without creating a second operation.
 
 The deployment must have min/max replicas of one, no warm pool, and exactly one
 read-only `/opt/ci-release` artifact mount with `strip_components: 1`, using the
@@ -170,11 +201,12 @@ retry controller replacement. Use the coordinated release policy for deployment;
 do not treat an individual validation rerun or a successful artifact upload as
 authorization to publish or as evidence that a replacement occurred.
 
-The durable rollout waits for jobs, claimed/building VMs, live native leases and
-other unresolved deployments. A historical running native job does not block
-once its lease has expired and its parent run is terminal: native endpoints
-reject further writes and the job cannot be leased again. An expired lease on
-a still-runnable run remains a blocker. No historical rows are deleted.
+The durable rollout waits for jobs, claimed/building VMs, unresolved host-work
+obligations, native executions and other unresolved deployments. Expired leases
+and terminal parent runs do not prove that a remote command stopped. Native
+leases remain reserved after expiry; another runner cannot take over that job.
+Unresolved execution blocks replacement until positively reconciled. No
+historical rows are deleted to bypass this barrier.
 Before the first replacement attempt,
 `CI_MAX_JOB_SECONDS` bounds the drain; timeout or cancellation leaves the
 controller unchanged and reopens submissions. After an ambiguous replacement
@@ -546,10 +578,8 @@ for an image already in the catalog answers `ready` without building — so even
 a lost claim collapses into one docker build rather than two racing for the
 same tag.
 
-CI sweeps unused source-built base images after `CI_VM_IDLE_SECS` (default
-seven days), separately from VM eviction. Cache hits refresh the image's last
-use; existing catalog entries receive a full grace period when the retention
-migration is first applied. Each minute, CI considers at most one image per
+CI sweeps unused source-built base images without a cache-retention window,
+separately from VM deletion. Each minute, CI considers at most one image per
 served runner and refuses cleanup while that runner has active job work or
 maintenance. Failed deletions stay recorded and retry after five minutes.
 
@@ -649,18 +679,35 @@ the author declares the driver, image, size and setup hooks — and, via
 (instead of `timeout-minutes:`) is a parse error naming the job, not a field that
 quietly does nothing.
 
-**A released VM is parked, not left running.** It is stopped — the daemon
-keeps its rootfs and its cache disk; only `destroy` removes those — and started
-again by the next job that claims it. Before this a pooled VM idled *running*
-until the daemon's TTL reaped it, which made the warm cache a matter of cadence:
-the next push had to land inside the TTL (an hour by default, four for
-`app-obs.yml`) or it booted a blank VM and paid the full cold build. For a
-repository pushed to a few times a day, most gaps are longer than that, so
-most builds were cold, and a `xlarge` sat on 16 GB of the host in between.
-Stopped, the VM costs disk and nothing else, the reaper ignores it, and
-`CI_VM_IDLE_SECS` (default a week) is what retires it — see the pool section.
-The TTL it is parked with is still the longer of `CI_VM_TTL_SECONDS` and the
-job's `vm.ttl_seconds`, because that is what it boots with next time.
+**CI-owned job VMs are deleted, not parked.** Success, failure and cancellation
+all hand the VM to durable cleanup after diagnostic capture. The daemon must
+confirm stop and deletion before CI forgets ownership. Failed cleanup retries
+after controller restart. Legacy `vm.reuse` declarations still parse but do not
+retain job VMs; existing idle caches are swept without a retention window.
+Explicit existing-VM `uses:` targets and service/maintenance resources are not
+ordinary disposable job VMs and remain under their owner's lifecycle.
+
+**Debug reports go to private S3 storage, not retained VMs.** CI snapshots job
+identity/revision, outcome, timestamps, operation IDs, all retained step logs,
+and captured VM metadata/console into a transactional outbox before cleanup.
+Console capture is bounded by `CI_VM_LOG_LINES` and 40 seconds; unavailable
+diagnostics are recorded explicitly. Environment values, raw commands and
+workspace contents are not exported. Known job secrets are redacted from the
+console; if secret resolution fails, that console is omitted rather than leaked.
+
+Configure `CI_S3_BUCKET`, optional `CI_S3_PREFIX` (default `ci`),
+`CI_S3_REGION`, and `CI_S3_ENDPOINT`. This report destination is independent of
+`CI_ARTIFACT_SINK`; regular artifacts can continue using the artifact service.
+AWS credentials come from the standard AWS credential chain, provisioned through
+the service's HeyoSecret configuration. Use a private bucket with public access
+blocked. No public ACL or public URL is requested. Report keys are
+`<prefix>/<run>/<job>/debug-<attempt>-<sandbox>.json`.
+
+S3 failures retain the report in shared Postgres for bounded upload retries but
+**never retain the VM**. After upload, the outbox releases its payload and keeps
+the S3 receipt. The authenticated `GET /api/runs/{run}` response includes
+`debug_reports` with upload state, URI and retry error. Missing S3 configuration
+is reported as an error; it is not silently replaced with disk storage.
 
 ### This repository's own
 
@@ -856,10 +903,20 @@ reattaches to, and the failed attempt is what somebody will want to read beside
 the one that passed.
 
 **What it runs is the source the submit described.** The CI service never clones
-or stores a repository credential. It durably keeps the immutable revisions and
-patch descriptor under `CI_WORKSPACE_DIR`; the selected runner reconstructs and
-verifies that tree using a freshly resolved job-scoped HeyoSecret. A run whose
-descriptor is gone says so and asks for a new submit. The re-run goes through
+or stores a repository credential during submission. It commits the immutable
+revisions, patch and workflow descriptor in `ci_run_source` in the same Postgres
+transaction as the run and jobs. The selected runner reconstructs and verifies
+that tree using a freshly resolved job-scoped HeyoSecret. Release publication
+also reads this shared descriptor before making its authorized temporary checkout.
+
+`CI_WORKSPACE_DIR` holds local submission staging files, not accepted source
+authority. On startup, retained `<run>.source.json` files for existing runs are
+validated and imported into shared storage without deleting the originals.
+Exact re-import is safe; conflicting or invalid descriptors stop startup instead
+of replacing accepted history. Source reads, native-runner checkout and reruns
+then use Postgres exclusively. A run without an imported descriptor reports the
+missing source explicitly; it never falls back to a different revision.
+The re-run goes through
 the same path as a submit, with the run's own
 workflow file as its `--only` selector, so it is planned, routed and given
 secrets exactly as the original was. As with `--only`, the `on.submit` branch
@@ -867,7 +924,12 @@ and path filters do not apply — and the run inherits the original's recorded
 change set, so job-level `changed()` filters decide as they did the first time.
 Same authority as cancel: `CI_ADMIN_EMAILS` through app-lb's gate, when set.
 
-## The warm VM pool
+## Legacy warm-pool bookkeeping
+
+The following fingerprint and cache-management surfaces describe legacy pool
+records. New execution is ephemeral as described above: it does not claim warm
+VMs, park failed jobs, or wait a week to reclaim capacity. The existing pool
+table remains the ownership ledger until deletion is confirmed.
 
 ```
 fingerprint = sha256( canonical_json(vm block, minus cache_key_files)
@@ -958,7 +1020,10 @@ VM creation. Claimed, building, and already-draining VMs are never victims;
 only CI pool rows on that host qualify. A failed deletion stays tracked as
 draining and stops that cleanup attempt. An explicit, persisted eviction intent
 makes the lease-loop sweep retry it after failures or controller restarts, even
-if its fingerprint is still wanted. Deletion holds a database row lock across
+if its fingerprint is still wanted. A failed eviction also discards that runner's
+cached tunnel so the next attempt reconnects instead of reusing a dead loopback
+connection indefinitely. Other runners and connections held by active VM
+operations are unaffected. Deletion holds a database row lock across
 the bounded daemon call and requires a follow-up not-found response before
 forgetting the pool row. Resize operations also use `draining`, but carry no
 eviction intent and are never selected for deletion. Pre-existing ambiguous
@@ -967,6 +1032,19 @@ draining rows are not automatically adopted as eviction requests.
 If no idle caches remain and space is
 still insufficient, the host cannot admit a new VM. This is admission headroom,
 not a disk reservation against concurrent allocations or unknown build scratch.
+
+Firecracker network pressure uses the same bounded eviction policy. A `/24`
+contains 64 `/30` TAP links, and stopped reusable VMs retain their link while
+they remain cached (normally up to `CI_VM_IDLE_SECS`). When the backend
+explicitly rejects a cold create with its "no usable /30 TAP subnet" capacity
+verdict, CI atomically takes the oldest idle CI cache on that same runner,
+destroys it, confirms that the daemon reports it absent, and retries the create
+once. A failed deletion retains the pool record and stops recovery; CI neither
+deletes another cache nor retries creation. Transport failures, timeouts, and
+other ambiguous create errors never trigger eviction. Running or claimed VMs,
+idle rows whose last owning job is not terminal, maintenance-fenced runners,
+service VMs, caches on another runner, and anything outside CI's pool are not
+eligible.
 
 A claim that cannot *reach* a pooled VM — the tunnel, the daemon not answering
 — hands the row back and fails the delivery so the ladder retries; discarding a
@@ -1031,31 +1109,30 @@ run left this behind", which is the question cleanup is asking.
 The pool table survives a restart. Without it a crash orphans every VM until its
 TTL, and the next run builds a second pool beside the one already sitting there.
 
-### A claimed VM is held by a lease, not by a job
+### Lease expiry is not execution takeover authority
 
-Each instance takes a **random id at startup** and stamps it, with an expiry, on
-every VM it claims — renewing on a timer while it holds them. Reclaim keys on
-that expiry.
+Each instance has a random startup identity and renews its VM leases. A missed
+renewal can mean either process death or a network partition while the process
+still drives a VM. It does not authorize reusing that VM.
 
-The obvious alternative does not work, and this is the bug it caused: asking
-whether the *job* is still `running` cannot distinguish "another instance is
-running it" from "the process that was running it died". A restart leaves the row
-`running` either way, so reclaim had to leave the VM alone — an orchestrator
-could not take back even its own VMs. They stayed `claimed` until the sandbox TTL
-reaped them (`CI_VM_TTL_SECONDS`, an hour by default), and the row leaked until
-some later restart happened to find the job terminal.
+Claiming a job atomically records `ci_host_work` and transitions the job to
+`running`. A concurrent claim or queue redelivery cannot replace that owner.
+While the obligation exists, lease expiry cannot repool its VM or delete a
+pending-create record. Cancellation does not remove this evidence either.
+Normal execution hands release to verified VM cleanup. Errors after a claim
+retain the obligation and report that reconciliation is required instead of
+automatically replaying potentially completed external effects. Errors before
+claiming work still use the retry ladder.
 
-A lease is a fact about the holder rather than an inference from the work. Three
-properties follow:
-
-- **A restarted instance reclaims its own previous life**, because the id is
-  fresh per process — a stable one would inherit the dead process's leases and
-  reclaim nothing.
-- **An instance never reclaims what it is holding**, whatever the clock says. A
-  slow database must not make a process fight itself; two dispatchers on one
-  sandbox is far worse than a VM reclaimed a minute late.
-- **Reclaim runs on a timer, not only at startup**, so a dead sibling's VMs come
-  back within a lease period instead of waiting for somebody to restart this one.
+The same rule applies to native runners: expiry rejects stale reports but does
+not reassign the execution or free its runner capacity. These guards are
+prerequisites for regional CI, not a complete multi-controller implementation.
+Source and logs use shared storage. Final submission transactions and native
+execution grants serialize with shared drain transitions, so a request that
+passed an earlier process-local check cannot commit through a closed gate.
+Already-admitted native jobs can obtain grants during draining; quiescence waits
+for those transactions and blocks later grants. Executor handoff and recovery
+remain required before running a second CI controller against production state.
 
 `uses: default` resolves through **`~/.heyo/daemon.json`** — heyvmd mints
 `backend_id` there on first start and registers and heartbeats under it, so it is
@@ -1326,6 +1403,86 @@ Binding also **reconciles an existing consumer**: JetStream returns the durable
 that is already there and ignores the config passed with it, so an upgrade would
 otherwise keep the old window and none of this would take effect.
 
+### Shared executor ownership is not automatic failover
+
+CI replicas sharing PostgreSQL register distinct process boots. One boot owns
+external effects; the others can serve shared run/source/log reads, submission,
+rerun and transactional completion writes. Queue execution, native grants,
+artifact uploads, VM changes and infrastructure reconcilers require the owner's
+permit. Managed replicas forward mutations once to the exact owner's boot through
+the per-application authenticated Orchestrator instance transport. The original
+caller authentication is preserved; wrong boots, forwarding loops and unavailable
+transport fail closed. Existing handler effect permits remain required. Unmanaged
+replicas still return 503 for owner-only operations on a standby.
+
+The owner is **non-expiring**. A timeout, cancelled run or lost heartbeat never
+proves that a worker or VM command stopped. An unplanned owner restart therefore
+does not recover execution automatically. There is no force-takeover API; runtime
+fencing and reconciliation must be implemented before claiming crash failover.
+
+Legacy direct controller replacement closes shared admission and grants, waits for
+local effect permits, then verifies durable jobs, leases, VM cleanup and remote
+operation fences. It transfers to a named, recently ready boot at a different
+deployment authority before replacing itself. The successor may perform only
+that exact recorded rollout until public revision verification and the atomic
+completion commit release normal execution. Both regions use the same canonical
+HeyoSecret service-role credential for that recorded authority. Readiness refresh
+only filters handoff candidates; it never revokes or grants ownership.
+
+Managed retirement uses a separate job-independent command and receipt ledger.
+The running target boot validates the immutable request and obtains its own local
+effect fence. Owner retirement closes shared admission, drains admitted work and
+durable remote obligations, and transfers only to a ready boot in the platform's
+pinned surviving set outside the retiring region. Standby retirement serializes
+with the same owner-row lock as successor selection. Receipt, retirement and owner
+generation commit together; replay cannot transfer twice. Normal admission resumes
+on the successor before the platform continues HTTP withdrawal and replacement.
+Retained old boots cannot issue effects. No timeout grants ownership.
+
+Configure `source.applicationLifecycle` in managed service metadata with `port`
+and `tokenSecretPath`; resolve `CI_APPLICATION_LIFECYCLE_TOKEN` from that same
+per-app HeyoSecret and configure `CI_APPLICATION_ORCHESTRATOR_URL`. Orchestrator
+injects `HEYO_SERVICE_ID`, `HEYO_DEPLOYMENT_ID` and `HEYO_REGION`. CI exposes
+authenticated `/api/lifecycle` identity and asynchronous
+`/api/lifecycle/retirements/{commandId}` command/status endpoints. Transport uses
+raw streaming bodies and base64url-no-pad metadata capped at 16KiB; this is not a
+16MiB body envelope. The native artifact endpoint retains its separate 512MiB
+limit. Full large-artifact transport parity has not been tested.
+
+**This is not a completed or deployed managed two-region application.** The
+legacy and v3 hierarchical managed controllers execute the pre-withdrawal barrier.
+New managed deployments capture immutable per-endpoint creation recipes with
+versioned secret references before creation and bind authenticated runtime receipts.
+Lifecycle rollback creates fresh baseline identities; it cannot reactivate retained
+retired boots. Existing endpoints without proven recipes fail closed. Scalar
+previous metadata and `envRefCount` are not a creation recipe.
+
+Managed `ci/deploy-controller` requires `with.archive-id` from the existing
+publish/promote-service-archive path for the confirmed release SHA. It records an
+intent, lets the release job finish, then asynchronously submits the ordinary
+Orchestrator managed update. The CI run remains pending until platform bake and
+exact boot/runtime verification of every regional target complete. An uncertain
+submission replays the same operation and command. This does not use the old
+direct app-lb self-replacement dispatcher. Composed full-stack acceptance remains
+outstanding; the external-service binding is still single-deployment and must not
+be used to label the singleton as a two-region service.
+
+**Initial managed CI startup fails closed on an empty executor-owner table.** An
+older singleton can still schedule without participating in this protocol. Empty
+ownership, empty Orchestrator discovery, or a successful stop with unknown runtime
+status do not prove it fenced. There is no bootstrap bypass flag. A supported
+legacy cutover must first establish authoritative non-restarting runtime fencing,
+preserve and reconcile shared database/job/source/log/artifact state, and provide
+a durable verified initial-owner handoff. That cutover/initialization capability is
+not implemented; do not initialize the owner table manually to bypass this gate.
+
+The exact-runtime Cloud transport must never wake stopped instances, retry, follow
+redirects or silently substitute another backend. The public client checks echoed
+backend identities and CI checks the target boot; existing Cloud exec/proxy is not
+a fallback. Private backend safety verification and composed real-process/live
+acceptance remain required. See the single acceptance checklist in
+`docs/MULTI_REGION_DESIGN.md` for local evidence and remaining gates.
+
 ### Migrations
 
 `migrations/*.sql` are re-executed on every startup with no tracking table —
@@ -1364,9 +1521,19 @@ local-only loop.
 
 ### Storage
 
-Postgres for runs, jobs, steps, artifacts and the pool; **step logs go to disk**
-with the path and byte count on the row. A build log is megabytes, and putting it
-in a column means every listing query drags all of it across the wire.
+Postgres holds runs, jobs, steps, source descriptors, artifact metadata and the
+pool. Step logs use a separate shared chunk table, so status queries do not fetch
+log bodies. Appends and byte counts commit atomically; native completion commits
+its logs with the completion evidence. Retention deletes shared chunks and clears
+their metadata in one transaction. Database failures are not empty logs.
+
+When upgrading from local log storage, drain and stop the old controller before
+starting the new binary with access to its retained log paths. Startup imports
+those files into Postgres without deleting the originals. Missing or unreadable
+files block startup. Once imported, another regional instance needs no local log
+files. Do not mix old disk-writing controllers with shared-storage controllers
+or roll back the binary without a compatible log-storage plan. This storage
+change alone does not authorize a second executor or prove regional failover.
 
 ### One submission across validation workflows and deployment
 
@@ -1490,6 +1657,8 @@ to accelerate drain. Queued work retains its delivery and retry budget; unpinned
 work can select another runner. The step, job and run do not succeed on admission.
 Only an exact `completed` operation with matching backend, target, archive owner,
 archive ID, executable digest and operation identity releases the fence.
+Both `host_heyvm_upgrade` and Cloud's operation-bound
+`host_heyvm_upgrade_receipt_v1` receipts use these checks; unknown types fail closed.
 
 Cancellation, timeout, missing identity, changed configuration and terminal
 failure **retain the CI cordon**, even if Cloud uncordons its own backend. An
@@ -1501,6 +1670,18 @@ Cancelled VM acquisition, interrupted delivery, or failed stop can leave durable
 drain evidence requiring operator reconciliation; terminal job status alone is
 not proof that host work stopped. Retries cannot clear another delivery's record.
 Deadlines include VM release and drain, survive restart, and cap HTTP retries.
+
+When Cloud completed an upgrade but CI rejected its receipt, a repository submit
+bearer can POST `/api/runs/{run_id}/maintenance/{operation_id}/recover`.
+Recovery GETs the original Cloud operation, checks every identity and the trusted
+mapping, and requires the original published release. It never POSTs an upgrade.
+Only a failed run with this one failed job and no unresolved execution is eligible;
+cancelled runs or skipped jobs that previously executed are refused. Recovery
+records the original error and receipt in `ci.host.maintenance.recovered.v1`,
+marks the proven operation successful, releases its fence and resumes untouched
+skipped jobs in the same run. Existing logs, attempt IDs and status events remain.
+A repeated call does not repeat maintenance or recovery. This is distinct from
+`rerun-failed`, which cannot authorize a release.
 
 Deploy the new Cloud endpoint **and every Cloud worker's cross-instance operation
 locking** before enabling this action. Older Cloud cannot execute the plural POST,
@@ -1850,6 +2031,22 @@ slashes). Existing mount credentials are preserved. A different store needs an
 explicitly configured release-mount auth reference; credentials are never copied
 across stores. Only secret references, not their values, enter the rollout intent.
 
+The token must be a direct `${{ secrets.NAME }}` reference. After cancellation,
+deadline expiry, or controller restart, CI keeps polling the exact persisted
+operation using the original job's workflow/environment secret scope, including
+while draining. Only a matching terminal app-lb receipt releases the drain fence;
+failed operations additionally require a durable `failed-rollout-reclamation-v1`
+settlement proving candidate resource reclamation. CI records that evidence in
+the deployment event and `settled_failure` phase; a legacy `failed` status alone
+does not satisfy handoff. This requires backend reclamation support before
+app-lb can settle failures with candidate allocations.
+Missing operations, authentication failures, identity mismatches and ambiguous
+remote outcomes remain unresolved. Recovery never starts a candidate or rewrites
+the original run/job result. An operator upgrading a controller that predates this
+reconciler can run `ci --reconcile-service-rollout RUN_ID OPERATION_ID` with the
+controller's configured database and HeyoSecret bindings. This uses the same
+receipt-only recovery path, without migrations, job admission or broker startup.
+
 This action requires app-lb's conditional candidate rollout API, a pinned
 rootfs artifact, pinned read-only mounts and an HTTP readiness path. Catalog
 image names alone cannot prove rootfs identity. Workspace/writable deployments
@@ -1996,8 +2193,9 @@ to download an earlier successful job's stored archive in the same run. Declare
 the producer in `needs`; set `with.job` to its expanded job key if multiple
 producers used the same artifact name. Missing, ambiguous, unfinished, or failed
 producers are refused. Downloads verify size and SHA256 when recorded, preserve
-the uploaded tar.gz bytes, and do not unpack them. Disk and `artifacts` stores
-support downloads; the S3 sink remains unimplemented. Downloading an artifact
+the uploaded tar.gz bytes, and do not unpack them. Disk, S3 and `artifacts` stores
+support downloads. S3 reads are restricted to the configured bucket/prefix.
+Downloading an artifact
 does not make it an approved release or service archive.
 
 This is CI execution history, not deployment authorization. The release actions
@@ -2057,13 +2255,11 @@ CI_TEST_STREAM_PREFIXES=citest cargo test -- --ignored delete_leftover
 Working: workflow parsing and planning (matrix, `needs`, `if`, `max-parallel`),
 branch and path filters with the `changed()` condition, runner discovery, the VM
 pool, the job queue, `git submit` with per-repository tokens, secrets with
-masking, disk and `artifacts` sinks, the dashboard with live logs, and workflow
+masking, disk, S3 and `artifacts` sinks, the dashboard with live logs, and workflow
 objects.
 
 Not built yet:
 
-- **The S3 artifact sink.** Declared and selectable; fails loudly naming the
-  alternatives rather than reporting an artifact stored that is not there.
 - **Composite `uses:` actions.** Artifact, release and deployment actions above are built in. Fetching
   an `action.yml` from a repository is a different feature with a different trust
   model.

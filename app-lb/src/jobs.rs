@@ -952,12 +952,15 @@ impl Jobs {
 
     /// Materialize privately: never install a spec or recycle its serving pool.
     /// Force verification rather than trusting catalog name/size reuse.
-    pub async fn prepare_candidate(&self, spec: &crate::config::DeploymentSpec, generation: &str) -> Result<crate::config::DeploymentSpec, String> {
-        let puller = self.puller.for_candidate()?;
+    pub async fn prepare_candidate(&self, spec: &crate::config::DeploymentSpec, generation: &str, progress: tokio::sync::watch::Sender<String>) -> Result<crate::config::DeploymentSpec, String> {
+        let mut puller = self.puller.for_candidate()?;
+        puller.preparation_progress = Some(progress.clone());
         let mut prepared = spec.clone();
         let mut artifact = spec.artifact.clone().ok_or("pinned rootfs artifact required")?;
         artifact.image_name = Some(format!("rollout-{}", generation));
+        progress.send_replace("rootfs_credentials".into());
         let key = self.store_key(artifact.auth.as_ref())?;
+        progress.send_replace("rootfs_manifest".into());
         artifact.artifact_ref = puller.pinned_rootfs(&artifact, key.as_deref()).await?;
         let mut log = |_: String| {};
         let pulled = puller.pull(&spec.id, &artifact, key.as_deref(), true, &mut log).await?;
@@ -968,7 +971,9 @@ impl Jobs {
         vm.image_sha256 = None;
         vm.image_size_bytes = None;
         for mount in &spec.vm_spec().mounts {
+            progress.send_replace("mount_credentials".into());
             let key = self.store_key(mount.auth.as_ref())?;
+            progress.send_replace("mount_materialization".into());
             let pulled = puller.pull_mount(mount, &self.cfg.mounts, key.as_deref(), true, &mut log).await?;
             if Some(&pulled.digest) != mount.digest.as_ref() { return Err("mount digest differs from requested artifact".into()); }
         }
@@ -1059,10 +1064,24 @@ impl Jobs {
         let job_id = record.id.clone();
         let deployment_id = deployment_id.to_string();
         tokio::spawn(async move {
+            let _retirement=jobs.registry.retirement_gate.read().await;
             let _slot = JobSlot {
                 jobs: jobs.clone(),
                 deployment: deployment_id.clone(),
             };
+            if jobs.registry.retirement_frozen(&deployment_id) {
+                jobs.finish(&job_id,JobStatus::Failed,Some("deployment permanently frozen for retirement".into()));
+                return;
+            }
+            // Arbitrary host jobs are not a complete allocation/effect ledger.
+            // Remember this across restart, not only in the bounded job history.
+            if let Some(d)=jobs.registry.get(&deployment_id) {
+                d.mutate_state(|s|s.allocation_history_complete=false);
+                if jobs.registry.persist_one(&deployment_id).is_err() {
+                    jobs.finish(&job_id,JobStatus::Failed,Some("cannot persist worker effect intent".into()));
+                    return;
+                }
+            }
             let started = std::time::Instant::now();
             match run(jobs.clone(), job_id.clone(), deployment_id.clone()).await {
                 Ok(outcome) => {

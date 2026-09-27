@@ -717,10 +717,21 @@ provisioned max is a cap, not the de-facto footprint. The disk-derived Postgres
 knobs (`max_wal_size`, `temp_file_limit`, swap sizing) key off the live
 filesystem size and are recomputed + reloaded on each growth step.
 
-**Growing the device (second line of defense).** The guest watcher above grows
-the *filesystem* inside the device and then retires — it logs
-`[grow] filesystem spans $DATA_DEV; watcher done` and exits. From that moment
-the **device** is the binding constraint, and only the host can grow it. That
+The watcher never exits. Once the filesystem spans the device it logs
+`[grow] filesystem spans $DATA_DEV; idling until it changes` and re-checks
+once a minute, re-reading the device size each time. When the host grows the
+device under the running VM (heyvmd's online resize runs `resize2fs` in the
+guest itself), the watcher sees a filesystem it didn't grow, logs
+`[grow] filesystem is now …MB (grown outside this watcher); retuning`, and
+recomputes + reloads the same knobs — within a minute of the grow. If the
+device grew but the filesystem didn't, its normal growth path takes over.
+Guests booted from an image older than this keep the old watcher, which exits
+at the first span; they still get the space from an online grow, but keep
+their boot-time knobs until the next restart.
+
+**Growing the device (second line of defense).** Once the guest watcher has
+grown the *filesystem* to span the device, the **device** is the binding
+constraint, and only the host can grow it. That
 is what `PG_VM_POOL_DISK_GROW_PCT` enables, and it has two triggers because one
 is not enough:
 

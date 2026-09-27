@@ -195,6 +195,7 @@ async fn finish(store:&Store,id:&str,passed:bool,note:&str,result:Option<&Value>
 }
 
 async fn reconcile(d:&Dispatcher,id:&str,token:&str,configured:Option<&Target>)->Result<()> {
+    let _effect = d.executor.effect_permit().await.map_err(anyhow::Error::msg)?;
     let row=sqlx::query("SELECT h.*,d.run_id,d.job_id FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment d ON d.id=h.id WHERE h.id=$1 AND h.phase NOT IN ('passed','failed','superseded')").bind(id).fetch_optional(d.store.pool()).await?;let Some(row)=row else{return Ok(())};
     let req:Request=serde_json::from_value(row.get("request"))?;let phase:String=row.get("phase");let deadline:chrono::DateTime<chrono::Utc>=row.get("deadline");
     let run:String=row.get("run_id");let job:String=row.get("job_id");
@@ -224,6 +225,7 @@ async fn reconcile(d:&Dispatcher,id:&str,token:&str,configured:Option<&Target>)-
 
 /// Stop and release the coordinator VM before host drain/network activity.
 pub(crate) async fn release(d:&Dispatcher,id:&str)->Result<()> {
+    let _effect = d.executor.effect_permit().await.map_err(anyhow::Error::msg)?;
     let mut tx=d.store.pool().begin().await?;
     let row=sqlx::query("SELECT s.job_id,j.sandbox_id,j.runner_hd_id,j.attempt FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment s ON s.id=h.id JOIN ci_job j ON j.id=s.job_id WHERE h.id=$1 AND h.phase='releasing' FOR UPDATE OF h SKIP LOCKED").bind(id).fetch_optional(&mut *tx).await?;
     let Some(row)=row else{return Ok(())};let job:String=row.get("job_id");let sandbox:String=row.try_get("sandbox_id")?;let runner:String=row.try_get("runner_hd_id")?;
@@ -239,6 +241,7 @@ pub async fn owns_job(store:&Store,job:&str)->Result<bool>{Ok(sqlx::query_scalar
 
 /// Explicit receipt-only recovery. Never redeliver the original installer or rewrite run history.
 pub async fn recover(d:&Dispatcher,run_id:&str,id:&str)->Result<Value> {
+    let _effect = d.executor.effect_permit().await.map_err(anyhow::Error::msg)?;
     let run=d.store.get_run(run_id).await?.ok_or_else(||anyhow::anyhow!("missing run"))?;
     ensure!(crate::repos::same_repo(REPOSITORY,&run.repo_url),"only the private Heyo repository may recover hosts");
     let mut tx=d.store.pool().begin().await?;

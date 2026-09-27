@@ -85,18 +85,117 @@ fn desired_spec(mut spec: Value, target: &Target, store: &str, artifact: &str, s
 }
 
 fn verify(body: &Value, id: &str, intent: &Intent) -> Result<bool> {
+    match outcome(body, id, intent)? {
+        Some("passed") => Ok(true),
+        None => Ok(false),
+        _ => anyhow::bail!("app-lb rollout failed"),
+    }
+}
+
+fn outcome(body: &Value, id: &str, intent: &Intent) -> Result<Option<&'static str>> {
     ensure!(body["operation_id"] == id && body["deployment"] == intent.target.deployment
         && body["source_revision"] == intent.source_revision && body["target_spec_sha256"] == intent.target_spec_sha256,
         "app-lb rollout identity or target configuration mismatch");
     match body["status"].as_str() {
-        Some("running") => Ok(false),
+        Some("running") => Ok(None),
+        Some("failed") => {
+            ensure!(body["failure_settlement"]["protocol"] == "failed-rollout-reclamation-v1"
+                && body["failure_settlement"]["reclaimed_candidate_ids"].as_array().is_some_and(|ids|
+                    ids.len() <= 128 && ids.iter().all(|id| id.as_str().is_some_and(|s|
+                        !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))))),
+                "failed rollout candidate reclamation is not confirmed");
+            Ok(Some("failed"))
+        }
         Some("succeeded") => {
             ensure!(body["readiness_verified"] == true && body["previous_stopped"] == true,
                 "rollout completed without verified readiness and previous-generation retirement");
-            Ok(true)
+            Ok(Some("passed"))
         }
         _ => anyhow::bail!("app-lb rollout failed or requires reconciliation"),
     }
+}
+
+/// Observe an existing operation only. Missing or ambiguous receipts never
+/// release the drain fence, and recovery never creates another candidate.
+async fn observe(store: &Store, id: &str, intent: &Intent, token: &str) -> Result<()> {
+    let base = crate::cd::app_lb_endpoint(&intent.target.url).map_err(anyhow::Error::msg)?;
+    let http = reqwest::Client::builder().connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(20)).redirect(reqwest::redirect::Policy::none()).build()?;
+    let response = http.get(format!("{base}/deployments/{}/rollouts/{id}", intent.target.deployment))
+        .bearer_auth(token).send().await?;
+    ensure!(response.status().is_success(), "rollout receipt unavailable");
+    let body: Value = response.json().await?;
+    if let Some(status) = outcome(&body, id, intent)? {
+        record_outcome(store, id, status, &body).await?;
+    }
+    Ok(())
+}
+
+async fn record_outcome(store: &Store, id: &str, status: &str, body: &Value) -> Result<()> {
+    // Store only the bounded identity and settlement proof, never arbitrary
+    // remote errors/specifications containing credentials. The event captures
+    // this receipt atomically with release of the drain obligation.
+    let note = json!({"operation_id":id,"deployment":body["deployment"],
+        "source_revision":body["source_revision"],"target_spec_sha256":body["target_spec_sha256"],
+        "status":body["status"],"failure_settlement":{
+            "protocol":body["failure_settlement"]["protocol"],
+            "reclaimed_candidate_ids":body["failure_settlement"]["reclaimed_candidate_ids"]}}).to_string();
+    let phase = if status == "failed" { "settled_failure" } else { "complete" };
+    let mut tx = store.pool().begin().await?;
+    let changed = sqlx::query("UPDATE ci_service_deployment SET status=$2,phase=$3,message=$4,error=NULL,updated_at=now() WHERE id=$1 AND status<>'passed' AND phase IS DISTINCT FROM 'settled_failure'")
+        .bind(id).bind(status).bind(phase).bind(note).execute(&mut *tx).await?.rows_affected();
+    if changed == 1 { Store::add_service_deployment_event(&mut tx, id).await?; }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Uses the immutable job plan, including for operations created before recovery
+/// existed. No plaintext credentials or new secret scopes are persisted.
+pub async fn recover(store: &Store, secrets: &crate::secrets::Secrets, run_id: &str, id: &str) -> Result<()> {
+    crate::submission::authorize_publication(store, run_id).await.map_err(anyhow::Error::msg)?;
+    let row = sqlx::query("SELECT r.intent,d.job_id,d.step_id,d.status,d.phase FROM ci_service_rollout r JOIN ci_service_deployment d ON d.id=r.id WHERE r.id=$1 AND d.run_id=$2")
+        .bind(id).bind(run_id).fetch_one(store.pool()).await?;
+    if row.get::<String,_>("status") == "passed" || row.get::<Option<String>,_>("phase").as_deref() == Some("settled_failure") { return Ok(()); }
+    let intent: Intent = serde_json::from_value(row.get("intent"))?;
+    let job_id: String = row.get("job_id");
+    let step_id: String = row.get("step_id");
+    let job = store.get_job(&job_id).await?.ok_or_else(|| anyhow::anyhow!("missing rollout job"))?;
+    let plan: crate::plan::JobPlan = serde_json::from_value(job.plan)?;
+    let step = plan.steps.iter().enumerate().find(|(index, _)| crate::store::step_id(&job_id, *index) == step_id);
+    let (_, step) = step.ok_or_else(|| anyhow::anyhow!("missing rollout step"))?;
+    ensure!(step.uses.as_deref() == Some("ci/rollout-service"), "rollout action differs");
+    let secret = crate::host_maintenance::token_secret(step.with.get("token")
+        .ok_or_else(|| anyhow::anyhow!("missing rollout credential reference"))?)?;
+    let run = store.get_run(run_id).await?.ok_or_else(|| anyhow::anyhow!("missing rollout run"))?;
+    let prefix = crate::secrets::Secrets::prefix(&run.workflow_id,
+        plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default"));
+    let resolved = secrets.resolve(&prefix).await?;
+    let token = resolved.secrets.get(&secret).filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("rollout credential unavailable"))?;
+    observe(store, id, &intent, token).await
+}
+
+pub fn spawn(d: std::sync::Arc<Dispatcher>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            // Receipt-only reconciliation must continue while draining. It does
+            // not acquire an execution permit or admit work into the old process.
+            let rows = sqlx::query("SELECT d.id,d.run_id FROM ci_service_rollout r JOIN ci_service_deployment d ON d.id=r.id JOIN ci_job j ON j.id=d.job_id JOIN ci_run n ON n.id=d.run_id WHERE d.status<>'passed' AND d.phase IS DISTINCT FROM 'settled_failure' AND (r.deadline<=now() OR j.status IN ('success','failure','cancelled','skipped') OR n.status IN ('success','failure','cancelled')) ORDER BY d.updated_at")
+                .fetch_all(d.store.pool()).await;
+            match rows {
+                Ok(rows) => for row in rows {
+                    let id: String = row.get("id");
+                    if recover(&d.store, &d.secrets, &row.get::<String,_>("run_id"), &id).await.is_err() {
+                        tracing::warn!(operation=%id, "service rollout receipt unresolved; drain fence retained");
+                    }
+                },
+                Err(error) => tracing::warn!(%error, "could not select abandoned service rollouts"),
+            }
+        }
+    });
 }
 
 /// Every replay uses the same persisted source revision and desired fingerprint.
@@ -171,14 +270,14 @@ async fn reconcile(store: &Store, msg: &JobMessage, id: &str, intent: &Intent,
     loop {
         let row = sqlx::query("SELECT r.deadline,d.status FROM ci_service_rollout r JOIN ci_service_deployment d ON d.id=r.id WHERE r.id=$1")
             .bind(id).fetch_one(store.pool()).await?;
+        let expired = row.get::<chrono::DateTime<chrono::Utc>,_>("deadline") <= chrono::Utc::now();
+        if expired || store.is_job_cancelled(&msg.job_id).await? {
+            anyhow::bail!("CI stopped waiting; remote rollout may continue. Reconcile operation {id} before another deployment");
+        }
         match row.get::<String,_>("status").as_str() {
             "passed" => return Ok(format!("[ci] {} candidate verified and previous generation stopped at {}\n", intent.target.deployment, intent.sha)),
             "failed" => anyhow::bail!("service rollout failed; reconcile operation {id}"),
             _ => {}
-        }
-        let expired = row.get::<chrono::DateTime<chrono::Utc>,_>("deadline") <= chrono::Utc::now();
-        if expired || store.is_job_cancelled(&msg.job_id).await? {
-            anyhow::bail!("CI stopped waiting; remote rollout may continue. Reconcile operation {id} before another deployment");
         }
         let attempt: Result<Option<bool>> = async {
             let response = http.get(format!("{endpoint}/rollouts/{id}")).bearer_auth(token).send().await?;
@@ -197,7 +296,11 @@ async fn reconcile(store: &Store, msg: &JobMessage, id: &str, intent: &Intent,
             }
             ensure!(!response.status().is_client_error() && !response.status().is_redirection(), "app-lb refused rollout lookup");
             if !response.status().is_success() { return Ok(None); }
-            Ok(Some(verify(&response.json::<Value>().await?, id, intent)?))
+            let body = response.json::<Value>().await?;
+            if outcome(&body, id, intent)? == Some("failed") {
+                record_outcome(store, id, "failed", &body).await?;
+            }
+            Ok(Some(verify(&body, id, intent)?))
         }.await;
         // Cancellation and the durable deadline also fence a slow successful GET.
         if store.is_job_cancelled(&msg.job_id).await? || row.get::<chrono::DateTime<chrono::Utc>,_>("deadline") <= chrono::Utc::now() {
@@ -226,7 +329,8 @@ async fn reconcile(store: &Store, msg: &JobMessage, id: &str, intent: &Intent,
             Err(error) if error.is::<reqwest::Error>() => {}
             Err(error) => {
                 let note = masker.mask(&error.to_string()).replace(token, "***");
-                store.update_service_deployment(id, "failed", Some("reconciliation"), None, Some(&note)).await?;
+                store.update_service_deployment(id, "submission_unknown", Some("reconciliation"), None, Some(&note)).await?;
+                anyhow::bail!("{note}; reconcile operation {id}");
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -343,11 +447,20 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires disposable CI_TEST_DATABASE_URL; fake app-lb HTTP"]
     async fn reconciliation_survives_response_loss_and_refuses_uncertain_success() {
-        use axum::{Json, Router, extract::{Path, State}, http::StatusCode, response::IntoResponse, routing::{get, post}};
+        use axum::{Json, Router, extract::{Path, State, Query}, http::{HeaderMap, StatusCode}, response::IntoResponse, routing::{get, post}};
         use std::sync::{Arc, Mutex};
         struct Remote { posts: Vec<Value>, result: Option<Value>, hidden: bool, mode: &'static str }
         let remote = Arc::new(Mutex::new(Remote { posts: vec![], result: None, hidden: false, mode: "success" }));
         let app = Router::new()
+            .route("/v1/secrets", get(|Query(query): Query<std::collections::BTreeMap<String, String>>| async move {
+                assert_eq!(query["prefix"], "ci/scope-test/staging");
+                Json(json!({"secrets":[{"path":"ci/scope-test/staging/APP_TOKEN","tags":[]}]}))
+            }))
+            .route("/v1/secrets/read", post(|Json(body): Json<Value>| async move {
+                assert_eq!(body["path"], "ci/scope-test/staging/APP_TOKEN");
+                use base64::Engine;
+                Json(json!({"valueBase64":base64::engine::general_purpose::STANDARD.encode("test-token")}))
+            }))
             .route("/deployments/cloud-eu1", get(|State(state): State<Arc<Mutex<Remote>>>| async move {
                 let mode = state.lock().unwrap().mode;
                 Json(json!({"rollout_revision":if mode == "stale" { "other" } else { "generation-3" },"spec":current()}))
@@ -364,7 +477,8 @@ mod tests {
                 // The server accepted the operation but the client cannot know it.
                 (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"lost response"})))
             }))
-            .route("/deployments/cloud-eu1/rollouts/{id}", get(|State(state): State<Arc<Mutex<Remote>>>, Path(_): Path<String>| async move {
+            .route("/deployments/cloud-eu1/rollouts/{id}", get(|State(state): State<Arc<Mutex<Remote>>>, Path(_): Path<String>, headers: HeaderMap| async move {
+                assert_eq!(headers["authorization"], "Bearer test-token");
                 let mut state = state.lock().unwrap();
                 if state.mode == "redirect" { return StatusCode::TEMPORARY_REDIRECT.into_response(); }
                 if state.hidden { state.hidden = false; return StatusCode::NOT_FOUND.into_response(); }
@@ -385,14 +499,24 @@ mod tests {
         let db = std::env::var("CI_TEST_DATABASE_URL").unwrap();
         let store = Store::connect(&db, workspace.path().into(), Duration::from_secs(30)).await.unwrap();
         store.migrate().await.unwrap();
+        unsafe {
+            std::env::set_var("CI_HEYO_API_KEY", "local-test-only");
+            std::env::set_var("CI_NETWORK", "local-test-only");
+            std::env::set_var("CI_DATABASE_URL", &db);
+            std::env::set_var("CI_WEBHOOK_SECRET", "0123456789abcdef");
+        }
+        let mut config = crate::config::Config::from_env().unwrap();
+        config.heyosecret_url = Some(base.clone());
+        config.heyosecret_token = Some("test-secret-store".into());
+        let secrets = crate::secrets::Secrets::new(&config);
         let plan = crate::plan::Plan::build(&crate::workflow::Workflow::parse("test.yml",
-            "jobs:\n  deploy:\n    steps: [{uses: ci/rollout-service}]\n").unwrap()).unwrap();
+            "jobs:\n  deploy:\n    env: {CI_ENVIRONMENT: staging}\n    steps:\n      - uses: ci/rollout-service\n        with:\n          token: '${{ secrets.APP_TOKEN }}'\n").unwrap()).unwrap();
         let masker = Masker::new(["test-token"].into_iter());
         for mode in ["success", "lost", "identity", "partial", "failed", "stale", "redirect", "cancelled", "expired"] {
             *remote.lock().unwrap() = Remote { posts: vec![], result: None, hidden: false, mode };
             let run = crate::vm::new_id();
             store.create_run(&run, &crate::store::RunRequest { repo_url:"https://repo.test/source.git".into(),
-                git_ref:"refs/heads/main".into(),sha:"a".repeat(40),..Default::default() }, &plan).await.unwrap();
+                workflow_id:"scope-test".into(),git_ref:"refs/heads/main".into(),sha:"a".repeat(40),..Default::default() }, &plan).await.unwrap();
             let job = store.jobs_of(&run).await.unwrap().remove(0);
             store.set_job_status(&job.id, crate::store::JobStatus::Running, None).await.unwrap();
             let step = crate::store::step_id(&job.id, 0);
@@ -432,6 +556,47 @@ mod tests {
                 let count = remote.lock().unwrap().posts.len();
                 reconcile(&restarted, &msg, &id, &intent, "test-token", &masker).await.unwrap();
                 assert_eq!(remote.lock().unwrap().posts.len(), count);
+            }
+            if matches!(mode, "identity" | "partial" | "stale" | "redirect") {
+                assert_eq!(status, "submission_unknown", "uncertainty must retain drain fence: {mode}");
+            }
+            if matches!(mode, "cancelled" | "expired") {
+                let original_run = store.get_run(&run).await.unwrap().unwrap().status;
+                let original_job = store.get_job(&job.id).await.unwrap().unwrap().status;
+                // Cancellation/deadline must not turn an absent operation into
+                // a new POST, nor imply that an accepted operation has stopped.
+                assert!(recover(&restarted, &secrets, &run, &id).await.is_err());
+                for receipt_status in ["running", "reconciliation_required", "succeeded", "failed"] {
+                    remote.lock().unwrap().result = Some(json!({"operation_id":id,"deployment":"cloud-eu1",
+                        "source_revision":"generation-3","target_spec_sha256":intent.target_spec_sha256,
+                        "status":receipt_status,"readiness_verified":true,"previous_stopped":false}));
+                    if receipt_status == "failed" {
+                        assert!(recover(&restarted, &secrets, &run, &id).await.is_err(), "failure without reclamation proof stays fenced");
+                        remote.lock().unwrap().result.as_mut().unwrap()["failure_settlement"] = json!({
+                            "protocol":"failed-rollout-reclamation-v1", "reclaimed_candidate_ids":["candidate-7"]});
+                        // Terminal failure with wrong provenance must not release
+                        // the fence either. Correct it only after asserting that.
+                        remote.lock().unwrap().result.as_mut().unwrap()["source_revision"] = json!("wrong");
+                        assert!(observe(&restarted, &id, &intent, "test-token").await.is_err());
+                        remote.lock().unwrap().result.as_mut().unwrap()["source_revision"] = json!("generation-3");
+                    }
+                    let observed = recover(&restarted, &secrets, &run, &id).await;
+                    assert_eq!(observed.is_ok(), matches!(receipt_status, "running" | "failed"));
+                    let status = store.service_deployments_of(&run).await.unwrap().remove(0).status;
+                    assert_eq!(status == "failed", receipt_status == "failed");
+                    assert_ne!(status, "passed", "partial readiness is not completion");
+                }
+                // Retry after process replacement is idempotent and cannot
+                // overwrite terminal evidence with a different result.
+                remote.lock().unwrap().result.as_mut().unwrap()["status"] = json!("succeeded");
+                remote.lock().unwrap().result.as_mut().unwrap()["previous_stopped"] = json!(true);
+                observe(&restarted, &id, &intent, "test-token").await.unwrap();
+                assert_eq!(store.service_deployments_of(&run).await.unwrap().remove(0).status, "failed");
+                assert_eq!(store.get_run(&run).await.unwrap().unwrap().status, original_run);
+                assert_eq!(store.get_job(&job.id).await.unwrap().unwrap().status, original_job);
+                assert!(remote.lock().unwrap().posts.is_empty());
+                assert!(reconcile(&restarted, &msg, &id, &intent, "test-token", &masker).await.is_err(),
+                    "recovered outcome must not resurrect an expired or cancelled waiter");
             }
         }
         server.abort();

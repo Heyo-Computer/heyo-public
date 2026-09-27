@@ -5,9 +5,513 @@ decisions and checklist below supersede conflicting next-step statements in the
 historical checkpoints. Existing capabilities are identified separately from new
 work. This document does not itself change running infrastructure.
 
+## IP capacity and failed-rollout recovery — 2026-09-25
+
+The existing /24 remains unchanged. Initial inventory found 63 reserved /30s
+and 18 running VMs on us3; eu1 had 53 reservations and 27 running VMs. Stopped
+service reservations are not free addresses. Three independently classified,
+terminal-run CI caches were destroyed through the owning run's cache API;
+no service/database VM was deleted. The blocked build subsequently allocated.
+
+Public release `01a0d737e492-00000050` deployed app-lb and Orchestrator to both
+regions with exact revision/readiness/predecessor-drain receipts. Its CI update
+did not execute: controller drain timed out and reopened submissions. Two older
+CI service operations still appeared running after app-lb had failed them.
+HTTP 502s were observed during eu1 ingress replacement; this is not a
+zero-failure acceptance result or independent regional CI availability.
+
+Public PR #122 adds durable failed-candidate reclamation and receipt-only CI
+reconciliation. A failed rollout alone cannot release drain: app-lb must prove
+candidate resources reclaimed, and CI must persist that exact settlement.
+Unknown creation outcomes, references to serving/source state and failed host
+verification remain fenced. Original run/job failure or cancellation is kept.
+Private PR #624 adds atomic subnet reservation ownership and a lifecycle-locked
+Firecracker reclamation verifier; its new endpoint performs no deletion.
+
+Executed local checks: 35 subnet tests from the earlier runtime revision;
+3 final Linux reclamation tests with real iproute2; 18 app-lb rollout tests,
+including 70 successive failures returning candidate capacity to baseline;
+5 CI service-rollout tests with disposable Postgres/HTTP/secret-store fixtures;
+and the Postgres handoff test rejecting unsettled legacy failure. These are
+not live reclamation or regional rollout acceptance.
+
+Private submission `01a0d939621d-00000056` failed before deployment. Both remote
+compile operations completed with exit code 0, confirmed in the backend's
+persisted execution records, but CI lost its runner connection and encountered
+database pool timeouts while retrieving results. That is not successful CI
+validation, and no result was rewritten. A full retry of the same private
+revision is `01a0d95802e8-00000059`, with Cloud validation
+`01a0d95802e4-00000057` and heyvm validation `01a0d95802e6-00000058`.
+That retry also failed before merge/deployment: its final attempts allocated
+VMs and reached checkout, then could not resolve the checkout credential from
+`https://heyosecret.eu1.heyo.work/v1/secrets?prefix=ci%2Fheyo%2Fdefault`.
+
+At approximately 17:00 UTC, operator secret reads also failed: the us3
+HeyoSecret dashboard read returned HTTP 500; eu1 returned an error reporting
+that its database peer closed the TLS connection without `close_notify`.
+Public eu1 HeyoSecret `/health` and Cloud `/health` still returned 200, so those
+health checks did not establish working secret access. No replacement
+management credential was scraped from process state. At 17:08 UTC, authenticated
+secret reads succeeded through both regional public endpoints without a restart
+or configuration change. The intermittent database-connectivity cause remains
+unresolved; a successful credential read does not prove the whole release path.
+
+Full private retry `01a0d98b3847-0000005c` failed before deployment. Cloud run
+`01a0d98b3843-0000005a` completed build, tests and artifact upload successfully;
+heyvm run `01a0d98b3845-0000005b` failed checkout with `Could not resolve host:
+github.com`. Host inspection found both reused CI VMs, `sb-823c73e7` and
+`sb-9bcddf88`, persisted at `10.88.0.206`. The failed VM's stop removed the
+shared outbound MASQUERADE rule while the other VM still had its TAP. Inventory
+found 64 reservation records but only 62 unique addresses, including a separate
+`.210` collision between `sb-4c20ed52` and `sb-25c5ff0e` (app-lb CI promotion
+preflight VMs). Those preflight VMs were not changed or deleted.
+
+The private fix now also rejects legacy duplicate ownership before restart,
+port publication or teardown, preserves the handle after refused restart, and
+fails closed on unreadable or malformed reservation inventory. Address checks
+span network names because host IP-keyed rules share one namespace. TAP removal
+must be confirmed before stop/delete or cancelled-boot reservation release.
+
+After both CI jobs finished and their processes/TAPs were absent, the two `.206`
+caches were classified against host service state, proxy/link records, routes,
+database registry and both public app-lb deployment lists. Their owning-run
+cleanup requests initially returned 503. CI logs
+showed durable eviction retries repeatedly using the same reset runner tunnel.
+After the next full submission, host inspection confirmed both caches absent
+from sandbox, run and KVM state; neither process nor TAP remained. The `.206`
+collision is gone. At 18:01 UTC, inventory still had 64 reservation records for
+63 unique addresses, with only the untouched `.210` preflight pair duplicated.
+The public fix makes failed cache eviction discard that runner's cached tunnel,
+matching the existing job and run-owned cleanup recovery paths. Active operations
+retain their own connection ownership. No manual host deletion or firewall repair
+was used to bypass these failures.
+
+Follow-up verification passed: 50 selected Linux tests, the separately executed
+privileged TAP-refusal test with real iproute2, and the stop/delete retention
+regressions. The CI eviction test passed against disposable Postgres/NATS/HTTP
+fixtures, along with 25 runner tests (one integration test remained ignored).
+Latest public trunk was incorporated and app-lb `cargo check` passed. Test
+containers were removed. These are not deployed or live-acceptance results.
+
+Private revision `10a58e0e5496e0fc26b7a7605fe394a466bd63f8` is pushed in PR #624
+and submitted through full release `01a0d9b75b46-00000060`; Cloud validation is
+`01a0d9b75b44-0000005e`, heyvm validation is `01a0d9b75b46-0000005f`.
+Public PR #122 also contains the failed-eviction reconnection fix. This retry's
+heyvm attempt 2 compiled successfully on `sb-6ea175f7`, but failed polling the
+test operation when its runner tunnel stopped accepting connections. The release
+coordinator failed before deployment. Cloud also encountered memory admission
+and secret-access failures. This is not a successful deployment.
+
+At 18:20 UTC, an app-lb-managed diagnostic exec found CI PID 421 at 1,024 open
+descriptors (its soft limit), including 1,018 sockets. CI logs reported `Too many
+open files` during ticket resolution, runner dials and VM cleanup. The SDK's
+inlined proxy omitted EOF propagation and detached accepted connection tasks;
+both published 0.1.9 and 0.1.11 contain that implementation. The private SDK fix
+propagates half-close, returns on copy errors, and cancels accepted tasks with
+their tunnel. Its 36 library tests and two real P2P tests passed. It is not yet
+published or installed in CI.
+
+Owning-run cleanup of the classified idle caches `sb-58e2f9a6` and `sb-c6b2d8e6`
+returned 503 during descriptor exhaustion. Host inspection still found both;
+their deletion is not claimed. No service/database VM was deleted to compensate.
+
+The requested CI policy is now ephemeral: snapshot diagnostics to a durable
+outbox, delete job VMs after success/failure/cancellation, and independently retry
+private S3 report uploads. Boot identities are returned before readiness polling
+so known boot/sizing failures enter ordinary cleanup. Legacy idle caches and
+unreferenced source-built images no longer get a retention window. Report
+snapshots exclude raw environments/workspaces, preserve available step logs,
+and explicitly record unavailable or bounded console diagnostics. S3 failure
+does not retain a VM. This is code, not executed live acceptance. A private
+`CI_S3_BUCKET` and service-role credentials still need to be configured, and CI
+must consume the corrected SDK. Create requests whose response is lost before
+identity persistence remain an unresolved lifecycle gap; they must not be
+guessed away or reported reclaimed from a terminal job alone.
+
+Final local checks: 462 CI tests passed (112 integration/environment tests
+ignored); the separately executed disposable Postgres/NATS cleanup regression
+and report restart/S3-failure regression passed. The cleanup regression covers
+lost stop/delete responses, concurrent reconciliation, ownership refusal and
+legacy `destroy=false` intents. Signed S3 HTTP tests passed, but no upload to a
+real report bucket has been verified. Cloud validation `01a0d9b75b44-0000005e`
+ended in failure after four attempts; the final attempt was refused by host
+memory admission. No new regional deployment completed.
+
+After operator approval, created `heyo-ci-debug-677866966701` in `us-west-2`
+for private CI reports. All four S3 public-access blocks and AES256 default
+encryption were read back successfully; bucket policy denies non-TLS access.
+The dedicated IAM user `heyo-ci-debug-reports` grants only PutObject/GetObject
+on this bucket's `ci/*` prefix. Its shared regional credential and configuration
+are stored in HeyoSecret under `ci-reports/aws-access-key-id`,
+`ci-reports/aws-secret-access-key`, `ci-reports/bucket`, and `ci-reports/region`.
+No existing bucket was modified. A non-sensitive provisioning receipt was
+uploaded and downloaded byte-for-byte using the credential read from HeyoSecret;
+anonymous access returned 403. Initial upload encountered IAM propagation delay;
+the subsequent verification succeeded without creating another key.
+This verifies storage access, not an installed CI report or regional deployment.
+Managed CI still needs these secret references wired into its service environment.
+
+SDK 0.1.12 packaging and packaged-source compilation passed. Actual publication
+stopped before upload because Cargo has no crates.io token; HeyoSecret's listed
+metadata contains no Cargo/crates.io credential. Publication is authorized but
+requires registry access. Do not resubmit regional builds with the old SDK as a
+substitute for installing the connection fix.
+
+The next private PR #624 change adds a request-bound, durable Firecracker
+creation-cancellation endpoint. Cancel-before-admission and queued work are
+fenced; active execution must leave its operation lock before cancellation
+returns. The receipt identifies the sandbox but does not claim resource absence.
+Six tests of the actual creation module passed in a disposable harness, and the
+full macOS backend library check passed. Full linked tests initially exhausted
+local disk during OpenSSL compilation; 2.8 GiB of disposable SDK build output and
+the temporary harness were removed. Linux/runtime cancellation remains unverified.
+CI-scoped access and durable CI create-intent recovery are still not integrated.
+
+Both deployed CI specs were readable. The us3 admin secret's metadata names
+`heyo`, not `admin`; the earlier Basic 401 was not a bad password. Direct app-lb
+VM-environment updates rebuild the active pool, so no such update was made to
+force S3 configuration before the CICD-managed replacement. Neither repository's
+GitHub secret names includes a Cargo/crates.io publishing credential either.
+
+Before registry access was available, CI used the exact
+`heyo-sdk` 0.1.12 Cargo package checked into `ci/vendor/heyo-sdk`. Its 29 files
+were compared byte-for-byte with the generated package; source revision and
+archive digest are recorded in `ci/README.md`. Cargo metadata resolves it as a
+local package with no registry source. The existing CI source filter and Docker
+copy include it. Offline CI tests passed: 462 CI tests and 46 submit-client
+tests; 112 environment-dependent tests were ignored. The SDK's added containerd
+driver variant required the corresponding CI capability spelling.
+
+Publication subsequently succeeded with the operator-provided credential.
+The registry checksum matches the verified package exactly:
+`880dffb6c86fab2a1b0a98efab9cb38f5a193c67a47a8037445ca9f21fcf8344`.
+CI now pins the public `=0.1.12` package and removes the temporary source copy.
+Locked offline tests against the published package passed: 462 CI tests and
+46 submit-client tests, with 112 environment-dependent tests ignored.
+No publishing credential is required to consume this package.
+
+The canonical `ci-reports` values have delivery copies in both regional app-lb
+secret stores. Eu1 reports encrypted storage; us3 does not. This is not proof
+that the running CI processes have the report environment configured.
+Validation runs `01a0da95cd12-00000061` (cloud) and
+`01a0da95cd15-00000062` (heyvm) succeeded. Operator debug reports for both were
+uploaded to the private bucket and downloaded byte-for-byte. Their VMs have not
+yet been confirmed reclaimed. Full backend release `01a0da95cd16-00000063`
+failed at 23:15 UTC: both regional cloud jobs succeeded, but us3 backend
+maintenance timed out in CI drain before backend submission. Eu1 backend and
+both heyvmd jobs were skipped. The us3 maintenance fence remains retained.
+
+Read-only recovery inventory (`job-793f4634c1a7`) found 35 host-work rows:
+34 on us3 associated with terminal jobs, plus one separate running native
+Windows job. Several rows represent earlier attempts whose sandbox association
+was overwritten by later attempts. The two claimed VMs are `sb-57d61813` and
+`sb-aa42ec19`; there are no durable `ci_vm_cleanup` handoffs. The database has
+no `ci_executor_owner` table, so the installed controller cannot be assumed to
+participate in the newer non-expiring execution-ownership protocol.
+
+Terminal job status does not prove that earlier remote commands or creates
+settled. The recovery must first fence the legacy executor against further
+effects, preserve shared data and diagnostics, and then reconcile exact attempt
+resources and receipts. Deleting host-work rows, assigning every historical
+attempt the current job sandbox, or ignoring the drain would erase uncertainty,
+not recover resources. No database writes, executor shutdown, credential
+revocation, or VM deletion were performed by this inventory. The temporary
+diagnostic command configuration was restored and read back exactly.
+
+The installed CI VM still had 1,016 descriptors against a soft limit of 1,024.
+Through app-lb managed exec, raised PID 421's soft limit to its existing hard
+limit of 4,096 and read it back. This is temporary recovery headroom so cleanup
+and corrective deployment can proceed, not a substitute for installing the
+connection fix and not an increase to the /24 address pool. No restart or direct
+app-lb pool replacement was performed.
+
+Read-only diagnostics found healthy host memory/disk capacity and successful
+fresh database TCP/TLS handshakes, but established database connections suffered
+retransmissions. Paired packet-header traces (`job-6a01b2fcdf11` on eu1 and
+`job-a150103facb0` on us3) showed packets leaving eu1 absent at us3's capture
+point, followed by successful retransmission seconds later. This localizes loss
+between capture points; it does not establish a provider or NIC root cause.
+No firewall, NIC, database, or service-restart workaround was applied.
+
+Broker inspection (`job-84e1aeadcc98`) also explained the unexpectedly long
+retry waits: NATS combines the explicit delayed NAK with the consumer's current
+BackOff entry minus its 60-second AckWait. The configured 5-minute and 15-minute
+delays therefore took approximately 9 and 29 minutes. The consumer had a waiting
+pull and two unacknowledged messages; broker state was not reset to hurry retry.
+
+The retry also encountered the existing 63-slot limit. Two additional idle,
+successful-run CI caches, `sb-20aa1a33` and `sb-0fa08d70`, were classified against
+service state, routes, metadata and owning runs, then destroyed through the
+owning-run CI API, which confirmed both deletions. Independent host inspection
+(`job-a1f6db8c1636`) found both caches absent from sandbox/runtime/KVM storage and
+61 reservations remaining. Candidate `sb-244b5380` was left untouched because
+its recorded guest IP also appeared in a database-related firewall rule. This
+is bounded release-capacity recovery, not proof that automatic reclamation is
+installed. Temporary diagnostic deployment registrations were removed.
+
+Remaining order: finish backend deployment to both hosts; deploy public
+app-lb/CI; reconcile the old operations using verified receipts; then record
+live capacity and public health. No manual production database correction was
+performed. The new reclamation protocol is not yet deployed.
+
+## CI correction and release reconciliation — 2026-09-24
+
+The required outcome is one logical `ci` application with instances in us3 and
+eu1, shared run/source/log/artifact state and coordinated execution ownership.
+An observation-only entry or adoption of the existing eu1 singleton is not that
+outcome. The acceptance checklist below remains authoritative and incomplete.
+
+PR #118 merged through release run `01a0d4e169d3-00000038`. The coordinator was
+cancelled before its eu1 and CI stages after the singleton scope was rejected.
+The us3 app-lb replacement completed. The already-submitted us3 Orchestrator
+operation `ci-service-919bf3328ffe2bfdde7c1e770965700fc8794131599323a0a50b472b558efae1`
+continued independently, then reported `failed`, `phase=verifying`,
+`readiness_verified=false`, `previous_stopped=false`, and
+`candidate readiness deadline elapsed; source retained`. Both public CI
+`/healthz` endpoints still returned revision
+`afc133a5e95eb0d29d02eab5ad86f191292758f8`. The us3 CI hostname still forwards to
+eu1; these responses are not independent regional CI availability. No CI
+adoption or obsolete-record deletion was performed.
+
+Local work on `fix/ci-shared-execution` first removes unsafe takeover authority:
+queue redelivery cannot claim running jobs; unresolved executor records protect
+expired VM/build claims; native expiry cannot reassign execution; drain includes
+unresolved native and host work. Repeated startup exposed a non-idempotent
+migration in PR #118, now corrected locally. These are safety prerequisites,
+not deployment completion. Submitted source and step logs now use shared
+PostgreSQL storage locally, with retained-file import and no original-file
+deletion. Cross-controller source replay and log reads were exercised against
+disposable PostgreSQL; log appends preserve concurrent writes and native
+completion logs roll back with failed completion transactions. Verification:
+458 CI unit tests, 46 native-agent tests, 34 store tests, 5 native tests, 10
+controller-rollout tests and the cross-controller HTTP/HTML log test passed;
+95 integration tests remain ignored
+by the default suite. These changes are not deployed.
+
+The local continuation adds non-expiring executor ownership and effect permits
+around deliveries, VM/image recovery, infrastructure reconcilers and direct
+HTTP infrastructure mutations. Planned self-replacement transfers to a named
+ready surviving boot before PUT, restricted to the exact persisted operation.
+Completion clears that restriction in the same transaction as the result.
+Readiness expires only for successor selection, never for ownership. Tests cover
+stale readiness, retired-boot refusal, cross-controller handoff, lost PUT response,
+atomic completion failure, failed remote-operation fences, and a delivery racing
+quiescence without retaining the handoff permit indefinitely. Record-only app-lb
+cleanup requires exact ETag and complete inventories and refuses retained jobs,
+workspace, rollout, disk or host-update references; it never invokes teardown.
+Verification: 458 CI unit and 46 native-agent tests, 5 executor PostgreSQL tests,
+11 controller-rollout tests, the PostgreSQL/NATS delivery-race test, and 890
+app-lb tests passed. All were local/disposable; no production deletion occurred.
+
+These prerequisites still do not make CI a managed two-region app. The existing
+external adoption/update path binds exactly one deployment and must not be
+expanded to disguise the singleton. The managed regional rollout needs a generic,
+exact-instance app lifecycle barrier before HTTP withdrawal; CI must implement
+durable background-work drain and handoff receipts through that contract. The
+platform, not CI's direct app-lb PUT loop, must then own replacement and rollback.
+Successors must be restricted to the platform-approved surviving instance set.
+Rollback needs a fresh eligible boot of the baseline revision, not reversal of a
+retired boot's fence. Owner-only HTTP operations currently return 503 on standbys;
+transparent owner routing remains required. Crash takeover remains blocked until
+authoritative runtime fencing and reconciliation exist. The live platform gates
+and global reference inventory before obsolete-record cleanup remain outstanding.
+Production CI remains on the previous revision while this work proceeds.
+
 ## Unified control-plane checkpoint — 2026-09-23
 
-- Post-login continuation: both live `/control-plane/config` responses remain
+- Preparation investigation, 2026-09-24: authenticated HEAD reads confirmed
+  the pinned rootfs blob exists (805306368 bytes) and the validated Orchestrator
+  bundle exists (8040047 bytes). Read-only host diagnostic `job-3f3c87335dd2`
+  attempted a complete rootfs read from us3 and exceeded its 240-second limit;
+  the host-command runner discarded partial stdout on timeout. Bounded probe
+  `job-8078bc5ca5f3` then received HTTP 200 in 0.369 seconds and read 8388608
+  bytes in 6.424 seconds. Extrapolating that sample gives roughly ten minutes
+  for the full rootfs, not an observed completed transfer. This demonstrates
+  that the hard-coded 120-second preparation cutoff is inadequate on the
+  measured path; the registered 300-second rollout budget is also too short
+  at that rate. No missing artifact or credential rejection was observed.
+  Correlated log search `job-c549138710bc` found no preserved preparation
+  events; the original operation's exact failing substep cannot be recovered
+  from those logs. Neither probe created a VM, changed a service route, or
+  changed the registered rollout budget. Diagnostic spec was restored.
+  Completion receipt `job-c171646e3aef` found no remaining probe processes;
+  subsequent authenticated regional reads showed one healthy Orchestrator
+  backend in each region and both rollout budgets still at 300 seconds.
+- App-lb preparation fix is local, not published: preparation shares the
+  remaining persisted rollout deadline rather than an independent two-minute
+  cap; latest safe stage/status codes are persisted during preparation and
+  survive failure/reload. Deadline expiry is distinct from preparation error,
+  with remote bodies and credentials excluded. The complete app-lb binary
+  test suite passed on macOS (880 passed, 6 ignored), including slow successful
+  preparation, remaining-budget expiry, durable error stages, and HTTP/digest
+  failure classification. Linux CI/release and live verification remain due.
+  PR114 is merged; publishing this additional fix requires a new public PR/CI
+  release authorization. Deployment should also raise the Orchestrator rollout
+  budget to 1800 seconds through the pool-preserving scaling PATCH API before
+  retrying the validated candidate. No such publication or policy write occurred.
+- Latest release supersedes the older publication failure below: Linux
+  validations `01a0d0633d65-00000008` (app-lb) and
+  `01a0d0633d69-00000009` (Orchestrator) passed. Release
+  `01a0d0633d6a-0000000a` published
+  [the candidate](https://github.com/Heyo-Computer/heyo-public/commit/edbe5eae73c890b5a9dc44b6a6dd82b651639c1d)
+  and replaced us3 app-lb, then failed us3 Orchestrator creation on subnet
+  exhaustion. Eu1 and controller stages did not run. Public `/healthz` checks
+  still show that candidate on us3 and revision
+  `5089a900e2f4312c252b9e2d43c6705acd72036b` on eu1; both return HTTP 200.
+- Subnet incident: receipt `job-156325a6e4f1` records the daemon refusing
+  candidate `sb-8368d453`; inventory `job-f2cc8b1ef5e5` found 63 reservations
+  and 18 live sockets. After service/reference checks, the repository-owned
+  cache destruction API deleted only stopped, unclaimed, unretained caches
+  `sb-4d20b5c9`, `sb-a53bd9a5`, and `sb-1457f52a` from successful public runs.
+  Receipt `job-3fabca13ad78` confirmed their state directories were removed,
+  60 reservations remained, and every remaining IP was unchanged. This gives
+  the old allocator three free slots, not a durable capacity fix. Libvirt's
+  DHCP range overlaps the old pool; its live `10.88.0.102` lease also appears
+  in a stopped CI reservation. Do not blindly restart that VM or resize the
+  live network without reconciling the collision. Read-only all-table route
+  inventory `job-3ebe144abe90` found no routes in the proposed added space
+  `10.88.1.0–10.88.3.255`; the existing libvirt DHCP lease is unchanged.
+- Managed recovery `network-recovery-us3-edbe5ea-20260923` used the same
+  validated Orchestrator artifact and exact target-spec fingerprint as the
+  failed CI operation. It failed in artifact preparation after approximately
+  120 seconds, before any candidate allocation or cutover; the API does not
+  distinguish its preparation timeout from an underlying preparation error.
+  Source `sb-a4dbf6b3` remains recorded healthy at `10.88.0.98:4446`.
+  Receipt `job-e5b8cfd77890` shows 2.4 TiB free on the target host, so host
+  disk exhaustion is not established. Do not retry creates or clear operation
+  history. CI's failed-run retry also returned a workflow-selector conflict;
+  no rerun was created.
+- Private backend allocator correction is **local and uncommitted**, not
+  installed: atomic cross-process reservation before returning an address,
+  retained-address reuse under compatible pool expansion, fail-closed corrupt
+  or duplicate records, DHCP exclusion for new allocations, and non-allocating
+  reattachment. Six isolated Linux tests passed (four allocator regressions,
+  including sixteen competing processes, plus two config tests). These tests
+  compile source-extracted allocator code with a minimal error-type fixture;
+  they are not live VM verification. Full backend library compilation also
+  passed with `cargo check --locked --lib` on Linux x86-64/Rust 1.95.0, with
+  21 existing warnings. No release binary has been built. The macOS crate
+  test filter ran zero relevant tests and is not counted. No private
+  publication, backend deployment, or live network-mask change has occurred.
+  Remaining gates: backend Linux release build/integration, authorized
+  publication and rollout, reconciled DHCP overlap and pool expansion, then
+  live capacity/restart checks. Artifact-preparation diagnosis and the broader
+  two-region acceptance remain incomplete.
+- Live NATS recovery: host memory admission evicted `sb-055d2cfb` at
+  19:22:31 UTC while admitting an 8192 MiB build VM. The empty replacement
+  `sb-f1b3942a` did not contain the original JetStream queues; CI still used
+  the original address. Both disks were explicitly retained through the admin
+  API. With Gary's approval, eu1 app-lb was stopped, the empty replacement was
+  stopped without deletion, and the exact original VM was resumed. The first
+  recovery job timed out waiting for controller shutdown before changing either
+  VM; after confirming the controller had stopped, the same operation completed.
+  App-lb adopted the original healthy backend at `10.120.179.238:8222`, verified
+  through the public authenticated dashboard API. Recovery receipt
+  `job-ffdd135dc4c9` records both original streams (`CI_US3_EVENTS`,
+  `CI_US3_JOBS`), five consumers and 1385 messages at recovery; subsequent
+  monitoring showed a reconnected client and new messages. No queue, consumer,
+  database or disk was cleared. This involved public eu1 interruption, not
+  zero-downtime acceptance. Idle-eviction prevention and replacement-aware NATS
+  client binding remain unresolved; disk retention alone prevents neither.
+- Gateway handoff changes are published in
+  [PR114](https://github.com/Heyo-Computer/heyo-public/pull/114).
+  Linux app-lb validation `01a0cfb7d5f6-00000003` and Orchestrator validation
+  `01a0cfb7d5fa-00000004` succeeded with artifacts. Regional release
+  `01a0cfb7d5fd-00000005` resumed automatically after NATS recovery, then its
+  merge job failed: PR115 had advanced trunk beyond the submitted base. CI
+  records a generic unknown-publication error, but the remote inspection and
+  exact-base publication guard establish that this candidate cannot replace
+  that newer trunk. A new validated candidate must include current trunk;
+  do not retry the old candidate or treat validation as deployed capability.
+- Live stale-request check after Gary requested safe cleanup: authenticated
+  public dashboard reads in both regions reported `regional-rollout-smoke`
+  total in-flight zero. Three successive `discovery-status` reads per region
+  also reported version 1, one backend, zero draining backends and zero
+  in-flight requests. No lingering requests were observed to cancel; no route,
+  VM or service data was deleted. The earlier stale-route discussion described
+  a local code race, not an observed backlog on the Linux deployment.
+- Local route-handoff correction: cutover fences the predecessor's backend
+  admission locks before acknowledgement. Requests holding stale route/backend
+  references cannot start new work; already-admitted streams retain their slots
+  until completion and remain visible in discovery drain counts. Flat requests
+  must also fail rather than switch to a regional runtime without generation
+  admission. This is a local fix, not an executed Linux cutover.
+  Handoff preparation now requires both readiness and active-policy adoption,
+  pins the boot/version, expires after 30 seconds without a valid snapshot, and
+  persists before publishing each phase. GET inspection no longer mutates the
+  durable phase. Intent fingerprints exclude discovery membership and normalize
+  secret references so refresh/restart does not invalidate unchanged intent.
+  The app-lb suite passed with 876 tests and six existing ignored tests before
+  the additional flat-to-regional proxy guard; all 18 proxy tests then passed,
+  including the stale-request regression. Enrollment controller integration, authenticated process-level
+  handoff verification, publication and live two-region acceptance remain open.
+- Retained-baseline migration check: the live Cloud receipt read for
+  `acceptance-v1c-20260922-r1?port=8080` returned 409, "Deployment has no
+  recoverable creation receipt". Added a separate authenticated, read-only
+  `/internal/orchestration/deployments/{id}/binding?port=` implementation in
+  private Cloud and a typed Orchestrator client. It observes existing runtime
+  placement and exact daemon mapping without inventing a create digest or
+  sending create. Cloud deployment-handler tests passed (20, one existing
+  ignored); client transport/identity tests passed. Handler success against
+  a database and live use remain unverified. These changes are local only and
+  do not enable bootstrap admission, route handoff or v3 execution. A Mac link
+  failure from disk exhaustion was resolved by removing inactive mvm-ctrl Rust
+  incremental artifacts; available space increased from 1.1 to 6.6 GiB. No
+  database volumes, service data or active compilation cache were removed.
+- Current direction: use authenticated regional HTTPS gateways, not opening
+  public VM ports. The replacement workload now lives in
+  `app-lb/testdata/regional_app.py`: explicit region/revision response headers,
+  health separate from admission history, held response bodies and an unhealthy
+  mode. The actual workload runs in the existing two-Pingora HTTPS regression;
+  request preservation, single POST execution, WebSocket transport and held-body
+  drain with 12 successful alternate-backend requests passed. Three workload
+  tests passed. These are local transport/workload checks, not hierarchical
+  enrollment or Linux VM lifecycle acceptance. The rewrite is not deployed.
+  Managed first-replica enrollment and flat-to-regional route handoff remain
+  implementation work; provider credentials are not the sole path forward.
+- Earlier direct-port diagnosis: eu1 placement through the old flat path was
+  blocked on the cross-region workload network. Both live Orchestrators reported failed
+  `acceptance-v1k-20260922` and identical version-1 discovery with only the US
+  endpoint. Managed eu1 inventory `job-99a68b785519` confirmed listeners on
+  2222, 2223 and 8080; us3 probe `job-6126fdbc35d7` connected to eu1 port 443
+  but timed out on all three workload ports. These TCP-only checks created no
+  candidate or application traffic. Earlier simultaneous captures below located
+  the missing candidate-port SYNs upstream of eu1's host interface; the new
+  probe alone does not identify the filtering device. Current HeyoSecret listing
+  contained 86 metadata entries, none identifying provider/network/firewall
+  credentials. Provider/network-admin access is required to investigate that
+  path; no firewall rules, discovery rows or health claims were changed.
+  Internal v3 regional HTTPS probes are not a deployable alternative yet:
+  admission and background execution remain closed, and application admission
+  requires retained healthy endpoints in every region. Do not bypass those
+  fences or manufacture an eu1 baseline to make a retry appear successful.
+- Unified overview delivered through [PR109](https://github.com/Heyo-Computer/heyo-public/pull/109)
+  and [regional release](https://ci.eu1.heyo.work/runs/01a0cf2817cf-00000001).
+  Linux validation, merge, us3 and eu1 replacements succeeded. Both gateways now
+  have revision 2 view configuration with identical `us3-edge` and `eu1-edge`
+  caller-auth bindings; existing Orchestrator service-key bindings were preserved.
+  Live Heyo-session `/fleet` requests through `admin.heyo.work`,
+  `admin.us3.heyo.work` and `admin.eu1.heyo.work` each returned both observations
+  without errors. Sample registry counts were US 30 deployments/22 tracked
+  backends and eu1 22/20; these are not unique application capacity totals.
+- Live browser checks on all three public origins used normal DNS and verified
+  TLS, with no response fixtures. Shared application content matched; default
+  overviews did not poll local metrics/secrets/tokens/jobs. Both regional local
+  drill-downs identified their selected hostname. Desktop, mobile and local
+  screenshots were inspected. Anonymous login redirect, emergency Basic reads,
+  Basic non-delegation and all three public health endpoints passed. A first
+  label assertion incorrectly compared CSS-uppercase rendered text to a lowercase
+  hostname; inspecting DOM text confirmed the correct label, and the corrected
+  check passed. Local verification: 871 tests passed/6 existing ignored; final
+  fleet compatibility regressions 8 passed; browser fixture checks passed.
+- eu1's replacement briefly produced public 502s at its dashboard, the common
+  hostname and CI; all recovered, and us3 remained reachable during that check.
+  This was not zero-interruption acceptance. The unified dashboard is deployed,
+  but the smoke application still has only its US endpoint. eu1 placement,
+  withdrawal/rollback/restart acceptance, generic-hostname us3 failover readiness
+  and shared-authority/database resilience remain open. No lifecycle fence was
+  removed and no new application candidate was created by this dashboard release.
+- Earlier post-login checkpoint: both `/control-plane/config` responses were
   revision 1 with identical Orchestrator bindings but empty `gateways`; both
   `/fleet` responses report `configured=false`. The legacy dashboard sections
   read their serving gateway's local registry/metrics, so a common hostname
@@ -500,7 +1004,276 @@ references until ownership-safe cleanup is separately performed.
 | [ ] app-lb update | Continuous public and peer requests plus held stream during old/new switch; no failures; crash helper after switch intent and reconcile exact instance | Current updater restarts in place; replacement/handoff missing |
 | [ ] Overload / partition | Alternate region cannot meet budget; block planned drain. Stale observer cannot authorize maintenance; no forwarding loops under split views | Not live-proven |
 | [ ] Whole-host maintenance | Withdraw external origin and regional capacity, drain, stop target ingress/host, verify normal hostname and dependencies through survivor, restore | External entry and stateful dependency failover not established |
-| [ ] CI as one app | Shared run state, one job owner, controller/worker restart and regional evacuation without duplicate action | Deferred until platform gates pass |
+| [ ] CI as one app | Shared run state, one job owner, controller/worker restart and regional evacuation without duplicate action | Public lifecycle, owner forwarding, v3 integration, fresh recipe replay and asynchronous self-release implemented locally. Initial legacy cutover and composed/live acceptance remain blocked; not deployed capability |
+
+Local managed-CI checkpoint, 2026-09-24 (unpublished; no live state changed):
+
+- `cargo test --locked --manifest-path ci/Cargo.toml`: 458 CI and 46 native-agent
+  tests passed; 107 integrations remain ignored. Git fixtures used test-scoped
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=false`
+  because this orb has no commit-signing key. Orchestrator's equivalent default
+  command passed 107 main and 7 provider tests (16 and 3 ignored). These are local
+  default suites, not evidence that ignored or live gates passed.
+- CI's PostgreSQL executor suite has 9 passing tests, including two sequential
+  us3→eu1→new-us3 transfers, immutable receipt replay, wrong-target refusal,
+  retained failed-effect obligations, local effect permits and the production
+  standby-retirement/owner-selection race. A separate lock-wait test rejects a
+  stale successor snapshot after retirement commits. Freshness selects successors
+  but never expires ownership.
+- The PostgreSQL/NATS frontend fixture passes direct and forwarded writes,
+  owner-only native polling, original-caller authentication and wrong-boot/loop
+  rejection. Its Orchestrator proxy is a protocol fixture, not the private Cloud
+  or backend implementation. No large-artifact parity claim follows from this.
+- Orchestrator's PostgreSQL barrier fixture pins target boots and the retiring
+  hook contract, loses the successful hook reply, reconstructs the controller,
+  reads the same receipt, then retires eu1 toward the new us3 boot. Application
+  receipts in this fixture are doubles. It does not substitute for composing
+  the actual CI process, Cloud transport and regional rollout controller.
+- The raw-streaming Cloud client fixture verifies binary body preservation,
+  echoed backend identity, unsupported endpoint refusal and no redirect fallback.
+  Request/response metadata is capped at 16KiB, separately from CI's 512MiB native
+  artifact limit. Clients explicitly disable retries. Ordinary Cloud exec and
+  public data-plane proxy are forbidden fallbacks because they can wake instances.
+
+Reproduce targeted disposable checks with `cargo test --locked --manifest-path
+ci/Cargo.toml executor::tests -- --ignored`, the CI test filter
+`managed_frontends_preserve_auth_and_reject_wrong_boot_without_retry`, and the
+Orchestrator filter `lifecycle_barrier_pins_targets_and_recovers_lost_reply_after_restart`
+(the latter two also require `-- --ignored`). Set `CI_TEST_DATABASE_URL` and
+`ORCHESTRATOR_TEST_DATABASE_URL` to disposable PostgreSQL 17, and `CI_NATS_URL` /
+`CI_TEST_NATS_URL` to disposable JetStream. Run the frontend fixture alone because
+it temporarily scopes its database environment. Do not run all ignored CI tests:
+some invoke real heyvm.
+
+Local continuation, 2026-09-25 (unpublished, includes Sam's merged PR120/121):
+
+- V3 execution now runs the generic barrier before withdrawal. Managed CI release
+  intent outlives the finished job; an owner reconciler submits/replays the normal
+  managed platform operation and verifies all regional target boots after bake.
+  It does not inherit the old direct app-lb replacement dispatcher.
+  The barrier regression also passes rollback after retirement but before HTTP
+  withdrawal, including recovery of a lost reply from the interrupted forward
+  step. It reuses that exact boot's receipt without issuing a second retirement.
+- Migration045 captures immutable per-endpoint creation recipes, exact versioned
+  secret references, request digests and authenticated creation bindings. The v3
+  rollback program creates fresh baseline identities through the same durable
+  candidate journal, probes and restores them; it never resets retired flags.
+  Existing endpoints without recipes fail closed. Initial platform enrollment is
+  not refused merely because no old managed endpoint/recipe exists.
+- Default suites: 458 CI +46 native-agent passed (110 CI integrations ignored);
+  108 Orchestrator +7 provider passed (17/3 ignored). No formatter was run.
+- Disposable PostgreSQL17: 10 executor tests passed, including managed startup
+  refusing empty ownership and leaving no boot/owner rows. Candidate restart and
+  recovery, immutable creation-recipe binding, fresh rollback journal ordering and
+  receipt-based endpoint selection each passed. Missing fresh receipts cannot
+  fall back to retired endpoint identity. CI run completion/cancellation passed.
+- Disposable PostgreSQL/JetStream: the production CI managed-release reconciler
+  waits for job exit, replays an uncertain submission with the same command,
+  releases its effect permit, rejects a changed regional target and completes only
+  on verified target identities. Its platform HTTP responses are a fixture; this
+  does not prove composed Orchestrator/Cloud/backend behavior.
+- `two_real_gateways_drain_through_authenticated_durable_barriers` passed through
+  the production v3 dispatcher (272 seconds, actual app-lb binaries). It covers
+  the no-hook generic-app path, HTTP withdrawal/drain, candidate recovery, rollback
+  and bake. Cloud remains a fixture; this is not live VM lifecycle acceptance.
+
+Parent-reported authenticated read-only live inventory, 2026-09-25:
+`GET https://orchestrator.{us3,eu1}.heyo.work/orchestration/services` returns empty
+`services` in both regions. `/orchestration/services/ci` reports null active and
+previous IDs (possibly a default response), and `/orchestration/services/ci/discovery`
+returns 404 in both. No managed CI baseline is advertised. This does not prove
+shared authority: deployed Orchestrator envRefs differ, despite a canonical
+`orchestrator/database-url` secret existing. The eu1 `ci-eu1` singleton still serves
+`sb-eee79af6` with retained workspace; us3 `ci-eu1-forward` points to it. Neither is
+obsolete. Zero VM rows for `ci-us3`, `ci-us3-browser`, `ci-us3-candidate` and
+`ci-us3-trial` do not prove absence of retained disks/global references;
+`ci-us3-next` has retained workspace. No deletion is authorized by these facts.
+app-lb deployment APIs expose normalized stored `env_from` references; secret
+APIs return summaries, not values. References resolve at VM creation. These reads
+cannot establish the resolved database authority of the running legacy process.
+
+**Initial CI cutover remains unsupported and fails closed.** The old singleton
+does not participate in executor ownership. `register_managed` cannot initialize
+an empty owner table; it may register only as standby to an existing protocol
+owner. No bypass flag or manual owner-table write is a supported cutover. Required
+missing capabilities/evidence, in order:
+
+1. Bind both managed CI replicas to the preserved authoritative CI database and
+   job stream; verify run/source/log/artifact and pending/native/external-effect
+   inventory before cutover. Bind both Orchestrators to one rollout authority.
+   Equal endpoint responses or matching database names are insufficient.
+2. A supported legacy admission-close/drain operation must stop new deliveries,
+   finish or explicitly reconcile admitted work and remote obligations, and
+   persist progress while retaining all workspaces, disks and database state.
+   The new boot cannot assert this on the old process's behalf.
+3. Obtain a durable platform retirement receipt for the exact backend, canonical
+   sandbox ID and persisted creation identity. Initial migration may permanently
+   retire the whole legacy sandbox, including all boot incarnations, without a
+   guest boot nonce. Persist retirement intent before termination; require strict
+   host-side termination confirmation before completing the receipt. Reserve the
+   retired ID permanently and preserve disks/metadata. Every product CLI/daemon
+   start, exec, restore and reconciliation path must honor the fence across
+   processes and restarts; app-lb must also prevent replacement under a new ID.
+   Unknown stop status, an observation-before-exec check, or a timeout is not
+   that proof. The non-starting HTTP transport alone is not a retirement operation.
+4. Implement an authenticated, idempotent initial-owner transaction consuming that
+   receipt plus the preserved-state reconciliation result, naming the exact first
+   managed boot and atomically opening shared admission. Lost responses must replay
+   the same result. Neither this initializer nor its runtime-fence authority exists
+   in the public checkpoint; startup therefore remains refused rather than silently
+   scheduling alongside the legacy singleton.
+
+Owner crash before handoff, or successor crash after it, remains blocked pending
+authoritative runtime fencing and reconciliation. A successful stop with unknown
+runtime status is not fencing, and timeout takeover remains prohibited. Private
+transport must pin deployment/backend identities through the stream lifetime and
+prove the runtime is already running without waking it; CI must also validate the
+application boot. Parent reports private shared-row/read-lease streaming tests,
+concurrent request/stop-wait/EOF-drop coverage and 512MiB streaming passed; those
+were not executed in this orb. Parent also reports 344 passing Linux transport
+tests, 350 passing combined WASIX/transport Linux tests (including update/replay
+waiting on a streaming lifecycle read lease), and an actual Wasmer revision,
+replay-PID, incompatible-update and failed-start rollback test passed in47.71s.
+The private integration branch is committed locally, not pushed. These results
+do not establish public/private composition or deployed capability.
+Parent integration verification on 2026-09-25 also passed 97 Orchestrator tests
+and 7 provider tests on macOS, plus the disposable PostgreSQL immutable-recipe
+binding test. Private lifecycle serialization now uses host file locks shared by
+CLI/daemon processes using the same sandbox data directory. Its final suites
+passed 354 Linux tests and 309 macOS tests (2 ignored on each platform), including
+separate-process exclusion, concurrent readers, storage errors and explicit unlock
+with inherited/duplicated descriptors. The first strengthened process test failed
+before explicit unlock was added; only the corrected rerun is counted here.
+This cross-process lock is not the durable retirement capability required above.
+
+**Public controller retirement checkpoint (2026-09-25, local only):** app-lb now
+offers authenticated namespace-admin `GET/POST /deployments/:id/retirement`.
+POST pins `operation_id`, `expected_revision`, `expected_spec_sha256`, and exact
+backend targets; it durably freezes ordinary mutations, allocation, adoption,
+rollouts and workspace workers before any backend retirement call. Admitted
+controller work and WebSocket shells hold read leases; retirement waits for
+them before taking its immutable inventory. Restart/reload retains the freeze;
+unreadable deployment state refuses controller startup. The process owns an
+exclusive state-directory file lock. Older binaries do not honor this protocol
+and must not run concurrently or be used as an operational rollback.
+
+The backend wire is unchanged: service-authenticated GET/POST
+`/sandboxes/{id}/retirement`, exact backend/server/sandbox/creation/Libvirt
+URI/UUID identity, no redirects or automatic retries, bounded JSON responses.
+`createdAtUnixNanos` is a canonical positive decimal **string** parsed as `u128`,
+matching the private backend, never a JSON number. Parent integration review
+caught the initial public `u64` mismatch; the corrected wire regression exercises
+values above `u64`, the `u128` maximum, and numeric/invalid/overflow rejection.
+Only an authenticated exact `state: retired` receipt completes a target. A lost
+reply replays the saved intent or recovers the exact receipt. `202`, unknown
+status, mismatched identity, and persistence errors never mean successful fencing.
+Retirement never deletes deployment records, disks, workspace snapshots or mount
+trees; force-purge cannot override its pins. Shared daemon-tree reclamation is
+conservatively suspended while retirement records exist because no complete
+cross-deployment tree-reference ledger exists. This is a controller primitive,
+not CI drain, state-authority evidence, or permission to initialize CI ownership.
+
+**Allocation closure is still missing, including for newly successful legacy
+creates.** Direct local app-lb/SDK creation sends one `/sandbox-deploy` request;
+the local daemon assigns one ID and queues one background create. It does not
+normally traverse Cloud JetStream. The Cloud route is a separate ingress: source
+inspection found Cloud `sandbox_queue.rs`
+`handle_create_message` executes each JetStream delivery and ACKs only after
+publishing its lifecycle event. Worker death or event-publication failure after
+backend allocation can redeliver. Only metadata `_orchestrationCreation` selects
+the correlated `/sandbox-creations` path; the legacy `/sandbox-deploy` path used
+by app-lb does not supply it. Replay can allocate a fresh backend ID through
+`/sandboxes` or `/sandboxes/from-archive`. Public request bodies contain replica
+names, account/user metering IDs and optional archive keys, not an authenticated
+deployment allocation epoch. Neither SDK success, matching names, nor inventory
+scans prove closure. Every legacy create dispatch therefore durably invalidates
+allocation completeness even when its returned ID is recorded. Unknown creates,
+historical records and arbitrary host jobs stay frozen/unresolved, with no
+override, timeout, inferred reconciliation or automatic target expansion.
+
+Required follow-through: integrate authoritative correlated allocation receipts
+for new creates; for historical closure, establish durable admission rejection
+at **every relevant ingress**, then quiesce/reconcile admitted queue deliveries
+and backend work without stopping unrelated workloads or deleting storage. Only
+an explicit proven closure may support a later controller completion protocol.
+Existing rollout/job/workspace obligations and host-update helpers also require
+reconciliation; this checkpoint does not invent their completion. Backend receipt
+replay tests use synthetic complete allocation histories, not evidence that the
+current legacy production create path can reach completed retirement.
+
+Public verification in the orb: `cargo test --locked --manifest-path
+app-lb/Cargo.toml` passed 899 tests, 6 ignored. Eight focused retirement tests
+exercise actual admin routing/SDK create/backend HTTP calls, in-flight creates,
+successful-but-incomplete legacy allocation, restart/lost response/exact replay,
+authentication, target mismatch, redirect refusal, frozen mutations, force-purge
+refusal, process locking, and persistence/corrupt-load failure. No live VM was
+retired. Parent separately reports private Linux 360/macOS 313 tests passed
+(2 ignored each), immutable retirement intent/receipt, reopened/cached lifecycle
+gates and storage retention; 11 virsh termination scenarios use subprocess
+doubles, not live VM retirement. Parent also reports the separate actual Wasmer
+replacement/replay/failed-start rollback test passed after exec/create locking.
+These private results are attributed, not rerun in this orb; later KVM-path fixes
+are now locally committed with parent-reported Linux 361 passed/2 ignored and
+serial macOS 313 passed/2 ignored. The parallel macOS run had one existing image
+eviction Busy-versus-Missing failure; the serial pass does not erase that limitation.
+No push, deploy, live migration or record deletion
+is authorized or performed by this controller checkpoint.
+
+**Local integration verification (2026-09-25):** imported the final v2 controller
+archive into `ci-app-registration` after verifying SHA-256
+`e721962f3452556f875e3a626f29f4495fa4884996fa56f54b96fd067a63bca4`.
+On this checkout, all eight retirement tests and the full locked app-lb suite
+passed (898 passed, six ignored). These are fresh local results, distinct from
+the orb count above. Private `ci-instance-http` now validates recovered creation
+receipt identities/fingerprints and re-establishes file/directory durability before
+returning a receipt. Its locked serial macOS library suite passed 314 tests,
+two ignored; the lockfile's package version was aligned with the existing
+`0.50.7` manifest, with no dependency changes. This is not a composed live test
+and does not connect app-lb's legacy creates to correlated creation yet.
+
+**Correlated autoscaler checkpoint (2026-09-25, local only):** the subsequent
+app-lb change adds opt-in `vm.correlated_creates`, default false, for direct
+heyvmd autoscaler allocations. It persists a random operation identity, exact
+transport and canonical request digests before POST; resolved secrets and request
+bodies remain in memory. A validated backend receipt is durable before pending
+capacity is published. Recovery only GETs the saved operation, never re-POSTs or
+uses name matching. Unknown identities pin cleanup globally; known receipts pin
+their exact sandbox until its runtime is observed running. Registry mutation,
+orphan cleanup, force-purge and record removal honor these reservations. Retirement
+also rejects missing/mismatched receipts and unobserved correlated runtimes.
+Legacy history remains incomplete; rollout candidate creation is still legacy.
+This does not establish historical ingress/queue closure or end-to-end CI ownership.
+
+Private heyvm now derives 15-byte TAP names for full correlated sandbox IDs,
+preserving existing short names and using a distinct shortened-name namespace.
+Setup/teardown serialize by interface name across processes sharing the heyvm
+data directory. Exact full-ID interface aliases prevent hash collisions from
+authorizing adoption or deletion. Inventory sweeps retain unknown shortened
+interfaces and their ambiguous IP rules. No privileged live TAP/VM lifecycle was
+exercised; these checks cover Rust code, protocol fixtures and sweep planning.
+
+Fresh final verification: public locked app-lb suite **908 passed, 6 ignored**;
+private locked serial Linux x86_64 library suite in disposable OrbStack container
+**367 passed, 2 ignored**; private locked serial macOS library suite **314 passed,
+2 ignored**. Schema golden was regenerated and the full public suite verifies it.
+New cases cover write-ahead persistence, lost response/reload, queued capacity,
+receipt mismatch/missing receipt without repost, persistence failure, registry
+contention, redirect traps, retirement refusal, and mixed legacy/shortened TAP
+cleanup. An earlier public run failed the unrelated random-token test whose
+`rsplit_once('_')` can select a suffix of the base64url secret; unchanged reruns
+passed. Earlier Linux runs hit the existing exact-runtime streaming test's
+one-second deadlines; the isolated test and final serial suite passed unchanged.
+These failures are retained as limitations, not erased by the green reruns.
+Changes are local: no push, deployment, shared migration, live retirement or
+service-data cleanup occurred. Historical admission closure, correlated rollout
+candidates, composed restart/rollback verification and all live acceptance gates
+remain outstanding.
+
+Composed actual CI/Orchestrator/Cloud/backend
+unhealthy-candidate/fresh-rollback and restart/lost-receipt sequences, plus all live
+acceptance gates, remain outstanding. Admission closure is not uninterrupted submission
+availability. PR119, production registrations, databases, workspaces and disks
+were not changed by this checkpoint.
 
 Local evidence, 2026-09-22: app-lb has 854 passing tests (6 ignored); Orchestrator
 has 99 passing tests with ignored tests explicitly included against disposable

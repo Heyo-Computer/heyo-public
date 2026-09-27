@@ -42,6 +42,8 @@ mod obs;
 mod plugins;
 mod proxy;
 mod registry;
+mod allocation;
+mod retirement;
 mod rollout;
 mod runtime;
 mod secrets;
@@ -460,12 +462,23 @@ fn main() {
     }
 
     let registry = Arc::new(Registry::new(&cfg.state_path));
+    let _controller_lock = registry.controller_lock().unwrap_or_else(|e| {
+        tracing::error!(error=%e,"cannot exclusively own deployment state; refusing controller startup");
+        std::process::exit(1);
+    });
     match registry.load() {
         Ok(0) => {
             tracing::info!(dir = %registry.state_dir().display(), "no persisted deployments")
         }
         Ok(n) => tracing::info!(count = n, "restored deployments"),
-        Err(e) => tracing::error!(error = %e, "failed to load persisted state; starting empty"),
+        Err(e) => {
+            tracing::error!(error=%e,"failed to load persisted state; refusing controller startup");
+            std::process::exit(1);
+        }
+    }
+    if let Err(e)=registry.require_complete_load() {
+        tracing::error!(error=%e,"refusing controller startup with incomplete deployment state");
+        std::process::exit(1);
     }
 
     // Beside the deployment state, derived the same way: `app-lb-state.json`

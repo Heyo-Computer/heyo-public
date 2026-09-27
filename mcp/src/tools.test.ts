@@ -280,6 +280,57 @@ test("deployment_logs asks app-lb whether the deployment is the caller's before 
   }
 });
 
+test("applb_security_events passes the /security query filters through unchanged", async () => {
+  // The five filters `/security` accepts are the tool's whole input, and the
+  // tool's job is to forward them verbatim — it must not invent a default for
+  // `namespace` (managed mode narrows server-side) nor drop an omitted one
+  // into the query string. What the caller sends is what app-lb gets.
+  const stub = stubFetch((c) =>
+    c.url.endsWith("/namespaces")
+      ? { body: { namespaces: [{ name: "team-a", scope: "admin" }] } }
+      : { body: { enabled: true, alerts: [], totals: {}, rules: [], guard: {} } },
+  );
+  try {
+    const out = await tool(twoKeys(), "applb_security_events").handler({
+      severity: "high",
+      rule: "auth.brute-force",
+      deployment: "web",
+      namespace: "team-a",
+      limit: 20,
+    });
+    assert.match(out, /"enabled": true/);
+    assert.equal(stub.calls.length, 2, "namespace discovery then /security");
+    const security = stub.calls[1]!.url;
+    assert.ok(security.includes("/lb/security"), `hit /security: ${security}`);
+    assert.ok(security.includes("severity=high"));
+    assert.ok(security.includes("rule=auth.brute-force"));
+    // 'auth.brute-force' has a '+', not a literal '-' in URLSearchParams.
+    assert.ok(security.includes("deployment=web"));
+    assert.ok(security.includes("namespace=team-a"));
+    assert.ok(security.includes("limit=20"));
+  } finally {
+    stub.restore();
+  }
+});
+
+test("applb_security_events sends nothing when no filter is given", async () => {
+  // An empty call must not synthesize a `namespace=` query param: through the
+  // managed door the response is narrowed server-side, and a self-hosted app-lb
+  // returns everything. Adding a default here would silently widen or narrow
+  // what the caller asked for. A self-hosted config (APPLB_URL) skips namespace
+  // discovery, so the only request is the one to /security.
+  const stub = stubFetch(() => ({ body: { enabled: false, alerts: [], rules: [] } }));
+  try {
+    const tools = buildTools(loadConfig({ APPLB_URL: "http://127.0.0.1:8090" }));
+    await tool(tools, "applb_security_events").handler({});
+    const security = stub.calls.find((c) => c.url.includes("/security"))!.url;
+    assert.ok(!security.includes("namespace="), `no namespace synthesized: ${security}`);
+    assert.ok(!security.includes("severity="), `no severity synthesized: ${security}`);
+  } finally {
+    stub.restore();
+  }
+});
+
 test("deployment_logs refuses a deployment app-lb will not show this credential", async () => {
   const stub = stubFetch((c) => {
     if (c.url.endsWith("/namespaces")) {

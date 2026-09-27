@@ -78,6 +78,7 @@ pub struct Snapshot {
 #[derive(Debug, Default)]
 struct State {
     snapshot: Option<Snapshot>,
+    observed_at: Option<std::time::Instant>,
     local: Vec<Arc<VmBackend>>,
     counters: BTreeMap<(i64, String), (u64, u64)>,
     sequence: u64,
@@ -86,6 +87,15 @@ struct State {
 
 #[derive(Debug)]
 pub struct Router { pub boot_id: String, state: Mutex<State> }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preparation {
+    pub boot_id: String,
+    pub operation_id: String,
+    pub version: u64,
+    pub prepared: bool,
+    pub adopted: bool,
+}
 
 impl Router {
     pub fn new() -> Self {
@@ -97,6 +107,30 @@ impl Router {
     }
 
     pub fn fence(&self) { self.state.lock().unwrap().fenced = true; }
+
+    /// Coherent preparation evidence used by the flat-to-regional handoff.
+    /// The boot identity deliberately is runtime-only: a restart invalidates a
+    /// prepare receipt instead of pretending the replacement was observed.
+    pub fn preparation(&self, enabled: bool) -> Option<Preparation> {
+        let state = self.state.lock().unwrap();
+        // This expiry gates a new selector transition, not ongoing routing:
+        // last-valid assignments may still serve during control-plane loss.
+        let snapshot = state.snapshot.as_ref().filter(|_| !state.fenced
+            && state.observed_at.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(30)))?;
+        let prepared = enabled && (snapshot.policies.iter()
+            .find(|p| p.generation == snapshot.proposal_generation)
+            .and_then(|p| p.policy.regions.iter().find(|r| r.region == snapshot.region))
+            .is_some_and(|r| r.weight == 0)
+            || state.local.iter().any(|b| b.is_healthy() && !b.is_draining()));
+        Some(Preparation {
+            boot_id: self.boot_id.clone(),
+            operation_id: snapshot.operation_id.clone(),
+            version: snapshot.version,
+            prepared,
+            adopted: snapshot.active_generation == Some(snapshot.proposal_generation)
+                && snapshot.closed_through_generation < snapshot.proposal_generation,
+        })
+    }
 
     pub fn apply(&self, snapshot: Snapshot, spec: &RegionalSpec, service: &str, region: &str,
         local: Vec<Arc<VmBackend>>) -> Result<bool, String> {
@@ -152,6 +186,7 @@ impl Router {
         }
         state.local = local;
         state.snapshot = Some(snapshot);
+        state.observed_at = Some(std::time::Instant::now());
         Ok(true)
     }
 
@@ -449,6 +484,20 @@ mod tests {
                     {"region":"us3","weight":0,"gateways":[{"id":"us","backendServerId":"host-us","url":"https://us.example"}]}
                 ]}}]})).unwrap();
         (router, spec, secrets, snapshot, vec![Arc::new(VmBackend::for_upstream("127.0.0.1:8888".into()))])
+    }
+
+    #[test]
+    fn handoff_preparation_expires_without_disabling_last_valid_routing() {
+        let (router, spec, secrets, snapshot, local) = setup();
+        router.apply(snapshot, &spec, "svc", "eu1", local).unwrap();
+        assert!(router.preparation(true).is_some_and(|p| p.prepared && p.adopted));
+        assert!(!router.preparation(false).unwrap().prepared);
+        router.state.lock().unwrap().observed_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
+        assert!(router.preparation(true).is_none());
+        assert!(router.admit(&spec, "svc", "eu1", &http::HeaderMap::new(), &secrets).is_ok());
+        router.fence();
+        assert!(router.preparation(true).is_none());
+        assert!(router.admit(&spec, "svc", "eu1", &http::HeaderMap::new(), &secrets).is_err());
     }
 
     fn probe_fixture() -> (Arc<Router>,RegionalSpec,SecretStore,Snapshot,ProbeRequest) {

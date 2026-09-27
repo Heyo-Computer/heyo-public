@@ -5,6 +5,11 @@ use sqlx::Row;
 use std::sync::Arc;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
+// Shared by final admission/grant transactions and exclusive drain transitions.
+// A process-local permit alone cannot fence a request on another HTTP replica.
+pub(crate) const DRAIN_LOCK: i64 = 0x0c19_6472;
+const PHASE_QUERY: &str = "SELECT phase FROM (SELECT phase,created_at FROM ci_controller_rollout WHERE phase<>'complete' UNION ALL SELECT phase,created_at FROM ci_application_retirement WHERE phase='draining') phases ORDER BY CASE WHEN phase IN ('prepared','pending') THEN 2 WHEN phase='draining' THEN 1 ELSE 0 END,created_at LIMIT 1";
+
 #[derive(Clone, Default)]
 pub struct Lifecycle {
     admission: Arc<RwLock<()>>,
@@ -12,10 +17,57 @@ pub struct Lifecycle {
 }
 
 impl Lifecycle {
+    /// Re-prove global quiescence while the executor handoff fence is held.
+    /// Terminal errors and expired leases are deliberately insufficient: all
+    /// durable remote-effect obligations must have been positively removed.
+    pub async fn verify_handoff_quiesced(&self, store: &Store, id: &str) -> Result<(), String> {
+        let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(DRAIN_LOCK)
+            .execute(&mut *tx).await.map_err(|e| e.to_string())?;
+        let phase: Option<String> = sqlx::query_scalar("SELECT phase FROM ci_controller_rollout WHERE id=$1 FOR UPDATE")
+            .bind(id).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
+        if !matches!(phase.as_deref(), Some("quiesced" | "submitting" | "verifying")) {
+            return Err(format!("rollout {id} is not durably quiesced"));
+        }
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ci_job j JOIN ci_run r ON r.id=j.run_id WHERE j.status='running' OR (j.status IN ('pending','queued') AND r.status NOT IN ('success','failure','cancelled'))) OR EXISTS(SELECT 1 FROM ci_native_job WHERE state='leased') OR EXISTS(SELECT 1 FROM ci_host_work) OR EXISTS(SELECT 1 FROM ci_vm_cleanup) OR EXISTS(SELECT 1 FROM ci_vm_pool WHERE status IN ('claimed','building','draining')) OR EXISTS(SELECT 1 FROM ci_service_deployment WHERE id<>$1 AND status NOT IN ('passed','failed'))"
+        ).bind(id).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
+        // These ledgers explicitly retain fences after a reported failure.
+        // Never interpret a failed run or a polling timeout as remote teardown.
+        let retained: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE phase NOT IN ('passed','superseded')) OR EXISTS(SELECT 1 FROM ci_service_deployment s WHERE s.status<>'passed' AND ((EXISTS(SELECT 1 FROM ci_service_rollout r WHERE r.id=s.id) AND (s.status<>'failed' OR s.phase IS DISTINCT FROM 'settled_failure')) OR EXISTS(SELECT 1 FROM ci_host_app_lb h WHERE h.id=s.id)))"
+        ).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
+        if blocked || retained { return Err("durable external-effect obligations remain".into()); }
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+
+    async fn transaction_phase(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<Option<String>, String> {
+        sqlx::query("SELECT pg_advisory_xact_lock_shared($1)").bind(DRAIN_LOCK)
+            .execute(&mut **tx).await.map_err(|e| e.to_string())?;
+        sqlx::query_scalar(PHASE_QUERY)
+            .fetch_optional(&mut **tx).await.map_err(|e| e.to_string())
+    }
+
+    /// Recheck at the commit boundary after potentially slow source preparation.
+    pub async fn admit_in(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), String> {
+        match Self::transaction_phase(tx).await? {
+            None => Ok(()),
+            Some(phase) if matches!(phase.as_str(), "prepared" | "pending") => Ok(()),
+            Some(phase) => Err(format!("controller rollout is {phase}; submissions are closed")),
+        }
+    }
+
+    /// Existing admitted jobs may receive native execution grants while draining.
+    pub async fn grant_in(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), String> {
+        match Self::transaction_phase(tx).await? {
+            None => Ok(()),
+            Some(phase) if matches!(phase.as_str(), "prepared" | "pending" | "draining") => Ok(()),
+            Some(phase) => Err(format!("controller rollout is {phase}; new work is paused")),
+        }
+    }
+
     async fn phase(store: &Store) -> Result<Option<String>, String> {
-        sqlx::query_scalar(
-            "SELECT phase FROM ci_controller_rollout WHERE phase <> 'complete' ORDER BY created_at LIMIT 1",
-        )
+        sqlx::query_scalar(PHASE_QUERY)
         .fetch_optional(store.pool())
         .await
         .map_err(|e| format!("could not read controller rollout phase: {e}"))
@@ -28,7 +80,7 @@ impl Lifecycle {
         let permit = self.admission.clone().read_owned().await;
         match Self::phase(store).await? {
             None => Ok(permit),
-            Some(phase) if phase == "pending" => Ok(permit),
+            Some(phase) if matches!(phase.as_str(), "prepared" | "pending") => Ok(permit),
             Some(phase) => Err(format!("controller rollout is {phase}; submissions are closed")),
         }
     }
@@ -37,7 +89,7 @@ impl Lifecycle {
         let permit = self.work.clone().read_owned().await;
         match Self::phase(store).await? {
             None => Ok(permit),
-            Some(phase) if matches!(phase.as_str(), "pending" | "draining") => Ok(permit),
+            Some(phase) if matches!(phase.as_str(), "prepared" | "pending" | "draining") => Ok(permit),
             Some(phase) => Err(format!("controller rollout is {phase}; new work is paused")),
         }
     }
@@ -45,6 +97,8 @@ impl Lifecycle {
     pub async fn close_admission(&self, store: &Store, id: &str) -> Result<(), String> {
         let _exclusive = self.admission.write().await;
         let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(DRAIN_LOCK)
+            .execute(&mut *tx).await.map_err(|e| e.to_string())?;
         let phase: Option<String> = sqlx::query_scalar(
             "SELECT phase FROM ci_controller_rollout WHERE id=$1 FOR UPDATE",
         )
@@ -67,6 +121,9 @@ impl Lifecycle {
             return Ok(false);
         };
         let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
+        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)").bind(DRAIN_LOCK)
+            .fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
+        if !locked { return Ok(false); }
         let phase: Option<String> = sqlx::query_scalar(
             "SELECT phase FROM ci_controller_rollout WHERE id=$1 FOR UPDATE",
         ).bind(id).fetch_optional(&mut *tx).await.map_err(|e|e.to_string())?;
@@ -85,12 +142,11 @@ impl Lifecycle {
             return Ok(false);
         }
 
-        // Running jobs count even when their parent failed, except a native
-        // lease that expired on a terminal run: native endpoints fence every
-        // heartbeat/completion/upload, and poll cannot lease that run again.
-        // Pending/queued jobs count while their run can still schedule them.
+        // Expiry and terminal status revoke future writes, but do not prove
+        // remote execution ended. Keep native and host-work obligations until
+        // their owner has positively completed or handed off cleanup.
         let blocked: bool = sqlx::query(
-            "SELECT EXISTS(SELECT 1 FROM ci_job j JOIN ci_run r ON r.id=j.run_id WHERE (j.status='running' AND NOT (r.status IN ('success','failure','cancelled') AND EXISTS (SELECT 1 FROM ci_native_job n WHERE n.job_id=j.id AND n.state='leased' AND n.lease_expires_at<=now()))) OR (j.status IN ('pending','queued') AND r.status NOT IN ('success','failure','cancelled'))) AS jobs, EXISTS(SELECT 1 FROM ci_vm_pool WHERE status IN ('claimed','building')) AS vms, EXISTS(SELECT 1 FROM ci_native_job WHERE state='leased' AND lease_expires_at>now()) AS native, EXISTS(SELECT 1 FROM ci_service_deployment WHERE id<>$1 AND status NOT IN ('passed','failed')) AS effects"
+            "SELECT EXISTS(SELECT 1 FROM ci_job j JOIN ci_run r ON r.id=j.run_id WHERE j.status='running' OR (j.status IN ('pending','queued') AND r.status NOT IN ('success','failure','cancelled'))) AS jobs, (EXISTS(SELECT 1 FROM ci_vm_pool WHERE status IN ('claimed','building')) OR EXISTS(SELECT 1 FROM ci_host_work)) AS vms, EXISTS(SELECT 1 FROM ci_native_job WHERE state='leased') AS native, EXISTS(SELECT 1 FROM ci_service_deployment s WHERE id<>$1 AND (status NOT IN ('passed','failed') OR (status='failed' AND phase IS DISTINCT FROM 'settled_failure' AND EXISTS(SELECT 1 FROM ci_service_rollout r WHERE r.id=s.id)))) AS effects"
         ).bind(id).fetch_one(&mut *tx).await.map_err(|e|e.to_string())
         .map(|r| r.get::<bool,_>("jobs") || r.get::<bool,_>("vms") || r.get::<bool,_>("native") || r.get::<bool,_>("effects"))?;
         if blocked { tx.rollback().await.map_err(|e|e.to_string())?; return Ok(false); }

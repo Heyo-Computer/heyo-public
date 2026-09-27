@@ -4,10 +4,9 @@
 //! crate compiles with no database reachable, which is what heyosecret does and
 //! what makes a CI build of this CI system possible.
 //!
-//! **Step logs are not in here.** A row holds a path and a byte count; the bytes
-//! are appended to a file under `CI_LOG_DIR`. A build log is megabytes, and
-//! putting it in a column means every `SELECT * FROM ci_step` for a status page
-//! drags all of it across the wire.
+//! Step logs live in a separate chunk table, shared by all controllers without
+//! loading large bodies into `SELECT * FROM ci_step` status queries. Retained
+//! local files are imported before serving and are never removed by import.
 //!
 //! Migrations are applied by re-executing `migrations/*.sql` in filename order
 //! on every startup, with no tracking table — heyosecret's approach. It puts one
@@ -1044,6 +1043,64 @@ impl Store {
         Ok(())
     }
 
+    /// Commit the immutable descriptor in the same transaction as admission.
+    /// Exact replay is allowed; another descriptor cannot replace accepted work.
+    pub(crate) async fn record_source_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        run_id: &str,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        crate::trigger::decode_descriptor(bytes).map_err(|e| StoreError::source(run_id, e))?;
+        let written = sqlx::query(
+            "INSERT INTO ci_run_source(run_id,descriptor) VALUES($1,$2)
+             ON CONFLICT(run_id) DO UPDATE SET descriptor=ci_run_source.descriptor
+             WHERE ci_run_source.descriptor=EXCLUDED.descriptor",
+        ).bind(run_id).bind(bytes).execute(&mut **tx).await.map_err(StoreError::sql)?;
+        if written.rows_affected() != 1 {
+            return Err(StoreError::source(run_id, "accepted source cannot be replaced"));
+        }
+        Ok(())
+    }
+
+    pub async fn source_bytes(&self, run_id: &str) -> Result<Vec<u8>, StoreError> {
+        sqlx::query_scalar("SELECT descriptor FROM ci_run_source WHERE run_id=$1")
+            .bind(run_id).fetch_optional(&self.pool).await.map_err(StoreError::sql)?
+            .ok_or_else(|| StoreError::source(run_id, "source is not in shared storage; import its retained descriptor before retrying"))
+    }
+
+    pub async fn source_descriptor(&self, run_id: &str) -> Result<crate::trigger::GitPatchSource, StoreError> {
+        crate::trigger::decode_descriptor(&self.source_bytes(run_id).await?)
+            .map_err(|e| StoreError::source(run_id, e))
+    }
+
+    /// Import retained descriptors before starting any executor or HTTP handler.
+    /// Local files remain untouched. Once imported, every reader uses Postgres.
+    pub async fn import_sources(&self, directory: &Path, max_bytes: usize) -> Result<u64, StoreError> {
+        let mut entries = match tokio::fs::read_dir(directory).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(StoreError::source("local import", e)),
+        };
+        let mut imported = 0;
+        while let Some(entry) = entries.next_entry().await.map_err(|e| StoreError::source("local import", e))? {
+            let name = entry.file_name();
+            let Some(run_id) = name.to_str().and_then(|name| name.strip_suffix(".source.json")) else { continue };
+            // Submission staging files without an admitted run are not history.
+            if self.get_run(run_id).await?.is_none() { continue; }
+            let metadata = entry.metadata().await.map_err(|e| StoreError::source(run_id, e))?;
+            if !metadata.is_file() || metadata.len() > max_bytes as u64 {
+                return Err(StoreError::source(run_id, "retained descriptor is not a bounded file"));
+            }
+            let bytes = tokio::fs::read(entry.path()).await.map_err(|e| StoreError::source(run_id, e))?;
+            if bytes.len() > max_bytes { return Err(StoreError::source(run_id, "retained descriptor exceeds source limit")); }
+            let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+            Self::record_source_in(&mut tx, run_id, &bytes).await?;
+            tx.commit().await.map_err(StoreError::sql)?;
+            imported += 1;
+        }
+        Ok(imported)
+    }
+
     pub async fn get_run(&self, run_id: &str) -> Result<Option<Run>, StoreError> {
         let row = sqlx::query(
             "SELECT r.*, rp.name AS repo_name
@@ -1181,7 +1238,7 @@ impl Store {
             status = RunStatus::Cancelled;
         } else if matches!(status, RunStatus::Success) {
             let deployments: Vec<String> = sqlx::query_scalar(
-                "SELECT s.status FROM ci_service_deployment s JOIN ci_controller_rollout c ON c.id=s.id WHERE s.run_id=$1",
+                "SELECT s.status FROM ci_service_deployment s JOIN ci_controller_rollout c ON c.id=s.id WHERE s.run_id=$1 UNION ALL SELECT COALESCE(result,'running') FROM ci_managed_update WHERE run_id=$1",
             ).bind(run_id).fetch_all(&mut **tx).await.map_err(StoreError::sql)?;
             if deployments.iter().any(|s| s == "failed") {
                 status = RunStatus::Failure;
@@ -1326,8 +1383,9 @@ impl Store {
     /// `sandbox_id` and `fingerprint` stay null until then, which is the honest
     /// reading: running, no machine yet.
     ///
-    /// Returns false when the job was already terminal — cancelled while it sat
-    /// on the queue, or finished by a delivery whose ack was lost.
+    /// Returns false for terminal or already-running work. Queue redelivery is
+    /// not evidence that the previous executor stopped issuing remote commands.
+    /// Reconciliation, not a delivery counter, must resolve an interrupted claim.
     pub async fn claim_job(
         &self,
         job_id: &str,
@@ -1348,7 +1406,8 @@ impl Store {
                 SET status = 'running', runner_hd_id = $2, attempt = $3,
                     started_at = COALESCE(started_at, now())
               WHERE id = $1
-                AND status NOT IN ('success','failure','skipped','cancelled')
+                AND status IN ('pending','queued')
+                AND NOT EXISTS (SELECT 1 FROM ci_host_work w WHERE w.job_id=ci_job.id)
                 AND NOT EXISTS (SELECT 1 FROM ci_service_deployment s JOIN ci_host_maintenance h ON h.id=s.id WHERE s.job_id=ci_job.id)
                 AND NOT EXISTS (SELECT 1 FROM ci_service_deployment s JOIN ci_host_heyvm_bootstrap h ON h.id=s.id WHERE s.job_id=ci_job.id)
               RETURNING run_id, job_key",
@@ -1375,6 +1434,18 @@ impl Store {
         sqlx::query("DELETE FROM ci_host_work WHERE job_id=$1 AND runner_hd_id=$2 AND attempt=$3")
             .bind(job_id).bind(runner).bind(attempt).execute(&self.pool).await.map_err(StoreError::sql)?;
         Ok(())
+    }
+
+    /// A recorded executor obligation survives cancellation, process death and
+    /// lease expiry. Only verified release may remove it.
+    pub async fn has_host_work(&self, job_id: &str) -> Result<bool, StoreError> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_work WHERE job_id=$1)")
+            .bind(job_id).fetch_one(&self.pool).await.map_err(StoreError::sql)
+    }
+
+    pub async fn has_unresolved_execution(&self, run_id: &str) -> Result<bool, StoreError> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_work w JOIN ci_job j ON j.id=w.job_id WHERE j.run_id=$1) OR EXISTS(SELECT 1 FROM ci_native_job WHERE run_id=$1 AND state='leased')")
+            .bind(run_id).fetch_one(&self.pool).await.map_err(StoreError::sql)
     }
 
     /// Record why an attempt failed, without deciding the job's fate.
@@ -1712,54 +1783,85 @@ impl Store {
             .join(format!("{idx:03}-{}.log", sanitize_component(step_id)))
     }
 
-    /// Append to a step's log and record the new size.
-    ///
-    /// The path is written on the row every time rather than only on the first
-    /// append, so a row created before the file existed still points at it.
+    /// Append in shared storage. The historical path argument is ignored;
+    /// existing execution callers can retain their diagnostic path calculation.
     pub async fn append_log(
         &self,
         step_id: &str,
-        path: &Path,
+        _path: &Path,
         text: &str,
     ) -> Result<(), StoreError> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| StoreError::LogDir {
-                    path: parent.to_path_buf(),
-                    reason: e.to_string(),
-                })?;
-        }
-        use tokio::io::AsyncWriteExt;
-        let mut f = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await
-            .map_err(|e| StoreError::LogDir {
-                path: path.to_path_buf(),
-                reason: e.to_string(),
-            })?;
-        f.write_all(text.as_bytes())
-            .await
-            .map_err(|e| StoreError::LogDir {
-                path: path.to_path_buf(),
-                reason: e.to_string(),
-            })?;
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        Self::append_log_in(&mut tx, step_id, text).await?;
+        tx.commit().await.map_err(StoreError::sql)
+    }
 
-        sqlx::query("UPDATE ci_step SET log_path = $2, log_bytes = log_bytes + $3 WHERE id = $1")
+    /// Native completion commits logs and execution evidence together.
+    pub async fn append_log_in(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        step_id: &str,
+        text: &str,
+    ) -> Result<(), StoreError> {
+        let row = sqlx::query("SELECT log_path, log_bytes FROM ci_step WHERE id=$1 FOR UPDATE")
             .bind(step_id)
-            .bind(path.to_string_lossy().as_ref())
+            .fetch_one(&mut **tx).await.map_err(StoreError::sql)?;
+        let path: Option<String> = row.get("log_path");
+        if path.as_deref().is_some_and(|p| p != "postgres:ci_step_log") {
+            return Err(StoreError::Sql(format!("step {step_id} still has unimported local logs")));
+        }
+        if !text.is_empty() {
+            sqlx::query("INSERT INTO ci_step_log(step_id,byte_offset,bytes) VALUES($1,$2,$3)")
+                .bind(step_id).bind(row.get::<i64, _>("log_bytes")).bind(text.as_bytes())
+                .execute(&mut **tx).await.map_err(StoreError::sql)?;
+        }
+        sqlx::query("UPDATE ci_step SET log_path='postgres:ci_step_log', log_bytes=log_bytes+$2 WHERE id=$1")
+            .bind(step_id)
             .bind(text.len() as i64)
-            .execute(&self.pool)
-            .await
-            .map_err(StoreError::sql)?;
+            .execute(&mut **tx).await.map_err(StoreError::sql)?;
         Ok(())
     }
 
-    pub async fn read_log(&self, step: &StepRow) -> Option<String> {
-        let path = step.log_path.as_ref()?;
-        tokio::fs::read_to_string(path).await.ok()
+    pub async fn read_log(&self, step: &StepRow) -> Result<Option<String>, StoreError> {
+        // One statement snapshot keeps retention from producing partial reads.
+        let rows = sqlx::query("SELECT s.log_path, l.bytes FROM ci_step s LEFT JOIN ci_step_log l ON l.step_id=s.id WHERE s.id=$1 ORDER BY l.byte_offset")
+            .bind(&step.id).fetch_all(&self.pool).await.map_err(StoreError::sql)?;
+        let Some(row) = rows.first() else { return Ok(None) };
+        let path: Option<String> = row.get("log_path");
+        let Some(path) = path else { return Ok(None) };
+        if path != "postgres:ci_step_log" {
+            return Err(StoreError::Sql(format!("step {} still has unimported local logs", step.id)));
+        }
+        let bytes: Vec<u8> = rows.into_iter().filter_map(|r| r.get::<Option<Vec<u8>>, _>("bytes")).flatten().collect();
+        String::from_utf8(bytes).map(Some).map_err(|e| StoreError::Sql(format!("invalid log UTF-8: {e}")))
+    }
+
+    /// Upgrade only after the old controller has drained and stopped. Missing
+    /// or unreadable retained logs block startup rather than silently losing history.
+    pub async fn import_logs(&self) -> Result<u64, StoreError> {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM ci_step WHERE log_path IS NOT NULL AND log_path <> 'postgres:ci_step_log' ORDER BY id")
+            .fetch_all(&self.pool).await.map_err(StoreError::sql)?;
+        let mut imported = 0;
+        for id in ids {
+            let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+            let row = sqlx::query("SELECT log_path,log_bytes FROM ci_step WHERE id=$1 FOR UPDATE")
+                .bind(&id).fetch_optional(&mut *tx).await.map_err(StoreError::sql)?;
+            let expected = row.as_ref().map(|r| r.get::<i64, _>("log_bytes")).unwrap_or(0);
+            let path = row.and_then(|r| r.get::<Option<String>, _>("log_path"));
+            if let Some(path) = path.filter(|p| p != "postgres:ci_step_log") {
+                let text = tokio::fs::read_to_string(&path).await.map_err(|e| StoreError::LogDir {
+                    path: PathBuf::from(&path), reason: e.to_string(),
+                })?;
+                if (text.len() as i64) < expected {
+                    return Err(StoreError::LogDir { path: PathBuf::from(&path), reason: format!("retained log is shorter than its recorded {expected} bytes") });
+                }
+                sqlx::query("UPDATE ci_step SET log_path=NULL,log_bytes=0 WHERE id=$1")
+                    .bind(&id).execute(&mut *tx).await.map_err(StoreError::sql)?;
+                Self::append_log_in(&mut tx, &id, &text).await?;
+                imported += 1;
+            }
+            tx.commit().await.map_err(StoreError::sql)?;
+        }
+        Ok(imported)
     }
 
     pub async fn record_artifact(
@@ -1875,22 +1977,27 @@ impl Store {
         Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
     }
 
-    /// Forget where a run's logs were, after deleting them.
+    /// Atomically expire shared log bytes and their metadata.
     ///
     /// The rows survive — a step that ran and its exit code are the run's
     /// history, and losing that because the log aged out would make an old run
     /// look like it never happened. Only the pointer and the byte count go.
     pub async fn forget_logs_of(&self, run_id: &str) -> Result<u64, StoreError> {
-        let result = sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let ids: Vec<String> = sqlx::query_scalar(
             "UPDATE ci_step SET log_path = NULL, log_bytes = 0
               WHERE log_path IS NOT NULL
-                AND job_id IN (SELECT id FROM ci_job WHERE run_id = $1)",
+                AND job_id IN (SELECT id FROM ci_job WHERE run_id = $1)
+              RETURNING id",
         )
         .bind(run_id)
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
-        Ok(result.rows_affected())
+        sqlx::query("DELETE FROM ci_step_log WHERE step_id=ANY($1)")
+            .bind(&ids).execute(&mut *tx).await.map_err(StoreError::sql)?;
+        tx.commit().await.map_err(StoreError::sql)?;
+        Ok(ids.len() as u64)
     }
 
     /// The directory holding every log of one run.
@@ -2263,12 +2370,17 @@ pub enum StoreError {
     Connect(String),
     Migrations { path: PathBuf, reason: String },
     LogDir { path: PathBuf, reason: String },
+    Source { run_id: String, reason: String },
     Sql(String),
 }
 
 impl StoreError {
     fn sql(e: sqlx::Error) -> Self {
         Self::Sql(e.to_string())
+    }
+
+    fn source(run_id: &str, reason: impl fmt::Display) -> Self {
+        Self::Source { run_id: run_id.into(), reason: reason.to_string() }
     }
 }
 
@@ -2285,6 +2397,7 @@ impl fmt::Display for StoreError {
             Self::LogDir { path, reason } => {
                 write!(f, "could not write logs under {}: {reason}", path.display())
             }
+            Self::Source { run_id, reason } => write!(f, "source of run {run_id}: {reason}"),
             Self::Sql(e) => write!(f, "database error: {e}"),
         }
     }
@@ -2387,6 +2500,63 @@ mod tests {
             .expect("connects");
         store.migrate().await.expect("migrations apply");
         store
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Postgres"]
+    async fn shared_source_is_atomic_immutable_and_independent_of_local_files() {
+        let store = test_store().await;
+        let peer = test_store().await;
+        let source = serde_json::to_vec(&serde_json::json!({
+            "baseRevision": "a".repeat(40), "targetTree": "b".repeat(40),
+            "patchBase64": "AAEC", "workflows": {"build.yml": "# héllo\njobs: {}\n"}
+        })).unwrap();
+        let run = crate::vm::new_id();
+        let mut tx = store.pool.begin().await.unwrap();
+        Store::create_run_in(&mut tx, &run, &RunRequest::default(), &test_plan()).await.unwrap();
+        Store::record_source_in(&mut tx, &run, &source).await.unwrap();
+        assert!(peer.get_run(&run).await.unwrap().is_none());
+        assert!(peer.source_bytes(&run).await.is_err(), "source is not visible before admission commits");
+        tx.commit().await.unwrap();
+        assert_eq!(peer.source_bytes(&run).await.unwrap(), source);
+        assert_eq!(peer.source_descriptor(&run).await.unwrap().patch().unwrap(), vec![0, 1, 2]);
+
+        let mut changed: serde_json::Value = serde_json::from_slice(&source).unwrap();
+        changed["targetTree"] = serde_json::json!("c".repeat(40));
+        let changed = serde_json::to_vec(&changed).unwrap();
+        let mut tx = peer.pool.begin().await.unwrap();
+        Store::record_source_in(&mut tx, &run, &source).await.unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = peer.pool.begin().await.unwrap();
+        assert!(Store::record_source_in(&mut tx, &run, &changed).await.is_err());
+        tx.rollback().await.unwrap();
+        assert_eq!(store.source_bytes(&run).await.unwrap(), source);
+
+        let rejected = crate::vm::new_id();
+        let mut tx = store.pool.begin().await.unwrap();
+        Store::create_run_in(&mut tx, &rejected, &RunRequest::default(), &test_plan()).await.unwrap();
+        assert!(Store::record_source_in(&mut tx, &rejected, b"{}").await.is_err());
+        tx.rollback().await.unwrap();
+        assert!(peer.get_run(&rejected).await.unwrap().is_none());
+        assert!(peer.jobs_of(&rejected).await.unwrap().is_empty());
+        assert!(peer.run_events(&rejected, None, 100).await.unwrap().is_empty());
+
+        // Existing admitted history is imported without deleting its files.
+        let old = crate::vm::new_id();
+        store.create_run(&old, &RunRequest::default(), &test_plan()).await.unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let file = local.path().join(format!("{old}.source.json"));
+        std::fs::write(&file, &source).unwrap();
+        assert!(store.import_sources(local.path(), source.len() - 1).await.is_err());
+        assert!(peer.source_bytes(&old).await.is_err());
+        assert_eq!(store.import_sources(local.path(), source.len()).await.unwrap(), 1);
+        assert_eq!(store.import_sources(local.path(), source.len()).await.unwrap(), 1);
+        assert_eq!(std::fs::read(&file).unwrap(), source);
+        std::fs::write(&file, &changed).unwrap();
+        assert!(store.import_sources(local.path(), changed.len()).await.is_err());
+        assert_eq!(peer.source_bytes(&old).await.unwrap(), source);
+        drop(local);
+        assert_eq!(peer.source_bytes(&old).await.unwrap(), source, "removing the old disk cannot remove admitted source");
     }
 
     #[tokio::test]
@@ -2772,6 +2942,32 @@ jobs:
         );
     }
 
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL; no VM execution"]
+    async fn managed_update_completion_controls_run_result_and_preserves_cancellation() {
+        let store = test_store().await;
+        for outcome in ["passed", "failed", "cancelled"] {
+            let run = crate::vm::new_id();
+            store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+            for key in ["build-x86_64", "build-aarch64", "deploy"] {
+                store.set_job_status(&job_id(&run,key), JobStatus::Success, None).await.unwrap();
+            }
+            let job = job_id(&run,"deploy");
+            let step = format!("{job}:managed-update");
+            sqlx::query("INSERT INTO ci_step(id,job_id,idx,name,status) VALUES($1,$2,99,'managed-update','success')")
+                .bind(&step).bind(&job).execute(store.pool()).await.unwrap();
+            sqlx::query("INSERT INTO ci_managed_update(operation_id,step_id,run_id,job_id,service_id,request) VALUES($1,$2,$1,$3,$1,'{}')")
+                .bind(&run).bind(&step).bind(&job).execute(store.pool()).await.unwrap();
+            assert_eq!(store.roll_up_run(&run).await.unwrap(),RunStatus::Running);
+            assert!(store.get_run(&run).await.unwrap().unwrap().finished_at.is_none());
+            if outcome=="cancelled" {store.cancel_run(&run).await.unwrap();}
+            sqlx::query("UPDATE ci_managed_update SET result=$2 WHERE operation_id=$1")
+                .bind(&run).bind(if outcome=="failed" {"failed"} else {"passed"}).execute(store.pool()).await.unwrap();
+            assert_eq!(store.roll_up_run(&run).await.unwrap(),match outcome {
+                "passed"=>RunStatus::Success,"failed"=>RunStatus::Failure,_=>RunStatus::Cancelled});
+        }
+    }
+
     /// A skipped job must not make the run fail — that is how a conditional
     /// deploy job behaves on a branch that does not deploy.
     #[tokio::test]
@@ -2844,7 +3040,7 @@ jobs:
 
     #[tokio::test]
     #[ignore = "needs CI_TEST_DATABASE_URL"]
-    async fn steps_record_their_outcome_and_their_logs_land_on_disk() {
+    async fn steps_record_their_outcome_and_share_logs_without_local_files() {
         let store = test_store().await;
         let plan = test_plan();
         let run_id = crate::vm::new_id();
@@ -2882,13 +3078,53 @@ jobs:
         assert_eq!(steps[0].exit_code, Some(0));
         assert_eq!(steps[0].log_bytes, 15, "both appends counted");
         assert_eq!(
-            store.read_log(&steps[0]).await.as_deref(),
+            store.read_log(&steps[0]).await.unwrap().as_deref(),
             Some("compiling\ndone\n")
         );
+        assert!(!path.exists());
+        let other = test_store().await;
+        let (a, b) = tokio::join!(
+            store.append_log(sid, &path, "α\0\n"),
+            other.append_log(sid, &path, "second\n"),
+        );
+        a.unwrap();
+        b.unwrap();
+        let text = other.read_log(&steps[0]).await.unwrap().unwrap();
+        assert!(text == "compiling\ndone\nα\0\nsecond\n" || text == "compiling\ndone\nsecond\nα\0\n");
+        assert_eq!(other.steps_of(&jid).await.unwrap()[0].log_bytes, 26);
+        let mut tx = store.pool.begin().await.unwrap();
+        Store::append_log_in(&mut tx, sid, "must roll back").await.unwrap();
+        tx.rollback().await.unwrap();
+        assert_eq!(other.read_log(&steps[0]).await.unwrap().unwrap(), text);
+    }
 
-        tokio::fs::remove_dir_all(path.parent().unwrap().parent().unwrap())
-            .await
-            .ok();
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn retained_logs_import_once_preserve_files_and_fail_on_missing_history() {
+        let store = test_store().await;
+        let run = crate::vm::new_id();
+        store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+        let jid = job_id(&run, "deploy");
+        let sid = step_id(&jid, 0);
+        store.create_step(&sid, &jid, 0, "old log", None).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retained.log");
+        sqlx::query("UPDATE ci_step SET log_path=$2,log_bytes=8 WHERE id=$1")
+            .bind(&sid).bind(path.to_str().unwrap()).execute(&store.pool).await.unwrap();
+        assert!(store.import_logs().await.is_err());
+        let steps = store.steps_of(&jid).await.unwrap();
+        assert_eq!(steps[0].log_bytes, 8);
+        assert!(store.read_log(&steps[0]).await.is_err());
+        assert!(store.append_log(&sid, &path, "do not overwrite").await.is_err());
+        tokio::fs::write(&path, "short").await.unwrap();
+        assert!(store.import_logs().await.is_err());
+        tokio::fs::write(&path, "old\0雪\n").await.unwrap();
+        assert!(store.import_logs().await.unwrap() >= 1);
+        assert_eq!(store.import_logs().await.unwrap(), 0);
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "old\0雪\n");
+        drop(dir);
+        let other = test_store().await;
+        assert_eq!(other.read_log(&steps[0]).await.unwrap().as_deref(), Some("old\0雪\n"));
     }
 
     /// Creating steps must be safe to repeat — a redelivered job re-creates its
@@ -3374,6 +3610,51 @@ jobs:
         assert_eq!(after, before, "terminal cancel and claim no-ops emit no false transition");
     }
 
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn regional_claims_and_expiry_cannot_reassign_unresolved_execution() {
+        let store = test_store().await;
+        let other = test_store().await;
+        let run = crate::vm::new_id();
+        store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+        let job = job_id(&run, "build-x86_64");
+        let us = format!("hd-us-{run}");
+        let eu = format!("hd-eu-{run}");
+        // Different runner locks must still serialize on the one job row.
+        let (a, b) = tokio::join!(store.claim_job(&job, &us, 1), other.claim_job(&job, &eu, 2));
+        assert_ne!(a.as_ref().unwrap(), b.as_ref().unwrap(), "exactly one regional claim wins");
+        let (runner, attempt) = if a.unwrap() { (&us, 1) } else { (&eu, 2) };
+        let first = store.get_job(&job).await.unwrap().unwrap();
+        assert_eq!(first.runner_hd_id.as_deref(), Some(runner.as_str()));
+        assert_eq!(first.attempt, attempt);
+        assert!(!other.claim_job(&job, &eu, 9).await.unwrap(), "redelivery cannot steal running work");
+        assert_eq!(other.get_job(&job).await.unwrap().unwrap().attempt, attempt);
+
+        let pool = crate::pool::Pool::new(store.pool().clone());
+        let sandbox = format!("sb-{run}");
+        let expired = crate::pool::Lease { instance: "partitioned-controller", ttl: Duration::ZERO };
+        pool.register(&sandbox, runner, "fp", "wf", None, &job, expired).await.unwrap();
+        let building = pool.begin_build(&job, runner, "fp-build", "wf", None,
+            crate::pool::Lease { instance: "partitioned-controller", ttl: Duration::ZERO }).await.unwrap();
+        let runners = vec![runner.clone()];
+        assert_eq!(pool.release_orphans(&runners, "new-controller").await.unwrap(), 0);
+        assert_eq!(pool.sweep_stale_builds(&runners, "new-controller").await.unwrap(), 0);
+        assert_eq!(pool.get(&sandbox).await.unwrap().unwrap().status, "claimed");
+        assert!(pool.get(&building).await.unwrap().is_some(), "lost create response retains its evidence");
+
+        store.cancel_run(&run).await.unwrap();
+        assert!(other.has_host_work(&job).await.unwrap(), "cancellation is not executor quiescence");
+        assert_eq!(pool.release_orphans(&runners, "new-controller").await.unwrap(), 0);
+        assert_eq!(pool.sweep_stale_builds(&runners, "new-controller").await.unwrap(), 0);
+        assert!(!other.claim_job(&job, &us, 10).await.unwrap());
+        // A verified release is an explicit action, not an expired timer.
+        store.end_host_work(&job, runner, attempt).await.unwrap();
+        assert!(!other.has_host_work(&job).await.unwrap());
+        assert_eq!(pool.release_orphans(&runners, "new-controller").await.unwrap(), 1);
+        assert_eq!(pool.sweep_stale_builds(&runners, "new-controller").await.unwrap(), 1);
+        assert_eq!(pool.get(&sandbox).await.unwrap().unwrap().status, "idle");
+    }
+
     // ---- log retention ---------------------------------------------------
 
     /// The sweep has to be driven by rows, converge, and leave the run's
@@ -3402,7 +3683,7 @@ jobs:
             .finish_step(&sid, StepStatus::Success, Some(0), None)
             .await
             .unwrap();
-        assert!(path.exists());
+        assert!(!path.exists());
 
         // Not yet old enough: a sweep must not take a run that is still inside
         // the retention window.
@@ -3437,7 +3718,10 @@ jobs:
         assert_eq!(steps[0].exit_code, Some(0));
         assert_eq!(steps[0].log_path, None);
         assert_eq!(steps[0].log_bytes, 0);
-        assert_eq!(store.read_log(&steps[0]).await, None);
+        assert_eq!(store.read_log(&steps[0]).await.unwrap(), None);
+        let chunks: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_step_log WHERE step_id=$1")
+            .bind(&sid).fetch_one(&store.pool).await.unwrap();
+        assert_eq!(chunks, 0);
         assert!(store.get_run(&run_id).await.unwrap().is_some());
 
         // And it converges: a swept run is not offered again, or the sweeper

@@ -1057,6 +1057,11 @@ impl Runners {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn tunnel_cache_for_test(&self) -> tokio::sync::MutexGuard<'_, HashMap<String, HeyoClient>> {
+        self.tunnels.lock().await
+    }
+
     /// `GET /me/daemons/{id}/connection-ticket`.
     ///
     /// Not on `Daemons` in the SDK, so it goes through the raw client. Uses

@@ -212,6 +212,8 @@ pub struct Puller {
     home: Option<String>,
     http: reqwest::Client,
     candidate: bool,
+    /// Rollout-owned, bounded stage codes; never URLs, credentials or bodies.
+    pub(crate) preparation_progress: Option<tokio::sync::watch::Sender<String>>,
 }
 
 impl Puller {
@@ -222,6 +224,7 @@ impl Puller {
             vms,
             home,
             candidate: false,
+            preparation_progress: None,
             http: reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
                 .read_timeout(READ_TIMEOUT)
@@ -236,6 +239,7 @@ impl Puller {
         Ok(Self {
             art_bin: self.art_bin.clone(), scratch: self.scratch.clone(),
             vms: self.vms.clone(), home: self.home.clone(), candidate: true,
+            preparation_progress: None,
             http: reqwest::Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT).read_timeout(READ_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
@@ -738,6 +742,7 @@ impl Puller {
         // Unpacking is synchronous and a corpus can be gigabytes of gzip: on the
         // job task directly it would stall every other future on this runtime
         // thread for the duration.
+        self.preparation_stage("mount_unpack");
         let tree = staging.path().join("tree");
         let unpacked = {
             let (bundle, tree) = (bundle.clone(), tree.clone());
@@ -1000,17 +1005,23 @@ impl Puller {
         expected_size: u64,
         log: &mut (dyn FnMut(String) + Send),
     ) -> Result<u64, String> {
+        self.preparation_stage("blob_request");
         let url = format!("{base}/blobs/{digest}");
         let resp = self
             .get(&url, api_key)
             .await
-            .map_err(|e| format!("GET {url} failed: {e}"))?;
+            .map_err(|e| {
+                self.preparation_stage(if e.is_timeout() { "blob_request_timeout" } else { "blob_request_failed" });
+                format!("GET {url} failed: {e}")
+            })?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            self.preparation_stage(&format!("blob_http_{}", status.as_u16()));
+            let body = if self.candidate { String::new() } else { resp.text().await.unwrap_or_default() };
             return Err(format!("GET {url} answered {status}{}", detail(&body)));
         }
 
+        self.preparation_stage("blob_download");
         log(format!("fetching {} from {url}", human(expected_size)));
         let mut file = tokio::fs::File::create(dest)
             .await
@@ -1021,6 +1032,7 @@ impl Puller {
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| {
+                self.preparation_stage(if e.is_timeout() { "blob_read_timeout" } else { "blob_read_failed" });
                 format!(
                     "the transfer failed after {} of {}: {e}",
                     human(written),
@@ -1036,6 +1048,7 @@ impl Puller {
         // Flush before the digest is pronounced good: a buffered tail that never
         // reached the kernel would make the check describe memory, not the file
         // that is about to be renamed into place and booted.
+        self.preparation_stage("blob_flush");
         file.flush()
             .await
             .map_err(|e| format!("flushing {}: {e}", dest.display()))?;
@@ -1046,6 +1059,7 @@ impl Puller {
 
         let actual = hex(&hasher.finalize());
         if actual != digest {
+            self.preparation_stage("blob_digest_mismatch");
             return Err(format!(
                 "the store answered {written} bytes that hash to {actual}, but {digest} was \
                  asked for — this is a corrupted or substituted rootfs and it has not been \
@@ -1255,6 +1269,7 @@ impl Puller {
         grow_gb: Option<u64>,
         log: &mut (dyn FnMut(String) + Send),
     ) -> Result<(PathBuf, u64), String> {
+        self.preparation_stage("daemon_image_import");
         let local = tokio::fs::metadata(tmp.path())
             .await
             .map_err(|e| format!("stat {}: {e}", tmp.path().display()))?
@@ -1274,6 +1289,12 @@ impl Puller {
         }
         drop(tmp);
         Ok((PathBuf::from(info.path), info.size_bytes))
+    }
+
+    fn preparation_stage(&self, stage: &str) {
+        if let Some(progress) = &self.preparation_progress {
+            progress.send_replace(stage.to_string());
+        }
     }
 
     async fn get(&self, url: &str, api_key: Option<&str>) -> reqwest::Result<reqwest::Response> {
@@ -1919,6 +1940,29 @@ mod tests {
         assert!(puller.pinned_rootfs(&artifact, None).await.unwrap_err().contains("digest mismatch"));
         artifact.artifact_ref = "2".repeat(64);
         assert_eq!(puller.pinned_rootfs(&artifact, None).await.unwrap(), "2".repeat(64), "blob refs must remain exact");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn preparation_progress_distinguishes_http_failure_and_corrupt_blob_without_response_secrets() {
+        use axum::{Router, routing::get, http::StatusCode};
+        let app = Router::new()
+            .route("/denied/blobs/:digest", get(|| async { (StatusCode::FORBIDDEN, "credential-super-secret") }))
+            .route("/corrupt/blobs/:digest", get(|| async { "changed" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let dir = tempfile::tempdir().unwrap();
+        let vms = crate::vm::VmManager::new(Some("http://127.0.0.1:1".into()), None, crate::mounts::MountStore::new(dir.path().join("mounts"), 0)).unwrap();
+        let mut candidate = Puller::new("art".into(), dir.path().join("scratch"), None, vms).for_candidate().unwrap();
+        let (progress, stages) = tokio::sync::watch::channel("initializing".to_string());
+        candidate.preparation_progress = Some(progress);
+        for (mode, stage) in [("denied", "blob_http_403"), ("corrupt", "blob_digest_mismatch")] {
+            let error = candidate.fetch_blob(&format!("{base}/{mode}"), &"a".repeat(64), None,
+                &dir.path().join("blob"), 7, &mut |_| {}).await.unwrap_err();
+            assert_eq!(&*stages.borrow(), stage);
+            assert!(!error.contains("credential-super-secret"));
+        }
         server.abort();
     }
 

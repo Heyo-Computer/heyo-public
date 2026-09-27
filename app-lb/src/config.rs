@@ -616,7 +616,7 @@ pub struct ScalingPolicy {
     /// the pool scale to zero and makes the next request pay a cold start.
     #[serde(default)]
     pub min_replicas: u32,
-    /// Ceiling on replicas the autoscaler may run. Defaults to 5. Must be 1
+    /// Ceiling on replicas the autoscaler may run. Defaults to 5. Must be at most 1
     /// when [`VmSpec::workspace`] is set — a single-writer workspace cannot
     /// have two replicas capturing divergent copies of it.
     #[serde(default = "default_max_replicas")]
@@ -762,6 +762,11 @@ pub struct VmSpec {
     /// container from an OCI image). `libvirt` and `firecracker_containerd`
     /// are rejected at registration.
     pub driver: Driver,
+    /// Require durable heyvmd operation receipts for autoscaler allocations.
+    /// Requires an internal daemon credential and /sandbox-creations support;
+    /// unknown outcomes never fall back to legacy create or name matching.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub correlated_creates: bool,
     /// Defaults to `ubuntu:24.04` daemon-side when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -1142,7 +1147,7 @@ pub const DEFAULT_WORKSPACE_PATH: &str = "/workspace";
 /// A capture stops the VM, so a rollout of a workspace deployment has a gap:
 /// the old replica is drained and stopped, its tree is extracted, and only then
 /// does the new one boot. That is inherent to single-writer state and it is why
-/// `scaling.max_replicas` **must be 1** — two replicas would each capture their
+/// `scaling.max_replicas` **must be at most 1** — two replicas would each capture their
 /// own divergent copy and the last one to land would win. `warm_pool` must be
 /// `0` for the same reason, and the driver must be `firecracker`: the KVM
 /// driver has its own idea of what a writable mount means when the VM stops.
@@ -1271,7 +1276,7 @@ impl WorkspaceSpec {
                 detail: e.to_string(),
             })?;
         }
-        if scaling.max_replicas != 1 {
+        if scaling.max_replicas > 1 {
             return Err(SpecError::WorkspaceReplicas(scaling.max_replicas));
         }
         if scaling.warm_pool != 0 {
@@ -4490,7 +4495,7 @@ impl std::fmt::Display for SpecError {
             ),
             Self::WorkspaceReplicas(n) => write!(
                 f,
-                "vm.workspace needs scaling.max_replicas = 1, got {n}: the workspace is one \
+                "vm.workspace needs scaling.max_replicas <= 1, got {n}: the workspace is one \
                  directory with one writer, captured from the replica that retires and seeded \
                  into the one that replaces it; two replicas would each capture a different copy"
             ),
@@ -4729,6 +4734,9 @@ impl DeploymentSpec {
 
         // Blocks that describe heyvmd doing something Incus has no equivalent
         // for. Each is refused by name.
+        if vm.correlated_creates {
+            return Err(SpecError::NotForLxc("vm.correlated_creates"));
+        }
         if vm.workspace_archive.is_some() {
             return Err(SpecError::NotForLxc("vm.workspace_archive"));
         }
@@ -5580,6 +5588,7 @@ mod tests {
                 strip_prefix: false,
             }],
             vm: Some(VmSpec {
+                correlated_creates: false,
                 env_from: vec![],
                 workspace_archive: None,
                 image_download_url: None,
@@ -7934,6 +7943,14 @@ mod tests {
 
         #[test]
         fn one_writer_only() {
+            let mut s = with_workspace(serde_json::json!({"store": "s3://b"}));
+            s.scaling.min_replicas = 0;
+            s.scaling.max_replicas = 0;
+            s.scaling.idle_action = IdleAction::Retain;
+            s.validate().expect("a retained workspace can pause without another writer");
+            s.scaling.min_replicas = 1;
+            assert!(s.validate().is_err(), "a paused ceiling cannot retain a running minimum");
+
             let mut s = with_workspace(serde_json::json!({"store": "s3://b"}));
             s.scaling.max_replicas = 2;
             assert!(matches!(s.validate(), Err(SpecError::WorkspaceReplicas(2))));

@@ -139,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.clone(),
     ));
     tokio::spawn(handlers::regional_rollout::run_reconciler(state.clone()));
+    tokio::spawn(handlers::application_update::run_reconciler(state.clone()));
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -216,6 +217,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/orchestration/services/deployments",
             post(handlers::service_deploy::deploy_service)
                 .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)),
+        )
+        .route(
+            "/orchestration/services/adoptions",
+            post(handlers::service_adoption::adopt_retained_deployment),
+        )
+        .route(
+            "/orchestration/services/{service_id}/updates",
+            post(handlers::application_update::create),
+        )
+        .route(
+            "/orchestration/services/{service_id}/managed-updates",
+            post(handlers::managed_update::create),
+        )
+        .route(
+            "/orchestration/services/{service_id}/managed-updates/{operation_id}",
+            get(handlers::managed_update::get),
+        )
+        .route(
+            "/orchestration/services/{service_id}/instances/{deployment_id}/http-request",
+            post(handlers::instance_http::forward).layer(DefaultBodyLimit::disable()),
         )
         .route(
             "/orchestration/services/deployments/{deployment_id}",

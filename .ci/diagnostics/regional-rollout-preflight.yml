@@ -42,7 +42,7 @@ jobs:
               return f'{host}:{parsed.port or 80}'
           snapshots = []
           print(json.dumps({'credentialsPresent': {k: bool(os.environ.get(k)) for k in ['US3_TOKEN', 'EU1_TOKEN', 'ORCHESTRATOR_TOKEN']}}), flush=True)
-          for region, deployment in [('us3', 'orchestrator-us3-next'), ('eu1', 'orchestrator-eu1')]:
+          for region, deployment in [('us3', 'orchestrator-us3'), ('eu1', 'orchestrator-eu1')]:
               token = os.environ[region.upper() + '_TOKEN']
               request = urllib.request.Request(
                   f'https://admin.{region}.heyo.work/deployments/{deployment}',

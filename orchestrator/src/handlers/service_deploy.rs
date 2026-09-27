@@ -349,6 +349,17 @@ pub async fn deploy_service(
             Ok(service_id) => service_id,
             Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error.to_string() }))),
         };
+        let database = match db::get_db() {
+            Ok(database) => database,
+            Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":error.to_string()}))),
+        };
+        let admission = match try_service_lifecycle_lock(database, &service_id).await {
+            Ok(Some(tx)) => tx,
+            _ => return (StatusCode::CONFLICT, Json(json!({"error":"Service lifecycle is busy"}))),
+        };
+        if let Err(error) = super::service_adoption::ensure_managed(&admission, &service_id).await {
+            return (StatusCode::CONFLICT, Json(json!({"error":error.to_string()})));
+        }
         let deployment_id = request
             .deployment_id
             .clone()
@@ -373,6 +384,9 @@ pub async fn deploy_service(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "Failed to persist service deployment run" })),
             );
+        }
+        if let Err(error) = admission.commit().await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":error.to_string()})));
         }
 
         let async_state = state.clone();
@@ -487,8 +501,13 @@ async fn deploy_service_inner(
     let _guard = try_service_lifecycle_lock(db::get_db()?, &service_id)
         .await?
         .with_context(|| format!("service {service_id} has a deployment or retirement in progress"))?;
+    super::service_adoption::ensure_managed(&_guard, &service_id).await?;
     super::regional_rollout::ensure_no_regional_rollout(db::get_db()?, &service_id).await?;
     super::regional_policy::require_legacy_topology(db::get_db()?, &service_id).await?;
+    let baseline = read_service_state(&state,&service_id).await?;
+    anyhow::ensure!(!request.retire_previous
+        || super::instance_http::Contract::from_metadata(&baseline.active_metadata["source"])?.is_none(),
+        "application lifecycle replacement requires a managed regional operation");
     bind_deployment_environment_identity(
         &state,
         &service_id,
@@ -592,8 +611,13 @@ pub(super) async fn validate_service_deployment_request(
         if super::host_ingress::enabled(state, &service_id) {
             super::host_ingress::validate(state, &service_id, route)
                 .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-            validate_regional_observers(state, &service_id, &request.replica_regions).await
-                .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+            if request.replica_regions.is_empty() {
+                super::regional_observers::validate_ingress_observers(state, &service_id)
+                    .map(drop)
+            } else {
+                validate_regional_observers(state, &service_id, &request.replica_regions).await
+            }
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
         }
         if route.path_prefix.as_deref().is_none_or(str::is_empty) {
             return Err((
@@ -1441,8 +1465,9 @@ pub(super) async fn prepare_cloud_candidate(
     request: &mut ServiceDeployRequest,
     deployment_id: &str,
     excluded_backend_server_ids: Vec<String>,
-) -> Result<(CreateDeploymentRequest, String, Vec<ResolvedSecretRef>)> {
+) -> Result<(CreateDeploymentRequest, String, Vec<ResolvedSecretRef>, super::service_recipe::Recipe)> {
     let service_id = sanitize_service_id(&request.service_id)?;
+    let mut source = request.clone();
     let archive_bytes = load_archive_bytes(state, request).await?;
     let archive_sha256 = format!("{:x}", Sha256::digest(&archive_bytes));
     let archive_bytes = if request.archive_id.is_some() && request.archive_bytes_base64.is_none() {
@@ -1457,6 +1482,17 @@ pub(super) async fn prepare_cloud_candidate(
         request.ports.clone()
     };
     let resolved_secrets = resolve_env_refs(state, request).await?;
+    source.env_refs = resolved_secrets.iter().map(|s| format!("{}=heyosecret://{}@{}",s.env,s.path,s.version)).collect();
+    // The bound archive ID, not a mutable name or duplicated archive payload,
+    // supplies bytes on a future fresh-boot rollback.
+    source.archive_bytes_base64 = None;
+    if super::instance_http::Contract::from_metadata(request.metadata.as_ref().unwrap_or(&serde_json::Value::Null))?.is_some() {
+        let env = request.env.get_or_insert_with(HashMap::new);
+        env.insert("HEYO_SERVICE_ID".into(), service_id.clone());
+        env.insert("HEYO_DEPLOYMENT_ID".into(), deployment_id.into());
+        env.insert("HEYO_REGION".into(), request.region.clone());
+        env.entry("HEYO_REVISION".into()).or_insert_with(||archive_sha256.clone());
+    }
     let cloud_request = CreateDeploymentRequest {
         deployment_id: deployment_id.into(),
         user_id: request.user_id.clone(),
@@ -1486,7 +1522,11 @@ pub(super) async fn prepare_cloud_candidate(
         allowed_backend_server_ids: None,
         metadata: request.metadata.clone(),
     };
-    Ok((cloud_request, archive_sha256, resolved_secrets))
+    let guest_port = super::instance_http::Contract::from_metadata(source.metadata.as_ref().unwrap_or(&serde_json::Value::Null))?
+        .map(|c|c.port).or_else(||cloud_request.ports.first().copied())
+        .or_else(||cloud_request.port_mappings.first().map(|p|p.container)).context("creation recipe has no guest port")?;
+    let recipe = super::service_recipe::Recipe {request:source,archive_sha256:archive_sha256.clone(),guest_port};
+    Ok((cloud_request, archive_sha256, resolved_secrets, recipe))
 }
 
 async fn deploy_service_candidate(
@@ -1496,6 +1536,9 @@ async fn deploy_service_candidate(
 ) -> Result<ServiceDeployResponse> {
     let service_id = sanitize_service_id(&request.service_id)?;
     let mut current_state = read_service_state(&state, &service_id).await?;
+    anyhow::ensure!(!request.retire_previous
+        || super::instance_http::Contract::from_metadata(&current_state.active_metadata["source"])?.is_none(),
+        "application lifecycle retirement requires the regional rollout barrier");
     let previous_discovery = service_discovery::read_stored_snapshot(&service_id).await?;
     let excluded_backend_server_ids = match placement_exclusions {
         Some(exclusions) => exclusions,
@@ -1507,9 +1550,11 @@ async fn deploy_service_candidate(
         .clone()
         .unwrap_or_else(|| format!("svc-{service_id}-{}", Uuid::new_v4()));
 
-    let (cloud_request, archive_sha256, resolved_secrets) = prepare_cloud_candidate(
+    let (cloud_request, archive_sha256, resolved_secrets, recipe) = prepare_cloud_candidate(
         &state, &mut request, &deployment_id, excluded_backend_server_ids,
     ).await?;
+    super::service_recipe::record(db::get_db()?, &recipe, &cloud_request).await?;
+    let creation_digest = cloud_client::deployment_request_digest(&cloud_request)?;
 
     record_service_deployment_event(
         &state,
@@ -1717,6 +1762,11 @@ async fn deploy_service_candidate(
         )
         .await?;
 
+        let receipt = cloud_client::recover_deployment(&state,&deployment_id,&creation_digest,Some(recipe.guest_port)).await?;
+        verify_applied_placement(request.deployment_environment.as_deref(),request.placement_pool.as_deref(),
+            &request.region,&receipt.deployment)?;
+        super::service_recipe::bind(db::get_db()?,&deployment_id,serde_json::to_value(&receipt.deployment)?).await?;
+
         let previous_deployment_id = current_state.active_deployment_id.clone();
         let previous_archive_id = current_state.active_archive_id.clone();
         let previous_metadata = Some(current_state.active_metadata.clone());
@@ -1805,7 +1855,9 @@ async fn deploy_service_candidate(
             &deployment_id,
             create_response.backend_server_id.as_deref(),
             Some(&request.region),
-            Some(&archive_sha256),
+            Some(if super::instance_http::Contract::from_metadata(request.metadata.as_ref().unwrap_or(&serde_json::Value::Null))?.is_some() {
+                request.env.as_ref().and_then(|e|e.get("HEYO_REVISION")).map(String::as_str).unwrap_or(&archive_sha256)
+            } else { &archive_sha256 }),
             &backend_url,
             request.retire_previous,
         )
@@ -2466,6 +2518,9 @@ async fn reconcile_pending_service_retirements(state: &AppState) -> Result<()> {
         let Some(guard) = try_service_lifecycle_lock(db, &retirement.service_id).await? else {
             continue;
         };
+        if super::service_adoption::ensure_managed(&guard, &retirement.service_id).await.is_err() {
+            continue;
+        }
         if super::regional_rollout::ensure_no_regional_rollout(&guard, &retirement.service_id).await.is_err() {
             continue;
         }
@@ -4464,7 +4519,7 @@ fn service_state_path(state: &AppState, service_id: &str) -> Result<PathBuf> {
     Ok(Path::new(base).join(format!("{service_id}.json")))
 }
 
-fn sanitize_service_id(service_id: &str) -> Result<String> {
+pub(super) fn sanitize_service_id(service_id: &str) -> Result<String> {
     let trimmed = service_id.trim();
     if trimmed.is_empty() {
         anyhow::bail!("serviceId is required");
@@ -4914,6 +4969,31 @@ mod tests {
         let guard = request.revision_guard.unwrap();
         assert_eq!(guard.git_ref, "refs/heads/main");
         assert!(!guard.force);
+    }
+
+    #[tokio::test]
+    async fn host_ingress_deploy_without_replica_regions_stays_single_region() {
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "server_port":0,"database_url":"unused","agent_provider":"test","agent_model":"test","agent_api_key":"",
+            "agent_timeout_seconds":1,"agent_max_iterations":1,"jwt_secret":"test","cloud_internal_url":"http://cloud",
+            "internal_api_key":"test","heyosecret_url":"http://secrets","discovery_routed_services":"smoke",
+            "discovery_observers":[{"service_id":"smoke","region":"us3","deployment_id":"smoke",
+                "base_url":"http://lb","ingress_url":"http://lb",
+                "discovery_url":"http://orch/orchestration/services/smoke/discovery","token_secret_path":"test/observer"}]
+        })).unwrap();
+        let state = crate::AppState { config: std::sync::Arc::new(config), http_client: reqwest::Client::new(),
+            worker_id: std::sync::Arc::new("test".into()), ci_workspace_cache: Default::default() };
+        let request = |regions: serde_json::Value| -> ServiceDeployRequest {
+            serde_json::from_value(serde_json::json!({
+                "serviceId":"smoke","userId":"u","desiredReplicas":1,"replicaRegions":regions,
+                "route":{"host":"smoke.example","pathPrefix":"/smoke","stripPrefix":false}
+            })).unwrap()
+        };
+        super::validate_service_deployment_request(&state, &request(serde_json::json!([]))).await.unwrap();
+        super::validate_service_deployment_request(&state, &request(serde_json::json!(["us3"]))).await.unwrap();
+        let (_, error) = super::validate_service_deployment_request(&state, &request(serde_json::json!(["eu1"])))
+            .await.unwrap_err();
+        assert!(error.contains("each rollout region"), "{error}");
     }
 
     #[test]

@@ -327,6 +327,7 @@
       <a href="/siem" data-local-nav>Security</a>
       <a href="/storage" data-local-nav>Disks</a>
       <a href="/plugins" data-local-nav>Plugins</a>
+      <a href="/network" data-local-nav>Network</a>
       <a href="/metrics" data-local-nav>Metrics</a>
     </nav>
     <div class="topbar-right">
@@ -2434,6 +2435,16 @@ function renderServices(result) {
   const services = result.data.inventory.services;
   target.innerHTML = `<div class="sub">Shared Orchestrator state · recorded health, not a live reachability test.</div>` +
     (services.length ? services.map(s => {
+      if (s.external) {
+        const external = s.external;
+        return `<article style="margin-top:16px;overflow-wrap:anywhere"><h3>${esc(s.serviceId)}</h3>
+          <div>${esc(external.region)} · Deployment: ${esc(external.deploymentId)}</div>
+          <div>Update: ${s.update ? `${esc(s.update.status)} · ${esc(s.update.phase || "awaiting activation")} · ${esc(s.update.operationId)}` : "none recorded"}</div>
+          ${s.update ? `<div>Target revision: ${esc(s.update.targetRevision)} · CI run: ${esc(s.update.runId)}</div>
+          <div>Last update status: ${esc(s.update.observedAt || "not yet available")}</div>
+          ${s.update.error ? `<div class="sub">${esc(s.update.error)}</div>` : ""}` : ""}
+          <div class="sub">Updates drain CI jobs and retain its workspace. One controller in ${esc(external.region)}; no regional failover.</div></article>`;
+      }
       const endpoints = s.endpoints;
       const regions = [...new Set([...(s.replicaRegions || []), ...(endpoints || []).map(e => e.region || "unplaced")])];
       const ready = endpoints?.filter(e => e.healthStatus === "healthy" && !e.draining).length;
@@ -2456,6 +2467,14 @@ function renderFleet(result) {
     return;
   }
   if (!result.data.configured) {
+    // Without a fleet this gateway is the whole deployment, so its local view is
+    // the only truthful default. An explicit ?view= is always respected.
+    const params = new URLSearchParams(location.search);
+    if (!params.has("view")) {
+      params.set("view", "local");
+      location.replace(location.pathname + "?" + params + location.hash);
+      return;
+    }
     target.textContent = "Regional observations are not configured. No region is assumed from this page's hostname.";
     return;
   }

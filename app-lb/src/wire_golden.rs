@@ -94,6 +94,7 @@ fn vm_spec() -> DeploymentSpec {
         ],
         maintenance: false,
         vm: Some(crate::config::VmSpec {
+            correlated_creates: false,
             env_from: vec![],
             workspace_archive: None,
             image_download_url: None,

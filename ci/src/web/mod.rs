@@ -21,6 +21,7 @@
 
 pub mod api;
 pub mod identity;
+mod owner_http;
 pub mod pages;
 pub mod stream;
 
@@ -132,6 +133,9 @@ pub fn router(
         .route("/api/native/jobs/{lease}/source", get(native_source))
         .route("/api/native/jobs/{lease}/release-source/{index}", get(native_release_source))
         .route("/api/native/jobs/{lease}/artifacts/{index}", post(native_artifact).layer(DefaultBodyLimit::max(512 * 1024 * 1024)))
+        .route("/api/lifecycle", get(application_lifecycle))
+        .route("/api/lifecycle/retirements/{id}", get(retirement_status).post(retire_application))
+        .route("/api/lifecycle/updates/{id}", get(application_update_status).post(activate_application_update))
         .route(
             "/api/submit",
             post(submit).layer(DefaultBodyLimit::max(submit_limit)),
@@ -141,7 +145,83 @@ pub fn router(
         // above, for the reason this module's header gives — a machine route
         // behind the gate answers 401 whatever it carries. See [`api`].
         .merge(api::router())
+        .layer(axum::middleware::from_fn_with_state(state.clone(), owner_http::route))
         .with_state(state)
+}
+
+fn application_lifecycle_auth(state: &AppState, headers: &HeaderMap) -> Result<(), axum::response::Response> {
+    use subtle::ConstantTimeEq;
+    let Some(expected) = state.config.application_lifecycle_token.as_deref().filter(|s| !s.is_empty()) else {
+        return Err(error(StatusCode::SERVICE_UNAVAILABLE, "application lifecycle is not configured"));
+    };
+    let Some(got) = bearer(headers) else { return Err(error(StatusCode::UNAUTHORIZED, "application lifecycle bearer required")); };
+    if !bool::from(got.as_bytes().ct_eq(expected.as_bytes())) {
+        return Err(error(StatusCode::UNAUTHORIZED, "invalid application lifecycle bearer"));
+    }
+    Ok(())
+}
+
+async fn application_lifecycle(State(state): State<AppState>, headers: HeaderMap) -> axum::response::Response {
+    if let Err(response) = application_lifecycle_auth(&state, &headers) { return response; }
+    if let Some(deployment) = &state.config.managed_deployment {
+        return Json(serde_json::json!({"applicationId":state.config.application_id,
+            "deploymentId":deployment,"bootId":state.dispatcher.executor.boot_id(),
+            "revision":state.config.expected_sha,"capabilities":["managed-retirement-v1"]})).into_response();
+    }
+    if state.config.application_id.is_none() || state.config.application_orchestrator_url.is_none()
+        || state.config.controller_deployment.is_none() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "application lifecycle is not configured");
+    }
+    Json(serde_json::json!({"applicationId":state.config.application_id,
+        "deploymentId":state.config.controller_deployment,"capabilities":["release-update"]})).into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetirementEnvelope { request_hash: String, request: crate::application_lifecycle::Retirement }
+
+async fn retire_application(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap,
+    Json(envelope): Json<RetirementEnvelope>) -> axum::response::Response {
+    if let Err(response) = application_lifecycle_auth(&state, &headers) { return response; }
+    if id != envelope.request.command_id { return error(StatusCode::CONFLICT,"retirement identity mismatch"); }
+    match crate::application_lifecycle::accept(&state.dispatcher,envelope.request,&envelope.request_hash).await {
+        Ok(status) => (StatusCode::ACCEPTED,Json(status)).into_response(),
+        Err(_) => error(StatusCode::CONFLICT,"retirement was not accepted"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetirementQuery { request_hash: String }
+
+async fn retirement_status(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap,
+    Query(query): Query<RetirementQuery>) -> axum::response::Response {
+    if let Err(response) = application_lifecycle_auth(&state, &headers) { return response; }
+    match crate::application_lifecycle::status(state.store.pool(),&id,&query.request_hash).await {
+        Ok(status) => Json(status).into_response(),
+        Err(_) => error(StatusCode::NOT_FOUND,"retirement receipt unavailable"),
+    }
+}
+
+async fn application_update_status(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> axum::response::Response {
+    if let Err(response) = application_lifecycle_auth(&state, &headers) { return response; }
+    match crate::controller_rollout::application_status(&state.dispatcher, &id).await {
+        Ok(status) => Json(status).into_response(),
+        Err(_) => error(StatusCode::NOT_FOUND, "application update unavailable"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApplicationActivation { intent_hash: String }
+
+async fn activate_application_update(State(state): State<AppState>, Path(id): Path<String>, headers: HeaderMap,
+    Json(activation): Json<ApplicationActivation>) -> axum::response::Response {
+    if let Err(response) = application_lifecycle_auth(&state, &headers) { return response; }
+    match crate::controller_rollout::activate_application_update(&state.dispatcher, &id, &activation.intent_hash).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => error(StatusCode::CONFLICT, "application update cannot be activated"),
+    }
 }
 
 fn native_auth(state: &AppState, headers: &HeaderMap) -> Result<(), axum::response::Response> {
@@ -160,15 +240,14 @@ fn native_poll_error(e: crate::native::PollError) -> axum::response::Response {
         }
     }
 }
-async fn native_poll(State(s):State<AppState>,h:HeaderMap,Json(p):Json<crate::native::Poll>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let _work=match s.dispatcher.lifecycle.work(&s.store).await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)};if let Ok(runs)=crate::native::pending_advancements(&s.store).await{for run in runs{if s.dispatcher.advance_run(&run).await.is_ok(){let _=crate::native::advancement_done(&s.store,&run).await;}}} match crate::native::poll(&s.store,p,&s.config.public_url,&s.dispatcher.secrets).await {Ok(job)=>Json(serde_json::json!({"job":job})).into_response(),Err(e)=>native_poll_error(e)} }
+async fn native_poll(State(s):State<AppState>,h:HeaderMap,Json(p):Json<crate::native::Poll>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let _effect=match s.dispatcher.executor.effect_permit().await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)};let _work=match s.dispatcher.lifecycle.work(&s.store).await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)};if let Ok(runs)=crate::native::pending_advancements(&s.store).await{for run in runs{if s.dispatcher.advance_run(&run).await.is_ok(){let _=crate::native::advancement_done(&s.store,&run).await;}}} match crate::native::poll(&s.store,p,&s.config.public_url,&s.dispatcher.secrets).await {Ok(job)=>Json(serde_json::json!({"job":job})).into_response(),Err(e)=>native_poll_error(e)} }
 async fn native_heartbeat(State(s):State<AppState>,h:HeaderMap,Json(u):Json<crate::native::LeaseUpdate>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let _work=match s.dispatcher.lifecycle.work(&s.store).await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)}; match crate::native::heartbeat(&s.store,&u).await {Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)} }
 async fn native_complete(State(s):State<AppState>,h:HeaderMap,Json(c):Json<crate::native::Completion>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let _work=match s.dispatcher.lifecycle.work(&s.store).await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)}; match crate::native::complete(&s.store,&s.dispatcher.secrets,c).await {Ok(Some(run))=>{match s.dispatcher.advance_run(&run).await{Ok(_)=>{let _=crate::native::advancement_done(&s.store,&run).await;},Err(e)=>tracing::error!("native completion scheduling failed: {e}")} StatusCode::NO_CONTENT.into_response()},Ok(None)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::CONFLICT,&e)} }
 async fn native_source(State(s):State<AppState>,h:HeaderMap,Path(lease):Path<uuid::Uuid>)->impl IntoResponse {
     if let Err(e)=native_auth(&s,&h){return e}
     let run_id=match crate::native::source_run(&s.store,lease).await {Ok(Some(r))=>r,Ok(None)=>return error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>return error(StatusCode::INTERNAL_SERVER_ERROR,&e)};
     let run=match s.store.get_run(&run_id).await {Ok(Some(r))=>r,Ok(None)=>return error(StatusCode::CONFLICT,"run disappeared"),Err(e)=>return error(StatusCode::INTERNAL_SERVER_ERROR,&e.to_string())};
-    let workspace=crate::trigger::Workspace::for_run(&s.config,&run_id);
-    let descriptor=match crate::trigger::read_descriptor(&workspace){Ok(v)=>v,Err(e)=>return error(StatusCode::INTERNAL_SERVER_ERROR,&e.to_string())};
+    let descriptor=match s.store.source_descriptor(&run_id).await{Ok(v)=>v,Err(e)=>return error(StatusCode::INTERNAL_SERVER_ERROR,&e.to_string())};
     Json(serde_json::json!({"repository":run.repo_url,"descriptor":descriptor,"workflowPath":run.workflow_path})).into_response()
 }
 async fn native_release_source(State(s):State<AppState>,h:HeaderMap,Path((lease,index)):Path<(uuid::Uuid,usize)>)->impl IntoResponse {
@@ -180,6 +259,10 @@ async fn native_release_source(State(s):State<AppState>,h:HeaderMap,Path((lease,
 #[derive(serde::Deserialize)] struct NativeArtifactQuery{name:String,#[serde(default)]description:Option<String>,#[serde(default)]public:bool,#[serde(default)]alias:Option<String>}
 async fn native_artifact(State(s):State<AppState>,h:HeaderMap,Path((lease,index)):Path<(uuid::Uuid,usize)>,Query(q):Query<NativeArtifactQuery>,body:Bytes)->impl IntoResponse {
     if let Err(e)=native_auth(&s,&h){return e};
+    let _effect = match s.dispatcher.executor.effect_permit().await {
+        Ok(permit) => permit,
+        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    };
     let _work = match s.dispatcher.lifecycle.work(&s.store).await {
         Ok(permit) => permit,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, &e),
@@ -491,7 +574,10 @@ async fn run_page(
     let event_before = q.get("events_before").and_then(|value| value.parse::<i64>().ok());
     match state.store.get_run(&run_id).await {
         Ok(Some(run)) => {
-            let jobs = state.store.jobs_of(&run_id).await.unwrap_or_default();
+            let jobs = match state.store.jobs_of(&run_id).await {
+                Ok(jobs) => jobs,
+                Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
+            };
             let artifacts = state.store.artifacts_of(&run_id).await.unwrap_or_default();
 
             // The VM log is the step recorded at index -2 by the executor. Read
@@ -499,9 +585,16 @@ async fn run_page(
             // the row with the bytes gone rather than vanishing from the page.
             let mut vm_logs = Vec::new();
             for job in &jobs {
-                let steps = state.store.steps_of(&job.id).await.unwrap_or_default();
+                let steps = match state.store.steps_of(&job.id).await {
+                    Ok(steps) => steps,
+                    Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
+                };
                 if let Some(step) = steps.iter().find(|s| s.idx == VM_LOG_STEP_IDX) {
-                    vm_logs.push((job.display.clone(), state.store.read_log(step).await));
+                    let log = match state.store.read_log(step).await {
+                        Ok(log) => log,
+                        Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
+                    };
+                    vm_logs.push((job.display.clone(), log));
                 }
             }
 
@@ -681,8 +774,15 @@ async fn job_page(
     };
 
     let mut steps = Vec::new();
-    for step in state.store.steps_of(&job.id).await.unwrap_or_default() {
-        let log = state.store.read_log(&step).await.unwrap_or_default();
+    let stored_steps = match state.store.steps_of(&job.id).await {
+        Ok(steps) => steps,
+        Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
+    };
+    for step in stored_steps {
+        let log = match state.store.read_log(&step).await {
+            Ok(log) => log.unwrap_or_default(),
+            Err(e) => return page_error(&state, &headers, who.as_ref(), &e.to_string()),
+        };
         steps.push((step, log));
     }
 
@@ -1276,8 +1376,23 @@ async fn log_stream(
             let Ok(jobs) = state.store.jobs_of(&run_id).await else { break };
             let Some(job) = jobs.into_iter().find(|j| j.job_key == job_key) else { break };
 
-            for step in state.store.steps_of(&job.id).await.unwrap_or_default() {
-                let text = state.store.read_log(&step).await.unwrap_or_default();
+            let steps = match state.store.steps_of(&job.id).await {
+                Ok(steps) => steps,
+                Err(e) => {
+                    tracing::error!("could not load steps for log stream: {e}");
+                    yield Ok::<Event, std::convert::Infallible>(Event::default().event("error").data("step logs are temporarily unavailable"));
+                    return;
+                }
+            };
+            for step in steps {
+                let text = match state.store.read_log(&step).await {
+                    Ok(log) => log.unwrap_or_default(),
+                    Err(e) => {
+                        tracing::error!("could not stream shared step logs: {e}");
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().event("error").data("step logs are temporarily unavailable"));
+                        return;
+                    }
+                };
                 let already = *sent.get(&step.idx).unwrap_or(&0);
                 if text.len() > already {
                     // Split on a character boundary: a log is arbitrary bytes
@@ -1452,6 +1567,10 @@ async fn destroy_vm(
         Ok(w) => w,
         Err(response) => return response,
     };
+    let _effect = match state.dispatcher.executor.effect_permit().await {
+        Ok(permit) => permit,
+        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    };
     let notice = match state.dispatcher.destroy_pooled_vm(&sandbox_id).await {
         Ok(message) => {
             tracing::info!(
@@ -1479,6 +1598,10 @@ async fn resize_vm(
     let who = match may_manage(&state, &headers).await {
         Ok(w) => w,
         Err(response) => return response,
+    };
+    let _effect = match state.dispatcher.executor.effect_permit().await {
+        Ok(permit) => permit,
+        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, &e),
     };
     // Parsed through the SDK's own enum so the page and the daemon cannot
     // disagree about what a class is called.
@@ -1508,6 +1631,10 @@ async fn cleanup_failed_vms(
     let who = match may_manage(&state, &headers).await {
         Ok(w) => w,
         Err(response) => return response,
+    };
+    let _effect = match state.dispatcher.executor.effect_permit().await {
+        Ok(permit) => permit,
+        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, &e),
     };
     let notice = match state.dispatcher.destroy_failed_vms().await {
         Ok(message) => {
@@ -1683,6 +1810,8 @@ mod tests {
         let runners = test_runners(config.clone());
         let dispatcher = Arc::new(Dispatcher {
             lifecycle: Arc::new(crate::lifecycle::Lifecycle::default()),
+            executor: Arc::new(crate::executor::ExecutorOwner::register(store.pool().clone(),
+                config.managed_deployment.as_deref().unwrap_or(&format!("web-test-{}", uuid::Uuid::new_v4()))).await.expect("executor")),
             config: config.clone(),
             store: store.clone(),
             pool: crate::pool::Pool::new(store.pool().clone()),
@@ -1702,6 +1831,116 @@ mod tests {
             objects: Arc::new(crate::objects::Workflows::new(&config)),
         });
         router(config, runners, store, dispatcher)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_NATS_URL; run alone"]
+    async fn managed_frontends_preserve_auth_and_reject_wrong_boot_without_retry() {
+        use base64::Engine;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let base = std::env::var("CI_TEST_DATABASE_URL").unwrap();
+        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        let schema = format!("routing_{}",uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&admin).await.unwrap();
+        let mut url = reqwest::Url::parse(&base).unwrap();
+        url.query_pairs_mut().append_pair("options",&format!("-c search_path={schema}"));
+        unsafe { std::env::set_var("CI_TEST_DATABASE_URL",url.as_str()); }
+        let mut config = Arc::try_unwrap(test_config()).unwrap();
+        config.managed_deployment=Some("managed-owner".into());
+        config.native_runner_secret=Some("original-native-token".into());
+        let owner = test_router_with_config(Arc::new(config)).await;
+        let pool = sqlx::PgPool::connect(url.as_str()).await.unwrap();
+        let boot: uuid::Uuid = sqlx::query_scalar("SELECT boot_id FROM ci_executor_owner").fetch_one(&pool).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let proxy_owner=owner.clone(); let proxy_calls=calls.clone();
+        let proxy=Router::new().route("/orchestration/services/ci/instances/{deployment}/http-request",post(
+            move |headers:HeaderMap,body:Body| {let owner=proxy_owner.clone(); let calls=proxy_calls.clone(); async move {
+                calls.fetch_add(1,Ordering::SeqCst);
+                assert_eq!(headers["authorization"],"Bearer app-role-token");
+                let meta:serde_json::Value=serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(headers["x-heyo-instance-request"].as_bytes()).unwrap()).unwrap();
+                assert_eq!(meta["bootId"],boot.to_string());
+                let mut request=Request::builder().method(meta["method"].as_str().unwrap()).uri(meta["path"].as_str().unwrap())
+                    .header("x-ci-target-boot",boot.to_string()).header("x-ci-forwarded","1");
+                for pair in meta["headers"].as_array().unwrap() {
+                    request=request.header(pair[0].as_str().unwrap(),pair[1].as_str().unwrap());
+                }
+                owner.oneshot(request.body(body).unwrap()).await.unwrap()
+            }}));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {axum::serve(listener,proxy).await.unwrap()});
+        let mut config=Arc::try_unwrap(test_config()).unwrap();
+        config.managed_deployment=Some("managed-standby".into());
+        config.application_id=Some("ci".into()); config.application_orchestrator_url=Some(address);
+        config.application_lifecycle_token=Some("app-role-token".into());
+        let standby=test_router_with_config(Arc::new(config)).await;
+        for (app,name,credential,status) in [(&owner,"direct","original-native-token",StatusCode::OK),
+            (&standby,"forwarded","original-native-token",StatusCode::OK),
+            (&standby,"unauthorized","wrong-token",StatusCode::UNAUTHORIZED)] {
+            let body=serde_json::json!({"runnerId":name,"name":name,"labels":["macos","x86_64"],"platform":"macos","arch":"x86_64","protocolVersion":1});
+            let response=app.clone().oneshot(Request::builder().method("POST").uri("/api/native/register")
+                .header("content-type","application/json").header("authorization",format!("Bearer {credential}"))
+                .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(),status);
+        }
+        let names:Vec<String>=sqlx::query_scalar("SELECT id FROM ci_native_runner ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(names,vec!["direct","forwarded"]);
+        // Registration is a shared write; polling additionally requires the
+        // owner's effect permit, so this checks an actually owner-only route.
+        for (app,runner) in [(&owner,"direct"),(&standby,"forwarded")] {
+            let response=app.clone().oneshot(Request::builder().method("POST").uri("/api/native/poll")
+                .header("content-type","application/json").header("authorization","Bearer original-native-token")
+                .body(Body::from(serde_json::json!({"runnerId":runner,"protocolVersion":1}).to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::OK);
+            let body=to_bytes(response.into_body(),1024).await.unwrap();
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(),serde_json::json!({"job":null}));
+        }
+        for (app,target,marker) in [(&owner,uuid::Uuid::new_v4(),"1"),(&standby,boot,"1"),(&owner,boot,"2")] {
+            let response=app.clone().oneshot(Request::builder().method("POST").uri("/api/native/register")
+                .header("x-ci-target-boot",target.to_string()).header("x-ci-forwarded",marker)
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::CONFLICT);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst),3,"wrong boots and loops must not dispatch another request");
+        server.abort();
+        unsafe {std::env::set_var("CI_TEST_DATABASE_URL",base);}
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_NATS_URL"]
+    async fn another_controller_serves_shared_logs_and_reports_unavailable_history() {
+        let app = test_router().await;
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::connect(&std::env::var("CI_TEST_DATABASE_URL").unwrap(), root.path().into(), Duration::from_secs(30)).await.unwrap();
+        let run = crate::vm::new_id();
+        let url = format!("https://example.test/{run}.git");
+        let repo = store.register_repo(&url, "shared logs", None, None, None).await.unwrap();
+        let (_, token) = store.create_repo_token(&repo.id, "logs", None).await.unwrap();
+        let plan = crate::plan::Plan::build(&crate::workflow::Workflow::parse("logs.yml", "jobs:\n  build:\n    steps: [{run: 'true'}]\n").unwrap()).unwrap();
+        store.create_run(&run, &crate::store::RunRequest { repo_id: Some(repo.id), repo_url: url, ..Default::default() }, &plan).await.unwrap();
+        let job = store.jobs_of(&run).await.unwrap().remove(0);
+        let sid = crate::store::step_id(&job.id, 0);
+        store.create_step(&sid, &job.id, 0, "Shared output", None).await.unwrap();
+        let path = root.path().join("not-created.log");
+        store.append_log(&sid, &path, "regional log 雪 <tag>\n").await.unwrap();
+        drop(root);
+        let response = app.clone().oneshot(Request::builder().uri(format!("/api/runs/{run}/logs"))
+            .header("Authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["jobs"][0]["steps"][0]["log"], "regional log 雪 <tag>\n");
+        let response = app.clone().oneshot(Request::builder().uri(format!("/runs/{run}/jobs/{}", job.job_key)).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("regional log 雪 &lt;tag&gt;"), "shared logs must remain escaped in the HTML");
+        // An unimported record must not masquerade as an empty log.
+        sqlx::query("UPDATE ci_step SET log_path='missing-retained-file' WHERE id=$1").bind(&sid).execute(store.pool()).await.unwrap();
+        let response = app.oneshot(Request::builder().uri(format!("/api/runs/{run}/logs"))
+            .header("Authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        sqlx::query("UPDATE ci_step SET log_path='postgres:ci_step_log' WHERE id=$1").bind(&sid).execute(store.pool()).await.unwrap();
     }
 
     #[tokio::test]

@@ -78,6 +78,28 @@ services. It checks request preservation, single POST delivery, peer admission,
 WebSocket echo, and a held response body draining across spec replay while new
 traffic uses another local backend.
 
+The workload is checked in as `testdata/regional_app.py`, rather than depending
+on a temporary app archive. Its region and immutable runtime revision are explicit
+startup arguments; both are returned in JSON and `X-Heyo-Region` /
+`X-Heyo-Revision` headers. `/health` is excluded from admission history,
+`/admissions` returns the last 4096 requests, and `/held?hold=10&id=drain-1`
+starts a response then holds its body for ten seconds. `--unhealthy` returns
+503 for negative readiness checks. Only use disposable request data: the app
+records paths and bodies; Authorization is hashed, never reflected verbatim.
+
+```sh
+python3 app-lb/testdata/regional_app.py --region eu1 --revision regional-gateway-v2 --port 8080
+python3 -B -m unittest discover -s app-lb/testdata -p test_regional_app.py
+```
+
+The default bind is loopback for host-local tests. A managed VM must explicitly
+bind its guest interface (for example `--bind 0.0.0.0`); only its owning gateway
+uses the host-bound mapping. Cross-region traffic and readiness use authenticated
+HTTPS gateways, not public VM ports. Use the same app artifact/revision in both
+regions and inject the region at startup. This app does not register routes,
+publish discovery, or grant itself serving weight. Rewriting the workload does
+not enable the currently gated managed first-replica enrollment path below.
+
 ### Hierarchical discovery (local integration; not live acceptance)
 
 `discovery.regional` contains `gateway_id`, `backend_server_id`, `environment` and
@@ -144,8 +166,25 @@ IDs are 1–128 ASCII letters, digits, hyphens or underscores. Exact replay retu
 same operation, including terminal operations; conflicting payloads/revisions return 409.
 GET `/deployments/:id/rollouts/:operation_id` reports `operation_id`, `deployment`,
 `source_revision`, `target_spec_sha256`, `status`, `phase`, `readiness_verified`,
-`previous_stopped`, and `error`. Status is `running`, `succeeded`, `failed`, or
+`previous_stopped`, `preparation_stage`, and `error`. Status is `running`, `succeeded`, `failed`, or
 `reconciliation_required`. Admission is not rollout success.
+
+Preparation uses the remaining persisted `scaling.boot_timeout_secs` rollout
+budget (30–1800 seconds), not a separate two-minute limit. Restart does not reset
+that deadline. The latest preparation stage is persisted while work runs and on
+failure: for example `rootfs_manifest`, `blob_download`, `blob_http_403`,
+`blob_digest_mismatch`, `daemon_image_import`, or `mount_unpack`. Deadline expiry
+is reported separately from preparation failure. Diagnostics contain bounded
+stage/status codes, not remote response bodies or credentials. Old operation
+records without this field remain readable. A failed preparation never creates
+a candidate or retires the serving generation.
+
+Failed pre-cutover rollouts remain reserved until every attempted Firecracker
+candidate has an authenticated host reclamation receipt. After cleanup progress
+and final settlement are durable, GET adds `failure_settlement` with protocol
+`failed-rollout-reclamation-v1` and the exact `reclaimed_candidate_ids`. A
+missing field means cleanup is unresolved; older hosts without the receipt API
+therefore retain the admission fence.
 
 `target_spec_sha256` hashes compact JSON of the **requested normalized spec**, with
 all object keys recursively sorted and array order preserved. A spec copied from
@@ -664,6 +703,8 @@ curl -XPOST localhost:9090/deployments -H 'content-type: application/json' -d '{
 curl localhost:9090/deployments          # list, with live VM state
 curl localhost:9090/deployments/demo     # one deployment
 curl -XDELETE localhost:9090/deployments/demo   # drain and reap every VM
+# Remove only a proven-empty stale record (ETag copied from GET):
+curl -XDELETE 'localhost:9090/deployments/demo/record' -H 'If-Match: "<sha256>"'
 curl localhost:9090/healthz
 curl localhost:9090/metrics              # metrics snapshot (JSON)
 curl localhost:9090/certs                # issued TLS certificates and expiry
@@ -956,6 +997,38 @@ Omitting `If-Match` retains the original unconditional replace behavior. Only
 one exact strong tag is supported: wildcard, list, weak, malformed, uppercase,
 or unquoted forms return **400 Bad Request**. A successful PUT also returns the
 new `ETag`.
+
+`DELETE /deployments/:id/record` is the metadata-cleanup endpoint. It
+requires the exact current strong `If-Match` ETag and returns **409 Conflict**
+unless the deployment is route-less, desires zero replicas, and has no live,
+pending/provisioning, suspended, rollout-generation, workspace, discovery,
+handoff, build/artifact/mount/host-update job configuration, job history, or
+host-update mapping. Complete runtime and disk inventories
+must confirm no remaining owned resources; unavailable inventories return **503**.
+The check and removal fence autoscaler reconciliation, registry mutation,
+allocation, and workspace lifecycle. Success removes only the
+persisted and in-memory deployment record; it never tears down a VM or queues
+disk/workspace cleanup. The separate path makes older servers reject the request
+rather than ignore a safety flag. Ordinary `DELETE /deployments/:id` keeps its
+existing drain-and-teardown behavior.
+
+`DELETE /deployments/:id/retired-record` additionally permits **settled terminal
+rollout history** and read-only release mounts for a managed Firecracker service.
+It requires authenticated fleet-admin access and the current `If-Match` ETag.
+First withdraw routes, scale to zero, drain, and explicitly clean up the approved
+VM generations through the runtime/disk APIs. This endpoint never performs that
+resource cleanup. Both ownership names and historical sandbox IDs must be absent
+from complete runtime and disk inventories. Running, uncertain or unsettled
+rollouts, correlated allocations, workspace state and job history remain blockers.
+Before removing the registration it durably archives the exact spec and state to
+`<state-dir>/retired/<sha256>.json`; these reports are not loaded as deployments.
+Archive failure preserves the registration. Export this report to the operator's
+audit store; the endpoint does not upload it to S3. It does not assert backend
+retirement or prevent an external authority from recreating a deployment.
+
+Before operational cleanup, also inventory references held outside this app-lb
+(Orchestrator, Cloud, service routes and host configuration). This local endpoint
+cannot prove that another authority no longer references a registration.
 
 The tag is `"<hex>"`, where `<hex>` is lowercase SHA-256 of the compact JSON
 bytes produced by first serializing the full normalized `DeploymentSpec` to a
@@ -1895,9 +1968,15 @@ result.
 Rules and caveats, each of which the spec validation enforces or the docs
 above imply:
 
-- `scaling.max_replicas` must be `1` and `warm_pool` must be `0`: one
+- `scaling.max_replicas` must be at most `1` and `warm_pool` must be `0`: one
   directory, one writer. Two replicas would each capture a divergent copy and
   the last to land would win.
+- For a maintenance pause, set both `min_replicas` and `max_replicas` to `0`
+  with `idle_action: retain` through the scaling API. This drains and stops the
+  replica for workspace capture; incoming requests cannot wake it. Keep the
+  deployment registered. Restore a ceiling of `1` to permit resume. A successful
+  scaling response records the policy, not proof of a stopped executor: verify
+  the exact runtime has stopped and workspace capture has settled before recovery.
 - `driver` must be `firecracker`. The KVM driver syncs a writable mount back
   into the shared host tree itself when the VM stops, which is a different
   feature with different semantics.
@@ -1994,6 +2073,30 @@ two seconds ago describes the process that was just replaced.
 in the spec, and `auth` supplies a git credential the same way a build does. A
 managed (`vm`) deployment cannot declare `update`: its backends are microVMs, and
 a directory on this host would update nothing.
+
+### Durable autoscaler allocations
+
+`vm.correlated_creates: true` opts managed VM autoscaling into the authenticated
+heyvmd `/sandbox-creations/:operation_id` protocol. It defaults to false, is not
+supported for LXC, and requires a daemon that supports durable creation receipts
+plus app-lb's internal daemon credential. This is not a Cloud legacy-create
+compatibility fallback.
+
+Before dispatch, app-lb persists the operation identity, endpoint and request
+digests. It persists the matching receipt before publishing pending capacity.
+After a lost response or restart it only GETs that saved operation: it never
+re-POSTs, follows redirects, substitutes a name match or times out into another
+allocation. Unknown outcomes block ordinary deployment mutations and cleanup;
+receipt-backed pending allocations remain reserved until the exact runtime is
+observed running. Resolved request bodies and secrets are not written to the
+allocation journal. Deployment deletion cannot discard correlated receipts.
+
+This option covers **autoscaler creates only**, not rollout candidate creation.
+It does not repair historical allocation completeness or prove that old queued
+work at other ingresses has finished. Retirement still requires complete
+allocation history, matching receipts, runtime observation and its other
+existing reconciliation gates. Do not run older app-lb binaries against this
+state directory: they do not honor these allocation reservations.
 
 ### Seeding `/workspace` from an archive
 
@@ -3112,6 +3215,8 @@ JWT against the same issuer, audience, signature and `require` policy before
 setting a host-only Secure/HttpOnly cookie. The form requires HTTPS, same-origin
 POST and signed, short-lived login state. Passwords and refresh tokens are not
 persisted; endpoint redirects are refused. Logout clears the access cookie.
+Opening another sign-in page reuses the browser's unexpired CSRF nonce rather
+than invalidating an open form. Each form retains its own local return path.
 Machine clients still receive 401 and continue using their existing credentials.
 An Auth service requiring CAPTCHA or another interactive challenge cannot use
 this password form; those requirements are not bypassed. This is not Google SSO
