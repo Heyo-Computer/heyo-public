@@ -43,7 +43,7 @@ jobs:
           sh -n init.sh
           sh -n physical.sh
           python3 -m py_compile deploy/test_physical_seed.py
-          cargo test --locked
+          cargo test --locked --workspace
           cargo build --release --locked --bin pg-vm-pool
           mkdir -p /workspace/dist
           mkdir -p /workspace/dist/guest

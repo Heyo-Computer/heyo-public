@@ -206,7 +206,7 @@ Config via env (all optional):
 | `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (2GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
 | `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
 | `PG_VM_POOL_DISK_GROW_PCT` | unset (off) | guest-filesystem used% at or above which a schema's data **device** is grown (doubled, offline). Setting it is the on/off switch for device growth — see "Growing the device" |
-| `PG_VM_POOL_DISK_GROW_URGENT_PCT` | `95` | used% at or above which a **warm** VM's device is grown without waiting for it to go idle — stop, resize, and let the next connect boot it, dropping the sessions it had. Must be >= `PG_VM_POOL_DISK_GROW_PCT`; `0` disables the online path. Without it a schema whose write load never pauses can never grow — see "Growing the device" |
+| `PG_VM_POOL_DISK_GROW_URGENT_PCT` | `95` | used% at or above which a **warm** VM's device is grown without waiting for it to go idle — online under the running VM when heyvmd has the online resize route, otherwise stop, resize, and let the next connect boot it, dropping the sessions it had. Once every host's heyvmd has the route, 70–80 grows early at no cost. Must be >= `PG_VM_POOL_DISK_GROW_PCT`; `0` disables the online path. Without it a schema whose write load never pauses can never grow — see "Growing the device" |
 | `PG_VM_POOL_DISK_MAX_GB` | `100` | ceiling device growth never passes (the daemon itself caps at 250) |
 | `PG_VM_POOL_ADMIT_TIMEOUT_SECS` | `30` | how long a client waits for a free connection slot on its schema's VM before the pooler errors it; `0` fails immediately when full |
 | `PG_VM_POOL_MAX_CONCURRENT_BRINGUPS` | `3` | max VM deploys/boots in flight against heyvmd; the excess queues FIFO in the pooler (an unbounded burst can wedge the daemon, whose watchdog restart then kills every running VM); `0` disables |
@@ -739,8 +739,13 @@ is not enough:
   stopping the VM anyway, so the offline resize is free: no client is
   disturbed. This handles every schema that goes quiet.
 - **While warm** (`PG_VM_POOL_DISK_GROW_URGENT_PCT`, default 95). The pooler
-  stops the VM *itself*, resizes, and leaves it for the next connect to boot —
-  dropping whatever sessions it had.
+  asks heyvmd to grow the device *online* (`POST /sandboxes/{id}/resize-online`):
+  heyvmd extends the disk under the running VM, grows the guest filesystem and
+  verifies both, and no session is dropped. When that is unavailable — an
+  older heyvmd without the route (404), a VM that is not running (409), or a
+  failure partway (5xx) — it falls back to stopping the VM *itself*, resizing
+  offline, and leaving it for the next connect to boot, dropping whatever
+  sessions it had.
 
 The second trigger exists because the first one cannot reach the schemas that
 need it most. Growing a device is offline-only (the daemon fscks and cold-boots
@@ -752,14 +757,16 @@ and *stay* that way until its traffic happened to pause for a whole
 `PG_VM_POOL_IDLE_TIMEOUT_SECS`. The busiest schemas were precisely the ones
 that could not grow.
 
-Hence the higher threshold on the online path: the free idle-stop grow keeps
-handling everything that does go idle, and the expensive one only fires on what
-it misses — a filesystem genuinely at the wall. It samples the warm set once a
-minute, resizes at most 4 devices per pass (each costs a schema its live
-sessions, so a busy pass trickles rather than restarting everything at once),
-and backs off per-schema on failure. It claims the schema the same way an
-offload does, so clients arriving mid-resize queue at the pooler instead of
-racing the stop/start, and it logs the stop at `warn` with the session count.
+Hence the higher default threshold on the warm path: the free idle-stop grow
+keeps handling everything that does go idle, and the offline fallback only
+fires on what it misses — a filesystem genuinely at the wall. It samples the
+warm set once a minute, does at most 4 *offline* grows per pass (each costs a
+schema its live sessions, so a busy pass trickles rather than restarting
+everything at once; online grows are not capped), and backs off per-schema on
+failure. The offline fallback claims the schema the same way an offload does,
+so clients arriving mid-resize queue at the pooler instead of racing the
+stop/start, and it logs the stop at `warn` with the session count. Once every
+host's heyvmd serves the online route, the threshold can come down to 70–80.
 
 When a full filesystem already spans a device at `PG_VM_POOL_DISK_MAX_GB`,
 growth has nothing left to give: that is logged at **error** level (and to the
@@ -1700,6 +1707,8 @@ What it gives you (browse to the listen address):
   the controls to start one, refresh it, promote a replica or detach. Same
   operations as JSON at `/api/replication` and `/api/peers` — see
   "Cross-host replication" above.
+- **JSON admin API** (`/api/…`) — everything above, for programs (app-lb's
+  pg-fc plugin reads it). See "JSON admin API" below.
 - **Logs** — tail the pooler log (`/logs/pooler`), the heyvmd log
   (`/logs/heyvmd`), and any VM's in-guest Postgres log (`/logs/vm/<id>`).
 - **Controls** — stop / start / reboot / resize any VM from its detail page.
@@ -1825,6 +1834,55 @@ endpoint is logged and never blocks the pooler. Rules persist to
 sibling of the schema registry) and survive restarts — including the paused
 flag; the firing state is in-memory, so a restart re-evaluates cleanly rather
 than replaying a stale edge.
+
+### JSON admin API
+
+The dashboard listener also serves a JSON API with the same reads and
+actions as the pages, behind the same Basic auth. It is keyed by **schema**
+(the database name clients connect with) rather than sandbox id, because a
+schema outlives its VMs: an offload deletes the VM and a restore creates a
+new one. The wire types live in the `pg-fc-api` crate (`api/`), which
+app-lb's pg-fc plugin depends on too, so the two sides cannot drift.
+
+| Route | What it does |
+|---|---|
+| `GET /api/health` | Version, uptime, listen address, warm/known schema counts, configured tiers. In-memory only. |
+| `GET /api/schemas[?tier=&q=]` | Every schema on every tier (`live`, `compacted`, `frozen`, `archived`, `pending`; `warm` filters to checked-in VMs), with sessions, slots and idle time when warm. |
+| `GET /api/schemas/{schema}` | One schema, plus live `db_size_bytes`/`backends` when warm. |
+| `POST /api/schemas/{schema}/{start,stop,reboot,resize,reap,restore,archive-image}` | The VM page's buttons. `resize` takes `{"size_class":"small"}`. Returns 409 for a pinned schema, or for a power action on an offloaded one. The long actions answer 202 and report in `/api/events`. |
+| `GET /api/host` | Host CPU/memory, disks, spare shelf, and schema counts by tier. |
+| `GET /api/events[?limit=&since=]` | The events journal, newest first. |
+| `GET /api/logs/{pooler,heyvmd}[?lines=]` and `GET /api/logs/schema/{schema}` | Log tails as JSON lines. The schema log is read from inside the VM. |
+| `POST /api/maintenance/{sweep,ttl-sweep,reclaim,stop-idle,purge}` | The monitoring page's buttons. `ttl-sweep` takes `{"ttl_secs":N}`. |
+| `GET /api/config`, `PUT /api/config` | Runtime configuration (below). |
+
+#### Runtime configuration
+
+A few knobs can change without a restart, which would drop every client
+session on the host:
+
+- `idle_timeout_secs`, `idle_timeout_fast_secs` (`0` turns the short timeout off)
+- `warm_spares`
+- `compact_after_secs`, `freeze_after_secs`, `archive_after_secs`
+
+`PUT /api/config` takes any subset of them; absent fields are left unchanged.
+The loops that use these knobs re-read them on every pass. Overrides are saved
+to `runtime-config.json` beside the registry file and applied over the
+environment at boot, so they survive a restart.
+
+`GET` reports each knob's effective value and where it came from (`override`,
+`env` or `default`). It also lists the env-only settings as read-only.
+
+A knob can only change if its subsystem was on at boot. For example, if
+`PG_VM_POOL_ARCHIVE_AFTER_SECS` was unset, the S3 tier has no loop and no
+credentials, so `archive_after_secs` is refused with a 400 until you set the
+variable and restart.
+
+```sh
+curl -u admin:secret http://127.0.0.1:8080/api/config
+curl -u admin:secret -X PUT http://127.0.0.1:8080/api/config \
+  -H 'content-type: application/json' -d '{"idle_timeout_secs": 300}'
+```
 
 ### Testing
 

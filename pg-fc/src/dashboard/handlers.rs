@@ -18,7 +18,7 @@ use super::{host, logs, model, views};
 
 /// Lifecycle actions can be slow (a cold boot re-runs init.sh), so give them a
 /// generous bound — but still bound them, so one wedged VM can't hang a request.
-const ACTION_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const ACTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One-shot status banner carried across a redirect (`?msg=` / `?err=`).
 #[derive(Deserialize, Default)]
@@ -301,13 +301,13 @@ pub async fn logs_vm(
 
 // ---- control actions -------------------------------------------------------
 
-enum Lifecycle {
+pub(super) enum Lifecycle {
     Start,
     Stop,
     Reboot,
 }
 
-async fn run_lifecycle(id: &str, act: Lifecycle) -> anyhow::Result<()> {
+pub(super) async fn run_lifecycle(id: &str, act: Lifecycle) -> anyhow::Result<()> {
     use anyhow::Context;
     let sb = Sandbox::connect(id.to_string(), vm::local_opts()).context("connecting to VM")?;
     let fut = async move {

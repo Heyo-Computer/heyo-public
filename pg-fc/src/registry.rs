@@ -357,10 +357,22 @@ const URGENT_GROW_WATCH_MARGIN_PCT: f64 = 15.0;
 /// stop.
 const URGENT_GROW_STOP_MARGIN: Duration = Duration::from_secs(10);
 
-/// Cap on devices the urgent grower resizes in one pass. Each one drops a
-/// schema's live sessions, so a pass that finds many trickles instead of
-/// restarting the whole warm set at once.
+/// Cap on devices the urgent grower resizes **offline** in one pass. Each
+/// offline grow drops a schema's live sessions, so a pass that needs many
+/// trickles instead of restarting the whole warm set at once. Online grows
+/// drop nothing and are not capped.
 const URGENT_GROW_MAX_PER_PASS: usize = 4;
+
+/// How [`SchemaRegistry::grow_device_now`] grew a device, or that it didn't.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UrgentGrow {
+    /// Grown under the running VM; no session was dropped.
+    Online,
+    /// Stopped and grown offline; the next connect boots it.
+    Offline,
+    /// Not this pass's to grow after all. Not a failure.
+    Skipped,
+}
 
 /// How many warm schemas the urgent grower samples at once. Each sample uses
 /// its own schema's housekeeping pool, so this bounds pooler-side concurrency
@@ -602,6 +614,9 @@ pub struct SchemaRegistry {
     physical: Arc<crate::replication::PhysicalStore>,
     physical_sources: Arc<crate::replication::PhysicalSourceStore>,
     replication_ops: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    // The knobs `PUT /api/config` may change while the pooler runs. The loops
+    // that use them read here on every pass rather than off `cfg`.
+    runtime: Arc<crate::runtime_config::RuntimeConfig>,
 }
 
 impl SchemaRegistry {
@@ -614,8 +629,12 @@ impl SchemaRegistry {
             .reclaim
             .as_ref()
             .map(|r| Arc::new(Reclaimer::new(r.cmd.clone(), cfg.run_dir.clone())));
-        let spares = (cfg.warm_spares > 0)
-            .then(|| Arc::new(SparePool::new(cfg.warm_spares, cfg.chilled_vehicles)));
+        let runtime = Arc::new(crate::runtime_config::RuntimeConfig::load(&cfg));
+        let spares = (cfg.warm_spares > 0).then(|| {
+            // A persisted override outranks the env's count from the first pass.
+            let target = runtime.warm_spares().unwrap_or(cfg.warm_spares);
+            Arc::new(SparePool::new(target, cfg.chilled_vehicles))
+        });
         // The dump server has two consumers: the frozen tier (freeze + thaw)
         // and the S3 archive tier, whose dumps *stream* through it so they
         // never touch the guest's data disk. Either one enables it.
@@ -651,7 +670,23 @@ impl SchemaRegistry {
             replication_ops: StdMutex::new(HashMap::new()),
             repl_status: StdMutex::new(HashMap::new()),
             repl_inactive: StdMutex::new(HashMap::new()),
+            runtime,
         })
+    }
+
+    /// The runtime-mutable knobs and where each came from.
+    pub fn runtime(&self) -> &Arc<crate::runtime_config::RuntimeConfig> {
+        &self.runtime
+    }
+
+    /// Apply a `PUT /api/config` patch and push the parts that live outside
+    /// the knob store (the spare pool's target) to where they are read.
+    pub fn apply_runtime(&self, patch: pg_fc_api::RuntimeKnobs) -> Result<pg_fc_api::RuntimeKnobs, String> {
+        let eff = self.runtime.apply(patch)?;
+        if let (Some(pool), Some(n)) = (&self.spares, eff.warm_spares) {
+            pool.set_target(n);
+        }
+        Ok(eff)
     }
 
     /// The trusted peer nodes — what the replication API and dashboard mutate.
@@ -1244,7 +1279,7 @@ impl SchemaRegistry {
     /// The configured idle-reaping timeout (`None` when reaping is disabled), so
     /// a dashboard can label how close a warm VM is to being stopped.
     pub fn idle_timeout(&self) -> Option<Duration> {
-        self.cfg.idle_timeout
+        self.runtime.idle_timeout()
     }
 
     /// Whether the S3 eviction tier is configured — gates the dashboard's manual
@@ -1380,8 +1415,8 @@ impl SchemaRegistry {
                     free_slots: e.free_slots(),
                     slot_limit: e.slot_limit(),
                     idle_secs: e.idle_for().as_secs(),
-                    idle_budget_secs: self.cfg.idle_timeout.map(|t| {
-                        e.idle_budget(t, self.cfg.idle_timeout_fast, self.cfg.fast_bringup)
+                    idle_budget_secs: self.runtime.idle_timeout().map(|t| {
+                        e.idle_budget(t, self.runtime.idle_timeout_fast(), self.cfg.fast_bringup)
                             .as_secs()
                     }),
                     bringup_ms: e.bringup_took.as_millis(),
@@ -2082,9 +2117,14 @@ impl SchemaRegistry {
             ),
         }
         // Reaper `tick` is already short, so first pass and steady state match.
+        // The timeouts are re-read every pass so `PUT /api/config` takes
+        // effect without a restart; the tick stays as paced at boot.
         tokio::spawn(supervise("idle-reaper", tick, tick, move || {
             let registry = registry.clone();
-            async move { registry.reap_idle(timeout, tick).await }
+            async move {
+                let timeout = registry.runtime.idle_timeout().unwrap_or(timeout);
+                registry.reap_idle(timeout, tick).await
+            }
         }));
     }
 
@@ -2111,7 +2151,7 @@ impl SchemaRegistry {
     ///
     /// Returns how many VMs were stopped, for the supervisor's heartbeat.
     async fn reap_idle(self: &Arc<Self>, timeout: Duration, tick: Duration) -> usize {
-        let fast = self.cfg.idle_timeout_fast;
+        let fast = self.runtime.idle_timeout_fast();
         let fast_bringup = self.cfg.fast_bringup;
         // Sized from the durable live-tier count, not the warm map: see
         // [`drain_allowance`] for why the divisor must not shrink mid-drain.
@@ -2639,9 +2679,10 @@ impl SchemaRegistry {
     /// Routine housekeeping: the configured thresholds, cheapest job first.
     fn offload_policy(&self) -> OffloadPolicy {
         OffloadPolicy {
-            compact_after: self.cfg.compact.as_ref().map(|c| c.compact_after.as_secs()),
-            freeze_after: self.cfg.freeze.as_ref().map(|f| f.freeze_after.as_secs()),
-            archive_after: self.cfg.archive.as_ref().map(|a| a.archive_after.as_secs()),
+            // Runtime knobs: `None` exactly when the tier is not configured.
+            compact_after: self.runtime.compact_after().map(|d| d.as_secs()),
+            freeze_after: self.runtime.freeze_after().map(|d| d.as_secs()),
+            archive_after: self.runtime.archive_after().map(|d| d.as_secs()),
             image_archive: self.image_archive_enabled(),
             no_boot: false,
             mode: OffloadMode::Routine,
@@ -2703,7 +2744,7 @@ impl SchemaRegistry {
         };
         info!(
             "warm-spare pool: keeping {} pre-booted VM(s) ready for claiming",
-            self.cfg.warm_spares.min(crate::spares::MAX_SPARES)
+            pool.target()
         );
         let registry = self.clone();
         // Claiming (or failure-killing) a spare pokes the wake handle, so the
@@ -2741,20 +2782,23 @@ impl SchemaRegistry {
     /// busy schema on its own. Inside the guest, `init.sh`'s watcher extends
     /// the *filesystem* online as it fills, and then retires
     /// (`filesystem spans $DATA_DEV; watcher done`) — from that moment the
-    /// *device* is the binding constraint. Growing the device is offline-only
-    /// (the daemon fscks and cold-boots the disk to do it), and its one
-    /// trigger was the idle-stop path in [`Self::reap_idle`]. A schema under
+    /// *device* is the binding constraint. Growing the device used to be
+    /// offline-only (the daemon fscks and cold-boots the disk to do it), and
+    /// its one trigger was the idle-stop path in [`Self::reap_idle`]. A schema under
     /// continuous write load never goes idle, so it never reaches that
     /// trigger: it fills its device, Postgres starts failing writes with
     /// `No space left on device`, and it stays that way until its traffic
     /// happens to pause for a whole idle timeout. The busiest schemas were
     /// precisely the ones that could not grow.
     ///
-    /// So this loop trades the idle-stop path's patience for a stop it
-    /// schedules itself, and pays for that with a much higher threshold
-    /// ([`crate::config::DiskGrowConfig::urgent_pct`], default 95% vs. 85%):
-    /// the cheap path keeps handling everything that does go idle, and this
-    /// one only touches schemas that are actually at the wall.
+    /// So this loop grows warm devices itself. It tries the daemon's online
+    /// resize first, which grows the device and filesystem under the running
+    /// VM and drops nothing; only when that is unavailable (an older heyvmd,
+    /// or a failure partway) does it stop the VM and resize offline, at most
+    /// [`URGENT_GROW_MAX_PER_PASS`] per pass. The threshold
+    /// ([`crate::config::DiskGrowConfig::urgent_pct`], default 95% vs. 85%)
+    /// was set for that offline cost; once every host's heyvmd has the online
+    /// route it can come down, since firing early then costs nothing.
     pub fn spawn_disk_grower(self: &Arc<Self>) {
         let Some(gc) = self.cfg.disk_grow else {
             // `spawn_reaper` already logs that growth is off entirely.
@@ -2771,9 +2815,10 @@ impl SchemaRegistry {
         info!(
             "urgent device growth: a warm VM whose data fs is >= {urgent:.0}% full and spans \
              its device, or is filling fast enough to get there before its next check, is \
-             stopped, resized (doubling, cap {}GiB) and left for the next connect to boot — \
-             checked every {:?}, or every {:?} while filling or within {:.0} points of the \
-             threshold; at most {} per pass",
+             grown (doubling, cap {}GiB) online under the running VM, falling back to stop, \
+             resize and boot on the next connect when the daemon can't — checked every {:?}, \
+             or every {:?} while filling or within {:.0} points of the threshold; at most {} \
+             offline grows per pass",
             gc.max_gb,
             URGENT_GROW_CHECK_INTERVAL,
             URGENT_GROW_FAST_INTERVAL,
@@ -2847,6 +2892,7 @@ impl SchemaRegistry {
             .await;
 
         let mut grown = 0usize;
+        let mut grown_offline = 0usize;
         for (schema, sample, at) in samples {
             let Some((fs, dev)) = sample else { continue };
             // The sample already answers the question `disk_gb` exists to
@@ -2887,15 +2933,14 @@ impl SchemaRegistry {
                     self.grow_backoff.record_failure(&schema, Instant::now());
                 }
                 GrowVerdict::Grow(target) => {
-                    // Bound the blast radius: each grow drops a schema's live
-                    // sessions, so a pass that found many of them trickles
-                    // rather than restarting the whole warm set at once.
-                    if grown >= URGENT_GROW_MAX_PER_PASS {
-                        continue;
-                    }
+                    // Bound the blast radius: an offline grow drops a schema's
+                    // live sessions, so a pass that needs many of them trickles
+                    // rather than restarting the whole warm set at once. Online
+                    // grows drop nothing and are not counted.
+                    let allow_offline = grown_offline < URGENT_GROW_MAX_PER_PASS;
                     // Say so when it is the projection that crossed, not the
-                    // reading: the stop is about to drop live sessions on a
-                    // filesystem that still has room — just not for long.
+                    // reading: the grow fires on a filesystem that still has
+                    // room — just not for long.
                     if grow_verdict(fs, dev, urgent, gc.max_gb) == GrowVerdict::NotNeeded {
                         info!(
                             "schema {schema}: data fs is {:.0}% full and filling at {}/s — \
@@ -2904,18 +2949,22 @@ impl SchemaRegistry {
                             crate::orphans::human_iec(reading.rate.unwrap_or(0.0).max(0.0) as u64),
                         );
                     }
-                    match self.grow_device_now(&schema, target).await {
-                        Ok(true) => {
+                    match self.grow_device_now(&schema, target, allow_offline).await {
+                        Ok(kind @ (UrgentGrow::Online | UrgentGrow::Offline)) => {
                             grown += 1;
+                            if kind == UrgentGrow::Offline {
+                                grown_offline += 1;
+                            }
                             self.grow_backoff.clear(&schema);
                             // A new device: the next bring-up starts a fresh
                             // baseline rather than dividing across the resize.
                             self.urgent_samples.lock().unwrap().remove(&schema);
                         }
-                        // Lost a race to an offload, or the schema went cold
-                        // under us. Neither is this schema's fault, so it
+                        // Lost a race to an offload, the schema went cold under
+                        // us, or it needs an offline grow this pass has no
+                        // budget left for. None is this schema's fault, so it
                         // keeps its clean backoff record.
-                        Ok(false) => {}
+                        Ok(UrgentGrow::Skipped) => {}
                         Err(e) => {
                             let (n, hold) =
                                 self.grow_backoff.record_failure(&schema, Instant::now());
@@ -2937,10 +2986,22 @@ impl SchemaRegistry {
         grown
     }
 
-    /// Grow one warm schema's data device now: claim it, stop it, resize, and
-    /// leave it for the next connect to boot.
+    /// Grow one warm schema's data device now.
     ///
-    /// Unlike every other exclusive operation in this file, this one does
+    /// Online first: the daemon grows the device and the guest filesystem
+    /// under the running VM and verifies both, so nothing is claimed, stopped
+    /// or dropped, and the entry keeps serving throughout. The daemon
+    /// serializes it against any stop on the same VM, so an offload that
+    /// races it either finds the device already grown or makes the online
+    /// grow answer 409.
+    ///
+    /// When the online route can't do it — a daemon without it, a VM that is
+    /// not running, a failure partway — and `allow_offline` is set, fall back
+    /// to the offline grow: claim it, stop it, resize, and leave it for the
+    /// next connect to boot. Without `allow_offline` the schema is skipped
+    /// and retried next pass.
+    ///
+    /// Unlike every other exclusive operation in this file, the offline grow does
     /// **not** refuse when the entry has live sessions. A schema that never
     /// goes idle is exactly the one this path exists for, and by the time it
     /// qualifies its database is out of room or seconds from it — those
@@ -2952,18 +3013,68 @@ impl SchemaRegistry {
     /// knows how to reattach by id and boot it — routing through that one path
     /// keeps the bring-up gate, the pending ledger and the failure bookkeeping
     /// in charge of the boot instead of duplicating all three here.
-    /// `Ok(true)` grew the device; `Ok(false)` means this schema was not this
-    /// pass's to touch after all (an offload claimed it, or it went cold
-    /// between the sample and here) — a race, not a failure, so the caller
-    /// must not put it in a backoff window for it. `Err` is a real failure.
-    async fn grow_device_now(&self, schema: &str, target: u64) -> Result<bool> {
+    /// `Online`/`Offline` grew the device that way; `Skipped` means this
+    /// schema was not this pass's to touch after all (an offload claimed it,
+    /// it went cold between the sample and here, or it needs an offline grow
+    /// and `allow_offline` is false) — not a failure, so the caller must not
+    /// put it in a backoff window for it. `Err` is a real failure.
+    async fn grow_device_now(
+        &self,
+        schema: &str,
+        target: u64,
+        allow_offline: bool,
+    ) -> Result<UrgentGrow> {
+        let warm_id = {
+            let map = self.entries.lock().await;
+            map.get(schema).and_then(|cell| cell.get()).map(|entry| entry.sandbox_id())
+        };
+        let Some(id) = warm_id else {
+            debug!("schema {schema} is no longer warm; leaving its device to the next pass");
+            return Ok(UrgentGrow::Skipped);
+        };
+        if self.is_archiving(schema) {
+            debug!("schema {schema}: an offload claimed it first; skipping this grow");
+            return Ok(UrgentGrow::Skipped);
+        }
+        let online = vm::resize_disk_online(&id, target).await.with_context(|| {
+            format!("growing schema {schema}'s data device to {target}GiB online")
+        })?;
+        match online {
+            vm::OnlineGrow::Grown => {
+                // Recorded the moment it is real, as the offline path does.
+                self.store.set_disk_gb(schema, target as u32);
+                info!(
+                    "schema {schema}: data device and filesystem grown to {target}GiB online \
+                     ({id} kept running; no sessions dropped)"
+                );
+                crate::events::journal_info(
+                    "disk-grow",
+                    format!("schema {schema}: online device grow to {target}GiB ({id})"),
+                );
+                return Ok(UrgentGrow::Online);
+            }
+            vm::OnlineGrow::FallBack(why) if !allow_offline => {
+                info!(
+                    "schema {schema}: online grow to {target}GiB unavailable ({why}) and this \
+                     pass's offline grows are spent; retrying next pass"
+                );
+                return Ok(UrgentGrow::Skipped);
+            }
+            vm::OnlineGrow::FallBack(why) => {
+                warn!(
+                    "schema {schema}: online grow to {target}GiB unavailable ({why}); falling \
+                     back to the offline grow"
+                );
+            }
+        }
+
         // The same claim an offload takes. `checkout` waits on this set, so a
         // client arriving mid-resize queues at the front door instead of
         // racing the stop/start — and no offload can pick this schema while
         // its VM is halfway through a resize.
         let Some(_guard) = ArchivingGuard::claim(&self.archiving, schema) else {
             debug!("schema {schema}: an offload claimed it first; skipping this grow");
-            return Ok(false);
+            return Ok(UrgentGrow::Skipped);
         };
 
         // Take the entry out of the map, but only once it is actually
@@ -2986,7 +3097,7 @@ impl SchemaRegistry {
                         "schema {schema} is no longer warm (gone cold, or a bring-up is in \
                          flight); leaving its device to the next pass"
                     );
-                    return Ok(false);
+                    return Ok(UrgentGrow::Skipped);
                 }
             }
         };
@@ -3026,7 +3137,7 @@ impl SchemaRegistry {
                  {sessions} session(s) dropped"
             ),
         );
-        Ok(true)
+        Ok(UrgentGrow::Offline)
     }
 
     pub fn spawn_pressure_reaper(self: &Arc<Self>) {
@@ -3402,7 +3513,7 @@ impl SchemaRegistry {
             bail!("an eviction sweep is already running");
         }
         let registry = self.clone();
-        let after = archive.archive_after;
+        let after = self.runtime.archive_after().unwrap_or(archive.archive_after);
         tokio::spawn(async move {
             let n = registry.sweep_archive(after).await;
             info!("manual eviction sweep finished: archived {n} schema(s)");

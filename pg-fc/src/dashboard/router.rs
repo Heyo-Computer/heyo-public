@@ -5,7 +5,7 @@ use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::Router;
 
-use super::{archives, auth, dedicated, handlers, replication, state::DashState};
+use super::{api, archives, auth, dedicated, handlers, replication, state::DashState};
 
 pub fn build(state: DashState) -> Router {
     Router::new()
@@ -20,6 +20,18 @@ pub fn build(state: DashState) -> Router {
             get(dedicated::api_list).post(dedicated::api_create),
         )
         .route("/api/databases/{database}", delete(dedicated::api_delete))
+        // The JSON admin API for programs (app-lb's pg-fc plugin): the same
+        // reads and actions as the pages, keyed by schema. See `api`.
+        .route("/api/health", get(api::health))
+        .route("/api/schemas", get(api::schemas))
+        .route("/api/schemas/{schema}", get(api::schema))
+        .route("/api/schemas/{schema}/{action}", post(api::schema_action))
+        .route("/api/host", get(api::host))
+        .route("/api/events", get(api::events))
+        .route("/api/logs/schema/{schema}", get(api::schema_log))
+        .route("/api/logs/{which}", get(api::host_log))
+        .route("/api/maintenance/{op}", post(api::maintenance))
+        .route("/api/config", get(api::config).put(api::put_config))
         // Cross-host logical replication: peers, pairings, and the
         // node-to-node endpoints a peer drives. All under the same Basic-auth
         // layer — peering is a full trust relationship, and the credential a

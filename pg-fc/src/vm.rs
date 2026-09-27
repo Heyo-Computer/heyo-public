@@ -2865,6 +2865,87 @@ async fn resize_disk_at(base_url: &str, sandbox_id: &str, target_gb: u64) -> Res
     Ok(())
 }
 
+/// What an online device grow came to. See [`resize_disk_online`].
+#[derive(Debug)]
+pub(crate) enum OnlineGrow {
+    /// The device and the guest filesystem on it both reached the target and
+    /// the daemon verified it from inside the guest. Nothing was stopped.
+    Grown,
+    /// The online route could not do it, for a reason the offline resize can
+    /// get past: an older daemon without the route (404), a VM that is not
+    /// running (409), or a failure partway through (5xx, or no answer). Each
+    /// leaves the VM as the offline path expects to find it — at worst a
+    /// backing file or device larger than its filesystem, which the offline
+    /// resize's host-side `resize2fs` finishes.
+    FallBack(String),
+}
+
+/// Grow a **running** sandbox's data device to `target_gb` without stopping
+/// it, through the daemon's online workspace resize
+/// (`POST /sandboxes/{id}/resize-online` with `disk_size_gb`).
+///
+/// The daemon extends the backing file, tells Firecracker the drive grew,
+/// runs `resize2fs` in the guest and verifies both sizes before answering, so
+/// `Grown` means the space is usable now. Sessions, the tunnel and the
+/// housekeeping pool are untouched.
+///
+/// `Err` only for a request the daemon refused as invalid (400: a shrink, a
+/// size past its cap, host storage below its reserve). The offline resize
+/// would refuse it the same way, so falling back would just fail slower.
+pub(crate) async fn resize_disk_online(sandbox_id: &str, target_gb: u64) -> Result<OnlineGrow> {
+    resize_disk_online_at(daemon_base_url(), sandbox_id, target_gb).await
+}
+
+/// [`resize_disk_online`] against an explicit daemon base URL.
+async fn resize_disk_online_at(
+    base_url: &str,
+    sandbox_id: &str,
+    target_gb: u64,
+) -> Result<OnlineGrow> {
+    anyhow::ensure!(
+        (1..=u64::from(DAEMON_MAX_DISK_GB)).contains(&target_gb),
+        "disk_size_gb must be within 1–{DAEMON_MAX_DISK_GB} GiB (daemon limit)"
+    );
+    let url = format!("{base_url}/sandboxes/{sandbox_id}/resize-online");
+    // No cold boot inside: the daemon bounds its in-guest grow and
+    // verification at 120s + 60s, and the file extend is one fallocate.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(240))
+        .build()
+        .context("building HTTP client for daemon online resize")?;
+    let resp = match client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(format!("{{\"disk_size_gb\":{target_gb}}}"))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Ok(OnlineGrow::FallBack(format!(
+                "online resize request failed: {e}"
+            )))
+        }
+    };
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(OnlineGrow::Grown);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let body = body.trim();
+    match status {
+        reqwest::StatusCode::BAD_REQUEST => {
+            bail!("daemon online workspace resize returned {status}: {body}")
+        }
+        reqwest::StatusCode::NOT_FOUND if body.is_empty() => Ok(OnlineGrow::FallBack(
+            "the deployed heyvmd has no online resize route".to_string(),
+        )),
+        _ => Ok(OnlineGrow::FallBack(format!(
+            "daemon online workspace resize returned {status}: {body}"
+        ))),
+    }
+}
+
 /// Remaining slots in heyvm's process-wide create gate, or `None` when it has
 /// not been sampled (or the daemon did not report one).
 ///
@@ -4338,6 +4419,88 @@ mod tests {
         // Exactly the SDK's ResizeDiskRequest shape, addressed to the right VM.
         assert_eq!(seen[0].0, "sb-abc123");
         assert_eq!(seen[0].1, r#"{"disk_size_gb":8}"#);
+    }
+
+    /// Spin an in-process daemon stub for the online route; answers every
+    /// request with `status` and `body`.
+    async fn online_resize_stub(
+        status: axum::http::StatusCode,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+        use axum::extract::Path as AxPath;
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+        let log = seen.clone();
+        let app = axum::Router::new().route(
+            "/sandboxes/{id}/resize-online",
+            axum::routing::post(move |AxPath(id): AxPath<String>, req_body: String| {
+                log.lock().unwrap().push((id, req_body));
+                async move { (status, body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(axum::serve(listener, app).into_future());
+        (base, seen)
+    }
+
+    #[tokio::test]
+    async fn resize_disk_online_posts_the_daemon_wire_format() {
+        let (base, seen) = online_resize_stub(axum::http::StatusCode::OK, "{}").await;
+        let grown = resize_disk_online_at(&base, "sb-abc123", 8).await.unwrap();
+        assert!(matches!(grown, OnlineGrow::Grown), "{grown:?}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "sb-abc123");
+        assert_eq!(seen[0].1, r#"{"disk_size_gb":8}"#);
+    }
+
+    /// Everything the offline resize can get past falls back to it; only a
+    /// request the daemon calls invalid is an error, since offline would
+    /// refuse it too.
+    #[tokio::test]
+    async fn resize_disk_online_falls_back_unless_the_request_is_invalid() {
+        use axum::http::StatusCode;
+        for (status, body) in [
+            (StatusCode::CONFLICT, "sandbox sb-x is not running; resize it offline"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "in-guest filesystem grow failed (exit 127)"),
+            (StatusCode::NOT_FOUND, "Sandbox not found: sb-x"),
+        ] {
+            let (base, _) = online_resize_stub(status, body).await;
+            match resize_disk_online_at(&base, "sb-x", 8).await.unwrap() {
+                OnlineGrow::FallBack(why) => {
+                    assert!(why.contains(status.as_str()) && why.contains(body), "{why}")
+                }
+                other => panic!("{status} must fall back, got {other:?}"),
+            }
+        }
+
+        let (base, _) = online_resize_stub(
+            StatusCode::BAD_REQUEST,
+            "workspace disk cannot shrink from 8 to 4 GiB",
+        )
+        .await;
+        let err = resize_disk_online_at(&base, "sb-x", 8).await.unwrap_err().to_string();
+        assert!(err.contains("400") && err.contains("cannot shrink"), "{err}");
+    }
+
+    /// A daemon that predates the route answers an empty-bodied 404 — the
+    /// capability probe. It must read as "resize offline", not as a failure.
+    #[tokio::test]
+    async fn resize_disk_online_treats_a_missing_route_as_unsupported() {
+        // This stub serves only the offline route.
+        let (base, _) = resize_stub(axum::http::StatusCode::OK, "{}").await;
+        match resize_disk_online_at(&base, "sb-x", 8).await.unwrap() {
+            OnlineGrow::FallBack(why) => assert!(why.contains("no online resize route"), "{why}"),
+            other => panic!("a missing route must fall back, got {other:?}"),
+        }
+        // No daemon at all falls back too; the offline call then reports it.
+        match resize_disk_online_at("http://127.0.0.1:9", "sb-x", 8).await.unwrap() {
+            OnlineGrow::FallBack(why) => assert!(why.contains("request failed"), "{why}"),
+            other => panic!("an unreachable daemon must fall back, got {other:?}"),
+        }
+        let (base, seen) = online_resize_stub(axum::http::StatusCode::OK, "{}").await;
+        assert!(resize_disk_online_at(&base, "sb-x", 251).await.is_err());
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

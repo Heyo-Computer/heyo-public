@@ -1506,6 +1506,28 @@ pub struct DiskInventory {
     pub extra: Extra,
 }
 
+/// `GET /api/plugins` and `/api/plugins/:id` — a built-in plugin, its stored
+/// record and its live status.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct PluginView {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for `config`. Advisory; app-lb validates on write.
+    pub config_schema: Value,
+    pub enabled: bool,
+    /// Kept while disabled, so re-enabling does not lose it.
+    pub config: Value,
+    pub updated_at: u64,
+    /// Why the last apply failed. A plugin can be enabled *and* failing.
+    pub last_error: Option<String>,
+    /// Whatever the plugin reports about itself; shape is per plugin.
+    pub status: Value,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

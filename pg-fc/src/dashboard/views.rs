@@ -191,7 +191,7 @@ pub fn dedicated_page(
                                     }
                                 }
                                 td {
-                                    @match r.tier {
+                                    @match r.tier.as_deref() {
                                         Some(t) => span.badge.s-stopped { (t) },
                                         None => span.dim { "—" },
                                     }

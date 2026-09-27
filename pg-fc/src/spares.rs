@@ -124,7 +124,9 @@ const SPARE_CHILL_CONCURRENCY: usize = 2;
 const SPARE_PERMIT_WAIT: Duration = Duration::from_secs(15);
 
 pub struct SparePool {
-    target: usize,
+    /// Atomic so `PUT /api/config` can move it while the replenisher runs;
+    /// every pass reads it fresh.
+    target: std::sync::atomic::AtomicUsize,
     /// How many spares to keep chilled — see [`Self::chilled`].
     chilled_target: usize,
     /// Sandbox ids claimed by this process (bound to a schema, or mid-claim).
@@ -186,7 +188,7 @@ pub struct SparePool {
 impl SparePool {
     pub fn new(target: usize, chilled_target: usize) -> Self {
         Self {
-            target: target.min(MAX_SPARES),
+            target: std::sync::atomic::AtomicUsize::new(target.min(MAX_SPARES)),
             chilled_target: chilled_target.min(MAX_SPARES),
             claimed: StdMutex::new(HashSet::new()),
             ready: StdMutex::new(VecDeque::new()),
@@ -194,6 +196,20 @@ impl SparePool {
             sick_since: StdMutex::new(HashMap::new()),
             poke: Arc::new(Notify::new()),
         }
+    }
+
+    /// How many warm spares the replenisher keeps on the shelf.
+    pub fn target(&self) -> usize {
+        self.target.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Move the target (capped at [`MAX_SPARES`]) and wake the replenisher so
+    /// a raise is acted on now rather than at the next tick. A lowered target
+    /// only stops the shelf being refilled past it; spares already on it stay
+    /// until claimed.
+    pub fn set_target(&self, target: usize) {
+        self.target.store(target.min(MAX_SPARES), std::sync::atomic::Ordering::Relaxed);
+        self.poke.notify_one();
     }
 
     /// Handle the replenisher's supervisor selects on alongside its tick.
@@ -214,7 +230,7 @@ impl SparePool {
     /// configured pool size — the dashboard's pool-depth readout. Zero ready
     /// means the next cold connect pays a full create + boot + initdb.
     pub fn depth(&self) -> (usize, usize) {
-        (self.ready.lock().unwrap().len(), self.target)
+        (self.ready.lock().unwrap().len(), self.target())
     }
 
     /// `(chilled, target)`: stopped vehicles on the shelf vs the configured
@@ -506,7 +522,7 @@ impl SparePool {
             .collect();
         let plan = {
             let claimed = self.claimed.lock().unwrap();
-            plan_replenish(&plan_input, bound, &claimed, self.target)
+            plan_replenish(&plan_input, bound, &claimed, self.target())
         };
 
         // Nothing is built while clients are queued for bring-ups. Every spare
@@ -578,12 +594,12 @@ impl SparePool {
         vm::refresh_create_gate().await;
 
         let (chilled_depth, chilled_target) = self.chilled_depth();
-        if acted > 0 || shelved < self.target || chilled_depth < chilled_target {
+        if acted > 0 || shelved < self.target() || chilled_depth < chilled_target {
             info!(
                 "warm-spares: pass done — {shelved}/{} ready, {chilled_depth}/{chilled_target} \
                  chilled, restarted {}, created {}, chilled {chilled_now}, deleted {} surplus, \
                  {} sick",
-                self.target,
+                self.target(),
                 plan.start.len(),
                 plan.create,
                 plan.delete.len(),
@@ -968,8 +984,8 @@ mod tests {
 
     #[test]
     fn target_is_capped() {
-        assert_eq!(SparePool::new(100, 0).target, MAX_SPARES);
-        assert_eq!(SparePool::new(2, 0).target, 2);
+        assert_eq!(SparePool::new(100, 0).target(), MAX_SPARES);
+        assert_eq!(SparePool::new(2, 0).target(), 2);
     }
 
     #[test]

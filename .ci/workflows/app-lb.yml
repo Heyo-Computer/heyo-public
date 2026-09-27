@@ -32,9 +32,9 @@ on:
   submit:
     paths:
       # app-lb's subtree covers `app-lb/heyctl/` too — `**` crosses segments.
-      # The workspace has no path dependency outside its own directory, so
-      # unlike the `heyo` monorepo there is no sibling crate to list here.
       - 'app-lb/**'
+      # The one path dependency outside it: the pg-fc plugin's wire types.
+      - 'pg-fc/api/**'
       # This workflow and the image it builds in — named precisely rather than
       # as `.ci/**`, so adding a workflow for another crate here does not
       # rebuild this one. The image is shared with `app-obs.yml`, so editing
