@@ -6,7 +6,7 @@ the disposable SSL_CERT_FILE. Certificate and hostname verification stay enabled
 import base64, concurrent.futures, hashlib, json, os, pathlib, socket, subprocess, tempfile, threading, time, urllib.request, urllib.error
 from regional_app import RegionalApp, server
 
-BINARY = str(pathlib.Path(__file__).resolve().parents[1] / 'target/debug/app-lb')
+BINARY = os.environ.get('APP_LB_TEST_BINARY', str(pathlib.Path(__file__).resolve().parents[1] / 'target/debug/app-lb'))
 
 def port():
     with socket.socket() as s:

@@ -272,6 +272,19 @@ jobs:
           ls -la dist
           cat dist/BUILD-INFO
 
+      # Keep the disposable CA feature out of the shipped release binary.
+      # Exercise real proxy traffic, including TLS, rather than only linking.
+      - name: Verify proxy protocol compatibility
+        working-directory: /workspace
+        run: |
+          set -eu
+          export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
+          apt-get update
+          apt-get install -y --no-install-recommends python3 openssl curl
+          cargo build --locked --manifest-path app-lb/Cargo.toml --features reqwest/rustls-tls-native-roots
+          APP_LB_TEST_BINARY="$CARGO_TARGET_DIR/debug/app-lb" python3 -B app-lb/testdata/gateway_smoke.py
+        timeout-minutes: 15
+
       # Lands in whichever sink the orchestrator is configured for — `disk`
       # (CI_ARTIFACT_DIR) by default, or the central `art serve` when
       # CI_ARTIFACT_SINK=artifacts. The workflow does not choose; it uploads.

@@ -1,7 +1,17 @@
 # app-lb
 
 An application load balancer for [heyvm](https://heyo.computer) Firecracker/KVM microVMs,
-built on [Pingora](https://github.com/cloudflare/pingora).
+built on [Pingora 0.9](https://github.com/cloudflare/pingora/releases/tag/0.9.0).
+
+The 0.9 upgrade retains app-lb's routing and process lifecycle. It adopts
+Pingora's default upstream hop-by-hop header sanitization (including headers
+nominated by `Connection`), normalized valid WebSocket upgrades, and bounded
+HTTP/2 defaults (100 concurrent streams and a 64 KiB decoded header list).
+The existing TLS listener still does not advertise HTTP/2 via ALPN; this upgrade
+does not enable a new listener protocol.
+Arbitrary non-WebSocket HTTP upgrades are no longer passed through by default.
+This dependency upgrade does **not** enable graceful binary replacement or
+regional ingress evacuation; host updates still use the existing restart path.
 
 This directory was imported from the standalone
 [`Heyo-Computer/app-lb`](https://github.com/Heyo-Computer/app-lb) repository
@@ -64,7 +74,8 @@ enable it on existing flattened discovery. Hierarchical discovery uses the separ
 `discovery.regional` opt-in below. Fleet registration, coordinated gateway upgrades
 and live two-region acceptance remain separate work.
 
-Run the isolated two-process regression with Python 3 and OpenSSL installed:
+Linux CI runs the isolated two-process regression with Python 3 and OpenSSL.
+To run it separately:
 
 ```sh
 cargo build --locked --manifest-path app-lb/Cargo.toml --features reqwest/rustls-tls-native-roots
@@ -77,6 +88,8 @@ extra feature. The test never disables TLS verification or touches deployed
 services. It checks request preservation, single POST delivery, peer admission,
 WebSocket echo, and a held response body draining across spec replay while new
 traffic uses another local backend.
+Set `APP_LB_TEST_BINARY` to the absolute binary path when using a custom
+`CARGO_TARGET_DIR`; otherwise the test uses `app-lb/target/debug/app-lb`.
 
 The workload is checked in as `testdata/regional_app.py`, rather than depending
 on a temporary app archive. Its region and immutable runtime revision are explicit
