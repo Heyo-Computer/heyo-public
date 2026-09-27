@@ -604,18 +604,21 @@ pub struct DiskGrowConfig {
     /// the on/off switch; sensible range 50–95.
     pub pct: f64,
     /// Guest-filesystem used% at or above which a **warm** VM's device is
-    /// grown without waiting for it to go idle — stop, resize, start, dropping
+    /// grown without waiting for it to go idle — online under the running VM
+    /// when the daemon supports it, else stop, resize, start, dropping
     /// whatever sessions it had.
     ///
     /// Why a second, higher threshold rather than reusing [`Self::pct`]: the
     /// idle-stop grow is free (the VM is stopping anyway), so it can afford to
-    /// fire early. This one costs every live session on the schema, so it must
-    /// fire late — only once the filesystem is genuinely at the wall.
+    /// fire early. The offline fallback costs every live session on the
+    /// schema, so the default fires late — only once the filesystem is
+    /// genuinely at the wall. Where every host's heyvmd has the online resize
+    /// route, that cost is gone and this can be lowered (70–80) to grow early.
     ///
     /// Without it a schema under continuous write load can never grow at all.
     /// The guest's own watcher extends the filesystem *inside* the device and
     /// then exits ("filesystem spans $DATA_DEV; watcher done"); past that only
-    /// a host-side device resize helps, the resize is offline-only, and the
+    /// a host-side device resize helps, the resize was offline-only, and the
     /// one trigger for it was an idle stop that a busy schema never reaches.
     /// The database wedges on `No space left on device` and stays wedged until
     /// its traffic happens to pause for a whole idle timeout.
