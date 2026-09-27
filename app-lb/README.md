@@ -1012,6 +1012,20 @@ disk/workspace cleanup. The separate path makes older servers reject the request
 rather than ignore a safety flag. Ordinary `DELETE /deployments/:id` keeps its
 existing drain-and-teardown behavior.
 
+`DELETE /deployments/:id/retired-record` additionally permits **settled terminal
+rollout history** and read-only release mounts for a managed Firecracker service.
+It requires authenticated fleet-admin access and the current `If-Match` ETag.
+First withdraw routes, scale to zero, drain, and explicitly clean up the approved
+VM generations through the runtime/disk APIs. This endpoint never performs that
+resource cleanup. Both ownership names and historical sandbox IDs must be absent
+from complete runtime and disk inventories. Running, uncertain or unsettled
+rollouts, correlated allocations, workspace state and job history remain blockers.
+Before removing the registration it durably archives the exact spec and state to
+`<state-dir>/retired/<sha256>.json`; these reports are not loaded as deployments.
+Archive failure preserves the registration. Export this report to the operator's
+audit store; the endpoint does not upload it to S3. It does not assert backend
+retirement or prevent an external authority from recreating a deployment.
+
 Before operational cleanup, also inventory references held outside this app-lb
 (Orchestrator, Cloud, service routes and host configuration). This local endpoint
 cannot prove that another authority no longer references a registration.

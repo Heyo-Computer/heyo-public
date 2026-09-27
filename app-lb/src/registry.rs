@@ -791,6 +791,31 @@ impl Registry {
         std::fs::File::open(dir)?.sync_all()
     }
 
+    /// Save the exact spec and completed history outside the startup registry.
+    /// Content addressing makes retries idempotent without rewriting old reports.
+    /// Caller holds the registry and lifecycle guards through record removal.
+    pub fn archive_record(&self, deployment: &Deployment) -> std::io::Result<()> {
+        let _guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.persist_snapshot_inner(deployment, &deployment.state())?;
+        let dir = self.state_dir();
+        let source = dir.join(state_file_name(&deployment.spec.id));
+        let bytes = std::fs::read(&source)?;
+        let archive = dir.join("retired");
+        std::fs::create_dir_all(&archive)?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        let target = archive.join(format!("{:x}.json", Sha256::digest(&bytes)));
+        match std::fs::hard_link(&source, &target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::read(&target)? != bytes {
+                    return Err(std::io::Error::other("retired record archive content mismatch"));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        std::fs::File::open(archive)?.sync_all()
+    }
+
     /// Drop one deployment's file. A missing file is success — deregistering
     /// something that was never persisted is not an error.
     pub fn forget(&self, id: &str) -> std::io::Result<()> {
@@ -798,7 +823,7 @@ impl Registry {
             return Err(std::io::Error::other("retirement preserves the deployment record"));
         }
         match std::fs::remove_file(self.state_dir().join(state_file_name(id))) {
-            Ok(()) => Ok(()),
+            Ok(()) => std::fs::File::open(self.state_dir())?.sync_all(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }

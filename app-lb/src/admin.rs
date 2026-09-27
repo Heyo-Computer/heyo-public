@@ -4112,10 +4112,21 @@ async fn uncordon_upstream(
     Json(upstream_traffic_status(&deployment, &upstream)).into_response()
 }
 
+#[cfg(test)]
 fn record_only_refusal(d: &Deployment, workspace_state: bool) -> Option<&'static str> {
+    record_removal_refusal(d, workspace_state, false)
+}
+
+fn record_removal_refusal(d: &Deployment, workspace_state: bool, archive_history: bool) -> Option<&'static str> {
     let state = d.state();
+    if archive_history && d.spec.vm.as_ref().is_none_or(|vm| vm.driver != crate::config::Driver::Firecracker) {
+        return Some("retired record archival requires a managed Firecracker deployment");
+    }
     if state.create_attempts.iter().any(|a| a.allocation.is_some()) {
         return Some("correlated allocation receipts must be retained");
+    }
+    if archive_history && state.create_attempts.iter().any(|a| !a.runtime_observed) {
+        return Some("unobserved allocation attempts require reconciliation");
     }
     if !d.spec.routes.is_empty() {
         return Some("record-only removal requires a route-less deployment");
@@ -4132,14 +4143,22 @@ fn record_only_refusal(d: &Deployment, workspace_state: bool) -> Option<&'static
     if !state.suspended.is_empty() {
         return Some("record-only removal requires zero suspended VMs");
     }
-    if crate::rollout::reserved(d) || state.active_prefix.is_some() || !state.rollouts.is_empty() {
+    if crate::rollout::reserved(d) || (!archive_history && (state.active_prefix.is_some() || !state.rollouts.is_empty())) {
         return Some("record-only removal requires no retained rollout generations");
+    }
+    if archive_history && state.rollouts.iter().any(|op| match op.status.as_str() {
+        "succeeded" => !op.readiness_verified || !op.previous_stopped,
+        "failed" => !op.failure_settled,
+        _ => true,
+    }) {
+        return Some("only settled terminal rollout history can be archived");
     }
     if d.spec.vm.as_ref().is_some_and(|vm| vm.workspace.is_some()) || workspace_state {
         return Some("record-only removal requires no workspace configuration or retained workspace state");
     }
     if d.spec.build.is_some() || d.spec.artifact.is_some() || d.spec.update.is_some()
-        || d.spec.vm.as_ref().is_some_and(|vm| !vm.mounts.is_empty())
+        || d.spec.vm.as_ref().is_some_and(|vm| vm.workspace_archive.is_some()
+            || vm.mounts.iter().any(|mount| !archive_history || !mount.read_only))
     {
         return Some("record-only removal requires no build, artifact, host-update or mount job configuration");
     }
@@ -4210,6 +4229,27 @@ async fn deregister_record(
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    remove_deployment_record(state, id, headers, false).await
+}
+
+async fn deregister_retired_record(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if caller.as_ref().is_none_or(|caller| !fleet_handoff_authorized(&caller.0)) {
+        return forbidden("authenticated fleet admin required");
+    }
+    remove_deployment_record(state, id, headers, true).await
+}
+
+async fn remove_deployment_record(
+    state: AdminState,
+    id: String,
+    headers: axum::http::HeaderMap,
+    archive_history: bool,
+) -> Response {
     // Match rollout cutover's lock order and wait out adoption/promotion and
     // orphan sweeps, not just allocations. A separate endpoint makes an old
     // server reject this request instead of ignoring a query flag and tearing down.
@@ -4240,9 +4280,10 @@ async fn deregister_record(
             };
             return err(status, message).into_response();
         }
-        if let Some(message) = record_only_refusal(
+        if let Some(message) = record_removal_refusal(
             &d,
             state.autoscaler.workspaces().has_retained_state(&id),
+            archive_history,
         ) {
             return err(StatusCode::CONFLICT, message).into_response();
         }
@@ -4271,8 +4312,29 @@ async fn deregister_record(
         if !inventory.complete {
             return err(StatusCode::SERVICE_UNAVAILABLE, "complete disk inventory is required for record-only removal").into_response();
         }
-        if inventory.disks.iter().any(|disk| disk.deployment.as_deref() == Some(id.as_str())) {
+        let saved = d.state();
+        let historical_ids: std::collections::HashSet<&String> = crate::rollout::protected_ids(&saved)
+            .chain(saved.create_attempts.iter().filter_map(|attempt| attempt.sandbox_id.as_ref())).collect();
+        if inventory.disks.iter().any(|disk| disk.deployment.as_deref() == Some(id.as_str())
+            || historical_ids.contains(&disk.sandbox_id)) {
             return err(StatusCode::CONFLICT, "retained disks still reference this deployment").into_response();
+        }
+        if archive_history {
+            // Names may have changed outside this controller. Check historical
+            // IDs as well as ownership, including stopped runtimes with no disks.
+            let vms = state.autoscaler.vms();
+            match (vms.list().await, vms.list_inactive().await) {
+                (Ok(active), Ok(inactive)) => {
+                    if active.iter().chain(inactive.iter()).any(|vm| historical_ids.contains(&vm.id)) {
+                        return err(StatusCode::CONFLICT, "runtime still references a historical sandbox ID").into_response();
+                    }
+                }
+                _ => return err(StatusCode::SERVICE_UNAVAILABLE, "historical runtime inventory unavailable").into_response(),
+            }
+            if let Err(error) = state.registry.archive_record(&d) {
+                tracing::error!(deployment = %id, %error, "failed to archive retired deployment");
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "deployment history was not archived; record retained").into_response();
+            }
         }
         // Unlink first. A failure leaves the live registry untouched; a crash
         // between unlink and the in-memory removal merely keeps the record
@@ -5649,6 +5711,7 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/rollouts/:operation", get(get_rollout))
         .route("/deployments/:id", get(get_one).put(update).delete(deregister))
         .route("/deployments/:id/record", axum::routing::delete(deregister_record))
+        .route("/deployments/:id/retired-record", axum::routing::delete(deregister_retired_record))
         .route("/deployments/:id/discovery-status", get(discovery_status))
         .route("/deployments/:id/scaling", patch(scale))
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
@@ -6308,6 +6371,7 @@ mod tests {
             registry: Arc<Registry>,
             root: PathBuf,
             mutations: Arc<AtomicUsize>,
+            inactive: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         }
 
         impl Drop for Fixture {
@@ -6327,13 +6391,16 @@ mod tests {
             std::fs::create_dir_all(&root).unwrap();
             let mutations = Arc::new(AtomicUsize::new(0));
             let mutation_count = mutations.clone();
+            let inactive = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let inactive_rows = inactive.clone();
             let app = Router::new()
                 .route("/deployed-sandboxes", get(move || async move {
                     if inventory_available { Json(serde_json::json!([])).into_response() }
                     else { StatusCode::SERVICE_UNAVAILABLE.into_response() }
                 }))
-                .route("/sandboxes/inactive", get(|| async {
-                    Json(serde_json::json!({"sandboxes": [], "next_cursor": null}))
+                .route("/sandboxes/inactive", get(move || {
+                    let rows = inactive_rows.lock().unwrap().clone();
+                    async move { Json(serde_json::json!({"sandboxes": rows, "next_cursor": null})) }
                 }))
                 .route("/storage", get(|| async {
                     Json(serde_json::json!({
@@ -6400,7 +6467,7 @@ mod tests {
                 Some(disks), PublicUrl::from_config(false, "127.0.0.1:80", "127.0.0.1:443"),
                 feed, &[], None,
             );
-            Fixture { state: api.state, registry, root, mutations }
+            Fixture { state: api.state, registry, root, mutations, inactive }
         }
 
         mod retirement_tests {
@@ -6652,6 +6719,109 @@ mod tests {
                 "vm": {"driver": "firecracker", "port": 8080},
                 "scaling": {"min_replicas": 0, "warm_pool": 0}
             })).unwrap()))
+        }
+
+        fn completed_history(d: &Deployment) {
+            let op = crate::rollout::Operation {
+                operation_id: "finished-1".into(), deployment: d.spec.id.clone(),
+                source_revision: "before".into(), target_spec_sha256: crate::rollout::fingerprint(&d.spec),
+                status: "succeeded".into(), phase: "complete".into(), readiness_verified: true,
+                previous_stopped: true, error: None, preparation_stage: None,
+                spec: d.spec.clone(), prepared: None, prefix: "applb-obsolete-r123-".into(),
+                allocations: vec![crate::rollout::Allocation { name: "applb-obsolete-r123-0".into(),
+                    sandbox_id: Some("sb-retired".into()), attempted: true }],
+                previous: vec!["sb-predecessor".into()], stopped: vec!["sb-predecessor".into()],
+                deadline: 1, drain_deadline: Some(1), reclaimed_candidate_ids: vec![], failure_settled: false,
+            };
+            d.mutate_state(|s| {s.active_prefix = Some(op.prefix.clone()); s.rollouts = vec![op];});
+        }
+
+        #[test]
+        fn retired_record_requires_settled_history_without_relaxing_normal_delete() {
+            let d = empty();
+            completed_history(&d);
+            assert!(record_only_refusal(&d, false).is_some());
+            assert_eq!(record_removal_refusal(&d, false, true), None);
+            for (status, settled, ready, stopped, permitted) in [
+                ("failed", false, true, true, false), ("failed", true, false, false, true),
+                ("running", true, true, true, false), ("reconciliation_required", true, true, true, false),
+                ("unknown", true, true, true, false), ("succeeded", false, false, true, false),
+                ("succeeded", false, true, false, false), ("succeeded", false, true, true, true),
+            ] {
+                d.mutate_state(|s| {let op = &mut s.rollouts[0]; op.status = status.into();
+                    op.failure_settled = settled; op.readiness_verified = ready; op.previous_stopped = stopped;});
+                assert_eq!(record_removal_refusal(&d, false, true).is_none(), permitted, "{status}/{settled}/{ready}/{stopped}");
+            }
+        }
+
+        #[tokio::test]
+        async fn retired_record_archives_exact_history_and_does_not_resurrect_on_restart() {
+            let f = fixture(true).await;
+            let d = f.registry.get("obsolete").unwrap();
+            completed_history(&d);
+            let saved = (*d.state()).clone();
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::IF_MATCH, deployment_etag(&d.spec).unwrap().parse().unwrap());
+            assert_eq!(remove_deployment_record(f.state.clone(), "obsolete".into(), headers, true).await.status(), StatusCode::NO_CONTENT);
+            let files: Vec<_> = std::fs::read_dir(f.registry.state_dir().join("retired")).unwrap().map(Result::unwrap).collect();
+            assert_eq!(files.len(), 1);
+            let report: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path()).unwrap()).unwrap();
+            assert_eq!(report["state"], serde_json::to_value(saved).unwrap());
+            assert_eq!(report["spec"], serde_json::to_value(&d.spec).unwrap());
+            let restarted = Registry::new(f.root.join("deployments.json"));
+            restarted.load().unwrap();
+            restarted.require_complete_load().unwrap();
+            assert!(restarted.get("obsolete").is_none());
+            assert_eq!(f.mutations.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn retired_record_archive_failure_keeps_registration_and_history() {
+            let f = fixture(true).await;
+            let d = f.registry.get("obsolete").unwrap();
+            completed_history(&d);
+            let saved = (*d.state()).clone();
+            std::fs::write(f.registry.state_dir().join("retired"), b"not a directory").unwrap();
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::IF_MATCH, deployment_etag(&d.spec).unwrap().parse().unwrap());
+            assert_eq!(remove_deployment_record(f.state.clone(), "obsolete".into(), headers, true).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(f.registry.get("obsolete").is_some());
+            assert!(persisted(&f.registry.state_dir()));
+            assert_eq!(*d.state(), saved);
+            assert_eq!(f.mutations.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn retired_record_refuses_renamed_historical_runtime_and_missing_inventory() {
+            for available in [true, false] {
+                let f = fixture(available).await;
+                let d = f.registry.get("obsolete").unwrap();
+                completed_history(&d);
+                if available {
+                    f.inactive.lock().unwrap().push(serde_json::json!({
+                        "id":"sb-retired", "name":"applb-other-000000000001", "status":"stopped",
+                        "image":"artifacts", "uptime_secs":0, "is_deployed":true, "status_changed_at":"", "urls":[]
+                    }));
+                }
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(header::IF_MATCH, deployment_etag(&d.spec).unwrap().parse().unwrap());
+                let result = remove_deployment_record(f.state.clone(), "obsolete".into(), headers, true).await;
+                assert_eq!(result.status(), if available {StatusCode::CONFLICT} else {StatusCode::SERVICE_UNAVAILABLE});
+                assert!(f.registry.get("obsolete").is_some());
+                assert!(!f.registry.state_dir().join("retired").exists());
+                assert_eq!(f.mutations.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn retired_record_requires_authentication_even_on_ungated_crud() {
+            let f = fixture(true).await;
+            let request = Request::builder().method("DELETE").uri("/deployments/obsolete/retired-record")
+                .body(Body::empty()).unwrap();
+            let mut app = router(f.state.clone());
+            std::future::poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)).await.unwrap();
+            assert_eq!(app.call(request).await.unwrap().status(), StatusCode::FORBIDDEN);
+            assert!(f.registry.get("obsolete").is_some());
         }
 
         #[test]
