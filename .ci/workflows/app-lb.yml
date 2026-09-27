@@ -277,6 +277,8 @@ jobs:
       - name: Prepare protocol test tools
         run: |
           set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          export TZ=Etc/UTC
           timeout 120 apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=20 update
           timeout 120 apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=20 install -y --no-install-recommends python3 openssl
         timeout-minutes: 5
