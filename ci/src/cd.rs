@@ -32,7 +32,7 @@ pub(crate) async fn publication_source_sha(store: &Store, msg: &JobMessage) -> R
     Ok(sha)
 }
 
-fn app_lb_endpoint(base: &str) -> Result<String, String> {
+pub(crate) fn app_lb_endpoint(base: &str) -> Result<String, String> {
     let url = reqwest::Url::parse(base).map_err(|_| "invalid app-lb URL")?;
     let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
     if (url.scheme() != "https" && !(url.scheme() == "http" && loopback)) || !url.username().is_empty()

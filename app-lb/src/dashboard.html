@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="/__ui/heyo.css">
 <script defer src="/__ui/theme.js"></script>
 <style>
+  [hidden] { display: none !important; }
   /* ------------------------------------------------------------------------
      app-lb, layered on ui/heyo.css — the same sheet ci, app-obs, heyosecret and
      artifacts serve, so the five read as one product.
@@ -53,6 +54,13 @@
      of chart series 1, which put a data colour on a control and made the
      one peach thing on the page compete with it. */
   .wrap { max-width: 1200px; margin: 0 auto; padding: 24px 20px 64px; }
+
+  @media (max-width: 720px) {
+    .topbar { flex-wrap: wrap; height: auto; padding: 12px; gap: 8px; }
+    .topbar-brand { white-space: normal; overflow-wrap: anywhere; }
+    .topbar-nav { order: 3; flex-basis: 100%; }
+    .topbar-right { flex-wrap: wrap; white-space: normal; }
+  }
 
   header.top {
     display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px 20px;
@@ -314,11 +322,13 @@
 <header class="topbar">
     <a class="topbar-brand" href="/"><span>heyo</span><span class="topbar-app">{{APP_NAME}}</span></a>
     <nav class="topbar-nav">
-      <a href="/">Directory</a>
+      <a href="/" data-local-nav>Directory</a>
       <a href="/dashboard" aria-current="page">Dashboard</a>
-      <a href="/siem">Security</a>
-      <a href="/storage">Disks</a>
-      <a href="/metrics">Metrics</a>
+      <a href="/siem" data-local-nav>Security</a>
+      <a href="/storage" data-local-nav>Disks</a>
+      <a href="/plugins" data-local-nav>Plugins</a>
+      <a href="/network" data-local-nav>Network</a>
+      <a href="/metrics" data-local-nav>Metrics</a>
     </nav>
     <div class="topbar-right">
       <!-- `uptime`, `livedot` and `updated` keep their ids: the poll loop
@@ -327,12 +337,25 @@
       <span class="sub" id="uptime">—</span>
       <span class="pill"><span class="dot" id="livedot"></span><span id="updated">connecting…</span></span>
       <span class="topbar-user">{{WHO}}</span>
+      {{SESSION_ACTION}}
       <button class="btn btn-sm" id="pausebtn">Pause</button>
       <button class="theme-toggle" type="button" data-theme-toggle><span data-theme-label>theme</span></button>
     </div>
   </header>
 
-  <div class="section-title">Host &amp; fleet</div>
+  <section aria-labelledby="services-title">
+    <div class="section-title" id="services-title">Global applications</div>
+    <div class="card" id="global-services" aria-live="polite">Loading shared application state…</div>
+    <div><button class="btn btn-sm" id="services-first" hidden>First page</button> <button class="btn btn-sm" id="services-next" hidden>Next page</button></div>
+  </section>
+
+  <section aria-labelledby="regions-title">
+    <div class="section-title" id="regions-title">Regional gateways</div>
+    <div class="card" id="regional-fleet" aria-live="polite">Loading regional observations…</div>
+  </section>
+
+  <section id="local-view" hidden aria-label="Selected gateway details">
+  <div class="section-title" id="local-title">Selected gateway · host &amp; pools</div>
   <div class="tiles" id="fleet-tiles"></div>
 
   <div class="section-title">Request latency &amp; throughput</div>
@@ -439,6 +462,7 @@
     Deploy jobs <span class="count" id="jobs-count"></span>
   </div>
   <div class="card" id="jobs"></div>
+  </section>
 </div>
 
 <div class="modal-overlay" id="modal-overlay">
@@ -457,6 +481,16 @@
 
 <script>
 "use strict";
+// The entry region must not silently select the fleet dashboard's data.
+// Gateway cards link to an explicit local view on that gateway's own origin.
+const localView = new URLSearchParams(location.search).get("view") === "local";
+document.getElementById("local-view").hidden = !localView;
+document.querySelectorAll("[data-local-nav]").forEach(el => el.hidden = !localView);
+document.querySelector(".topbar-brand").href = "/dashboard";
+document.querySelector(".topbar-app").textContent = localView ? location.host : "Control plane";
+document.title = localView ? location.host + " · Heyo" : "Heyo control plane";
+document.getElementById("local-title").textContent = "Selected gateway: " + location.host + " · host & pools";
+document.getElementById("uptime").hidden = !localView;
 const REFRESH_MS = 2000;
 // Certs, secrets and jobs move on human timescales; see `pollSlow`.
 const SLOW_REFRESH_MS = 10000;
@@ -2353,6 +2387,7 @@ function metricsUrl() {
 }
 
 async function poll() {
+  if (!localView) return;
   try {
     const r = await fetch(metricsUrl(), { headers: { accept: "application/json" }, cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
@@ -2370,10 +2405,106 @@ async function poll() {
 // two seconds would be three requests wasted. The exception is a job in flight:
 // while one is running its record is the only progress there is, so the loop
 // tightens to the metrics cadence until it finishes.
+let servicesCursor = null, servicesNext = null;
+$("services-first").onclick = () => { servicesCursor = null; pollServices(); };
+$("services-next").onclick = () => { servicesCursor = servicesNext; pollServices(); };
+
+async function pollServices() {
+  const cursor = servicesCursor;
+  let result;
+  try { result = await api("GET", "services" + (cursor ? "?after=" + encodeURIComponent(cursor) : "")); }
+  catch (_) { result = { ok: false }; }
+  if (cursor === servicesCursor) renderServices(result);
+}
+
+function renderServices(result) {
+  const target = $("global-services");
+  servicesNext = result.ok ? result.data.inventory?.nextCursor : null;
+  $("services-first").hidden = !servicesCursor;
+  $("services-next").hidden = !servicesNext;
+  if (!result.ok) {
+    target.textContent = result.status === 401 || result.status === 403
+      ? "Global applications require an authenticated fleet-wide view."
+      : "Shared control plane unavailable. Application state is unknown; local gateway counts are not a substitute.";
+    return;
+  }
+  if (!result.data.configured) {
+    target.textContent = "Shared control plane is not configured on this gateway.";
+    return;
+  }
+  const services = result.data.inventory.services;
+  target.innerHTML = `<div class="sub">Shared Orchestrator state · recorded health, not a live reachability test.</div>` +
+    (services.length ? services.map(s => {
+      if (s.external) {
+        const external = s.external;
+        return `<article style="margin-top:16px;overflow-wrap:anywhere"><h3>${esc(s.serviceId)}</h3>
+          <div>${esc(external.region)} · Deployment: ${esc(external.deploymentId)}</div>
+          <div>Update: ${s.update ? `${esc(s.update.status)} · ${esc(s.update.phase || "awaiting activation")} · ${esc(s.update.operationId)}` : "none recorded"}</div>
+          ${s.update ? `<div>Target revision: ${esc(s.update.targetRevision)} · CI run: ${esc(s.update.runId)}</div>
+          <div>Last update status: ${esc(s.update.observedAt || "not yet available")}</div>
+          ${s.update.error ? `<div class="sub">${esc(s.update.error)}</div>` : ""}` : ""}
+          <div class="sub">Updates drain CI jobs and retain its workspace. One controller in ${esc(external.region)}; no regional failover.</div></article>`;
+      }
+      const endpoints = s.endpoints;
+      const regions = [...new Set([...(s.replicaRegions || []), ...(endpoints || []).map(e => e.region || "unplaced")])];
+      const ready = endpoints?.filter(e => e.healthStatus === "healthy" && !e.draining).length;
+      return `<article style="margin-top:16px;overflow-wrap:anywhere"><h3>${esc(s.serviceId)}</h3>
+        <div>Desired replicas: ${s.desiredReplicas ?? "unknown"} · Recorded eligible: ${ready ?? "unknown"} · Discovery version: ${s.discoveryVersion ?? "unknown"}</div>
+        ${regions.map(region => {
+          const members = (endpoints || []).filter(e => (e.region || "unplaced") === region);
+          return `<div><strong>${esc(region)}</strong>: ${members.length ? members.map(e => `${esc(e.revision || "revision unknown")} · ${esc(e.healthStatus)}${e.draining ? " · draining" : ""}`).join("; ") : "no recorded endpoint"}</div>`;
+        }).join("")}
+        <div>Regional rollout: ${s.rollout ? `${esc(s.rollout.status)} · ${esc(s.rollout.phase)} · ${esc(s.rollout.operationId)}` : "none recorded"}</div></article>`;
+    }).join("") : `<div>No applications on this page.</div>`);
+}
+
+function renderFleet(result) {
+  const target = $("regional-fleet");
+  if (!result.ok) {
+    target.textContent = result.status === 401 || result.status === 403
+      ? "Regional inventory requires an authenticated fleet-wide view."
+      : "Regional observations unavailable — retrying. No current regional capacity is known.";
+    return;
+  }
+  if (!result.data.configured) {
+    // Without a fleet this gateway is the whole deployment, so its local view is
+    // the only truthful default. An explicit ?view= is always respected.
+    const params = new URLSearchParams(location.search);
+    if (!params.has("view")) {
+      params.set("view", "local");
+      location.replace(location.pathname + "?" + params + location.hash);
+      return;
+    }
+    target.textContent = "Regional observations are not configured. No region is assumed from this page's hostname.";
+    return;
+  }
+  target.innerHTML = `<div class="sub">Independent gateway observations, not a shared rollout snapshot. Counts may include the same application on several gateways; do not sum them as unique capacity.</div>
+    <div>${result.data.gateways.map(g => {
+      const m = g.metrics, p = m?.fleet;
+      return `<article style="margin-top:16px;overflow-wrap:anywhere"><strong>${esc(g.region)}</strong> · ${esc(g.id)}
+        <div>${m ? "Observed" : `<strong>Unavailable</strong> · ${esc(g.error)}`}</div>
+        <div>Deployments: ${p ? fmt(p.deployments) : "—"} · In-flight: ${p ? fmt(p.total_in_flight) : "—"}</div>
+        <div>Backends: ${p ? `${fmt(p.ready)} tracked · ${fmt(p.draining)} draining · ${fmt(p.pending)} pending` : "—"}</div>
+        <div>Sample time: ${m ? esc(new Date(m.generated_at * 1000).toLocaleTimeString()) : "—"}</div>
+        <a href="${esc(g.dashboard_url)}">Open ${esc(g.region)} gateway details</a></article>`;
+    }).join("")}</div>`;
+}
+
 async function pollSlow() {
   clearTimeout(slowTimer);
   let interval = SLOW_REFRESH_MS;
   try {
+    // Independent of the local CRUD reads, which can fail for a view token.
+    // Clear old values on failure instead of leaving a disconnected region green.
+    await Promise.all([
+      api("GET", "fleet").then(renderFleet).catch(() => renderFleet({ ok: false })),
+      pollServices(),
+    ]);
+    if (!localView) {
+      $("updated").textContent = "checked " + new Date().toLocaleTimeString();
+      $("livedot").hidden = true;
+      return;
+    }
     const [certs, secrets, tokens, jobs, security, namespaces] = await Promise.all([
       api("GET", "certs"),
       api("GET", "secrets"),

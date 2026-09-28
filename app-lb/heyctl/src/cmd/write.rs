@@ -588,9 +588,17 @@ fn trim_one_newline(s: &str) -> String {
 
 #[derive(Args, Debug)]
 pub struct CreateSecretArgs {
-    /// The secret id, unique across the load balancer.
+    /// The secret id, unique within its namespace.
     #[arg(value_name = "NAME")]
     pub name: String,
+
+    /// The namespace the secret lives behind. Omitted means `default`.
+    ///
+    /// A wall, not a label: only deployments and auth providers in the same
+    /// namespace can resolve it, so a key stored in the wrong one is missing
+    /// rather than merely misfiled.
+    #[arg(long, short = 'n', value_name = "NAMESPACE")]
+    pub namespace: Option<String>,
 
     /// `KEY=VALUE`, repeatable. Visible in `ps` and in shell history — prefer
     /// --from-file, --from-env or --from-stdin for anything real.
@@ -620,6 +628,9 @@ pub fn create_secret(ctx: &Ctx, args: &CreateSecretArgs) -> Result<()> {
 
     let mut body = Map::new();
     body.insert("id".into(), Value::String(args.name.clone()));
+    if let Some(ns) = &args.namespace {
+        body.insert("namespace".into(), Value::String(ns.clone()));
+    }
     if let Some(d) = &args.description {
         body.insert("description".into(), Value::String(d.clone()));
     }
@@ -641,7 +652,10 @@ pub fn create_secret(ctx: &Ctx, args: &CreateSecretArgs) -> Result<()> {
     }
 
     // POST upserts, so say which one actually happened.
-    let existed = ctx.client.secret_exists(&args.name).unwrap_or(false);
+    let existed = ctx
+        .client
+        .secret_exists_in(args.namespace.as_deref(), &args.name)
+        .unwrap_or(false);
     let result = ctx.client.raw().put_secret(&Value::Object(body))?;
     report_secret(ctx, &result, &args.name, if existed { "replaced" } else { "created" })
 }
@@ -651,6 +665,10 @@ pub struct SetSecretArgs {
     /// The secret, e.g. `github` or `secret/github`.
     #[arg(value_name = "RESOURCE")]
     pub resource: String,
+
+    /// The namespace it lives in. Omitted means `default`.
+    #[arg(long, short = 'n', value_name = "NAMESPACE")]
+    pub namespace: Option<String>,
 
     /// `KEY=VALUE` to set, `KEY-` to remove. Repeatable. Keys not mentioned are
     /// left as they are — which matters here, because there is no way to read
@@ -718,7 +736,10 @@ pub fn set_secret(ctx: &Ctx, args: &SetSecretArgs) -> Result<()> {
         return print_spec(ctx, &Value::Object(shown));
     }
 
-    let result = ctx.client.raw().patch_secret(&id, &Value::Object(body))?;
+    let result = ctx
+        .client
+        .raw()
+        .patch_secret_in(args.namespace.as_deref(), &id, &Value::Object(body))?;
     report_secret(ctx, &result, &id, "updated")
 }
 
@@ -1327,6 +1348,20 @@ pub struct SetAuthArgs {
     #[arg(value_name = "RESOURCE")]
     pub resource: String,
 
+    /// Inherit this deployment's identity from a namespace auth provider
+    /// instead of writing it here: who may enter and how they are verified come
+    /// from `heyctl get auth-providers`, and editing the provider reaches every
+    /// deployment that names it.
+    ///
+    /// The provider must be declared in *this deployment's* namespace. Setting
+    /// it clears any inline identity on the gate, because app-lb refuses a gate
+    /// that carries both — everything route-scoped (public paths, base path,
+    /// cookie name, session TTL) stays where it is.
+    #[arg(long, value_name = "NAME", conflicts_with_all = [
+        "client_id", "secret", "allow_domains", "allow_emails",
+    ])]
+    pub provider_ref: Option<String>,
+
     /// OAuth client id from the Google Cloud console. Required the first time.
     #[arg(long, value_name = "ID")]
     pub client_id: Option<String>,
@@ -1371,8 +1406,9 @@ pub struct SetAuthArgs {
 
     /// Remove the gate; the deployment serves everyone again.
     #[arg(long, conflicts_with_all = [
-        "client_id", "secret", "allow_domains", "allow_emails", "public_paths",
-        "base_path", "session_ttl_secs", "cookie_name", "no_forward_identity",
+        "provider_ref", "client_id", "secret", "allow_domains", "allow_emails",
+        "public_paths", "base_path", "session_ttl_secs", "cookie_name",
+        "no_forward_identity",
     ])]
     pub clear: bool,
 
@@ -1392,7 +1428,8 @@ pub fn set_auth(ctx: &Ctx, args: &SetAuthArgs) -> Result<()> {
         });
     }
 
-    let touched = args.client_id.is_some()
+    let touched = args.provider_ref.is_some()
+        || args.client_id.is_some()
         || args.secret.is_some()
         || !args.allow_domains.is_empty()
         || !args.allow_emails.is_empty()
@@ -1403,8 +1440,8 @@ pub fn set_auth(ctx: &Ctx, args: &SetAuthArgs) -> Result<()> {
         || args.no_forward_identity;
     if !touched {
         bail!(
-            "nothing to set — pass --client-id, --secret, --allow-domain, --allow-email, \
-             --public-path, --base-path, --session-ttl, --cookie-name or \
+            "nothing to set — pass --provider-ref, --client-id, --secret, --allow-domain, \
+             --allow-email, --public-path, --base-path, --session-ttl, --cookie-name or \
              --no-forward-identity (or --clear to remove the gate)"
         );
     }
@@ -1417,6 +1454,33 @@ pub fn set_auth(ctx: &Ctx, args: &SetAuthArgs) -> Result<()> {
     edit_spec(ctx, &id, args.dry_run, "sign-in gate set", |spec| {
         let auth = spec::auth_mut(spec)?;
         let fresh = auth.is_empty();
+
+        // Inheriting is the whole gate's identity, so it replaces whatever was
+        // written inline rather than sitting beside it — app-lb refuses a gate
+        // that carries both, and silently leaving a stale client id behind
+        // would turn this command into a 400 nobody asked for.
+        if let Some(name) = &args.provider_ref {
+            auth.insert("provider_ref".into(), Value::String(name.clone()));
+            for identity in [
+                "provider",
+                "client_id",
+                "client_secret",
+                "allowed_domains",
+                "allowed_emails",
+                "jwt",
+                "cookie_domain",
+            ] {
+                auth.remove(identity);
+            }
+            // The route-scoped half below still applies, and a gate that
+            // inherits needs none of the first-time identity checks.
+            apply_route_scoped_auth(auth, args);
+            return Ok(());
+        }
+        // Going the other way — writing identity onto a gate that inherited it —
+        // has to drop the reference for the same reason.
+        auth.remove("provider_ref");
+
         if fresh && (args.client_id.is_none() || secret.is_none()) {
             bail!(
                 "deployment {id:?} has no sign-in gate yet, so --client-id and --secret are \
@@ -1440,7 +1504,6 @@ pub fn set_auth(ctx: &Ctx, args: &SetAuthArgs) -> Result<()> {
         for (key, values) in [
             ("allowed_domains", &args.allow_domains),
             ("allowed_emails", &args.allow_emails),
-            ("public_paths", &args.public_paths),
         ] {
             if !values.is_empty() {
                 auth.insert(
@@ -1449,16 +1512,522 @@ pub fn set_auth(ctx: &Ctx, args: &SetAuthArgs) -> Result<()> {
                 );
             }
         }
-        insert_opt_str(auth, "base_path", args.base_path.as_deref());
-        insert_opt_str(auth, "cookie_name", args.cookie_name.as_deref());
-        if let Some(ttl) = args.session_ttl_secs {
-            auth.insert("session_ttl_secs".into(), Value::from(ttl));
-        }
-        if args.no_forward_identity {
-            auth.insert("forward_identity".into(), Value::Bool(false));
-        }
+        apply_route_scoped_auth(auth, args);
         Ok(())
     })
+}
+
+/// The half of a gate that is the deployment's own whether or not its identity
+/// is inherited: which paths skip it, where its endpoints live, how long a
+/// session lasts, and whether identity goes upstream.
+fn apply_route_scoped_auth(auth: &mut Map<String, Value>, args: &SetAuthArgs) {
+    if !args.public_paths.is_empty() {
+        auth.insert(
+            "public_paths".into(),
+            Value::Array(args.public_paths.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    insert_opt_str(auth, "base_path", args.base_path.as_deref());
+    insert_opt_str(auth, "cookie_name", args.cookie_name.as_deref());
+    if let Some(ttl) = args.session_ttl_secs {
+        auth.insert("session_ttl_secs".into(), Value::from(ttl));
+    }
+    if args.no_forward_identity {
+        auth.insert("forward_identity".into(), Value::Bool(false));
+    }
+}
+
+// -- auth providers --------------------------------------------------------
+
+/// The identity half of a sign-in gate, declared once and inherited by name.
+///
+/// Three shapes, and the flags pick between them rather than a mode argument:
+/// `--preset` materialises a known issuer's policy from a secret alone,
+/// `--issuer` describes any other JWT issuer, and `--client-id` is Google.
+#[derive(Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("identity")
+        .args(["preset", "issuer", "client_id"])
+        .required(true)
+))]
+pub struct CreateAuthProviderArgs {
+    /// The provider's name, unique within its namespace. Deployments name it in
+    /// `auth.provider_ref`, so keep it short: `heyo`, `corp-google`, `okta`.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+
+    /// The namespace that owns it. A deployment may only inherit a provider in
+    /// its own namespace. Omitted means `default`.
+    #[arg(long, short = 'n', value_name = "NAMESPACE")]
+    pub namespace: Option<String>,
+
+    /// What this provider is for. Shown by `heyctl get auth-providers -o wide`.
+    #[arg(long, value_name = "TEXT")]
+    pub description: Option<String>,
+
+    /// Build a known issuer's policy for you. Two exist:
+    ///
+    /// `heyo-jwks` — the Heyo auth API's gate tokens, verified `RS256` against
+    /// its published key set. Needs no secret, and app-lb derives the key set
+    /// URL from the auth service it federates to unless `--jwks-url` says
+    /// otherwise. **Prefer this one**, and the more so the less you own of what
+    /// the provider sits behind: nothing in it is secret, so it is safe in a
+    /// namespace somebody else administers.
+    ///
+    /// `heyo` — the same service's `HS256` access tokens, from `--secret`. That
+    /// key both verifies *and* mints, so whoever can read it can issue any
+    /// identity the auth service can.
+    ///
+    /// The expansion happens on the server, so it is app-lb's idea of that
+    /// issuer and not this build's. Any other flag here is applied on top of
+    /// the result.
+    #[arg(long, value_name = "NAME")]
+    pub preset: Option<String>,
+
+    /// The `iss` a token must carry, exactly. This is the bring-your-own form:
+    /// with a key source it describes any issuer at all — your own service,
+    /// Auth0, Okta, Cognito, Keycloak.
+    #[arg(long, value_name = "ISSUER")]
+    pub issuer: Option<String>,
+
+    /// OAuth client id, for a Google provider.
+    #[arg(long, value_name = "ID")]
+    pub client_id: Option<String>,
+
+    /// A stored secret, `NAME` or `NAME/KEY`: the HMAC signing key for an
+    /// `HS*` JWT provider, or the OAuth client secret for Google. Resolved in
+    /// this provider's namespace, never another's.
+    #[arg(long = "secret", value_name = "NAME[/KEY]")]
+    pub secret: Option<String>,
+
+    /// The issuer's JWKS endpoint, usually `<issuer>/.well-known/jwks.json`.
+    /// The right choice for any issuer that rotates keys — nothing has to be
+    /// done here when it does.
+    #[arg(long, value_name = "URL")]
+    pub jwks_url: Option<String>,
+
+    /// A PEM public key or certificate file, for an issuer that publishes one
+    /// key rather than a set. Read here and sent inline: it is a public key, so
+    /// it is not a secret and does not go in the store.
+    #[arg(long, value_name = "PATH")]
+    pub public_key_file: Option<PathBuf>,
+
+    /// A signature algorithm this provider accepts. Repeatable. Defaults to
+    /// `HS256` with `--secret` and `RS256` with a public key or JWKS — the
+    /// token never chooses, because the token is attacker-controlled input.
+    #[arg(long = "alg", value_name = "ALG")]
+    pub algorithms: Vec<String>,
+
+    /// The `aud` a token must carry. Omitted means the audience is not checked.
+    #[arg(long, value_name = "AUDIENCE")]
+    pub audience: Option<String>,
+
+    /// A claim a token must satisfy: `CLAIM=VALUE`, or `CLAIM=A,B` for "any of
+    /// these". Repeatable, and every one of them must hold. `true`/`false` are
+    /// sent as booleans; everything else is a string, so an all-digits account
+    /// id stays the id it is.
+    ///
+    /// This is a JWT provider's allow-list. With none, any unexpired token the
+    /// issuer signed for this audience gets in — which for your own issuer
+    /// means "a signed-in user", and is a reasonable thing to want.
+    #[arg(long = "require", value_name = "CLAIM=VALUE")]
+    pub require: Vec<String>,
+
+    /// Which claim holds the stable user id forwarded as `x-auth-request-user`.
+    /// `sub` unless the issuer says otherwise.
+    #[arg(long, value_name = "CLAIM")]
+    pub subject_claim: Option<String>,
+
+    /// Which claim holds the address forwarded as `x-auth-request-email`.
+    #[arg(long, value_name = "CLAIM")]
+    pub email_claim: Option<String>,
+
+    /// Which claim holds the display name.
+    #[arg(long, value_name = "CLAIM")]
+    pub name_claim: Option<String>,
+
+    /// Clock skew allowed on `exp` and `nbf`.
+    #[arg(long = "leeway", value_name = "SECS")]
+    pub leeway_secs: Option<u64>,
+
+    /// A cookie to read the token from when there is no `Authorization` header.
+    /// What makes a JWT provider work for people in browsers at all — a
+    /// navigation cannot carry a header.
+    #[arg(long, value_name = "NAME")]
+    pub cookie: Option<String>,
+
+    /// Where to send a token-less browser to sign in. Your issuer's own page:
+    /// app-lb redirects there with the URL the person wanted, that page sets
+    /// the cookie above and sends them back. Requires --cookie.
+    #[arg(long, value_name = "URL")]
+    pub login_url: Option<String>,
+
+    /// The query parameter that page reads the return URL from. `redirect_uri`
+    /// unless set; `return_to`, `next` and `rd` are the other common spellings.
+    #[arg(long, value_name = "NAME")]
+    pub login_redirect_param: Option<String>,
+
+    /// A Google Workspace domain whose accounts may enter. Repeatable. `*`
+    /// means any Google account.
+    #[arg(long = "allow-domain", value_name = "DOMAIN")]
+    pub allow_domains: Vec<String>,
+
+    /// An individual address allowed regardless of domain. Repeatable.
+    #[arg(long = "allow-email", value_name = "EMAIL")]
+    pub allow_emails: Vec<String>,
+
+    /// Also admit app-tokens app-lb minted. The usual shape for a deployment
+    /// with both a UI and a machine caller.
+    #[arg(long)]
+    pub app_token: bool,
+
+    /// Share one sign-in across every gate that inherits this provider, by
+    /// setting the session cookie on a parent domain, e.g. `.example.com`.
+    #[arg(long, value_name = "DOMAIN")]
+    pub cookie_domain: Option<String>,
+
+    /// Print what would be sent, and send nothing. With `--preset` that is the
+    /// first of two requests — the rest of the flags are applied to whatever
+    /// the server expands, which only exists once it has answered.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// `CLAIM=VALUE` / `CLAIM=A,B` into the `require` map's one entry.
+fn parse_require(arg: &str) -> Result<(String, Value)> {
+    let (claim, values) = arg
+        .split_once('=')
+        .with_context(|| format!("{arg:?} is not CLAIM=VALUE"))?;
+    let claim = claim.trim();
+    if claim.is_empty() {
+        bail!("{arg:?} has an empty claim name");
+    }
+    let scalar = |v: &str| match v {
+        // The two values a claim is genuinely likely to hold as a non-string.
+        // Numbers are deliberately not converted: an account id that happens to
+        // be all digits is a string in every token that carries one.
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        other => Value::String(other.to_string()),
+    };
+    let parts: Vec<&str> = values.split(',').map(str::trim).filter(|v| !v.is_empty()).collect();
+    match parts.as_slice() {
+        [] => bail!("{arg:?} has no value — write CLAIM=VALUE, or CLAIM=A,B for any of them"),
+        [one] => Ok((claim.to_string(), scalar(one))),
+        many => Ok((
+            claim.to_string(),
+            Value::Array(many.iter().map(|v| scalar(v)).collect()),
+        )),
+    }
+}
+
+impl CreateAuthProviderArgs {
+    fn namespace(&self) -> &str {
+        self.namespace.as_deref().unwrap_or(crate::DEFAULT_NAMESPACE)
+    }
+
+    /// The `jwt` block these flags describe, or `None` when they describe none.
+    ///
+    /// Not built for a `--preset`: the server owns that expansion, and the
+    /// tweaks are applied to what it returns.
+    fn jwt_block(&self) -> Result<Option<Map<String, Value>>> {
+        let public_key = match &self.public_key_file {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("reading the public key {}", path.display()))?,
+            ),
+            None => None,
+        };
+        let key_sources = [
+            ("--secret", self.secret.is_some()),
+            ("--public-key-file", public_key.is_some()),
+            ("--jwks-url", self.jwks_url.is_some()),
+        ];
+        let named: Vec<&str> = key_sources.iter().filter(|(_, set)| *set).map(|(n, _)| *n).collect();
+
+        let Some(issuer) = &self.issuer else {
+            return Ok(None);
+        };
+        match named.as_slice() {
+            [] => bail!(
+                "--issuer needs a key to verify with: --secret <NAME[/KEY]> for HS256, \
+                 --jwks-url <URL> for an issuer that publishes a key set, or \
+                 --public-key-file <PATH> for one static public key"
+            ),
+            [_] => {}
+            many => bail!(
+                "a JWT provider verifies with exactly one key — {} were given",
+                many.join(", ")
+            ),
+        }
+        if self.login_url.is_some() && self.cookie.is_none() {
+            bail!(
+                "--login-url needs --cookie: the trip back from a sign-in page is a \
+                 navigation, and a navigation can only carry a token in a cookie"
+            );
+        }
+
+        let mut jwt = Map::new();
+        if let Some(s) = &self.secret {
+            jwt.insert("secret".into(), spec::parse_secret_ref(s)?);
+        }
+        if let Some(pem) = public_key {
+            jwt.insert("public_key".into(), Value::String(pem));
+        }
+        insert_opt_str(&mut jwt, "jwks_url", self.jwks_url.as_deref());
+        // Defaulted by key kind rather than left to the server, which has no
+        // default at all — an algorithm the spec did not choose is the
+        // confusion attack this field exists to prevent.
+        let algorithms: Vec<Value> = if self.algorithms.is_empty() {
+            let default = if self.secret.is_some() { "HS256" } else { "RS256" };
+            vec![Value::String(default.to_string())]
+        } else {
+            self.algorithms.iter().cloned().map(Value::String).collect()
+        };
+        jwt.insert("algorithms".into(), Value::Array(algorithms));
+        jwt.insert("issuer".into(), Value::String(issuer.clone()));
+        insert_opt_str(&mut jwt, "audience", self.audience.as_deref());
+        self.apply_jwt_tweaks(&mut jwt)?;
+        Ok(Some(jwt))
+    }
+
+    /// The fields that are the same whether the block was written by these
+    /// flags or expanded from a preset. Applied to both, which is what lets
+    /// `--preset heyo --require accountId=…` mean what it looks like.
+    fn apply_jwt_tweaks(&self, jwt: &mut Map<String, Value>) -> Result<()> {
+        if !self.require.is_empty() {
+            let mut require = Map::new();
+            for arg in &self.require {
+                let (claim, value) = parse_require(arg)?;
+                require.insert(claim, value);
+            }
+            jwt.insert("require".into(), Value::Object(require));
+        }
+        insert_opt_str(jwt, "subject_claim", self.subject_claim.as_deref());
+        insert_opt_str(jwt, "email_claim", self.email_claim.as_deref());
+        insert_opt_str(jwt, "name_claim", self.name_claim.as_deref());
+        insert_opt_str(jwt, "cookie", self.cookie.as_deref());
+        insert_opt_str(jwt, "login_url", self.login_url.as_deref());
+        insert_opt_str(jwt, "login_redirect_param", self.login_redirect_param.as_deref());
+        if let Some(secs) = self.leeway_secs {
+            jwt.insert("leeway_secs".into(), Value::from(secs));
+        }
+        Ok(())
+    }
+
+    /// Whether a Google allow-list was written on a provider that will never
+    /// run a Google flow. Refused rather than dropped: whoever wrote it
+    /// believes the provider is restricted, and it would not be.
+    fn misplaced_google_allow_list(&self) -> bool {
+        (self.preset.is_some() || self.issuer.is_some())
+            && self.client_id.is_none()
+            && !(self.allow_domains.is_empty() && self.allow_emails.is_empty())
+    }
+
+    /// Whether any flag applies on top of a preset's expansion.
+    fn tweaks_a_preset(&self) -> bool {
+        !self.require.is_empty()
+            || self.audience.is_some()
+            || self.subject_claim.is_some()
+            || self.email_claim.is_some()
+            || self.name_claim.is_some()
+            || self.cookie.is_some()
+            || self.login_url.is_some()
+            || self.login_redirect_param.is_some()
+            || self.leeway_secs.is_some()
+            || !self.algorithms.is_empty()
+            || self.app_token
+            || self.cookie_domain.is_some()
+    }
+
+    /// The providers this object admits, as the server spells them: a bare
+    /// string for one, an array for several.
+    fn providers(&self) -> Value {
+        let mut kinds: Vec<&str> = Vec::new();
+        if self.client_id.is_some() {
+            kinds.push("google");
+        }
+        if self.issuer.is_some() || self.preset.is_some() {
+            kinds.push("jwt");
+        }
+        if self.app_token {
+            kinds.push("app-token");
+        }
+        match kinds.as_slice() {
+            [one] => Value::String((*one).to_string()),
+            many => Value::Array(many.iter().map(|k| Value::String((*k).to_string())).collect()),
+        }
+    }
+}
+
+pub fn create_auth_provider(ctx: &Ctx, args: &CreateAuthProviderArgs) -> Result<()> {
+    let ns = args.namespace().to_string();
+
+    let mut body = Map::new();
+    body.insert("name".into(), Value::String(args.name.clone()));
+    body.insert("namespace".into(), Value::String(ns.clone()));
+    insert_opt_str(&mut body, "description", args.description.as_deref());
+    insert_opt_str(&mut body, "cookie_domain", args.cookie_domain.as_deref());
+
+    // These describe a *Google* identity and mean nothing to a JWT provider,
+    // whose allow-list is `require`. app-lb refuses the combination; saying so
+    // here names the flag to use instead, and stops a preset from quietly
+    // dropping them.
+    if args.misplaced_google_allow_list() {
+        bail!(
+            "--allow-domain/--allow-email describe a Google identity. A JWT provider's \
+             allow-list is --require <claim>=<value>, e.g. --require accountId=acct_7f3c"
+        );
+    }
+
+    if let Some(preset) = &args.preset {
+        // The preset is the server's, so the body carries the request-only
+        // `preset` plus whatever key material that preset takes, and nothing
+        // that would collide with what it expands. Everything else is applied
+        // in a second pass below.
+        if args.public_key_file.is_some() {
+            bail!("--preset brings its own key material; drop --public-key-file");
+        }
+        body.insert("preset".into(), Value::String(preset.clone()));
+        match preset.as_str() {
+            // Verifies against a published key set: no secret exists to name,
+            // and the URL is optional because app-lb can derive it.
+            "heyo-jwks" => {
+                if args.secret.is_some() {
+                    bail!(
+                        "--preset heyo-jwks verifies against the issuer's published key set, \
+                         so there is no secret to give it. (That is the point of it — use \
+                         --preset heyo if you really want the HS256 shared-secret form.)"
+                    );
+                }
+                if let Some(url) = &args.jwks_url {
+                    body.insert("jwks_url".into(), Value::String(url.clone()));
+                }
+            }
+            // Verifies with the issuer's own signing key, which has to be here.
+            _ => {
+                if args.jwks_url.is_some() {
+                    bail!("--preset {preset} verifies with a shared secret; drop --jwks-url");
+                }
+                let Some(secret) = &args.secret else {
+                    bail!(
+                        "--preset {preset} needs the signing key it verifies with: \
+                         --secret <NAME[/KEY]>, e.g. --secret heyo-auth/jwt_secret \
+                         (store it first with `heyctl create secret heyo-auth --from-stdin \
+                         jwt_secret`) — or use --preset heyo-jwks, which needs no secret"
+                    );
+                };
+                body.insert("secret".into(), spec::parse_secret_ref(secret)?);
+            }
+        }
+    } else {
+        body.insert("provider".into(), args.providers());
+        if let Some(jwt) = args.jwt_block()? {
+            body.insert("jwt".into(), Value::Object(jwt));
+        }
+        if let Some(id) = &args.client_id {
+            body.insert("client_id".into(), Value::String(id.clone()));
+            let Some(secret) = &args.secret else {
+                bail!(
+                    "a Google provider needs its OAuth client secret: \
+                     --secret <NAME[/KEY]> (store it first with \
+                     `heyctl create secret google --from-stdin client_secret`)"
+                );
+            };
+            body.insert("client_secret".into(), spec::parse_secret_ref(secret)?);
+            if args.allow_domains.is_empty() && args.allow_emails.is_empty() {
+                bail!(
+                    "a Google provider needs an allow-list: --allow-domain <workspace-domain> \
+                     and/or --allow-email <address>. Use --allow-domain '*' to admit any \
+                     Google account"
+                );
+            }
+        }
+        for (key, values) in [
+            ("allowed_domains", &args.allow_domains),
+            ("allowed_emails", &args.allow_emails),
+        ] {
+            if !values.is_empty() {
+                body.insert(
+                    key.to_string(),
+                    Value::Array(values.iter().cloned().map(Value::String).collect()),
+                );
+            }
+        }
+    }
+
+    if args.dry_run {
+        return print_spec(ctx, &Value::Object(body));
+    }
+
+    let existed = ctx.client.auth_provider_exists(&ns, &args.name).unwrap_or(false);
+    let mut stored = ctx.client.create_auth_provider(&Value::Object(body))?;
+
+    // A preset's tweaks are a second write against what the server expanded,
+    // rather than a copy of the preset in this binary: the materialised object
+    // comes back, the flags are applied to it, and it goes up again. `POST`
+    // upserts and keeps the original `created_at`, so the result is one object
+    // either way.
+    if args.preset.is_some() && args.tweaks_a_preset() {
+        // The server's own bytes, minus what these flags change — not a
+        // re-serialised view, which would drop any field this build predates.
+        let mut object = ctx
+            .client
+            .raw()
+            .auth_provider(&ns, &args.name)?
+            .as_object()
+            .cloned()
+            .context("app-lb returned an auth provider that is not an object")?;
+        let mut jwt = object
+            .get("jwt")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        args.apply_jwt_tweaks(&mut jwt)?;
+        if !args.algorithms.is_empty() {
+            jwt.insert(
+                "algorithms".into(),
+                Value::Array(args.algorithms.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        object.insert("jwt".into(), Value::Object(jwt));
+        if args.app_token {
+            object.insert("provider".into(), args.providers());
+        }
+        insert_opt_str(&mut object, "cookie_domain", args.cookie_domain.as_deref());
+        stored = ctx.client.create_auth_provider(&Value::Object(object))?;
+    }
+
+    if ctx.out.is_machine() {
+        let raw = ctx.client.raw().auth_provider(&ns, &args.name)?;
+        return output::emit(&raw, ctx.out, &[format!("auth-provider/{ns}/{}", args.name)]);
+    }
+    println!(
+        "auth-provider/{ns}/{} {} ({})",
+        args.name,
+        if existed { "replaced" } else { "created" },
+        stored.providers().join(" or "),
+    );
+    println!(
+        "\nInherit it: `heyctl set auth <deployment> --provider-ref {}` — the deployment \
+         must be in namespace {ns}.",
+        args.name
+    );
+    Ok(())
+}
+
+pub fn delete_auth_providers(ctx: &Ctx, names: &[String], namespace: Option<&str>) -> Result<()> {
+    if names.is_empty() {
+        bail!("delete needs a name, e.g. `heyctl delete auth-provider heyo -n team-a`");
+    }
+    let ns = namespace.unwrap_or(crate::DEFAULT_NAMESPACE);
+    for name in names {
+        ctx.client
+            .delete_auth_provider(ns, name)
+            .with_context(|| format!("deleting auth provider {name:?} in namespace {ns:?}"))?;
+        println!("auth-provider/{ns}/{name} deleted");
+    }
+    Ok(())
 }
 
 // -- update ----------------------------------------------------------------
@@ -1699,10 +2268,14 @@ pub fn apply(ctx: &Ctx, args: &ApplyArgs) -> Result<()> {
             apply_namespace(ctx, s, args.dry_run)?;
             continue;
         }
+        if kind == "auth-provider" || kind == "AuthProvider" || kind == "authProvider" {
+            apply_auth_provider(ctx, s, args.dry_run)?;
+            continue;
+        }
         if kind != "deployment" && kind != "Deployment" {
             bail!(
-                "unknown kind {kind:?} — `apply` understands \"deployment\" and \"namespace\", \
-                 and an object with no `kind` is a deployment"
+                "unknown kind {kind:?} — `apply` understands \"deployment\", \"namespace\" \
+                 and \"auth-provider\", and an object with no `kind` is a deployment"
             );
         }
         let id = spec::spec_id(s)
@@ -1752,6 +2325,41 @@ fn apply_namespace(ctx: &Ctx, spec: &Value, dry_run: bool) -> Result<()> {
         return output::emit(&applied, ctx.out, &[format!("namespace/{name}")]);
     }
     println!("namespace/{name} configured");
+    Ok(())
+}
+
+/// One `kind: auth-provider` object from an `apply` input.
+///
+/// Like a namespace and unlike a deployment, `POST` is already the upsert —
+/// re-declaring keeps the original `created_at` — so there is nothing to look
+/// up first. The body may carry the request-only `preset`/`secret` pair, which
+/// the server expands and never stores, so a file can say "the Heyo auth API,
+/// with this key" in three lines.
+fn apply_auth_provider(ctx: &Ctx, spec: &Value, dry_run: bool) -> Result<()> {
+    let name = spec
+        .get("name")
+        .and_then(Value::as_str)
+        .context("a `kind: auth-provider` object needs a `name`")?
+        .to_string();
+    let ns = spec
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(crate::DEFAULT_NAMESPACE)
+        .to_string();
+    if dry_run {
+        return print_spec(ctx, spec);
+    }
+    // `kind` is heyctl's dispatch key, not part of app-lb's object.
+    let mut body = spec.clone();
+    if let Some(o) = body.as_object_mut() {
+        o.remove("kind");
+    }
+    ctx.client.create_auth_provider(&body)?;
+    if ctx.out.is_machine() {
+        let raw = ctx.client.raw().auth_provider(&ns, &name)?;
+        return output::emit(&raw, ctx.out, &[format!("auth-provider/{ns}/{name}")]);
+    }
+    println!("auth-provider/{ns}/{name} configured");
     Ok(())
 }
 
@@ -2364,6 +2972,11 @@ pub struct DeleteArgs {
     #[arg(long, short = 'd', value_name = "NAME")]
     pub deployment: Option<String>,
 
+    /// The namespace an auth provider lives in. A provider is unique within
+    /// its namespace, not across the fleet, so this is how one is named.
+    #[arg(long, short = 'n', value_name = "NAMESPACE")]
+    pub namespace: Option<String>,
+
     /// Delete every deployment, or every VM of --deployment.
     #[arg(long)]
     pub all: bool,
@@ -2404,6 +3017,7 @@ pub fn delete(ctx: &Ctx, args: &DeleteArgs) -> Result<()> {
              `POST /disks/sweep` on the admin API, which delete gigabytes with no undo"
         ),
         Resource::Namespace => delete_namespaces(ctx, &names),
+        Resource::AuthProvider => delete_auth_providers(ctx, &names, args.namespace.as_deref()),
         Resource::All => bail!("`delete all` is not supported — name the deployments, or use --all"),
     }
 }
@@ -2517,8 +3131,11 @@ fn delete_namespaces(ctx: &Ctx, names: &[String]) -> Result<()> {
 }
 
 fn delete_secrets(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()> {
+    let ns = args.namespace.as_deref();
     let targets: Vec<String> = if args.all {
-        let list: Vec<SecretSummary> = serde_json::from_value(ctx.client.raw().secrets()?)?;
+        // Narrowed to the namespace being deleted from, so `--all -n team-a`
+        // cannot reach past its own wall.
+        let list: Vec<SecretSummary> = serde_json::from_value(ctx.client.raw().secrets_in(ns)?)?;
         list.into_iter().map(|s| s.id).collect()
     } else {
         if names.is_empty() {
@@ -2542,8 +3159,11 @@ fn delete_secrets(ctx: &Ctx, names: &[String], args: &DeleteArgs) -> Result<()> 
     for id in &targets {
         // The server refuses (409) while a deployment's build still references
         // the secret; --force is how you say you meant it.
-        ctx.client.delete_secret(id, args.force)?;
-        println!("secret/{id} deleted");
+        ctx.client.delete_secret_in(ns, id, args.force)?;
+        match ns {
+            Some(ns) => println!("secret/{id} deleted from namespace {ns}"),
+            None => println!("secret/{id} deleted"),
+        }
     }
     Ok(())
 }
@@ -2660,4 +3280,166 @@ fn report_write(ctx: &Ctx, result: &Value, id: &str, verb: &str) -> Result<()> {
         None => println!("deployment/{id} {verb}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// A `#[derive(Args)]` struct is parsed through a command that flattens it.
+    #[derive(Parser, Debug)]
+    struct ProviderCmd {
+        #[command(flatten)]
+        args: CreateAuthProviderArgs,
+    }
+
+    fn provider(argv: &[&str]) -> CreateAuthProviderArgs {
+        let mut full = vec!["create-auth-provider"];
+        full.extend_from_slice(argv);
+        ProviderCmd::try_parse_from(full).expect("flags parse").args
+    }
+
+    #[test]
+    fn a_claim_requirement_is_a_value_or_any_of_several() {
+        assert_eq!(
+            parse_require("accountId=acct_7f3c").unwrap(),
+            ("accountId".to_string(), Value::String("acct_7f3c".into())),
+        );
+        assert_eq!(
+            parse_require("role=user,admin").unwrap(),
+            (
+                "role".to_string(),
+                Value::Array(vec![Value::String("user".into()), Value::String("admin".into())]),
+            ),
+        );
+        // The one conversion, because a boolean claim is genuinely common.
+        assert_eq!(
+            parse_require("email_verified=true").unwrap(),
+            ("email_verified".to_string(), Value::Bool(true)),
+        );
+        // And the one that is deliberately *not* converted: an id that happens
+        // to be digits is a string in the token it came from.
+        assert_eq!(
+            parse_require("orgId=12345").unwrap(),
+            ("orgId".to_string(), Value::String("12345".into())),
+        );
+        assert!(parse_require("role").is_err(), "no `=`");
+        assert!(parse_require("=user").is_err(), "no claim");
+        assert!(parse_require("role=").is_err(), "no value");
+    }
+
+    /// The bring-your-own-issuer path: any issuer, one key, and the algorithm
+    /// chosen by the spec rather than by the token.
+    #[test]
+    fn a_jwt_provider_names_one_key_and_defaults_its_algorithm_by_key_kind() {
+        let jwt = provider(&["okta", "--issuer", "https://example.okta.com", "--jwks-url", "https://example.okta.com/keys"])
+            .jwt_block()
+            .unwrap()
+            .expect("an issuer means a jwt block");
+        assert_eq!(jwt["algorithms"], serde_json::json!(["RS256"]));
+        assert_eq!(jwt["issuer"], "https://example.okta.com");
+
+        let jwt = provider(&["own", "--issuer", "my-service", "--secret", "signing/jwt"])
+            .jwt_block()
+            .unwrap()
+            .expect("an issuer means a jwt block");
+        assert_eq!(jwt["algorithms"], serde_json::json!(["HS256"]), "a shared secret is symmetric");
+        assert_eq!(jwt["secret"], serde_json::json!({"secret": "signing", "key": "jwt"}));
+
+        // Two keys is the question "which one verified this?" with no answer.
+        let two = provider(&[
+            "both", "--issuer", "x", "--secret", "s/k", "--jwks-url", "https://e/keys",
+        ]);
+        assert!(two.jwt_block().is_err());
+
+        // No key at all.
+        assert!(provider(&["none", "--issuer", "x"]).jwt_block().is_err());
+    }
+
+    /// The redirect and the cookie are one mechanism: without the cookie the
+    /// browser comes back holding nothing and is redirected again, forever.
+    #[test]
+    fn a_login_redirect_without_a_cookie_is_refused_before_the_server_sees_it() {
+        let args = provider(&[
+            "own", "--issuer", "my-service", "--secret", "s/k",
+            "--login-url", "https://auth.example.com/login",
+        ]);
+        let err = args.jwt_block().expect_err("login_url needs a cookie");
+        assert!(err.to_string().contains("--cookie"), "{err}");
+
+        let ok = provider(&[
+            "own", "--issuer", "my-service", "--secret", "s/k",
+            "--login-url", "https://auth.example.com/login",
+            "--cookie", "heyo_token",
+            "--login-redirect-param", "return_to",
+        ])
+        .jwt_block()
+        .unwrap()
+        .expect("a jwt block");
+        assert_eq!(ok["login_url"], "https://auth.example.com/login");
+        assert_eq!(ok["login_redirect_param"], "return_to");
+        assert_eq!(ok["cookie"], "heyo_token");
+    }
+
+    /// A Google allow-list on a JWT provider is refused rather than dropped:
+    /// whoever wrote it believes the provider is restricted, and it is not.
+    #[test]
+    fn a_google_allow_list_on_a_jwt_provider_is_refused_with_the_right_flag_named() {
+        let misplaced = |argv: &[&str]| provider(argv).misplaced_google_allow_list();
+        assert!(misplaced(&[
+            "heyo", "--preset", "heyo", "--secret", "s/k", "--allow-domain", "example.com",
+        ]));
+        assert!(misplaced(&[
+            "own", "--issuer", "x", "--secret", "s/k", "--allow-email", "a@example.com",
+        ]));
+        // Not misplaced: a Google provider is exactly where they belong.
+        assert!(!misplaced(&[
+            "corp", "--client-id", "1234.apps.googleusercontent.com", "--secret", "g/s",
+            "--allow-domain", "example.com",
+        ]));
+        assert!(!misplaced(&["heyo", "--preset", "heyo", "--secret", "s/k"]));
+    }
+
+    /// The two Heyo presets take different key material, and each refuses the
+    /// other's: naming a secret for the key-set preset means somebody thinks
+    /// they are configuring something they are not.
+    #[test]
+    fn the_presets_refuse_each_others_key_material() {
+        use clap::Parser as _;
+        let parse = |argv: &[&str]| {
+            let mut full = vec!["create-auth-provider"];
+            full.extend_from_slice(argv);
+            ProviderCmd::try_parse_from(full).map(|c| c.args)
+        };
+        // Both are accepted by the parser; the refusal is the handler's, and
+        // these assert the flag combinations that reach it.
+        let jwks = parse(&["heyo", "--preset", "heyo-jwks"]).expect("no secret needed");
+        assert!(jwks.secret.is_none() && jwks.jwks_url.is_none());
+        let with_url = parse(&[
+            "heyo", "--preset", "heyo-jwks", "--jwks-url", "https://auth.example.com/.well-known/jwks.json",
+        ])
+        .expect("an explicit key set is allowed");
+        assert_eq!(
+            with_url.jwks_url.as_deref(),
+            Some("https://auth.example.com/.well-known/jwks.json"),
+        );
+        // And the preset itself satisfies the "one identity shape" group, so
+        // `--preset heyo-jwks` alone is a complete command.
+        assert!(parse(&["heyo", "--preset", "heyo-jwks"]).is_ok());
+    }
+
+    /// One provider serialises as a bare string, several as an array — the
+    /// shape app-lb's own `Providers` round-trips.
+    #[test]
+    fn the_provider_list_is_a_string_for_one_and_an_array_for_several() {
+        assert_eq!(
+            provider(&["heyo", "--preset", "heyo", "--secret", "s/k"]).providers(),
+            Value::String("jwt".into()),
+        );
+        assert_eq!(
+            provider(&["mixed", "--issuer", "x", "--secret", "s/k", "--app-token"]).providers(),
+            serde_json::json!(["jwt", "app-token"]),
+        );
+    }
 }

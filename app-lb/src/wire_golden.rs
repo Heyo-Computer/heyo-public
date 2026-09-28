@@ -94,6 +94,7 @@ fn vm_spec() -> DeploymentSpec {
         ],
         maintenance: false,
         vm: Some(crate::config::VmSpec {
+            correlated_creates: false,
             env_from: vec![],
             workspace_archive: None,
             image_download_url: None,
@@ -147,12 +148,14 @@ fn vm_spec() -> DeploymentSpec {
             idle_action: crate::config::IdleAction::Retain,
         },
         health: crate::config::HealthCheck {
+            expected_header: Some(crate::config::ExpectedHeader { name: "x-heyo-revision".into(), value: "0123456789abcdef0123456789abcdef01234567".into() }),
             path: Some("/healthz".into()),
             port: Some(8080),
             timeout_secs: 2,
         },
         upstreams: vec![],
         discovery: None,
+        gateway: None,
         build: Some(crate::config::BuildSpec {
             repo: Some("https://github.com/example/agent".into()),
             store: None,
@@ -243,6 +246,7 @@ fn site_spec() -> DeploymentSpec {
         health: crate::config::HealthCheck::default(),
         upstreams: vec![],
         discovery: None,
+        gateway: None,
         build: None,
         artifact: None,
         site: Some(crate::config::SiteSpec {
@@ -300,7 +304,11 @@ fn static_spec() -> DeploymentSpec {
         upstreams: vec!["10.0.0.4:8080".into(), "10.0.0.5:8080".into()],
         discovery: Some(crate::config::DiscoverySpec {
             service_id: "cloud".into(),
+            region: None,
+            source: None,
+            regional: None,
         }),
+        gateway: None,
         build: None,
         artifact: None,
         site: None,
@@ -485,6 +493,7 @@ fn deployment_status_is_stable() {
         golden(
             name,
             &DeploymentStatus {
+                rollout_revision: "persisted-opaque-revision".into(),
                 spec,
                 kind,
                 desired_replicas: if managed { 1 } else { 0 },
@@ -1368,4 +1377,40 @@ fn a_minimal_workflow_fills_its_defaults() {
     assert_eq!(minimal.path, ".ci/workflows/*.yml");
     assert!(minimal.enabled);
     golden("workflow-minimal", &minimal);
+}
+
+/// `GET /api/plugins` — the plugin list the console and `heyctl plugins` read.
+#[test]
+fn plugin_list_is_stable() {
+    use crate::plugins::{PluginMeta, PluginView};
+    let enabled = PluginView {
+        meta: PluginMeta {
+            id: "example",
+            name: "Example",
+            description: "A plugin that is switched on and failing.",
+            config_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+            }),
+        },
+        enabled: true,
+        config: serde_json::json!({"url": "http://127.0.0.1:34199"}),
+        updated_at: 1_760_000_000,
+        last_error: Some("connection refused".into()),
+        status: serde_json::json!({"state": "retrying"}),
+    };
+    let disabled = PluginView {
+        meta: PluginMeta {
+            id: "idle",
+            name: "Idle",
+            description: "A plugin nobody switched on.",
+            config_schema: serde_json::json!({"type": "object"}),
+        },
+        enabled: false,
+        config: serde_json::Value::Null,
+        updated_at: 0,
+        last_error: None,
+        status: serde_json::json!({}),
+    };
+    golden("plugins", &vec![enabled, disabled]);
 }

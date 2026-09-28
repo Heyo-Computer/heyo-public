@@ -192,7 +192,11 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
         "Log lines for one deployment, newest first, with the filters app-obs supports: " +
         "time window or explicit from/to, level, backend, a substring query, and a cursor for " +
         "paging. Collected from the daemon's native tail of each sandbox's console and its " +
-        "start_command's stdout/stderr, so no shipper inside the guest is required.",
+        "start_command's stdout/stderr, so no shipper inside the guest is required — and " +
+        "including app-lb's own events for the deployment, which is where a VM that never " +
+        "booted says why, since a guest that panics has no console to tail. " +
+        "Needs APP_OBS_URL, and APP_OBS_API_TOKEN when app-obs sits behind an app-lb gate: " +
+        "without the token the gate answers 401 and no log line reaches this tool.",
       schema: {
         id: z.string().describe("app-lb deployment id"),
         window: z.string().optional().describe("e.g. '15m'; ignored when from/to are given"),
@@ -206,6 +210,22 @@ export function diagnosticTools(clients: Clients, config: Config): Tool[] {
       },
       handler: async (args) => {
         const id = String(args.id);
+        // app-obs knows nothing about namespaces: its partitions are deployment
+        // ids, and a token that reaches its API reaches all of them. The wall a
+        // caller is behind is app-lb's, so ask app-lb — with the caller's own
+        // credential, through whichever door this server is configured with —
+        // whether this deployment is theirs to see. A namespace-confined caller
+        // gets a 404 there, and gets one here.
+        try {
+          await clients.applb({ path: `/deployments/${encodeURIComponent(id)}` });
+        } catch (e) {
+          return json({
+            error:
+              `no deployment ${JSON.stringify(id)} is visible to this credential, ` +
+              "so its logs are not either",
+            detail: e instanceof Error ? e.message : String(e),
+          });
+        }
         const out = await clients.obs({
           path: `/api/deployments/${encodeURIComponent(id)}/logs`,
           query: {

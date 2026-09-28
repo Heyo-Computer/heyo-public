@@ -236,11 +236,40 @@ disk_in_use() {
 # for free, and only what survives that pays for a live scan. Under the global
 # gate it is never called at all — no VM can boot during a pass in the first
 # place. Fails closed, like disk_in_use.
+#
+# The verdict is CAPTURED as a value, never read from the pipeline's exit
+# status, because this script runs under `set -o pipefail` and the producer
+# side of that scan fails routinely and harmlessly:
+#
+#   * a /proc walk races every process on the host, so any pid or fd that
+#     vanishes between readdir and stat makes `stat` — and therefore `find`,
+#     which reports a failed -exec — exit non-zero, at any fleet size worth
+#     scanning, and
+#   * a consumer that stops early (`grep -q` quits on its first match) SIGPIPEs
+#     `stat` on its next write, i.e. the producer fails *because* the disk is
+#     in use.
+#
+# Under pipefail either of those outranks the consumer's 0, so the pipeline
+# reports failure and a status-based predicate reads it as "free". The
+# `find … | grep -qxF` this replaces was therefore not merely unreliable, it
+# was inverted in precisely the case it exists to catch: on a busy host the
+# answer was always "not in use", and a pass would fsck, prune and discard a
+# filesystem a live guest had mounted.
+#
+# awk consumes the whole scan (nothing is SIGPIPEd) and reports one token,
+# including whether the scan saw any fds at all: a scan that produced nothing
+# is "unknown", not "free", so an unreadable /proc fails closed the way
+# disk_in_use does. Keep the assignment and the test on separate lines —
+# `local verdict=$(...)` would take `local`'s status instead of the
+# substitution's, which is how this class of bug hides.
 disk_in_use_live() {
-    local key
+    local key verdict
     key=$(stat -c '%d:%i' "$1" 2>/dev/null) || return 0
-    find /proc/[0-9]*/fd -maxdepth 1 -type l -exec stat -L -c '%d:%i' {} + 2>/dev/null \
-        | grep -qxF "$key"
+    verdict=$(find /proc/[0-9]*/fd -maxdepth 1 -type l -exec stat -L -c '%d:%i' {} + 2>/dev/null \
+              | awk -v key="$key" '$0 == key { found = 1 }
+                                   END { print (NR == 0 ? "unknown" : (found ? "inuse" : "free")) }')
+    # Anything but a scan that ran and found nothing counts as in use.
+    [ "$verdict" != "free" ]
 }
 
 shopt -s nullglob
@@ -363,23 +392,42 @@ trim_one() {
     local fsck_rc=$?
 
     # Remediate the damage that old ordering left behind: preen reports
-    # "Unattached inode N" and gives up. Strictly NAMELESS inodes (no dirent
-    # anywhere — ncheck prints nothing) are unreachable dead weight, i.e. the
+    # "Unattached inode N" and gives up. Strictly NAMELESS inodes (ncheck ran
+    # and listed no path for them) are unreachable dead weight, i.e. the
     # ex-swapfile; kill_file frees their blocks, clri zeroes the inode so
     # nothing resurrects it, and a re-preen leaves a clean filesystem. An
     # unattached inode that still has a name anywhere is a real file and is
     # never touched (the FAIL stands, for badfs/manual recovery).
-    if [ "$fsck_rc" -ge 4 ] && echo "$fsck_out" | grep -q "Unattached inode"; then
-        local ino killed=0
-        for ino in $(echo "$fsck_out" | grep -oE 'Unattached (zero-length )?inode [0-9]+' \
+    if [ "$fsck_rc" -ge 4 ] && grep -q "Unattached inode" <<<"$fsck_out"; then
+        local ino killed=0 skipped_ncheck=0 ncheck_out
+        for ino in $(grep -oE 'Unattached (zero-length )?inode [0-9]+' <<<"$fsck_out" \
                      | grep -oE '[0-9]+$' | sort -un); do
-            if ! debugfs -R "ncheck $ino" "$disk" 2>/dev/null \
-                 | awk 'NR>1 && NF>=2 {f=1} END {exit !f}'; then
-                debugfs -w -R "kill_file <$ino>" "$disk" >/dev/null 2>&1
-                debugfs -w -R "clri <$ino>" "$disk" >/dev/null 2>&1
-                killed=$((killed + 1))
+            # "No name" has to be something ncheck actually reported, not just
+            # an empty stdout. debugfs exits 0 whatever happens — including
+            # when it cannot open the filesystem at all, which on a damaged one
+            # is the normal outcome ("Filesystem not open", on stderr, which
+            # this call discards). Its header line is the only proof the lookup
+            # ran; without it the answer is unknown and the inode is left for
+            # manual recovery, because kill_file/clri on a *named* file is
+            # exactly the data loss this remediation exists to clean up after.
+            ncheck_out=$(debugfs -R "ncheck $ino" "$disk" 2>/dev/null)
+            case "$ncheck_out" in
+                Inode*) ;;
+                *)
+                    skipped_ncheck=$((skipped_ncheck + 1))
+                    continue
+                    ;;
+            esac
+            # A name anywhere means a real file: never touched.
+            if awk 'NR>1 && NF>=2 {f=1} END {exit !f}' <<<"$ncheck_out"; then
+                continue
             fi
+            debugfs -w -R "kill_file <$ino>" "$disk" >/dev/null 2>&1
+            debugfs -w -R "clri <$ino>" "$disk" >/dev/null 2>&1
+            killed=$((killed + 1))
         done
+        [ "$skipped_ncheck" -gt 0 ] \
+            && echo "note  (left $skipped_ncheck unattached inode(s) alone: ncheck could not read the filesystem)  $disk"
         if [ "$killed" -gt 0 ]; then
             fsck_out=$(e2fsck -fp "$disk" 2>&1)
             fsck_rc=$?

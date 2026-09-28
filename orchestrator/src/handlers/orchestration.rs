@@ -668,8 +668,10 @@ pub async fn create_resource_deployment(
         setup_hooks: req.setup_hooks,
         size_class: req.size_class,
         ttl_seconds: req.ttl_seconds,
+        deployment_environment: None,
         placement_pool: None,
         excluded_backend_server_ids: Vec::new(),
+        allowed_backend_server_ids: None,
         metadata: req.metadata,
     };
 

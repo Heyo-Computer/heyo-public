@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use config::{Config as ConfigBuilder, Environment, File};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -109,8 +109,60 @@ pub struct Config {
     #[serde(default)]
     pub discovery_routed_services: String,
 
+    /// All ingress app-lb instances for each discovery service. Regional
+    /// rollouts require an observer in every target region and query them all.
+    #[serde(default)]
+    pub discovery_observers: Vec<DiscoveryObserver>,
+
+    /// Trusted retained-workspace runtimes for adopted applications.
+    #[serde(default)]
+    pub external_service_bindings: Vec<ExternalServiceBinding>,
+
     #[serde(default)]
     pub nats: NatsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryObserver {
+    pub service_id: String,
+    pub region: String,
+    /// Explicit hierarchical gateway identity; required for regional-v1 reports.
+    #[serde(default)]
+    pub gateway_id: Option<String>,
+    pub deployment_id: String,
+    pub base_url: String,
+    /// Opt in to host-managed ingress. Origin used to probe this particular
+    /// ingress, with the service route's Host header (not a global LB URL).
+    #[serde(default)]
+    pub ingress_url: Option<String>,
+    /// Existing app-lb secret ID, in the route's default namespace, with a
+    /// `token` key for this discovery authority. The value stays in app-lb.
+    #[serde(default)]
+    pub discovery_token_secret: Option<String>,
+    /// Existing namespace-local app-lb peer-role secret ID for cold regional
+    /// enrollment. This is a reference, not a credential value.
+    #[serde(default)]
+    pub regional_peer_token_secret: Option<String>,
+    /// Exact authoritative service discovery URL, identical at every ingress.
+    #[serde(default)]
+    pub discovery_url: Option<String>,
+    /// HeyoSecret path containing an app-lb admin bearer. Never persisted in
+    /// rollout requests or returned by status APIs.
+    pub token_secret_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalServiceBinding {
+    pub service_id: String,
+    pub authority: String,
+    pub region: String,
+    pub namespace: String,
+    pub deployment_id: String,
+    /// HeyoSecret credential scoped to this application's lifecycle exchange.
+    #[serde(default)]
+    pub lifecycle_token_secret_path: String,
+    pub health_origin: String,
+    pub token_secret_path: String,
 }
 
 impl Config {
@@ -369,7 +421,13 @@ impl Config {
         );
 
         let config = config_builder.build()?;
+        let observers = Self::load_discovery_observers(&config,
+            env::var("ORCHESTRATOR_DISCOVERY_OBSERVERS_JSON").ok().as_deref())?;
+        let external_bindings = Self::load_external_service_bindings(&config,
+            env::var("ORCHESTRATOR_EXTERNAL_SERVICE_BINDINGS_JSON").ok().as_deref())?;
         let mut orchestrator_config: Config = config.try_deserialize()?;
+        orchestrator_config.discovery_observers = observers;
+        orchestrator_config.external_service_bindings = external_bindings;
 
         if let Ok(server_port) = env::var("ORCHESTRATOR_SERVER_PORT") {
             if !server_port.is_empty() {
@@ -497,6 +555,40 @@ impl Config {
         Ok(orchestrator_config)
     }
 
+    fn load_discovery_observers(config: &ConfigBuilder, env_json: Option<&str>) -> Result<Vec<DiscoveryObserver>> {
+        // An explicitly empty TOML list disables observers, even if the VM
+        // deployment supplies an environment fallback.
+        if config.get::<config::Value>("discovery_observers").is_ok() {
+            return Ok(config.get("discovery_observers")?);
+        }
+        serde_json::from_str(env_json.filter(|s| !s.trim().is_empty()).unwrap_or("[]"))
+            .context("invalid ORCHESTRATOR_DISCOVERY_OBSERVERS_JSON")
+    }
+
+    fn load_external_service_bindings(config: &ConfigBuilder, env_json: Option<&str>) -> Result<Vec<ExternalServiceBinding>> {
+        let mut bindings: Vec<ExternalServiceBinding> = if config.get::<config::Value>("external_service_bindings").is_ok() {
+            config.get("external_service_bindings")?
+        } else {
+            serde_json::from_str(env_json.filter(|s| !s.trim().is_empty()).unwrap_or("[]"))
+                .context("invalid ORCHESTRATOR_EXTERNAL_SERVICE_BINDINGS_JSON")?
+        };
+        let mut identities = std::collections::HashSet::new();
+        let mut services = std::collections::HashSet::new();
+        for binding in &mut bindings {
+            for value in [&mut binding.authority, &mut binding.health_origin] {
+                let url = reqwest::Url::parse(value)?;
+                anyhow::ensure!(matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                    && url.path() == "/" && url.query().is_none() && url.fragment().is_none()
+                    && url.username().is_empty() && url.password().is_none(), "external service URLs must be credential-free origins");
+                *value = url.to_string();
+            }
+            anyhow::ensure!(services.insert(binding.service_id.clone()), "duplicate external service ID");
+            anyhow::ensure!(identities.insert((binding.authority.clone(), binding.namespace.clone(), binding.deployment_id.clone())),
+                "duplicate external service authority/namespace/deployment binding");
+        }
+        Ok(bindings)
+    }
+
     fn get_config_path() -> Option<std::path::PathBuf> {
         if let Ok(config_path) = env::var("HEYO_ORCHESTRATOR_CONFIG_PATH") {
             return Some(std::path::PathBuf::from(config_path));
@@ -507,5 +599,25 @@ impl Config {
         }
 
         dirs::home_dir().map(|home| home.join(".heyo/orchestrator/orchestrator.toml"))
+    }
+}
+
+#[cfg(test)]
+mod observer_config_tests {
+    use super::*;
+
+    #[test]
+    fn managed_observer_env_is_a_fallback_not_a_file_override() {
+        let empty = ConfigBuilder::builder().build().unwrap();
+        assert!(Config::load_discovery_observers(&empty, None).unwrap().is_empty());
+        assert!(Config::load_discovery_observers(&empty, Some("not json")).is_err());
+        let json = r#"[{"service_id":"smoke","region":"us","deployment_id":"smoke","base_url":"https://admin.example","token_secret_path":"observer/token","discovery_token_secret":"reader"}]"#;
+        let observers = Config::load_discovery_observers(&empty, Some(json)).unwrap();
+        assert_eq!(observers[0].region, "us");
+        assert_eq!(observers[0].discovery_token_secret.as_deref(), Some("reader"));
+        let file = ConfigBuilder::builder()
+            .add_source(File::from_str("discovery_observers = []", config::FileFormat::Toml)).build().unwrap();
+        assert!(Config::load_discovery_observers(&file, Some(json)).unwrap().is_empty());
+        assert!(Config::load_discovery_observers(&file, Some("invalid ignored fallback")).unwrap().is_empty());
     }
 }

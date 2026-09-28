@@ -55,6 +55,10 @@
     "idle_action": "retain"
   },
   "health": {
+    "expected_header": {
+      "name": "x-heyo-revision",
+      "value": "0123456789abcdef0123456789abcdef01234567"
+    },
     "path": "/healthz",
     "port": 8080,
     "timeout_secs": 2

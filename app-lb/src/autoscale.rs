@@ -94,6 +94,7 @@ const GUEST_LOG_LINES: usize = 20;
 const SUSPENDED_SWEEP: Duration = Duration::from_secs(300);
 
 pub struct Autoscaler {
+    rollout_gate: tokio::sync::RwLock<()>,
     registry: Arc<Registry>,
     /// Both runtimes: heyvmd for microVMs, Incus for containers. See
     /// [`crate::runtime`] for why this is an enum-shaped struct rather than a
@@ -131,6 +132,7 @@ impl Autoscaler {
         secrets: Arc<crate::secrets::SecretStore>,
     ) -> Self {
         Self {
+            rollout_gate: tokio::sync::RwLock::new(()),
             registry,
             runtime,
             metrics,
@@ -147,6 +149,16 @@ impl Autoscaler {
     /// Resolved at create rather than at registration so rotating a secret
     /// reaches the next replica without re-registering the deployment — the
     /// same reason a build reads its git token when it runs.
+    pub async fn rollout_guard(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.rollout_gate.write().await
+    }
+
+    pub async fn create_candidate(&self, spec: &crate::config::DeploymentSpec, name: &str) -> Result<String, String> {
+        let _permit = self.creates.acquire().await;
+        let env = self.secret_env(spec.vm_spec()).map_err(|e| e.to_string())?;
+        self.runtime.create(spec.vm_spec(), name.to_string(), None, &vm::VmOwner::of(spec), env).await.map_err(|e| e.to_string())
+    }
+
     fn secret_env(&self, spec: &crate::config::VmSpec) -> Result<HashMap<String, String>, vm::VmError> {
         let mut env = HashMap::with_capacity(spec.env_from.len());
         for from in &spec.env_from {
@@ -165,6 +177,22 @@ impl Autoscaler {
     /// The workspace store, for the admin API's status view.
     pub fn workspaces(&self) -> &Arc<Workspaces> {
         &self.workspaces
+    }
+
+    pub(crate) async fn workspace_recovery_guard(&self) -> WorkspaceReplacementGuard<'_> {
+        WorkspaceReplacementGuard { _creates: self.creates.acquire_many(CREATE_CONCURRENCY as u32).await.expect("create semaphore open") }
+    }
+
+    /// A record may own resources absent from its in-memory pool. Removing it
+    /// would turn those resources into orphans for a later sweep. The caller
+    /// holds rollout, registry and allocation guards through removal.
+    pub(crate) async fn has_owned_resources(&self, id: &str) -> Result<bool, String> {
+        let fleet = self.runtime.list().await;
+        fleet.heyvm?;
+        if let Some(result) = fleet.lxc { result?; }
+        let inactive = self.vms().list_inactive().await.map_err(|e| e.to_string())?;
+        Ok(fleet.sandboxes.iter().chain(inactive.iter())
+            .any(|vm| vm::owner_of(&vm.name) == Some(id)))
     }
 
     /// Fence a workspace rollout before its replacement becomes live.
@@ -239,6 +267,12 @@ impl Autoscaler {
     /// two that do not — the orphan sweeps, where the deployment is already
     /// gone — use [`crate::runtime::Runtime::kill_unknown`] instead.
     async fn kill_vm(&self, d: &Arc<Deployment>, sandbox_id: &str) -> Result<(), vm::VmError> {
+        if self.registry.allocation_protects(sandbox_id) {return Ok(());}
+        if self.registry.retirement_protects(sandbox_id,Some(&d.spec.id)) || self.workspaces.retirement_protects(sandbox_id) {return Ok(());}
+        if self.workspaces.recovery_pinned(sandbox_id) { return Ok(()); }
+        if Self::has_workspace(d) && self.workspaces.source_retained(sandbox_id) {
+            return self.vms().suspend(sandbox_id).await;
+        }
         let driver = d.spec.driver().unwrap_or_default();
         self.runtime.kill(driver, sandbox_id).await
     }
@@ -257,7 +291,7 @@ impl Autoscaler {
     fn is_live(&self, d: &Arc<Deployment>) -> bool {
         self.registry
             .get(&d.spec.id)
-            .is_some_and(|live| Arc::ptr_eq(&live, d))
+            .is_some_and(|live| Arc::ptr_eq(&live, d) && live.state().retirement.is_none())
     }
 
     /// Which of `ids` no live deployment is tracking any more.
@@ -295,6 +329,7 @@ impl Autoscaler {
                     .iter()
                     .map(|p| p.sandbox_id.clone())
                     .chain(backends.iter().map(|b| b.sandbox_id.clone()))
+                    .chain(crate::rollout::protected_ids(&l.state()).cloned())
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -359,6 +394,9 @@ impl Autoscaler {
         let mut adopted = Vec::new();
         for (id, info) in fleet {
             if vm::owner_of(&info.name) != Some(d.spec.id.as_str())
+                || !crate::rollout::adoptable(d, &info.name, id)
+                || self.workspaces.recovery_pinned(id)
+                || self.workspaces.recovery_active(&d.spec.id)
                 || tracked.contains(id.as_str())
                 || state.suspended.contains(id)
                 || vm::is_terminal(&info.status)
@@ -368,6 +406,10 @@ impl Autoscaler {
             // Dated from the daemon's own uptime, not from now: this VM may have
             // been booting for minutes already, and starting its clock here
             // would hand it a fresh `boot_timeout_secs` on every adoption.
+            if !state.create_attempts.iter().any(|a|a.sandbox_id.as_ref()==Some(id)) {
+                d.mutate_state(|s|s.allocation_history_complete=false);
+                let _=self.registry.persist_one(&d.spec.id);
+            }
             let created_at = now_secs().saturating_sub(info.uptime_secs);
             adopted.push(PendingVm {
                 created_at,
@@ -405,7 +447,9 @@ impl Autoscaler {
     /// pass could outrun [`TICK`] entirely. Bounded by
     /// [`RECONCILE_CONCURRENCY`] so a large fleet cannot open thousands of
     /// simultaneous connections to the daemon.
-    async fn reconcile(&self) {
+    pub(crate) async fn reconcile(&self) {
+        let _retirement = self.registry.retirement_gate.read().await;
+        let _rollout = self.rollout_gate.read().await;
         let deployments = self.registry.deployments();
         // Sites are excluded outright rather than partitioned: they have no VMs
         // to reconcile *and* no upstreams to probe, so there is nothing for this
@@ -507,6 +551,13 @@ impl Autoscaler {
         let mut busy = Vec::new();
         for d in &managed {
             if !self.is_live(d) {
+                continue;
+            }
+            self.recover_allocations(d, &fleet).await;
+            if crate::rollout::reserved(d) {
+                // Keep source health recovery, but do not prune, adopt, scale
+                // or persist over the rollout's durable generation record.
+                busy.push(d);
                 continue;
             }
             self.prune(d, &fleet);
@@ -612,6 +663,11 @@ impl Autoscaler {
         // again here even though `reconcile` checked before dispatching,
         // because the dispatch itself yields.
         if !self.is_live(d) {
+            return;
+        }
+
+        if crate::rollout::reserved(d) {
+            self.reprobe_unhealthy_managed(d, fleet).await;
             return;
         }
 
@@ -733,7 +789,12 @@ impl Autoscaler {
     /// each tick, so a name that fails to resolve reads as unhealthy.
     async fn reconcile_static(&self, d: &Arc<Deployment>) {
         for b in d.backends().iter() {
-            let healthy = if b.tls {
+            let healthy = if let Some(gateway) = d.spec.gateway.as_ref()
+                .filter(|g| g.mode == crate::gateway::GatewayMode::Forward) {
+                crate::gateway::probe(gateway, &b.peer,
+                    d.spec.routes[0].host.as_deref().expect("validated gateway host"),
+                    &d.spec.health, &self.secrets).await
+            } else if b.tls {
                 health::probe_https(&b.address, &b.sni, &d.spec.health).await
             } else {
                 match tokio::net::lookup_host(&b.address).await {
@@ -1155,7 +1216,101 @@ impl Autoscaler {
         }
     }
 
+    /// Recover only the saved operation, never re-POST or infer an ID by name.
+    /// A receipt reserves capacity even when the daemon has not started it yet.
+    async fn recover_allocations(&self, d: &Arc<Deployment>, fleet: &HashMap<String, SandboxInfo>) {
+        let Some(_change) = self.registry.try_change_guard() else { return; };
+        if !self.is_live(d) { return; }
+        for (index, attempt) in d.state().create_attempts.clone().iter().enumerate() {
+            let Some(intent) = &attempt.allocation else { continue; };
+            if attempt.runtime_observed { continue; }
+            let receipt = match &attempt.receipt {
+                Some(receipt) if intent.transport == self.vms().transport() && intent.accepts(receipt) => receipt.clone(),
+                _ => match self.vms().recover_allocation(intent).await {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        tracing::warn!(deployment=%d.spec.id, operation=%intent.operation_id, %error, "allocation remains unresolved");
+                        continue;
+                    }
+                },
+            };
+            let id = receipt.sandbox_id.clone();
+            if attempt.sandbox_id.as_ref().is_some_and(|saved| saved != &id) {
+                tracing::error!(deployment=%d.spec.id, operation=%intent.operation_id, "allocation receipt changed sandbox identity");
+                continue;
+            }
+            let observed = fleet.get(&id).is_some_and(|info| info.status == heyo_sdk::SandboxStatus::Running);
+            d.mutate_state(|s| {
+                let saved = &mut s.create_attempts[index];
+                saved.sandbox_id = Some(id.clone());
+                saved.receipt = Some(receipt);
+                saved.runtime_observed = observed;
+            });
+            if self.registry.persist_one(&d.spec.id).is_err() {
+                d.mutate_state(|s| s.create_attempts[index] = attempt.clone());
+                continue;
+            }
+            if d.spec.vm_spec().workspace.is_some() {
+                self.workspaces.note_seeded(&d.spec.id, &id, attempt.seed_digest.clone(), attempt.seed_mount_index);
+            }
+            if !d.backends().iter().any(|b| b.sandbox_id == id)
+                && !d.pending().iter().any(|p| p.sandbox_id == id)
+                && !d.state().suspended.contains(&id) {
+                let mut pending = (*d.pending()).clone();
+                pending.push(PendingVm::new(id));
+                d.set_pending(pending);
+            }
+        }
+    }
+
+    async fn allocate_replica(&self, d: &Arc<Deployment>, name: String,
+        seed: Option<&vm::WorkspaceSeed>, seed_digest: Option<String>, owner: &vm::VmOwner,
+    ) -> Result<String, vm::VmError> {
+        let secret_env = self.secret_env(d.spec.vm_spec())?;
+        let prepared = if d.spec.vm_spec().correlated_creates {
+            let request = self.vms().prepare_create(d.spec.vm_spec(), name.clone(), seed, owner, secret_env.clone()).await?;
+            Some(self.vms().prepare_allocation(&request, &format!("{}:{}:{}", d.spec.namespace, d.spec.id, d.state().rollout_revision))?)
+        } else { None };
+        let attempt = d.state().create_attempts.len();
+        let history_was_complete = d.state().allocation_history_complete;
+        d.mutate_state(|s| {
+            if prepared.is_none() { s.allocation_history_complete = false; }
+            s.create_attempts.push(crate::retirement::CreateAttempt {
+                name:name.clone(), allocation:prepared.as_ref().map(|p| p.intent.clone()),
+                seed_digest, seed_mount_index:d.spec.vm_spec().mounts.len(), ..Default::default()
+            });
+        });
+        self.registry.persist_one(&d.spec.id).map_err(|_| vm::VmError::Runtime("cannot persist allocation intent".into()))?;
+        let result = match prepared {
+            Some(prepared) => self.vms().submit_allocation(&prepared).await.map(|r| (r.sandbox_id.clone(), Some(r))),
+            None => self.runtime.create(d.spec.vm_spec(), name, seed, owner, secret_env).await.map(|id| (id,None)),
+        };
+        match result {
+            Ok((id, receipt)) => {
+                d.mutate_state(|s| { s.create_attempts[attempt].sandbox_id=Some(id.clone()); s.create_attempts[attempt].receipt=receipt; });
+                if self.registry.persist_one(&d.spec.id).is_err() {
+                    d.mutate_state(|s| { s.create_attempts[attempt].sandbox_id=None; s.create_attempts[attempt].receipt=None; });
+                    return Err(vm::VmError::Runtime("cannot persist allocation receipt".into()));
+                }
+                Ok(id)
+            }
+            Err(error) => {
+                if matches!(error, vm::VmError::SecretUnresolved {..} | vm::VmError::MountNotPulled {..}
+                    | vm::VmError::WrongRuntime {..} | vm::VmError::RuntimeUnavailable {..}) {
+                    d.mutate_state(|s| { s.create_attempts.remove(attempt); s.allocation_history_complete=history_was_complete; });
+                    let _ = self.registry.persist_one(&d.spec.id);
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn scale_up(&self, d: &Arc<Deployment>, count: usize) {
+        let _change = if d.spec.vm_spec().correlated_creates {
+            let Some(guard) = self.registry.try_change_guard() else { return; };
+            Some(guard)
+        } else { None };
+        if !self.is_live(d) || d.state().create_attempts.iter().any(|a|a.sandbox_id.is_none()) {return;}
         tracing::info!(deployment = %d.spec.id, count, "scaling up");
         // Keep the slot until the resulting pending pool has been published,
         // not just until the daemon answered. A replacement draining these
@@ -1225,17 +1380,12 @@ impl Autoscaler {
                 }
             }
 
-            let name = vm::replica_name(&d.spec.id, self.next_nonce());
+            let name = d.state().active_prefix.as_ref().map(|p| format!("{p}{:016x}", self.next_nonce()))
+                .unwrap_or_else(|| vm::replica_name(&d.spec.id, self.next_nonce()));
             let seed = seeded.as_ref().map(|s| s.seed());
             let owner = vm::VmOwner::of(&d.spec);
-            let created_vm = match self.secret_env(d.spec.vm_spec()) {
-                Ok(secret_env) => {
-                    self.runtime
-                        .create(d.spec.vm_spec(), name, seed.as_ref(), &owner, secret_env)
-                        .await
-                }
-                Err(e) => Err(e),
-            };
+            let created_vm = self.allocate_replica(d, name, seed.as_ref(),
+                seeded.as_ref().and_then(|s| s.digest.clone()), &owner).await;
             match created_vm {
                 Ok(sandbox_id) => {
                     if let Some(seeded) = &seeded {
@@ -1444,6 +1594,7 @@ impl Autoscaler {
     /// what happened before this existed, and the resume path does not care
     /// either way.
     async fn discard_rootfs_of(&self, d: &Arc<Deployment>, sandbox_id: &str) {
+        if self.workspaces.source_retained(sandbox_id) { return; }
         // Libvirt resumes its existing qcow2 disk, unlike the tap drivers'
         // disposable rootfs copies. Removing it would destroy retained state.
         if d.spec.vm_spec().driver == Driver::Libvirt {
@@ -1495,6 +1646,7 @@ impl Autoscaler {
         sandbox_id: &str,
         origin: BootOrigin,
     ) {
+        if self.workspaces.source_retained(sandbox_id) { return; }
         if origin != BootOrigin::Created {
             tracing::info!(
                 deployment = %d.spec.id,
@@ -1567,8 +1719,8 @@ impl Autoscaler {
     fn take_suspended(&self, d: &Arc<Deployment>) -> Option<String> {
         let mut taken = None;
         let changed = d.mutate_state(|s| {
-            if !s.suspended.is_empty() {
-                taken = Some(s.suspended.remove(0));
+            if let Some(index) = s.suspended.iter().position(|id| !self.workspaces.recovery_pinned(id)) {
+                taken = Some(s.suspended.remove(index));
             }
         });
         if changed && let Err(e) = self.registry.persist_one(&d.spec.id) {
@@ -1604,7 +1756,9 @@ impl Autoscaler {
     /// Only sandboxes named `applb-<deployment>-<nonce>` are touched, and only
     /// when their deployment either does not exist or does not list them. A
     /// sandbox somebody else made is never destroyed.
-    async fn sweep_suspended(&self) {
+    pub(crate) async fn sweep_suspended(&self) {
+        let _retirement = self.registry.retirement_gate.read().await;
+        let _rollout = self.rollout_gate.read().await;
         // Both listings, because *where* a stopped sandbox turns up depends on
         // the backend. mvm-ctrl re-adds every persisted **KVM** sandbox to
         // `GET /sandboxes` on each call, so a stopped one appears there with
@@ -1655,6 +1809,8 @@ impl Autoscaler {
         let mut seen: HashSet<String> = HashSet::new();
 
         for info in stopped {
+            if self.registry.allocation_protects(&info.id) {continue;}
+            if self.registry.retirement_protects(&info.id,vm::owner_of(&info.name)) || self.workspaces.retirement_protects(&info.id) {continue;}
             let Some(owner) = vm::owner_of(&info.name) else {
                 continue; // not ours
             };
@@ -1663,6 +1819,8 @@ impl Autoscaler {
                 continue;
             }
             let d = deployments.get(owner);
+            if d.is_some_and(|d| crate::rollout::protected_ids(&d.state()).any(|id| id == &info.id)
+                || d.state().rollouts.iter().any(|o| info.name.starts_with(&o.prefix))) { continue; }
             if d.is_some_and(|d| d.state().suspended.contains(&info.id)) {
                 continue; // claimed: nothing to decide
             }
@@ -1718,6 +1876,8 @@ impl Autoscaler {
         }
 
         for (sandbox_id, owner) in &orphans {
+            if self.registry.allocation_protects(sandbox_id) { continue; }
+            if self.workspaces.source_retained(sandbox_id) { continue; }
             tracing::warn!(deployment = %owner, sandbox = %sandbox_id, "destroying unclaimed suspended VM");
             if let Err(e) = self.runtime.kill_unknown(sandbox_id).await {
                 tracing::warn!(sandbox = %sandbox_id, error = %e, "failed to kill suspended VM");
@@ -1757,6 +1917,8 @@ impl Autoscaler {
     /// Without this, a restart would leave old VMs running while booting a fresh
     /// set — the orphans would only die when their TTL expired.
     pub async fn adopt_existing(&self) {
+        let _retirement = self.registry.retirement_gate.read().await;
+        let _rollout = self.rollout_gate.read().await;
         let fleet = match self.vms().list().await {
             Ok(list) => list,
             Err(e) => {
@@ -1769,7 +1931,14 @@ impl Autoscaler {
         let mut adopted: HashMap<String, Vec<Arc<VmBackend>>> = HashMap::new();
         let mut orphans = Vec::new();
 
+        let indexed = vm::index_by_id(fleet.clone());
+        for d in deployments.values().filter(|d| d.spec.is_managed()) {
+            self.recover_allocations(d, &indexed).await;
+        }
         for info in &fleet {
+            if self.registry.allocation_protects(&info.id) { continue; }
+            if self.registry.retirement_protects(&info.id,vm::owner_of(&info.name)) || self.workspaces.retirement_protects(&info.id) {continue;}
+            if self.workspaces.recovery_pinned(&info.id) { continue; }
             let Some(owner) = vm::owner_of(&info.name) else {
                 continue; // not ours; leave it alone
             };
@@ -1778,11 +1947,16 @@ impl Autoscaler {
                 orphans.push(info.id.clone());
                 continue;
             };
+            if !crate::rollout::adoptable(d, &info.name, &info.id) { continue; }
             if !d.spec.is_managed() {
                 // The id was reused for a static deployment or a site since this
                 // VM was created; neither owns VMs, so this sandbox is an orphan.
                 orphans.push(info.id.clone());
                 continue;
+            }
+            if !d.state().create_attempts.iter().any(|a|a.sandbox_id.as_ref()==Some(&info.id)) {
+                d.mutate_state(|s|s.allocation_history_complete=false);
+                let _=self.registry.persist_one(&d.spec.id);
             }
             // A VM this deployment deliberately suspended is neither adoptable
             // nor an orphan: it is stopped on purpose and its data disk *is* the
@@ -1829,6 +2003,7 @@ impl Autoscaler {
                         .or_default()
                         .push(Arc::new(VmBackend::new(info.id.clone(), addr)));
                 }
+                _ if !d.state().rollouts.is_empty() => {}, // uncertain service generation: retain
                 _ => orphans.push(info.id.clone()),
             }
         }
@@ -1840,6 +2015,8 @@ impl Autoscaler {
         }
 
         for id in orphans {
+            if self.registry.allocation_protects(&id) { continue; }
+            if self.workspaces.source_retained(&id) { continue; }
             tracing::info!(sandbox = %id, "killing orphaned VM from a previous run");
             if let Err(e) = self.runtime.kill_unknown(&id).await {
                 tracing::warn!(sandbox = %id, error = %e, "failed to kill orphan");
@@ -2244,6 +2421,7 @@ mod tests {
                 strip_prefix: false,
             }],
             vm: Some(VmSpec {
+                correlated_creates: false,
                 env_from: vec![],
                 workspace_archive: None,
                 image_download_url: None,
@@ -2268,6 +2446,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,
@@ -2297,6 +2476,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec!["127.0.0.1:9".into()],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,
@@ -2324,10 +2504,11 @@ mod tests {
             N.fetch_add(1, Ordering::Relaxed),
         ));
         let registry = Arc::new(Registry::new(dir.join("state.json")));
+        let api_key = initial.vm.as_ref().is_some_and(|vm| vm.correlated_creates).then(|| "allocation-test-key".to_string());
         registry.upsert(initial);
         let vms = VmManager::new(
             Some(daemon_url.into()),
-            None,
+            api_key,
             crate::mounts::MountStore::new(dir.join("mounts"), 0),
         )
         .unwrap();
@@ -2371,6 +2552,142 @@ mod tests {
             ),
             registry,
         )
+    }
+
+    mod correlated_allocations {
+        use super::*;
+        use axum::{Json, Router, extract::Path, http::{HeaderMap, StatusCode}, response::IntoResponse, routing::post};
+        use serde_json::{Value, json};
+        use sha2::{Digest, Sha256};
+        use std::sync::{Mutex, atomic::AtomicUsize};
+
+        const ID: &str = "sb-0123456789abcdef0123456789abcdef";
+
+        #[derive(Default)]
+        struct Backend {
+            posts: AtomicUsize,
+            reads: AtomicUsize,
+            mode: AtomicUsize,
+            receipt: Mutex<Option<Value>>,
+            journal: Mutex<Option<std::path::PathBuf>>,
+        }
+
+        async fn fixture(mode: usize) -> (Autoscaler, Arc<Registry>, Arc<Backend>, tokio::task::JoinHandle<()>) {
+            let b = Arc::new(Backend::default());
+            b.mode.store(mode, Ordering::SeqCst);
+            let write = b.clone(); let read = b.clone();
+            let app = Router::new().route("/sandbox-creations/:id", post(move |Path(id):Path<String>, headers:HeaderMap, Json(body):Json<Value>| {
+                let b = write.clone(); async move {
+                    assert_eq!(headers["authorization"], "Bearer allocation-test-key");
+                    let journal = b.journal.lock().unwrap().clone().unwrap();
+                    let persisted = Registry::new(journal.with_extension("json"));
+                    persisted.load().unwrap();
+                    let saved = persisted.get("demo").unwrap().state();
+                    assert_eq!(saved.create_attempts[0].allocation.as_ref().unwrap().operation_id, id);
+                    assert!(saved.create_attempts[0].receipt.is_none());
+                    assert!(saved.create_attempts[0].sandbox_id.is_none());
+                    assert_eq!(body["request"]["backend_type"], "firecracker");
+                    assert_eq!(body["request"]["size_class"], "small");
+                    let mut bound = json!({"kind":body["kind"],"request":body["request"]});
+                    bound.sort_all_objects();
+                    let receipt = json!({"operationId":id,"sandboxId":ID,"requestDigest":body["requestDigest"],
+                        "backendRequestDigest":format!("{:x}",Sha256::digest(serde_json::to_vec(&bound).unwrap()))});
+                    if b.mode.load(Ordering::SeqCst) != 2 { *b.receipt.lock().unwrap() = Some(receipt.clone()); }
+                    b.posts.fetch_add(1,Ordering::SeqCst);
+                    if b.mode.load(Ordering::SeqCst) != 0 { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
+                    (StatusCode::ACCEPTED, Json(receipt)).into_response()
+                }
+            }).get(move |Path(id):Path<String>, headers:HeaderMap| {
+                let b = read.clone(); async move {
+                    assert_eq!(headers["authorization"], "Bearer allocation-test-key");
+                    b.reads.fetch_add(1,Ordering::SeqCst);
+                    let Some(mut receipt) = b.receipt.lock().unwrap().clone() else { return StatusCode::NOT_FOUND.into_response(); };
+                    assert_eq!(receipt["operationId"],id);
+                    if b.mode.load(Ordering::SeqCst) == 3 { receipt["requestDigest"] = json!("wrong"); }
+                    Json(receipt).into_response()
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}",listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener,app).await.unwrap(); });
+            let mut s = spec(); s.vm.as_mut().unwrap().correlated_creates = true;
+            let (scaler, registry) = autoscaler_against(&url,s);
+            *b.journal.lock().unwrap() = Some(registry.state_dir());
+            (scaler,registry,b,server)
+        }
+
+        #[tokio::test]
+        async fn lost_reply_restart_recovers_exact_receipt_and_holds_queued_capacity() {
+            let (mut scaler,r,b,server) = fixture(1).await;
+            let d = r.get("demo").unwrap();
+            scaler.scale_up(&d,1).await;
+            assert_eq!(b.posts.load(Ordering::SeqCst),1);
+            assert!(d.state().create_attempts[0].sandbox_id.is_none());
+            assert!(d.state().allocation_history_complete);
+            let reopened = Arc::new(Registry::new(r.state_dir().with_extension("json")));
+            reopened.load().unwrap();
+            scaler.registry = reopened.clone();
+            let d = reopened.get("demo").unwrap();
+            scaler.recover_allocations(&d,&HashMap::new()).await;
+            assert_eq!(b.reads.load(Ordering::SeqCst),1);
+            assert_eq!(d.state().create_attempts[0].sandbox_id.as_deref(),Some(ID));
+            assert!(d.state().create_attempts[0].receipt.is_some());
+            assert_eq!(d.pending()[0].sandbox_id,ID);
+            assert!(crate::rollout::reserved(&d));
+            assert!(reopened.allocation_protects(ID));
+            assert!(!reopened.allocation_protects("sb-unrelated"));
+            assert!(reopened.remove("demo").is_none());
+            // The grace timer may expire, but it cannot prove queued work ended.
+            let mut p = (*d.pending()).clone();p[0].missing_since=Some(0);d.set_pending(p);
+            scaler.reconcile_one(&d,&HashMap::new(),&HashMap::new()).await;
+            assert_eq!(d.pending().len(),1);
+            assert_eq!(b.posts.load(Ordering::SeqCst),1);
+            let mut running = info(heyo_sdk::SandboxStatus::Running,Some("172.16.0.2"));
+            running.id=ID.into();
+            scaler.recover_allocations(&d,&HashMap::from([(ID.into(),running)])).await;
+            assert!(d.state().create_attempts[0].runtime_observed);
+            assert!(!crate::rollout::reserved(&d));
+            assert!(d.state().allocation_history_complete);
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn missing_or_mismatched_receipts_never_repost_or_repair_legacy_history() {
+            for mode in [2,3] {
+                let (scaler,r,b,server) = fixture(mode).await;
+                let d = r.get("demo").unwrap();
+                d.mutate_state(|s|s.allocation_history_complete=false);
+                scaler.scale_up(&d,1).await;
+                for _ in 0..2 {
+                    scaler.recover_allocations(&d,&HashMap::new()).await;
+                    scaler.scale_up(&d,1).await;
+                }
+                assert_eq!(b.posts.load(Ordering::SeqCst),1);
+                assert_eq!(b.reads.load(Ordering::SeqCst),2);
+                assert!(d.state().create_attempts[0].sandbox_id.is_none());
+                assert!(!d.state().allocation_history_complete);
+                assert!(crate::rollout::reserved(&d));
+                assert!(r.allocation_protects("unknown-id"));
+                server.abort();
+            }
+        }
+
+        #[tokio::test]
+        async fn persistence_failure_and_concurrent_edit_prevent_dispatch() {
+            let (scaler,r,b,server) = fixture(0).await;
+            let d = r.get("demo").unwrap();
+            let edit = r.change_guard().await;
+            tokio::time::timeout(Duration::from_secs(1),scaler.scale_up(&d,1)).await.unwrap();
+            assert!(d.state().create_attempts.is_empty());
+            drop(edit);
+            std::fs::create_dir_all(r.state_dir().parent().unwrap()).unwrap();
+            std::fs::write(r.state_dir(),b"not a directory").unwrap();
+            scaler.scale_up(&d,1).await;
+            assert_eq!(b.posts.load(Ordering::SeqCst),0);
+            assert!(d.state().create_attempts[0].sandbox_id.is_none());
+            assert!(crate::rollout::reserved(&d));
+            server.abort();
+        }
     }
 
     /// app-lb's part of a cloud URL: bind a ready replica's port on the
@@ -3082,6 +3399,7 @@ mod tests {
     #[test]
     fn a_stalled_boot_says_whether_the_daemon_or_the_guest_is_the_problem() {
         let check = crate::config::HealthCheck {
+            expected_header: None,
             path: Some("/healthz".into()),
             port: None,
             timeout_secs: 2,
@@ -3110,7 +3428,7 @@ mod tests {
         );
 
         // A TCP-only check names no path, so it must not claim to have requested one.
-        let tcp = crate::config::HealthCheck { path: None, port: Some(9000), timeout_secs: 2 };
+        let tcp = crate::config::HealthCheck { expected_header: None, path: None, port: Some(9000), timeout_secs: 2 };
         let msg = boot_stall(&info(heyo_sdk::SandboxStatus::Running, Some("172.16.0.2")), &tcp, 8080);
         assert!(msg.contains("TCP") && msg.contains("9000"), "{msg}");
     }
@@ -3213,5 +3531,118 @@ mod tests {
         a.reprobe_unhealthy_managed(&d, &fleet).await;
         assert!(backend.is_healthy(), "a successful re-probe restores routing");
         assert_eq!(d.backends()[0].sandbox_id, "sb-1", "recovery does not replace the VM");
+    }
+
+    #[tokio::test]
+    async fn reserved_rollout_recovers_source_without_adoption_scaling_or_persistence() {
+        use heyo_sdk::SandboxStatus;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024]; socket.read(&mut request).await.unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+            }
+        });
+        let mut spec = spec();
+        spec.health.port = Some(addr.port());
+        spec.scaling.min_replicas = 4; spec.scaling.max_replicas = 4;
+        let (scaler, registry) = autoscaler_against("http://127.0.0.1:1", spec);
+        let d = registry.get("demo").unwrap();
+        let source = Arc::new(VmBackend::new("source".into(), addr));
+        let draining = Arc::new(VmBackend::new("draining".into(), addr));
+        draining.set_draining(true);
+        d.set_backends(vec![source.clone(), draining.clone()]);
+        let mut candidate = info(SandboxStatus::Running, Some("127.0.0.1"));
+        candidate.id = "candidate".into(); candidate.name = "applb-demo-candidate".into();
+        let fleet = HashMap::from([
+            ("source".into(), info(SandboxStatus::Running, Some("127.0.0.1"))),
+            ("candidate".into(), candidate),
+        ]);
+        for status in ["running", "reconciliation_required"] {
+            let operation = serde_json::from_value(serde_json::json!({
+                "operation_id":"reserved", "deployment":"demo", "source_revision":"before",
+                "target_spec_sha256":"hash", "status":status, "phase":"preparing",
+                "readiness_verified":false, "previous_stopped":false, "error":null,
+                "spec":d.spec, "prepared":null, "prefix":"applb-demo-candidate",
+                "allocations":[], "previous":["source"], "stopped":[], "deadline":0, "drain_deadline":null
+            })).unwrap();
+            d.mutate_state(|s| s.rollouts = vec![operation]);
+            registry.persist_one("demo").unwrap();
+            let state = d.state();
+            let persisted = std::fs::read(registry.state_dir().join("demo.json")).unwrap();
+            source.set_healthy(false);
+            scaler.reconcile_one(&d, &fleet, &HashMap::new()).await;
+            assert!(source.is_healthy(), "source recovery must work while {status}");
+            assert!(draining.is_draining(), "recovery cannot reopen admission on a retiring VM");
+            assert_eq!(d.backends().len(), 2, "candidate must not be adopted and source must not be pruned");
+            assert!(Arc::ptr_eq(&d.backends()[0], &source));
+            assert!(d.pending().is_empty(), "reserved deployment cannot scale");
+            assert_eq!(*d.state(), *state, "no lifecycle state mutation");
+            assert_eq!(std::fs::read(registry.state_dir().join("demo.json")).unwrap(), persisted);
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_recovery_admission_waits_for_creates_and_blocks_new_placement() {
+        let mut spec = spec();
+        spec.vm.as_mut().unwrap().workspace = Some(serde_json::from_value(serde_json::json!({"store":"/unused"})).unwrap());
+        let (scaler, registry) = autoscaler_against("http://127.0.0.1:1", spec);
+        let d = registry.get("demo").unwrap();
+        let in_progress = scaler.creates.acquire().await.unwrap();
+        let guard = scaler.workspace_recovery_guard(); tokio::pin!(guard);
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut guard).await.is_err());
+        drop(in_progress);
+        let admission = guard.await;
+        scaler.workspaces.begin_replacement("demo", 1).unwrap();
+        let create = scaler.scale_up(&d, 1); tokio::pin!(create);
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut create).await.is_err());
+        drop(admission);
+        create.await;
+        assert!(d.pending().is_empty());
+        assert!(scaler.workspaces.blocked(&d).is_some());
+    }
+
+    #[tokio::test]
+    async fn record_only_inventory_detects_untracked_and_inactive_resources() {
+        use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+        use std::sync::atomic::AtomicUsize;
+        let mode = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/deployed-sandboxes", get(|State(mode): State<Arc<AtomicUsize>>| async move {
+                let owned = serde_json::json!({
+                    "id": "sb-1", "name": "applb-demo-000000000001", "status": "running",
+                    "image": "artifacts", "uptime_secs": 0, "is_deployed": true,
+                    "status_changed_at": "", "urls": [], "guest_ip": "127.0.0.1"
+                });
+                Json(if mode.load(Ordering::SeqCst) == 2 { vec![owned] } else { vec![] })
+            }))
+            .route("/sandboxes/inactive", get(|State(mode): State<Arc<AtomicUsize>>| async move {
+                if mode.load(Ordering::SeqCst) == 3 { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
+                let owned = serde_json::json!({
+                    "id": "sb-1", "name": "applb-demo-000000000001", "status": "stopped",
+                    "image": "artifacts", "uptime_secs": 0, "is_deployed": true,
+                    "status_changed_at": "", "urls": []
+                });
+                let rows = if mode.load(Ordering::SeqCst) == 1 { vec![owned] } else { vec![] };
+                Json(serde_json::json!({"sandboxes": rows, "next_cursor": null})).into_response()
+            })).with_state(mode.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (scaler, registry) = autoscaler_against(&url, spec());
+        assert!(registry.get("demo").unwrap().backends().is_empty());
+        assert!(!scaler.has_owned_resources("demo").await.unwrap());
+        for state in [1, 2] {
+            mode.store(state, Ordering::SeqCst);
+            assert!(scaler.has_owned_resources("demo").await.unwrap());
+            assert!(!scaler.has_owned_resources("another-deployment").await.unwrap());
+        }
+        mode.store(3, Ordering::SeqCst);
+        assert!(scaler.has_owned_resources("demo").await.is_err(), "unavailable inventory is not empty");
+        server.abort();
     }
 }

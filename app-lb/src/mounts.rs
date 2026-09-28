@@ -268,13 +268,16 @@ impl MountStore {
 /// module note: a VM holds its own copy from the moment it is created, so what
 /// a tree is still needed for is the next create — and that is what a spec says.
 pub fn referenced_trees(registry: &Registry) -> HashSet<String> {
-    registry
-        .deployments()
-        .values()
-        .filter_map(|d| d.spec.vm.as_ref())
-        .flat_map(|vm| vm.mounts.iter())
-        .filter_map(|m| Some(tree_name(m.digest.as_deref()?, m.strip())))
-        .collect()
+    let mut referenced = HashSet::new();
+    for d in registry.deployments().values() {
+        let state = d.state();
+        for spec in std::iter::once(&d.spec).chain(state.rollouts.iter().map(|o| &o.spec)) {
+            if let Some(vm) = &spec.vm {
+                referenced.extend(vm.mounts.iter().filter_map(|m| Some(tree_name(m.digest.as_deref()?, m.strip()))));
+            }
+        }
+    }
+    referenced
 }
 
 /// The directory name for a blob unpacked with a given strip. See the module
@@ -289,9 +292,9 @@ fn tree_name(digest: &str, strip: usize) -> String {
 
 /// `0755`, so heyvmd can read the tree when it runs as another user.
 ///
-/// The files inside land under app-lb's umask, which is the same treatment
-/// [`crate::unpack`] gives a site's bundle and for the same reason: an archive
-/// must not be able to ship something setuid or group-writable.
+/// Files inside are normalized by [`crate::unpack`] to safe read permissions
+/// plus their archived executable bits. An archive cannot ship something
+/// setuid or group-writable, but release entry points remain runnable.
 fn set_readable(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {

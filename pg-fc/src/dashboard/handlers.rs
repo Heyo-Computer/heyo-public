@@ -18,7 +18,7 @@ use super::{host, logs, model, views};
 
 /// Lifecycle actions can be slow (a cold boot re-runs init.sh), so give them a
 /// generous bound — but still bound them, so one wedged VM can't hang a request.
-const ACTION_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const ACTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One-shot status banner carried across a redirect (`?msg=` / `?err=`).
 #[derive(Deserialize, Default)]
@@ -85,6 +85,16 @@ pub async fn monitoring(
         // Same 24h window as the charts, so the create rate above and the
         // create latency below describe exactly the same set of creates.
         vm_create: crate::events::timing_stats(crate::events::Timing::VmCreate, 24),
+        // Same window again, so a restore rate above and its latency below
+        // describe the same restores.
+        restore_latency: views::RestoreLatency {
+            s3_image: crate::events::timing_stats(crate::events::Timing::RestoreS3Image, 24),
+            s3_dump: crate::events::timing_stats(crate::events::Timing::RestoreS3Dump, 24),
+            local_image: crate::events::timing_stats(crate::events::Timing::RestoreLocalImage, 24),
+            local_dump: crate::events::timing_stats(crate::events::Timing::RestoreLocalDump, 24),
+            s3_download: crate::events::timing_stats(crate::events::Timing::RestoreS3Download, 24),
+            image_adopt: crate::events::timing_stats(crate::events::Timing::RestoreImageAdopt, 24),
+        },
     };
     Ok(views::monitoring_page(
         &st,
@@ -291,13 +301,13 @@ pub async fn logs_vm(
 
 // ---- control actions -------------------------------------------------------
 
-enum Lifecycle {
+pub(super) enum Lifecycle {
     Start,
     Stop,
     Reboot,
 }
 
-async fn run_lifecycle(id: &str, act: Lifecycle) -> anyhow::Result<()> {
+pub(super) async fn run_lifecycle(id: &str, act: Lifecycle) -> anyhow::Result<()> {
     use anyhow::Context;
     let sb = Sandbox::connect(id.to_string(), vm::local_opts()).context("connecting to VM")?;
     let fut = async move {

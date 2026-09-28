@@ -2014,10 +2014,19 @@ mod tests {
             if let Ok(path) = std::env::var("HEYO_LOGIN_HTML") { std::fs::write(path, &page.body).unwrap(); }
             let raw = cookie_values(&page.cookies, FLOW_COOKIE).remove(0);
             let flow = Flow::decode(&a.verify(&raw).unwrap()).unwrap();
+            assert!(page.body.contains("name=\"return_to\" value=\"/runs/abc?before=17\""));
+            // Another tab refreshes the browser cookie before the original
+            // form is submitted. Both its CSRF state and destination survive.
+            let second = a.start(&g, "web", &req("/runs/other", page.cookies), "/runs/other");
+            let second_raw = cookie_values(&second.cookies, FLOW_COOKIE).remove(0);
+            let second_flow = Flow::decode(&a.verify(&second_raw).unwrap()).unwrap();
+            assert_eq!(second_flow.nonce, flow.nonce);
+            assert_eq!(second_flow.return_to, "/runs/other");
             let body = form_urlencoded::Serializer::new(String::new())
                 .append_pair("state", &flow.nonce).append_pair("email", "someone@example.com")
+                .append_pair("return_to", "/runs/abc?before=17")
                 .append_pair("password", "p&ss word").finish();
-            let request = req("/__applb/auth/login", page.cookies);
+            let request = req("/__applb/auth/login", second.cookies);
             let r = a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com:443"), body.as_bytes()).await;
             assert_eq!(r.status, 302);
             assert_eq!(r.location.as_deref(), Some("/runs/abc?before=17"));
@@ -2025,6 +2034,11 @@ mod tests {
             assert!(r.cookies[0].contains("Secure") && r.cookies[0].contains("HttpOnly"));
             assert!(!r.cookies[0].contains("Domain="));
             assert!(matches!(a.decide(&g, "web", "default", &req("/runs/abc", r.cookies)).await, Decision::Allow(identity) if identity.is_some()));
+            let external = body.replace("%2Fruns%2Fabc%3Fbefore%3D17", "%2F%2Fevil.example.com");
+            assert_ne!(external, body);
+            let r = a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com"), external.as_bytes()).await;
+            assert_eq!(r.status, 302);
+            assert_eq!(r.location.as_deref(), Some("/"));
             g.jwt.as_mut().unwrap().require.insert("email".into(), json!("other@example.com"));
             let denied = a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com"), body.as_bytes()).await;
             assert_eq!(denied.status, 403);
@@ -2046,6 +2060,11 @@ mod tests {
                 let flow = Flow { deployment:deployment.into(), exp, nonce:nonce.into(), verifier:String::new(), return_to:"/".into() };
                 request.cookies = vec![format!("{FLOW_COOKIE}={}", a.sign(&flow.encode()))];
                 assert_eq!(a.heyo_login_submit(&g, "web", &request, Some("https://app.example.com"), b"state=a&email=a&password=b").await.status, 403);
+                if deployment != "web" || exp <= now_secs() {
+                    let page = a.start(&g, "web", &request, "/");
+                    let raw = cookie_values(&page.cookies, FLOW_COOKIE).remove(0);
+                    assert_ne!(Flow::decode(&a.verify(&raw).unwrap()).unwrap().nonce, nonce);
+                }
             }
             request.secure = false;
             assert_eq!(a.start(&g, "web", &request, "/").status, 403);

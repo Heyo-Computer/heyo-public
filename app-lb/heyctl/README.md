@@ -797,6 +797,74 @@ discovered at runtime:
 - **Mixing works.** `provider: [google, jwt]` is the common shape for a product UI: a person
   signs in with Google, and the UI's own API calls carry the token the auth service gave it.
 
+### Declaring an auth provider, and inheriting it
+
+The block above is one deployment's copy of an identity. An **auth provider** is
+that identity on its own — named, owned by a namespace, and inherited by any
+deployment in it. Editing the provider reaches every one of them at once, and
+rotating the key is a secret write and nothing else.
+
+```sh
+# The Heyo auth API, verified against its published key set. No secret exists
+# to store, which is what makes it safe in a namespace somebody else runs.
+heyctl create auth-provider heyo -n team-a \
+  --preset heyo-jwks \
+  --require accountId=acct_7f3c            # the preset alone admits every Heyo user
+
+# The same service's HS256 access tokens, for a fleet and a namespace that are
+# both yours. That key mints as well as verifies.
+heyctl create secret heyo-auth -n team-a --from-stdin jwt_secret < ~/.heyo-jwt-secret
+heyctl create auth-provider heyo-hs -n team-a \
+  --preset heyo --secret heyo-auth/jwt_secret
+
+# Any other issuer: Auth0, Okta, Cognito, Keycloak, your own service.
+heyctl create auth-provider okta -n team-a \
+  --issuer https://example.okta.com \
+  --jwks-url https://example.okta.com/oauth2/v1/keys \
+  --alg RS256 --require groups=engineering,ops
+
+# Google, with one session shared across the namespace's deployments.
+heyctl create auth-provider corp-google -n team-a \
+  --client-id 1234.apps.googleusercontent.com --secret google/client_secret \
+  --allow-domain example.com --cookie-domain .example.com
+
+heyctl set auth reports --provider-ref heyo --public-path /healthz
+heyctl get auth-providers -n team-a
+heyctl describe auth-provider heyo -n team-a
+heyctl delete auth-provider okta -n team-a
+```
+
+A spec file works too, and `apply` upserts it:
+
+```yaml
+kind: auth-provider
+name: heyo
+namespace: team-a
+preset: heyo
+secret: { secret: heyo-auth, key: jwt_secret }
+```
+
+Four things worth knowing:
+
+- **A gate either inherits an identity or writes one.** `--provider-ref` and
+  `--client-id`/`--secret`/`--allow-*` are refused together, because app-lb refuses
+  a gate carrying both. Setting one clears the other; everything route-scoped
+  (`--public-path`, `--base-path`, `--cookie-name`, `--session-ttl`) stays where it is.
+- **The key is named exactly once.** `--secret` for `HS*`, `--jwks-url` for a rotating
+  key set, `--public-key-file` for a static public key — and `--alg` defaults by which
+  one you chose, because the token never gets to pick. A key set rotates with no change
+  here at all: app-lb refetches when it meets a `kid` it has not seen.
+- **Prefer a key set to a shared secret.** An `HS*` key verifies *and* mints, so whoever
+  can read it can issue any identity that issuer can — and a namespace admin can read
+  any secret behind their own wall (`vm.env_from` puts it in a guest they control).
+- **`--require` is the allow-list.** `--require role=user,admin` is "either of these";
+  several `--require` flags must all hold. With none, any unexpired token that issuer
+  signed for the audience gets in.
+- **For people in browsers, add `--cookie` and `--login-url`.** A navigation cannot carry
+  an `Authorization` header, so app-lb redirects a token-less browser to your issuer's
+  sign-in page and reads the cookie it sets on the way back. See
+  [AUTH_PROVIDERS.md](../AUTH_PROVIDERS.md) for that contract.
+
 ### Scaling and rollouts
 
 ```sh

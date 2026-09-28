@@ -100,6 +100,42 @@ pub enum Timing {
     /// Excludes the wait for a bring-up slot: that measures how many other
     /// creates are already in flight, not what this one costs.
     VmCreate,
+    /// Time to a serving Postgres for a restore from the schema's S3 **dump**:
+    /// the whole bring-up, as the waiting client experiences it — vehicle or
+    /// fresh VM, boot, `CREATE DATABASE`, then the guest's
+    /// `curl | pg_restore`.
+    ///
+    /// One total per restore source rather than one for "a restore", because
+    /// the four sources have nothing in common to average: a dump reloads
+    /// through Postgres, an image swaps a disk under a booted VM, and the S3
+    /// pair pays a download the local pair does not. Bounded the same way
+    /// [`Timing::VmCreate`] is — successful restores only, and the admission
+    /// wait excluded.
+    RestoreS3Dump,
+    /// Time to a serving Postgres for a restore from the schema's S3 **disk
+    /// image**: download, decompress, swap the disk under a vehicle VM, boot
+    /// on it. [`Timing::RestoreS3Download`] and [`Timing::RestoreImageAdopt`]
+    /// split this one between the network and everything after it.
+    RestoreS3Image,
+    /// Time to a serving Postgres for a thaw from a **local frozen dump** —
+    /// the S3 dump path minus the download.
+    RestoreLocalDump,
+    /// Time to a serving Postgres for a thaw from a **local compacted image**
+    /// — the S3 image path minus the download. Read against
+    /// [`Timing::RestoreS3Image`], the gap between them is what the bucket
+    /// costs.
+    RestoreLocalImage,
+    /// The download alone, S3 to the local `.img.zst`: the phase that answers
+    /// whether a slow image restore is the network or the host. Recorded even
+    /// when the restore that follows it fails — the bytes were still moved,
+    /// and a download that lands before a failed boot is exactly the case
+    /// worth seeing.
+    RestoreS3Download,
+    /// Everything an image restore does after the bytes are on the host:
+    /// decompress, `e2fsck`, the disk swap under a booted vehicle, and the
+    /// boot on the real data. Recorded for local and S3 image restores alike,
+    /// so the two are directly comparable.
+    RestoreImageAdopt,
 }
 
 impl Timing {
@@ -107,12 +143,24 @@ impl Timing {
     fn as_str(self) -> &'static str {
         match self {
             Timing::VmCreate => "vm_create",
+            Timing::RestoreS3Dump => "restore_s3_dump_total",
+            Timing::RestoreS3Image => "restore_s3_image_total",
+            Timing::RestoreLocalDump => "restore_local_dump_total",
+            Timing::RestoreLocalImage => "restore_local_image_total",
+            Timing::RestoreS3Download => "restore_s3_download",
+            Timing::RestoreImageAdopt => "restore_image_adopt",
         }
     }
 
     fn parse(s: &str) -> Option<Self> {
         match s {
             "vm_create" => Some(Timing::VmCreate),
+            "restore_s3_dump_total" => Some(Timing::RestoreS3Dump),
+            "restore_s3_image_total" => Some(Timing::RestoreS3Image),
+            "restore_local_dump_total" => Some(Timing::RestoreLocalDump),
+            "restore_local_image_total" => Some(Timing::RestoreLocalImage),
+            "restore_s3_download" => Some(Timing::RestoreS3Download),
+            "restore_image_adopt" => Some(Timing::RestoreImageAdopt),
             _ => None,
         }
     }
@@ -753,14 +801,57 @@ mod tests {
 
     /// Timing tokens are on-disk format, exactly like event tokens.
     #[test]
-    // One variant today; the loop is the shape this test keeps as more are
-    // added, and a missing token here silently zeroes historical data.
-    #[allow(clippy::single_element_loop)]
+    // A missing token here silently zeroes historical data: the partitions
+    // are written with these strings, and a kind that no longer parses back
+    // reads as "nothing was ever measured".
     fn timing_tokens_roundtrip() {
-        for k in [Timing::VmCreate] {
+        for k in [
+            Timing::VmCreate,
+            Timing::RestoreS3Dump,
+            Timing::RestoreS3Image,
+            Timing::RestoreLocalDump,
+            Timing::RestoreLocalImage,
+            Timing::RestoreS3Download,
+            Timing::RestoreImageAdopt,
+        ] {
             assert_eq!(Timing::parse(k.as_str()), Some(k), "token {:?}", k.as_str());
         }
         assert_eq!(Timing::parse("from_the_future"), None);
+    }
+
+    /// The restore kinds are reported separately, so they must not pool: a
+    /// slow S3 image restore has no business moving the local-image figures,
+    /// and a source with nothing in the window stays `None`.
+    #[test]
+    fn restore_kinds_keep_their_own_percentiles() {
+        let _g = exclusive_log();
+        TIMINGS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let base = 8_000_000 * 3600;
+        let now = base + 3600;
+        for ms in [8_000u32, 9_000, 30_000] {
+            record_timing_at(
+                Timing::RestoreS3Image,
+                Duration::from_millis(ms as u64),
+                base + 10,
+            );
+        }
+        for ms in [900u32, 1_100] {
+            record_timing_at(
+                Timing::RestoreLocalImage,
+                Duration::from_millis(ms as u64),
+                base + 10,
+            );
+        }
+
+        let s3 = timing_stats_at(Timing::RestoreS3Image, 2, now).expect("s3 image samples");
+        let local =
+            timing_stats_at(Timing::RestoreLocalImage, 2, now).expect("local image samples");
+        assert_eq!((s3.count, s3.p50_ms, s3.max_ms), (3, 9_000, 30_000));
+        // Nearest rank over two samples puts p50 at the first of them.
+        assert_eq!((local.count, local.p50_ms, local.max_ms), (2, 900, 1_100));
+        // Neither dump source ran: no figure to report, rather than zero.
+        assert!(timing_stats_at(Timing::RestoreS3Dump, 2, now).is_none());
+        assert!(timing_stats_at(Timing::RestoreLocalDump, 2, now).is_none());
     }
 
     /// Nearest-rank, checked against the definition: the p-th percentile is

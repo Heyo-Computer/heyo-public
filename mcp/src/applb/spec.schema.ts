@@ -104,6 +104,10 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
         }
       ]
     },
+    "maintenance": {
+      "description": "Temporarily fence this deployment's public data plane.",
+      "type": "boolean"
+    },
     "namespace": {
       "description": "The namespace this deployment belongs to.",
       "type": "string"
@@ -333,6 +337,11 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
         }
       ]
     },
+    "ExpectedHeader": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "A response identity assertion, in addition to HTTP success. (Call applb_spec_schema with block \"ExpectedHeader\" for the full shape; everything it accepted is still accepted.)"
+    },
     "FeedSpec": {
       "type": "object",
       "additionalProperties": true,
@@ -342,6 +351,17 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
       "description": "How a freshly-booted VM is proven ready before it joins the pool.",
       "type": "object",
       "properties": {
+        "expected_header": {
+          "description": "With an identity assertion, require a 2xx response and exactly one matching header.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExpectedHeader"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "path": {
           "description": "`None` means a bare TCP connect is enough.",
           "type": [
@@ -730,6 +750,10 @@ export const DEPLOYMENT_SPEC_FULL = {
         }
       ]
     },
+    "maintenance": {
+      "description": "Temporarily fence this deployment's public data plane. Routed requests\nreceive HTTP 503 before auth or backend selection, while deployment\nmanagement and VM exec remain available on the separate admin listener.\nPersisted as part of the deployment spec and safe to toggle with PUT.",
+      "type": "boolean"
+    },
     "namespace": {
       "description": "The namespace this deployment belongs to. Namespaces segregate use: a\ntoken minted for a namespace reaches only the deployments in it, and the\nevent feed is kept per namespace. Absent means `\"default\"`, so a fleet\nthat never says the word keeps behaving as one namespace.",
       "type": "string"
@@ -956,6 +980,13 @@ export const DEPLOYMENT_SPEC_FULL = {
           "$ref": "#/$defs/Providers",
           "default": "google"
         },
+        "provider_ref": {
+          "description": "Inherit the *identity* half of this gate from a named provider declared on\nthe deployment's namespace. See [`AuthProviderSpec`].\n\nWhen set, this gate carries only the route-scoped fields — `public_paths`,\n`session_scope`, `base_path`, `cookie_name`, `redirect_url`,\n`forward_identity`, `session_ttl_secs` — and the provider supplies who may\nenter and how they are verified (`provider`, `client_id`, `client_secret`,\n`allowed_domains`, `allowed_emails`, `jwt`, `cookie_domain`). Setting any\nof those inline *and* a reference is refused\n([`SpecError::ProviderRefWithInlineIdentity`]) rather than silently\noverridden, because whoever wrote them believes they take effect.\n\nResolution is live: app-lb looks the provider up on every gated request,\nso rotating the client secret or tightening the allow-list on the provider\npropagates to every deployment that names it — and, because the resolved\ngate's [`policy_fingerprint`](Self::policy_fingerprint) changes with it,\nre-signs the sessions issued under the old policy. A reference that names\nno provider in the namespace is refused at registration, and if one is\nremoved out from under a live deployment the gate fails *closed*.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "public_paths": {
           "description": "Path prefixes the *sign-in* gate does not sit in front of.\n\nThis list was never \"paths with no authorization\" — it is \"paths an API\nclient reaches without being sent to Google\", which is a different\nthing and was too easily read as the first. Each entry now carries the\nscope app-lb requires in the gate's place, and an entry written as a\nbare string means [`PathScope::Admin`]: the fail-closed reading, because\nthe alternative default is the one that leaked.\n\nA path whose *upstream* does its own authorization — an artifact store\nchecking its API key, a secret service checking a bearer — says so with\n`{\"path\": \"/blobs/\", \"scope\": \"public\"}`. That is the only spelling that\nmeans \"no credential at all\", and it has to be written out.",
           "type": "array",
@@ -1107,6 +1138,22 @@ export const DEPLOYMENT_SPEC_FULL = {
         }
       ]
     },
+    "ExpectedHeader": {
+      "description": "A response identity assertion, in addition to HTTP success.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ]
+    },
     "FeedSpec": {
       "description": "A deployment's opt-in hooks into its namespace's event feed.\n\nEverything here defaults to *off*: the feed is a megaphone, and a\ndeployment should end up on it only because its spec said so, never because\na default did. The three switches are independent — a deployment can\nannounce itself without reporting issues, report issues without announcing,\nor neither and only `expose` the feed for the rest of its namespace.",
       "type": "object",
@@ -1134,6 +1181,17 @@ export const DEPLOYMENT_SPEC_FULL = {
       "description": "How a freshly-booted VM is proven ready before it joins the pool.\n\nThis exists because the SDK's readiness signal is not trustworthy on its own\n(see `vm::wait_until_running`), so we always probe the guest ourselves.",
       "type": "object",
       "properties": {
+        "expected_header": {
+          "description": "With an identity assertion, require a 2xx response and exactly one\nmatching header. An old baked-in listener must not verify a new release.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExpectedHeader"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "path": {
           "description": "`None` means a bare TCP connect is enough.",
           "type": [
@@ -1241,6 +1299,27 @@ export const DEPLOYMENT_SPEC_FULL = {
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "login_endpoint": {
+          "description": "Optional Heyo Auth `/api/auth/login` endpoint for browser email/password\nsign-in. The returned access token must pass this JWT policy before a\nhost-only HttpOnly cookie is set. Requires `cookie`; never stores refresh\ntokens or passwords. Existing bearer-only gates remain unchanged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "login_redirect_param": {
+          "description": "The query parameter the hosted sign-in reads the return URL from. Only\nmeaningful with `login_url`; unset means `redirect_uri`. Set it to whatever\nthe issuer expects — `return_to`, `next`, `rd`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "login_url": {
+          "description": "Where to send a browser that reaches a gated path holding no valid token.\n\nThe `jwt` provider is otherwise stateless: it verifies a token that is\nalready being carried and, finding none, answers `401`. That is right for\na program, and a dead end for a person — a browser cannot set an\n`Authorization` header on a navigation, so it has no way to *acquire* one.\n\nSet this to the issuer's hosted sign-in page and a token-less **browser**\n(a request whose `Accept` includes HTML) is redirected there instead, with\nthe URL it was trying to reach passed in `login_redirect_param`. The issuer\nsigns the user in, sets the JWT in the `cookie` named above, and redirects\nback; the gate then reads the cookie and admits the request. app-lb mints\nno session and keeps no flow state — the cookie the issuer set *is* the\nsession. A program (no HTML in `Accept`) still gets the `401`, which it can\nact on and would only fail to parse as a sign-in page.\n\nRequires `cookie`: the return trip is a navigation, and a navigation can\ncarry a credential only in a cookie ([`SpecError::LoginUrlWithoutCookie`]).\nMust be `https://` (or a loopback `http://` for an issuer on this host),\nfor the same reason `jwks_url` must.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "name_claim": {
           "description": "Which claim holds the display name. Absent from most tokens, and absent\nhere means the header is simply not sent.",

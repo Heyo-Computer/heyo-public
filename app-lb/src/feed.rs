@@ -319,6 +319,7 @@ mod tests {
             id: id.into(),
             routes: vec![],
             vm: Some(crate::config::VmSpec {
+                correlated_creates: false,
                 env_from: vec![],
                 workspace_archive: None,
                 image_download_url: None,
@@ -343,6 +344,7 @@ mod tests {
             health: Default::default(),
             upstreams: vec![],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,

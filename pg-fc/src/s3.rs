@@ -29,8 +29,13 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Clone)]
 pub struct S3Config {
     pub bucket: String,
-    /// Key prefix (e.g. `pg-vm-pool/`); joined with `{schema}.dump`.
+    /// Key prefix (e.g. `pg-vm-pool/`); joined with `{schema}.dump`. Every
+    /// upload and delete goes here.
     pub prefix: String,
+    /// A prefix restores fall back to when [`Self::prefix`] holds nothing for
+    /// a schema: the layout an earlier prefix wrote. Read-only — nothing is
+    /// ever uploaded or deleted under it. See [`legacy_prefix_for`].
+    pub legacy_prefix: Option<String>,
     /// Region as *configured* (`PG_VM_POOL_S3_REGION`, default `us-east-1`).
     /// Read [`Self::region`] instead of this field — the configured value can be
     /// wrong, and where it is, S3 tells us so and we follow S3.
@@ -54,7 +59,47 @@ pub struct S3Config {
     pub secret_access_key: String,
 }
 
+/// The prefix every host used before prefixes were configurable per host.
+pub const DEFAULT_PREFIX: &str = "pg-vm-pool/";
+
+/// The read-only fallback prefix for a write prefix, from
+/// `PG_VM_POOL_S3_LEGACY_PREFIX` (`configured`).
+///
+/// Unset means [`DEFAULT_PREFIX`] whenever the host has moved off it. Keys
+/// carry no record of the prefix they were written under, so without this
+/// every schema archived before a prefix change would fail its next restore
+/// with "no archive to restore" while its object sat untouched under the old
+/// layout. Set it empty to turn the fallback off; a value equal to the write
+/// prefix is no fallback at all.
+pub fn legacy_prefix_for(prefix: &str, configured: Option<String>) -> Option<String> {
+    let legacy = match configured {
+        None => DEFAULT_PREFIX.to_string(),
+        Some(v) if v.trim().is_empty() => return None,
+        Some(v) => v,
+    };
+    (legacy != prefix).then_some(legacy)
+}
+
 impl S3Config {
+    /// The prefix a restore may fall back to, when one distinct from
+    /// [`Self::prefix`] is configured.
+    pub fn fallback_prefix(&self) -> Option<&str> {
+        self.legacy_prefix.as_deref().filter(|p| *p != self.prefix)
+    }
+
+    /// This config addressed at `prefix` instead, for reading an archive an
+    /// earlier prefix wrote. The copy has no fallback of its own and shares
+    /// the latched region with `self`. Only restores hold one: an upload
+    /// through it would write into the shared legacy layout, which is exactly
+    /// what a per-host prefix exists to stop.
+    pub fn at_prefix(&self, prefix: &str) -> S3Config {
+        S3Config {
+            prefix: prefix.to_string(),
+            legacy_prefix: None,
+            ..self.clone()
+        }
+    }
+
     /// The region to sign and address for: whatever S3 has told us the bucket
     /// really lives in, else the configured value.
     pub fn region(&self) -> &str {
@@ -777,6 +822,7 @@ mod tests {
         let cfg = S3Config {
             bucket: "wb".into(),
             prefix: "pg-vm-pool/".into(),
+            legacy_prefix: None,
             region: "us-west-2".into(),
             discovered_region: Default::default(),
             endpoint: None,
@@ -794,6 +840,7 @@ mod tests {
         let cfg = S3Config {
             bucket: "wb".into(),
             prefix: "".into(),
+            legacy_prefix: None,
             region: "us-east-1".into(),
             discovered_region: Default::default(),
             endpoint: Some("http://minio.internal:9000/".into()),
@@ -811,6 +858,7 @@ mod tests {
         let aws = S3Config {
             bucket: "wb".into(),
             prefix: "".into(),
+            legacy_prefix: None,
             region: "us-east-2".into(),
             discovered_region: Default::default(),
             endpoint: None,
@@ -875,10 +923,72 @@ mod tests {
     }
 
     #[test]
+    fn legacy_prefix_defaults_to_the_old_layout_only_after_a_move() {
+        // Unset: a host still on the default prefix has nothing to fall back to…
+        assert_eq!(legacy_prefix_for(DEFAULT_PREFIX, None), None);
+        // …and one that moved reads the default layout it used to write.
+        assert_eq!(
+            legacy_prefix_for("pg-vm-pool/host-a/", None).as_deref(),
+            Some(DEFAULT_PREFIX)
+        );
+        // Explicit values win; empty (or blank) turns the fallback off.
+        assert_eq!(
+            legacy_prefix_for("new/", Some("old/".into())).as_deref(),
+            Some("old/")
+        );
+        assert_eq!(
+            legacy_prefix_for("pg-vm-pool/host-a/", Some(String::new())),
+            None
+        );
+        assert_eq!(
+            legacy_prefix_for("pg-vm-pool/host-a/", Some("  ".into())),
+            None
+        );
+        // A fallback to the write prefix itself would only double every HEAD.
+        assert_eq!(legacy_prefix_for("same/", Some("same/".into())), None);
+    }
+
+    #[test]
+    fn at_prefix_reads_the_old_layout_without_chaining_or_forgetting_the_region() {
+        let cfg = S3Config {
+            bucket: "wb".into(),
+            prefix: "pg-vm-pool/host-a/".into(),
+            legacy_prefix: Some(DEFAULT_PREFIX.into()),
+            region: "us-east-1".into(),
+            discovered_region: Default::default(),
+            endpoint: None,
+            access_key_id: "AK".into(),
+            secret_access_key: "sk".into(),
+        };
+        assert_eq!(cfg.fallback_prefix(), Some(DEFAULT_PREFIX));
+        assert_eq!(cfg.image_object_key("t1"), "pg-vm-pool/host-a/t1.img.zst");
+
+        let old = cfg.at_prefix(DEFAULT_PREFIX);
+        assert_eq!(old.object_key("t1"), "pg-vm-pool/t1.dump");
+        assert_eq!(old.image_object_key("t1"), "pg-vm-pool/t1.img.zst");
+        assert_eq!(
+            old.fallback_prefix(),
+            None,
+            "a fallback view must not fall back again"
+        );
+        // A region learned through either copy fixes both.
+        let _ = old.discovered_region.set("us-west-2".into());
+        assert_eq!(cfg.region(), "us-west-2");
+
+        // A configured fallback equal to the write prefix is ignored.
+        let same = S3Config {
+            legacy_prefix: Some(cfg.prefix.clone()),
+            ..cfg
+        };
+        assert_eq!(same.fallback_prefix(), None);
+    }
+
+    #[test]
     fn image_key_sits_beside_dump_key() {
         let cfg = S3Config {
             bucket: "wb".into(),
             prefix: "pg-vm-pool/".into(),
+            legacy_prefix: None,
             region: "us-east-1".into(),
             discovered_region: Default::default(),
             endpoint: None,

@@ -293,16 +293,9 @@ impl Pool {
         Ok(id)
     }
 
-    /// Drop `building` rows whose holder stopped renewing.
-    ///
-    /// The counterpart to [`Self::release_orphans`], and a delete rather than a
-    /// release because there is nothing to release: the row stands for an
-    /// attempt, not for a machine. A sandbox the dead process did manage to
-    /// create before it died is left to its TTL, which is what happened before
-    /// this state existed too.
-    ///
-    /// Scoped to `runners` for the reason every sweep here is: instances own
-    /// disjoint hosts, and one must not clear another's in-flight work.
+    /// Drop expired build records only when no executor obligation remains.
+    /// A lost create response can leave a real VM behind; lease expiry does not
+    /// resolve that uncertainty or authorize maintenance of its host.
     pub async fn sweep_stale_builds(
         &self,
         runners: &[String],
@@ -315,6 +308,7 @@ impl Pool {
             "DELETE FROM ci_vm_pool
               WHERE status = 'building'
                 AND runner_hd_id = ANY($1)
+                AND NOT EXISTS (SELECT 1 FROM ci_host_work w WHERE w.job_id=ci_vm_pool.claimed_by_job)
                 AND leased_by IS DISTINCT FROM $2
                 AND (leased_until IS NULL OR leased_until < now())",
         )
@@ -370,7 +364,7 @@ impl Pool {
             "UPDATE ci_vm_pool
                 SET status='idle', claimed_by_job=NULL, last_used_at=now(),
                     leased_by=NULL, leased_until=NULL
-              WHERE sandbox_id = $1",
+              WHERE sandbox_id = $1 AND NOT eviction_requested",
         )
         .bind(sandbox_id)
         .execute(&self.db)
@@ -571,19 +565,35 @@ impl Pool {
         sandbox_id: &str,
         runners: &[String],
     ) -> Result<Option<PooledVm>, PoolError> {
+        self.take_run_cache_for_sweep(sandbox_id, runners, None).await
+    }
+
+    /// A machine caller may reclaim only a cache last used by its authorized
+    /// run. Check ownership in the same UPDATE that excludes concurrent claims.
+    pub async fn take_run_cache_for_sweep(
+        &self,
+        sandbox_id: &str,
+        runners: &[String],
+        run_id: Option<&str>,
+    ) -> Result<Option<PooledVm>, PoolError> {
         if runners.is_empty() {
             return Ok(None);
         }
         let row = sqlx::query(
             "UPDATE ci_vm_pool
-                SET status = 'draining'
+                SET status = 'draining', eviction_requested = TRUE
               WHERE sandbox_id = $1
                 AND runner_hd_id = ANY($2)
-                AND status NOT IN ('claimed','building')
+                AND (status = 'idle' OR (status = 'draining' AND eviction_requested))
+                AND ($3::text IS NULL OR EXISTS (
+                    SELECT 1 FROM ci_job j WHERE j.id = ci_vm_pool.last_job
+                    AND j.run_id = $3 AND j.status IN ('success','failure','cancelled','skipped')
+                ))
              RETURNING *",
         )
         .bind(sandbox_id)
         .bind(runners)
+        .bind(run_id)
         .fetch_optional(&self.db)
         .await
         .map_err(PoolError::sql)?;
@@ -605,7 +615,7 @@ impl Pool {
         }
         let rows = sqlx::query(
             "UPDATE ci_vm_pool
-                SET status = 'draining'
+                SET status = 'draining', eviction_requested = TRUE
               WHERE sandbox_id IN (
                     SELECT p.sandbox_id FROM ci_vm_pool p
                       JOIN ci_job j ON j.id = p.last_job
@@ -622,6 +632,32 @@ impl Pool {
         .await
         .map_err(PoolError::sql)?;
         Ok(rows.iter().map(PooledVm::from_row).collect())
+    }
+
+    /// Take just the oldest safely-evictable idle cache on this host.
+    /// Locking and marking it draining atomically excludes concurrent claims.
+    /// Maintenance fences and a non-terminal last owner make an apparently
+    /// idle row ineligible: both are durable evidence that cleanup still has
+    /// obligations to this VM.
+    pub async fn take_oldest_idle(&self, runner: &str) -> Result<Option<PooledVm>, PoolError> {
+        let row = sqlx::query(
+            "UPDATE ci_vm_pool SET status = 'draining', eviction_requested = TRUE
+              WHERE sandbox_id = (
+                    SELECT p.sandbox_id FROM ci_vm_pool p
+                      JOIN ci_job j ON j.id = p.last_job
+                     WHERE p.status = 'idle' AND p.runner_hd_id = $1
+                       AND j.status IN ('success','failure','cancelled','skipped')
+                       AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h WHERE h.runner_hd_id=p.runner_hd_id AND h.phase<>'passed')
+                       AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h WHERE h.runner_hd_id=p.runner_hd_id AND h.phase NOT IN ('passed','superseded'))
+                     ORDER BY p.last_used_at ASC, p.sandbox_id ASC
+                     LIMIT 1 FOR UPDATE OF p SKIP LOCKED
+              ) RETURNING *",
+        )
+        .bind(runner)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PoolError::sql)?;
+        Ok(row.as_ref().map(PooledVm::from_row))
     }
 
     /// Idle VMs whose fingerprint is no longer wanted, or which have sat unused
@@ -649,13 +685,15 @@ impl Pool {
         }
         let rows = sqlx::query(
             "UPDATE ci_vm_pool
-                SET status = 'draining'
+                SET status = 'draining', eviction_requested = TRUE
               WHERE sandbox_id IN (
                     SELECT sandbox_id FROM ci_vm_pool
-                     WHERE status = 'idle'
-                       AND runner_hd_id = ANY($1)
-                       AND (NOT (fingerprint = ANY($2))
-                            OR last_used_at < now() - make_interval(secs => $3))
+                     WHERE runner_hd_id = ANY($1)
+                       AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase<>'passed')
+                       AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase NOT IN ('passed','superseded'))
+                       AND ((status = 'draining' AND eviction_requested)
+                            OR (status = 'idle' AND (NOT (fingerprint = ANY($2))
+                                OR last_used_at < now() - make_interval(secs => $3))))
                      FOR UPDATE SKIP LOCKED
               )
              RETURNING *",
@@ -696,7 +734,8 @@ impl Pool {
         let result = sqlx::query(
             "UPDATE ci_vm_pool
                 SET leased_until = now() + make_interval(secs => $2)
-              WHERE leased_by = $1 AND status IN ('claimed','building')",
+              WHERE leased_by = $1 AND status IN ('claimed','building')
+                AND leased_until IS DISTINCT FROM 'infinity'::timestamptz",
         )
         .bind(lease.instance)
         .bind(lease.ttl.as_secs() as f64)
@@ -727,23 +766,11 @@ impl Pool {
             .collect())
     }
 
-    /// Return VMs whose holder has stopped renewing their lease.
-    ///
-    /// **The lease is the authority, not the job's status.** A job left
-    /// `running` by a process that died is indistinguishable, from a row, from a
-    /// job another instance is running right now — so keying on it meant an
-    /// orchestrator could not reclaim even its own VMs after a restart. They
-    /// stayed `claimed` until the sandbox TTL reaped them, and the row leaked
-    /// until some later restart found the job terminal. An expired lease says
-    /// something the job status cannot: nobody is holding this.
-    ///
-    /// A row with **no** lease is one written before this existed, so it falls
-    /// back to the old job-status test. That matters for exactly one deploy —
-    /// the one that introduces leases, where a previous build may still be
-    /// running beside this one — and costs a clause to be safe through it.
-    ///
-    /// Still scoped to `runners`: a VM on a host this instance does not serve
-    /// belongs to whichever instance does, however stale its lease looks.
+    /// Reclaim expired records without an unresolved executor obligation.
+    /// A missing heartbeat cannot distinguish process death from a partition.
+    /// Work claimed through Store::claim_job must use verified cleanup; even a
+    /// terminal job or an expired lease cannot hand its VM to another executor.
+    /// Reclamation remains scoped to the runners served by this instance.
     pub async fn release_orphans(
         &self,
         runners: &[String],
@@ -757,6 +784,10 @@ impl Pool {
                 SET status='idle', claimed_by_job=NULL, leased_by=NULL, leased_until=NULL
               WHERE p.status = 'claimed'
                 AND p.runner_hd_id = ANY($1)
+                AND NOT EXISTS (SELECT 1 FROM ci_host_work w WHERE w.job_id=p.claimed_by_job)
+                AND NOT EXISTS (SELECT 1 FROM ci_vm_cleanup c WHERE c.sandbox_id=p.sandbox_id)
+                AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase<>'passed' AND s.job_id=p.claimed_by_job)
+                AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase NOT IN ('passed','superseded') AND s.job_id=p.claimed_by_job)
                 AND p.leased_by IS DISTINCT FROM $2
                 AND (
                      p.leased_until < now()
@@ -1302,6 +1333,104 @@ mod tests {
         );
     }
 
+    /// A host bootstrap fences new work and then waits for all old work to
+    /// drain. Expired state from a dead controller therefore has to remain
+    /// reclaimable while the fence is active, while the bootstrap's own VM
+    /// remains exclusively owned by its coordinator.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_bootstrap_fence_allows_unrelated_expired_pool_state_to_drain() {
+        let (pool, store) = test_pool().await;
+        let runner = runner_id();
+        let ours = std::slice::from_ref(&runner);
+        let run_id = crate::vm::new_id();
+        let wf = crate::workflow::Workflow::parse(
+            "wf.yml",
+            "name: t\njobs:\n  bootstrap:\n    vm: { driver: firecracker }\n    steps: [{ run: \"true\" }]\n",
+        )
+        .expect("workflow");
+        let plan = crate::plan::Plan::build(&wf).expect("plan");
+        store
+            .create_run(&run_id, &crate::store::RunRequest::default(), &plan)
+            .await
+            .unwrap();
+        let job = crate::store::job_id(&run_id, "bootstrap");
+        let coordinator = sb(&runner, "coordinator");
+        store
+            .start_job(&job, &runner, &coordinator, "fp-bootstrap", 1)
+            .await
+            .unwrap();
+        pool.register(
+            &coordinator,
+            &runner,
+            "fp-bootstrap",
+            "wf",
+            None,
+            &job,
+            lapsed("ci-previous-life"),
+        )
+        .await
+        .unwrap();
+
+        let step = format!("{job}.0");
+        let operation = format!("bootstrap-{run_id}");
+        store
+            .create_step(&step, &job, 0, "bootstrap", None)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) VALUES($1,$2,$3,$4,'host','test','running','draining','test','main')")
+            .bind(&operation).bind(&step).bind(&run_id).bind(&job)
+            .execute(store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_host_heyvm_bootstrap(id,runner_hd_id,request,launcher_recipe,deadline,launcher_deployment_id,phase) VALUES($1,$2,'{}','{}',now()+interval '1 hour','launcher','draining')")
+            .bind(&operation).bind(&runner).execute(store.pool()).await.unwrap();
+
+        pool.register(
+            &sb(&runner, "orphan"),
+            &runner,
+            "fp-old",
+            "wf",
+            None,
+            "job-from-dead-controller",
+            lapsed("ci-dead-controller"),
+        )
+        .await
+        .unwrap();
+        pool.begin_build(
+            "job-abandoned-build",
+            &runner,
+            "fp-build",
+            "wf",
+            None,
+            lapsed("ci-dead-controller"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(pool.release_orphans(ours, INSTANCE).await.unwrap(), 1);
+        assert_eq!(pool.sweep_stale_builds(ours, INSTANCE).await.unwrap(), 1);
+        assert_eq!(
+            pool.get(&coordinator).await.unwrap().unwrap().status,
+            "claimed",
+            "the bootstrap coordinator keeps its own VM until explicit release"
+        );
+        assert_eq!(
+            pool.get(&sb(&runner, "orphan"))
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "idle",
+            "an unrelated expired claim no longer blocks the host drain"
+        );
+        assert!(
+            pool.get(&Pool::building_id("job-abandoned-build"))
+                .await
+                .unwrap()
+                .is_none(),
+            "an abandoned build placeholder no longer blocks the host drain"
+        );
+    }
+
     /// The other half, and the one that must never regress: a VM another
     /// instance is genuinely holding stays held. Two orchestrators on one
     /// sandbox is far worse than a VM reclaimed a minute late.
@@ -1353,6 +1482,47 @@ mod tests {
             0,
             "an instance must never reclaim a VM it is holding"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn run_cache_eviction_checks_last_use_inside_the_claim_exclusion() {
+        let (pool, store) = test_pool().await;
+        let runner = runner_id();
+        let ours = std::slice::from_ref(&runner);
+        let wf = crate::workflow::Workflow::parse("wf.yml", "name: t\njobs:\n  build:\n    vm: { driver: firecracker }\n    steps: [{run: 'true'}]\n").unwrap();
+        let plan = crate::plan::Plan::build(&wf).unwrap();
+        let runs = [crate::vm::new_id(), crate::vm::new_id()];
+        let jobs = runs.each_ref().map(|run| crate::store::job_id(run, "build"));
+        for (run, job) in runs.iter().zip(&jobs) {
+            store.create_run(run, &crate::store::RunRequest::default(), &plan).await.unwrap();
+            store.set_job_status(job, crate::store::JobStatus::Success, None).await.unwrap();
+        }
+        let id = sb(&runner, "owned-cache");
+        pool.register(&id, &runner, "fp-owned", "wf", None, &jobs[0], held()).await.unwrap();
+        assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[0])).await.unwrap().is_none(), "claimed caches cannot be evicted");
+        pool.release(&id).await.unwrap();
+        assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[1])).await.unwrap().is_none(), "another run cannot evict this cache");
+        assert!(pool.take_run_cache_for_sweep(&id, &[runner_id()], Some(&runs[0])).await.unwrap().is_none(), "another host is outside authority");
+        assert_eq!(pool.claim(&runner, "fp-owned", &jobs[1], held()).await.unwrap(),Some(id.clone()));
+        pool.release(&id).await.unwrap();
+        assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[0])).await.unwrap().is_none(), "an earlier owner loses authority after reuse");
+        store.set_job_status(&jobs[1], crate::store::JobStatus::Running, None).await.unwrap();
+        assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[1])).await.unwrap().is_none(), "idle status alone is not a terminal job");
+        store.set_job_status(&jobs[1], crate::store::JobStatus::Success, None).await.unwrap();
+        let (eviction, claim) = tokio::join!(
+            pool.take_run_cache_for_sweep(&id, ours, Some(&runs[1])),
+            pool.claim(&runner, "fp-owned", &jobs[0], held()),
+        );
+        let eviction = eviction.unwrap(); let claim = claim.unwrap();
+        assert_ne!(eviction.is_some(),claim.is_some(), "claim and eviction must not both win");
+        if eviction.is_some() {
+            assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[1])).await.unwrap().is_some(), "same-owner retry retains durable intent");
+        } else {
+            pool.release(&id).await.unwrap();
+            assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[1])).await.unwrap().is_none());
+            assert!(pool.take_run_cache_for_sweep(&id, ours, Some(&runs[0])).await.unwrap().is_some());
+        }
     }
 
     /// The two selections the cleanup page offers, and the guard that matters:
@@ -1556,6 +1726,93 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn disk_pressure_takes_oldest_idle_only_on_requested_host() {
+        let (pool, store) = test_pool().await;
+        let runner = runner_id();
+        let other = runner_id();
+        let run = format!("run-{runner}");
+        sqlx::query("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES($1,'test','test.yml','success')")
+            .bind(&run).execute(store.pool()).await.unwrap();
+        for (host, name, age, idle) in [
+            (&runner, "new", 1, true),
+            (&runner, "old", 2, true),
+            (&runner, "claimed", 3, false),
+            (&other, "foreign", 4, true),
+            (&runner, "nonterminal", 5, true),
+        ] {
+            let id = sb(host, name);
+            let job = format!("job-{id}");
+            sqlx::query("INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES($1,$2,$1,$1,$1,'success')")
+                .bind(&job).bind(&run).execute(store.pool()).await.unwrap();
+            if name == "nonterminal" {
+                sqlx::query("UPDATE ci_job SET status='running' WHERE id=$1")
+                    .bind(&job).execute(store.pool()).await.unwrap();
+            }
+            pool.register(&id, host, name, "wf", None, &job, held()).await.unwrap();
+            if idle { pool.release(&id).await.unwrap(); }
+            sqlx::query("UPDATE ci_vm_pool SET last_used_at = now() - make_interval(secs => $2) WHERE sandbox_id = $1")
+                .bind(id).bind(f64::from(age)).execute(&pool.db).await.unwrap();
+        }
+        let building = pool.begin_build("building-job", &runner, "building", "wf", None, held()).await.unwrap();
+        // A concurrent claim holding the oldest row wins; eviction skips it.
+        let mut claim = pool.db.begin().await.unwrap();
+        sqlx::query("SELECT sandbox_id FROM ci_vm_pool WHERE sandbox_id = $1 FOR UPDATE")
+            .bind(sb(&runner, "old")).fetch_one(&mut *claim).await.unwrap();
+        let taken = pool.take_oldest_idle(&runner).await.unwrap().unwrap();
+        assert_eq!(taken.sandbox_id, sb(&runner, "new"));
+        assert_eq!(taken.status, "draining");
+        claim.rollback().await.unwrap();
+        assert_eq!(pool.take_oldest_idle(&runner).await.unwrap().unwrap().sandbox_id, sb(&runner, "old"));
+        assert!(pool.take_oldest_idle(&runner).await.unwrap().is_none());
+        assert!(pool.claim(&runner, "old", "j2", held()).await.unwrap().is_none());
+        assert_eq!(pool.get(&sb(&runner, "claimed")).await.unwrap().unwrap().status, "claimed");
+        assert_eq!(pool.get(&sb(&other, "foreign")).await.unwrap().unwrap().status, "idle");
+        assert_eq!(pool.get(&sb(&runner, "nonterminal")).await.unwrap().unwrap().status, "idle");
+        assert_eq!(pool.get(&building).await.unwrap().unwrap().status, "building");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn eviction_intent_survives_restart_without_deleting_resizes() {
+        let (pool, _store) = test_pool().await;
+        let runner = runner_id();
+        let foreign = runner_id();
+        for (host, name) in [(&runner, "evict"), (&runner, "resize"),
+            (&runner, "legacy-draining"), (&runner, "fresh"), (&foreign, "evict")] {
+            let id = sb(host, name);
+            pool.register(&id, host, "live", "wf", None, "job", held()).await.unwrap();
+            pool.release(&id).await.unwrap();
+            if name == "evict" {
+                pool.take_one_for_sweep(&id, std::slice::from_ref(host)).await.unwrap().unwrap();
+            } else if name != "fresh" {
+                pool.take_idle(&id, std::slice::from_ref(host)).await.unwrap().unwrap();
+            }
+        }
+        // An unrelated release must not cancel the durable deletion request.
+        let target = sb(&runner, "evict");
+        pool.release(&target).await.unwrap();
+        assert_eq!(pool.get(&target).await.unwrap().unwrap().status, "draining");
+        assert!(pool.take_one_for_sweep(&sb(&runner, "resize"), &[runner.clone()])
+            .await.unwrap().is_none());
+
+        // New process, no in-memory cleanup list. Even a recently used image
+        // must be retried once eviction was explicitly requested.
+        let restarted = Pool::new(pool.db.clone());
+        let taken = restarted.take_for_sweep(&[runner.clone()], &["live".into()], 86400)
+            .await.unwrap();
+        assert_eq!(taken.iter().map(|v| &v.sandbox_id).collect::<Vec<_>>(), vec![&target]);
+        let mut in_flight = pool.db.begin().await.unwrap();
+        sqlx::query("SELECT sandbox_id FROM ci_vm_pool WHERE sandbox_id=$1 FOR UPDATE")
+            .bind(&target).fetch_one(&mut *in_flight).await.unwrap();
+        assert!(restarted.take_for_sweep(&[runner.clone()], &["live".into()], 86400)
+            .await.unwrap().is_empty());
+        in_flight.rollback().await.unwrap();
+        assert_eq!(restarted.take_for_sweep(&[runner], &["live".into()], 86400)
+            .await.unwrap().len(), 1);
     }
 
     /// Sweeping marks VMs `draining` so a concurrent claim cannot take one that
