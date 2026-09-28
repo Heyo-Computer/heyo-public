@@ -666,6 +666,30 @@ impl Dispatcher {
             )));
         }
 
+        // A published release is not an ordinary partial submit. Re-planning
+        // it would remove the release workflow, and running the merge again
+        // could publish a second candidate. Admit a failed-only attempt from
+        // the persisted plans and immutable publication/submission evidence.
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM ci_submission WHERE release_run_id=$1)",
+        )
+        .bind(run_id)
+        .fetch_one(self.store.pool())
+        .await
+        .map_err(|e| DispatchError::Workflow(format!("inspect release submission: {e}")))?
+        {
+            if !failed_only {
+                return Err(DispatchError::Workflow(
+                    "full release reruns are unsupported because they could publish the merge again; use Re-run failed jobs on the latest failed release attempt".into(),
+                ));
+            }
+            let submitted = self.retry_published_release(run_id, actor).await?;
+            for id in &submitted.run_ids {
+                self.advance_run(id).await?;
+            }
+            return Ok(submitted);
+        }
+
         let bytes = self.store.source_bytes(run_id).await?;
 
         let req = crate::trigger::SubmitRequest {
@@ -713,6 +737,163 @@ impl Dispatcher {
             submitted.run_ids.join(", ")
         );
         Ok(submitted)
+    }
+
+    async fn retry_published_release(
+        &self,
+        run_id: &str,
+        actor: Option<&crate::web::identity::Identity>,
+    ) -> Result<Submitted, DispatchError> {
+        let retry = crate::vm::new_id();
+        let mut tx = self.store.pool().begin().await
+            .map_err(|e| DispatchError::Workflow(format!("begin release retry: {e}")))?;
+        crate::lifecycle::Lifecycle::admit_in(&mut tx).await.map_err(DispatchError::Workflow)?;
+        let source = sqlx::query(
+            "SELECT r.status,rel.status AS release_status
+               FROM ci_run r JOIN ci_submission sub ON sub.release_run_id=r.id
+               LEFT JOIN ci_release rel ON rel.run_id=r.id
+              WHERE r.id=$1 FOR UPDATE OF r,sub",
+        ).bind(run_id).fetch_optional(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("lock release retry source: {e}")))?
+            .ok_or_else(|| DispatchError::Workflow(
+                "release retry requires one unambiguous admitted submission".into()))?;
+        if source.get::<Option<String>, _>("release_status").as_deref() != Some("published") {
+            return Err(DispatchError::Workflow(
+                "release retry requires a confirmed published release; reconcile publication before retrying failed jobs".into(),
+            ));
+        }
+        if !matches!(source.get::<String, _>("status").as_str(), "failure" | "cancelled") {
+            return Err(DispatchError::Workflow(
+                "only a failed or cancelled published release can retry failed jobs".into(),
+            ));
+        }
+        let merge_complete: bool = sqlx::query_scalar(
+            "SELECT count(*)=1 AND bool_and(j.status='success') FROM ci_job j,
+             LATERAL jsonb_array_elements(j.plan->'steps') s
+             WHERE j.run_id=$1 AND s->>'uses'='ci/merge-release'",
+        ).bind(run_id).fetch_one(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("inspect publication job: {e}")))?;
+        if !merge_complete {
+            return Err(DispatchError::Workflow(
+                "reconcile the published merge job before retrying; release retry never repeats publication".into(),
+            ));
+        }
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ci_job WHERE run_id=$1 AND status NOT IN ('success','failure','skipped','cancelled'))
+                 OR EXISTS(SELECT 1 FROM ci_service_deployment WHERE run_id=$1 AND status NOT IN ('passed','failed'))
+                 OR EXISTS(SELECT 1 FROM ci_service_deployment d JOIN ci_service_rollout s ON s.id=d.id
+                            WHERE d.run_id=$1 AND d.status='failed' AND d.phase IS DISTINCT FROM 'settled_failure')",
+        ).bind(run_id).fetch_one(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("inspect release retry settlement: {e}")))?;
+        if active {
+            return Err(DispatchError::Workflow(
+                "release work is still active or an earlier rollout failure is not terminally settled; reconcile it before retrying".into(),
+            ));
+        }
+        let partial_effect: Option<String> = sqlx::query_scalar(
+            "SELECT j.job_key FROM ci_job j JOIN ci_step s ON s.job_id=j.id
+              WHERE j.run_id=$1 AND j.status<>'success' AND s.status='success'
+                AND s.uses IN ('ci/deploy-service','ci/deploy-app-lb','ci/deploy-controller',
+                               'ci/host-heyvm-maintenance','ci/bootstrap-host-heyvm',
+                               'ci/rollout-host-heyvmd','ci/rollout-service','ci/rollout-host-app-lb')
+                AND NOT (s.uses IN ('ci/rollout-service','ci/rollout-host-app-lb')
+                    AND COALESCE(j.plan->'native_labels','[]'::jsonb)='[]'::jsonb
+                    AND (EXISTS(SELECT 1 FROM ci_service_deployment d WHERE d.step_id=s.id AND d.status='passed')
+                         OR EXISTS(SELECT 1 FROM ci_release_carried_deployment c
+                                   JOIN ci_service_deployment d ON d.id=c.deployment_id
+                                   WHERE c.job_id=j.id AND c.step_index=s.idx AND d.status='passed')))
+              ORDER BY j.created_at LIMIT 1",
+        ).bind(run_id).fetch_optional(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("inspect completed release effects: {e}")))?;
+        if let Some(job) = partial_effect {
+            return Err(DispatchError::Workflow(format!(
+                "release job {job:?} already completed a deployment step before failing; reconcile that deployment instead of repeating the job"
+            )));
+        }
+
+        // The unique retry_of index is the concurrent duplicate guard. Since
+        // every accepted child is itself a submission, an old ancestor also
+        // remains permanently ineligible for replay.
+        let has_child: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ci_submission WHERE retry_of=$1)",
+        ).bind(run_id).fetch_one(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("inspect release retry lineage: {e}")))?;
+        if has_child {
+            return Err(DispatchError::Workflow(
+                "this release attempt already has a retry; retry failed jobs on the latest descendant instead".into(),
+            ));
+        }
+
+        sqlx::query(
+            "INSERT INTO ci_run(id,workflow_id,workflow_path,workflow_name,repo_url,git_ref,sha,before_sha,
+                                actor_subject,actor_email,source,status,repo_id,changes,rerun_of,default_branch,release_base_sha)
+             SELECT $2,workflow_id,workflow_path,workflow_name,repo_url,git_ref,sha,before_sha,$3,$4,
+                    'rerun','queued',repo_id,changes,$1,default_branch,release_base_sha FROM ci_run WHERE id=$1",
+        ).bind(run_id).bind(&retry).bind(actor.map(|a| &a.subject)).bind(actor.map(|a| &a.email))
+            .execute(&mut *tx).await.map_err(|e| DispatchError::Workflow(format!("create release retry: {e}")))?;
+        let copied_source = sqlx::query("INSERT INTO ci_run_source(run_id,descriptor) SELECT $2,descriptor FROM ci_run_source WHERE run_id=$1")
+            .bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("copy release source: {e}")))?;
+        if copied_source.rows_affected() != 1 {
+            return Err(DispatchError::Workflow(
+                "release retry requires the original persisted source descriptor".into(),
+            ));
+        }
+        let jobs = sqlx::query("SELECT job_key,status,outputs FROM ci_job WHERE run_id=$1 ORDER BY created_at,id")
+            .bind(run_id).fetch_all(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("read release jobs: {e}")))?;
+        sqlx::query(
+            "INSERT INTO ci_job(id,run_id,job_key,base_id,display,network,status,matrix,outputs,plan,carried_from,started_at,finished_at)
+             SELECT $2||'.'||job_key,$2,job_key,base_id,display,network,
+                    CASE WHEN status='success' THEN 'success' ELSE 'pending' END,matrix,
+                    CASE WHEN status='success' THEN outputs ELSE '{}'::jsonb END,plan,
+                    CASE WHEN status='success' THEN $1 ELSE NULL END,
+                    CASE WHEN status='success' THEN now() ELSE NULL END,
+                    CASE WHEN status='success' THEN now() ELSE NULL END
+               FROM ci_job WHERE run_id=$1",
+        ).bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("copy release job plans: {e}")))?;
+        sqlx::query(
+            "INSERT INTO ci_release_carried_deployment(job_id,step_index,deployment_id)
+             SELECT $2||'.'||j.job_key,s.idx,d.id FROM ci_job j
+               JOIN ci_step s ON s.job_id=j.id JOIN ci_service_deployment d ON d.step_id=s.id
+              WHERE j.run_id=$1 AND s.status='success' AND d.status='passed'
+                AND s.uses IN ('ci/rollout-service','ci/rollout-host-app-lb')
+             UNION
+             SELECT $2||'.'||j.job_key,c.step_index,c.deployment_id FROM ci_job j
+               JOIN ci_release_carried_deployment c ON c.job_id=j.id WHERE j.run_id=$1",
+        ).bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("preserve completed deployment receipts: {e}")))?;
+        sqlx::query("INSERT INTO ci_submission(release_run_id,validation_count,retry_of) SELECT $2,validation_count,$1 FROM ci_submission WHERE release_run_id=$1")
+            .bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("record release retry: {e}")))?;
+        let copied_validations = sqlx::query("INSERT INTO ci_submission_validation(release_run_id,validation_run_id,ordinal) SELECT $2,validation_run_id,ordinal FROM ci_submission_validation WHERE release_run_id=$1")
+            .bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("copy frozen validations: {e}")))?;
+        let expected: i64 = sqlx::query_scalar("SELECT validation_count::bigint FROM ci_submission WHERE release_run_id=$1")
+            .bind(&retry).fetch_one(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("verify frozen validations: {e}")))?;
+        if copied_validations.rows_affected() as i64 != expected {
+            return Err(DispatchError::Workflow(
+                "release retry found incomplete frozen validation membership".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status,error)
+             SELECT $2,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,'published',NULL FROM ci_release WHERE run_id=$1",
+        ).bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("copy published release: {e}")))?;
+        Store::add_event(&mut tx, &retry, None, None, None, "ci.run.status.v1", "queued", None).await?;
+        for job in jobs {
+            let key: String = job.get("job_key");
+            let status = if job.get::<String, _>("status") == "success" { "success" } else { "pending" };
+            Store::add_event(&mut tx, &retry, Some(&crate::store::job_id(&retry, &key)), Some(&key), None,
+                "ci.job.status.v1", status, None).await?;
+        }
+        tx.commit().await.map_err(|e| DispatchError::Workflow(format!("commit release retry: {e}")))?;
+        Ok(Submitted { run_ids: vec![retry.clone()], warnings: vec![
+            format!("release retry reuses published candidate and frozen validation artifacts from {run_id}")
+        ], submission: Some(retry) })
     }
 
     /// Fill a failed-only re-run's jobs with the results their counterparts
@@ -2653,6 +2834,19 @@ impl Dispatcher {
             "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance" | "ci/bootstrap-host-heyvm" | "ci/rollout-host-heyvmd" | "ci/rollout-service" | "ci/rollout-host-app-lb") {
             crate::submission::authorize_publication(&self.store, &msg.run_id).await
                 .map_err(DispatchError::StepFailed)?;
+        }
+
+        if matches!(action, "ci/rollout-service" | "ci/rollout-host-app-lb") {
+            let completed: Option<String> = sqlx::query_scalar(
+                "SELECT d.id FROM ci_release_carried_deployment c
+                 JOIN ci_step s ON s.job_id=c.job_id AND s.idx=c.step_index
+                 JOIN ci_service_deployment d ON d.id=c.deployment_id
+                 WHERE s.id=$1 AND d.status='passed'",
+            ).bind(sid).fetch_optional(self.store.pool()).await
+                .map_err(|e| DispatchError::StepFailed(format!("read carried deployment receipt: {e}")))?;
+            if let Some(id) = completed {
+                return Ok((format!("[ci] retained completed deployment {id}; no deployment repeated\n"), json!({})));
+            }
         }
 
         match action {
@@ -6547,6 +6741,96 @@ mod tests {
         crate::managed_update::reconcile(&d).await.unwrap(); assert_eq!(posts.load(Ordering::SeqCst),2);
         server.abort();
         sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
+    async fn published_release_failed_only_retry_preserves_identity_and_single_flight() {
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let validation = crate::workflow::Workflow::parse("build.yml", "jobs:\n  build:\n    steps: [{run: cargo test}]\n").unwrap();
+        let release = crate::workflow::Workflow::parse("release.yml", r#"
+on: release
+jobs:
+  merge:
+    steps: [{uses: ci/merge-release, with: {manifests: '[]'}}]
+  us:
+    needs: [merge]
+    steps: [{uses: ci/rollout-service}]
+  eu:
+    needs: [us]
+    steps: [{uses: ci/rollout-host-app-lb}, {uses: ci/rollout-service}]
+"#).unwrap();
+        let validation_plan = crate::plan::Plan::build(&validation).unwrap();
+        let release_plan = crate::plan::Plan::build(&release).unwrap();
+        let source_run = format!("release-{}", crate::vm::new_id());
+        let validation_run = format!("validation-{}", crate::vm::new_id());
+        let sha = "a".repeat(40);
+        let request = crate::store::RunRequest { repo_url: "https://example.test/repo.git".into(),
+            git_ref: "refs/heads/main".into(), sha: sha.clone(), changes: crate::paths::Changes::unknown("frozen"), ..Default::default() };
+        let mut tx = d.store.pool().begin().await.unwrap();
+        Store::create_run_in(&mut tx, &validation_run, &request, &validation_plan).await.unwrap();
+        Store::create_run_in(&mut tx, &source_run, &request, &release_plan).await.unwrap();
+        sqlx::query("INSERT INTO ci_run_source(run_id,descriptor) VALUES($1,'frozen-source'),($2,'frozen-source')")
+            .bind(&validation_run).bind(&source_run).execute(&mut *tx).await.unwrap();
+        crate::submission::record(&mut tx, &source_run, std::slice::from_ref(&validation_run)).await.unwrap();
+        tx.commit().await.unwrap();
+        let validation_job = d.store.jobs_of(&validation_run).await.unwrap().remove(0);
+        d.store.create_step(&crate::store::step_id(&validation_job.id, 0), &validation_job.id, 0, "test", None).await.unwrap();
+        d.store.finish_step(&crate::store::step_id(&validation_job.id, 0), StepStatus::Success, Some(0), None).await.unwrap();
+        d.store.set_job_status(&validation_job.id, JobStatus::Success, None).await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='success' WHERE id=$1").bind(&validation_run).execute(d.store.pool()).await.unwrap();
+        let jobs = d.store.jobs_of(&source_run).await.unwrap();
+        for job in &jobs {
+            d.store.set_job_status(&job.id, if job.job_key == "eu" { JobStatus::Failure } else { JobStatus::Success }, None).await.unwrap();
+        }
+        let eu_job = jobs.iter().find(|j| j.job_key == "eu").unwrap();
+        let completed_step = crate::store::step_id(&eu_job.id, 0);
+        d.store.create_step(&completed_step, &eu_job.id, 0, "app-lb", Some("ci/rollout-host-app-lb")).await.unwrap();
+        d.store.finish_step(&completed_step, StepStatus::Success, Some(0), None).await.unwrap();
+        let operation = format!("host-{source_run}");
+        sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES($1,$2,$3,$4,'app-lb-eu1','hash','passed',$5,'refs/heads/main')")
+            .bind(&operation).bind(&completed_step).bind(&source_run).bind(&eu_job.id).bind(&sha)
+            .execute(d.store.pool()).await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id=$1").bind(&source_run).execute(d.store.pool()).await.unwrap();
+        let prepared = json!({"source_sha":sha,"release_sha":sha,"git_ref":"refs/heads/main","versions":{},"tags":[]});
+        sqlx::query("INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status) VALUES($1,'request',$2,$2,'refs/heads/main','{}',$2,$3,'published')")
+            .bind(&source_run).bind(&sha).bind(&prepared).execute(d.store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_artifact(id,run_id,job_id,name,sink,digest,size_bytes,uri) VALUES('frozen-artifact',$1,$2,'bundle','artifacts',$3,17,'blob')")
+            .bind(&validation_run).bind(&validation_job.id).bind("b".repeat(64)).execute(d.store.pool()).await.unwrap();
+
+        assert!(d.rerun(&source_run, false, None).await.err().unwrap().to_string().contains("full release reruns are unsupported"));
+        let admitted = d.retry_published_release(&source_run, None).await.unwrap();
+        let retry = &admitted.run_ids[0];
+        assert_eq!(crate::submission::validations(&d.store, retry).await.unwrap(), [validation_run.clone()]);
+        assert_eq!(crate::submission::artifact_run(&d.store, retry, "build.yml").await.unwrap(), validation_run);
+        assert_eq!(d.store.source_bytes(retry).await.unwrap(), b"frozen-source");
+        let copied = crate::release::get(&d.store, retry).await.unwrap().unwrap();
+        assert_eq!(copied.status, "published");
+        assert_eq!(copied.prepared.release_sha, sha);
+        let retry_jobs = d.store.jobs_of(retry).await.unwrap();
+        assert_eq!(retry_jobs.iter().find(|j| j.job_key == "us").unwrap().status, "success");
+        assert_eq!(retry_jobs.iter().find(|j| j.job_key == "eu").unwrap().status, "pending");
+        let retry_eu = retry_jobs.iter().find(|j| j.job_key == "eu").unwrap();
+        let retained: Vec<(i32, String)> = sqlx::query_as("SELECT step_index,deployment_id FROM ci_release_carried_deployment WHERE job_id=$1")
+            .bind(&retry_eu.id).fetch_all(d.store.pool()).await.unwrap();
+        assert_eq!(retained, vec![(0, operation.clone())], "retain only app-lb, not the failed service step");
+        assert!(d.retry_published_release(&source_run, None).await.err().unwrap().to_string().contains("latest descendant"));
+
+        d.store.set_job_status(&retry_eu.id, JobStatus::Failure, None).await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id=$1").bind(retry).execute(d.store.pool()).await.unwrap();
+        let (first, duplicate) = tokio::join!(d.retry_published_release(retry, None), d.retry_published_release(retry, None));
+        assert_ne!(first.is_ok(), duplicate.is_ok(), "only one concurrent retry may be admitted");
+        let descendant = first.or(duplicate).unwrap().run_ids.remove(0);
+        let inherited: String = sqlx::query_scalar("SELECT deployment_id FROM ci_release_carried_deployment WHERE job_id=$1 AND step_index=0")
+            .bind(crate::store::job_id(&descendant, "eu")).fetch_one(d.store.pool()).await.unwrap();
+        assert_eq!(inherited, operation, "receipt survives more than one retry");
+
+        sqlx::query("UPDATE ci_release SET status='unknown' WHERE run_id=$1").bind(retry).execute(d.store.pool()).await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id=$1").bind(retry).execute(d.store.pool()).await.unwrap();
+        assert!(d.retry_published_release(retry, None).await.err().unwrap().to_string().contains("confirmed published"));
+        assert!(crate::submission::authorize_publication(&d.store, &validation_run).await.is_err(),
+            "reusing validation membership must not relax validation-only publication restrictions");
     }
 
     #[tokio::test]

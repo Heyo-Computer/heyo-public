@@ -896,6 +896,17 @@ not bypass repository policy or release/deployment gates. If a request loses
 its response, check `reruns` in `GET /api/runs/{id}` before posting again:
 every accepted request creates a new run, not an idempotent reset.
 
+Published releases use a separate **failed-jobs-only** retry path. The retry
+atomically inherits the original job plans, source, published commit and frozen
+validation/artifact membership. Successful regional jobs are carried over;
+completed `ci/rollout-host-app-lb` and `ci/rollout-service` steps inside failed
+Linux jobs retain their original deployment receipts and do not deploy again.
+Failed service candidates must have confirmed reclamation before retry admission.
+Other partially completed deployment actions require reconciliation rather than
+blind replay. Full release reruns and unconfirmed publication are rejected.
+Each release attempt admits at most one retry; further retries target the latest
+failed descendant. Ordinary partial submissions remain validation-only.
+
 **A re-run is a new run**, with `rerun_of` pointing at the one it re-plays and
 the original's page listing what re-played it — never a reset of the old run.
 Run and job ids name their logs and derive the step operation ids the daemon
@@ -916,7 +927,7 @@ Exact re-import is safe; conflicting or invalid descriptors stop startup instead
 of replacing accepted history. Source reads, native-runner checkout and reruns
 then use Postgres exclusively. A run without an imported descriptor reports the
 missing source explicitly; it never falls back to a different revision.
-The re-run goes through
+An ordinary validation re-run goes through
 the same path as a submit, with the run's own
 workflow file as its `--only` selector, so it is planned, routed and given
 secrets exactly as the original was. As with `--only`, the `on.submit` branch
@@ -1681,7 +1692,8 @@ records the original error and receipt in `ci.host.maintenance.recovered.v1`,
 marks the proven operation successful, releases its fence and resumes untouched
 skipped jobs in the same run. Existing logs, attempt IDs and status events remain.
 A repeated call does not repeat maintenance or recovery. This is distinct from
-`rerun-failed`, which cannot authorize a release.
+`rerun-failed`: a published-release retry preserves its original publication,
+but cannot authorize a new merge or bypass unresolved maintenance.
 
 Deploy the new Cloud endpoint **and every Cloud worker's cross-instance operation
 locking** before enabling this action. Older Cloud cannot execute the plural POST,
