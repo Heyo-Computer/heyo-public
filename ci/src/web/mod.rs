@@ -84,6 +84,9 @@ pub fn router(
         .route("/healthz", get(healthz))
         .route("/__ui/{*path}", get(ui_asset))
         .route("/", get(runs_page))
+        // Behind the identity gate, never a repository-token/public machine API.
+        .route("/maintenance", get(maintenance_status))
+        .route("/maintenance/{id}/{action}", post(maintenance_action))
         .route("/runs/{run_id}", get(run_page))
         // Admin-only like the other state-changing routes: cancelling stops
         // somebody's build.
@@ -147,6 +150,46 @@ pub fn router(
         .merge(api::router())
         .layer(axum::middleware::from_fn_with_state(state.clone(), owner_http::route))
         .with_state(state)
+}
+
+async fn maintenance_admin(state: &AppState, headers: &HeaderMap) -> Result<Identity, axum::response::Response> {
+    may_manage(state, headers).await?.ok_or_else(||
+        error(StatusCode::UNAUTHORIZED, "maintenance requires an authenticated CI admin"))
+}
+
+async fn maintenance_status(State(state): State<AppState>, headers: HeaderMap) -> axum::response::Response {
+    if let Err(response) = maintenance_admin(&state, &headers).await { return response; }
+    match crate::maintenance::status(&state.store).await {
+        Ok(status) => Json(status).into_response(),
+        Err(detail) => {
+            tracing::error!(%detail, "could not read operator maintenance");
+            error(StatusCode::SERVICE_UNAVAILABLE, "maintenance status unavailable")
+        }
+    }
+}
+
+async fn maintenance_action(State(state): State<AppState>, Path((id, action)): Path<(uuid::Uuid, String)>, headers: HeaderMap) -> axum::response::Response {
+    let who = match maintenance_admin(&state, &headers).await {
+        Ok(who) => who,
+        Err(response) => return response,
+    };
+    let operation = async {
+        match action.as_str() {
+            "pause" => crate::maintenance::pause(&state.store, id, &who.subject).await,
+            "quiesce" => crate::maintenance::quiesce(&state.store, &state.dispatcher.executor, &state.dispatcher.lifecycle, id).await,
+            "resume" => crate::maintenance::resume(&state.store, id).await,
+            "activate-recovery" => crate::executor_recovery::activate(&state.dispatcher, id).await.map_err(|e| e.to_string()),
+            _ => Err("unknown maintenance action".into()),
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(5), operation).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(detail)) => {
+            tracing::warn!(%id, %action, %detail, "operator maintenance transition refused");
+            error(StatusCode::CONFLICT, "maintenance transition refused; inspect maintenance status and logs")
+        }
+        Err(_) => error(StatusCode::GATEWAY_TIMEOUT, "maintenance transition timed out; read status before retrying the same operation ID"),
+    }
 }
 
 fn application_lifecycle_auth(state: &AppState, headers: &HeaderMap) -> Result<(), axum::response::Response> {

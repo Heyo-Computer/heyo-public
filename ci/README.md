@@ -106,6 +106,100 @@ before using this migration for live CI. Database access must survive a change o
 VM address/interface; a firewall allowance tied to the retired VM is insufficient.
 Branch promotion authorizes deployment of the tested artifact, not GitHub merge/tag writes.
 
+### Operator maintenance pause
+
+The CI admin routes below provide a durable, reversible pause across processes
+sharing the CI database. They require an authenticated admin through the app-lb
+identity gate, including in development; repository submit tokens are insufficient.
+Keep `/maintenance` and its descendants out of app-lb `public_paths`. Scripted
+requests through the browser gate must use its authenticated session and
+`Accept: text/html`; these handlers return JSON status or an empty success response.
+
+1. `POST /maintenance/{uuid}/pause` closes new submissions, including submissions
+   still preparing source that have not committed. Already-admitted jobs and
+   cleanup may finish. Repeating the same active operation is idempotent.
+2. `GET /maintenance` reports the phase and durable blockers without advancing it.
+3. `POST /maintenance/{uuid}/quiesce` runs on the execution owner. It waits for local
+   effects, checks local work and durable obligations, and only then persists
+   `paused`, blocking new grants and external-effect permits. Running jobs, expired
+   but uncompleted native leases, pending cleanup, and unresolved failed maintenance
+   or deployment operations prevent this transition. A five-second HTTP timeout
+   is not evidence of success or failure: read status and retry the same ID.
+4. `POST /maintenance/{uuid}/resume` removes only that operation's pause. It does
+   not change ownership or clear other rollout/retirement/maintenance restrictions.
+   A stale resume cannot reopen a newer pause. Completed IDs cannot be reused.
+
+**This is not a VM replacement authorization.** `quiesced` means work drained
+under this protocol; `safeToReplace` remains false because pause does not transfer
+the non-expiring executor ownership. Replacing the owning singleton still needs
+a separately verified ownership handoff. This feature does not bootstrap itself
+into an older installed binary, and an older binary does not enforce this gate.
+Do not use it as a mixed-version or binary-rollback safety guarantee. Migration
+039 is additive and is not a request to alter live data manually.
+
+### Explicit recovery of a retained singleton
+
+This is an operator-approved maintenance-window procedure, not automatic failover
+or managed two-region bootstrap. Keep the logical deployment ID, workspace,
+external PostgreSQL and NATS services unchanged. Build and verify the recovery
+artifact before interrupting the installed CI app.
+
+`ci --inspect-executor` reads the existing owner/generation and outstanding
+obligation categories without migrating or starting workers. Record those values
+and the exact source VM before replacement. A recovery plan JSON contains
+`operation_id` (fresh UUID), `source_boot`, `source_generation`, `deployment`,
+`source_sandbox`, `revision` (exact artifact Git SHA), `maintenance_run`,
+`maintenance_operation`, and `operator`. It contains no credentials.
+
+Close submission traffic, finish admitted work, and account for direct callers
+and native callbacks before using app-lb maintenance mode. Use a conditional
+same-deployment template replacement with the tested artifact and the plan as
+the fourth argument to `start-artifact.sh`. This invokes
+`ci --hold-executor-recovery PLAN_JSON`. It runs embedded migrations and registers
+a fresh held boot, but starts no imports, NATS, consumers, cleanup or reconcilers.
+Its `/healthz` identifies the operation/boot/revision; HTTP 200 means alive, **not
+authorized to execute jobs**. Keep public maintenance enabled.
+
+After capture/replacement, an authenticated operator runs
+`ci --transfer-executor-recovery PLAN_JSON CANDIDATE_BOOT CANDIDATE_SANDBOX SPEC_ETAG`
+through exact-sandbox platform exec. Supply ordinary CI configuration and
+HeyoSecret-backed `CI_RECOVERY_APP_LB_URL`, `CI_RECOVERY_APP_LB_USER`,
+`CI_RECOVERY_APP_LB_PASSWORD`, `CI_RECOVERY_BACKEND_URL`, and
+`CI_RECOVERY_BACKEND_TOKEN` in the exec environment; never in the plan or Git.
+The command requires a durable matching spec read, a sole healthy candidate,
+the exact held boot observed through non-waking exec, a pushed workspace captured
+from the predecessor, and a positive authenticated Firecracker reclamation receipt.
+Do not allow concurrent deployment writers during this operator procedure.
+Reclamation is point-in-time evidence, not a permanent tombstone: inventory and
+exclude other authorities or outstanding requests capable of recreating the old VM.
+
+The ownership transaction compares the recorded predecessor boot/generation,
+preserves every job and operation ledger, retires the predecessor, and authorizes
+only the named maintenance reconciliation. It does not grant general execution.
+The candidate continues in the **same process boot**, serving the recovery API
+without starting workers. Reconcile the named operation through the existing
+run-scoped maintenance recovery endpoint. In this mode, positive Cloud receipt
+reconciliation releases the maintenance obligation **without resuming the old
+failed release or its skipped regional deployments**.
+
+An authenticated admin then posts `/maintenance/{operation_id}/activate-recovery`.
+Activation requires the pinned owner, the settled named operation and no remaining
+jobs/leases/cleanup/remote-effect obligations. It atomically removes the restriction;
+only then do queue workers start. Verify public identity, state continuity, and
+execution before reopening ingress. Never clear a blocker by deleting its row.
+For an explicitly retired native job, retain `ci_host_work`, cancel the job and
+native lease, revoke its lease token, and record the runner in
+`ci_native_quarantine` with the S3 report and operator identity. That runner cannot
+receive new jobs, even if it re-registers. Explicit executor recovery can exclude
+only this isolated native work from its Linux activation check; it does not claim
+the remote process stopped. Ordinary handoff checks remain unchanged. A partially
+settled maintenance record still requires both its host and deployment records to
+be passed after exact receipt verification.
+An ambiguous transfer is retried with identical arguments; it cannot increment
+the owner generation twice. A crashed candidate cannot reuse its receipt in a
+new boot. Keep maintenance enabled and explicitly fence/recover again rather than
+restoring an old specification as if it were a verified ownership rollback.
+
 Release and deployment default to disabled. A merge requires both
 `RELEASE_ENABLED=true` and `RELEASE_SOURCE_SHA` equal to the exact submitted commit,
 plus the HeyoSecret-backed `GIT_AUTH_TOKEN`. CI checks the captured base, requires
@@ -1428,8 +1522,9 @@ replicas still return 503 for owner-only operations on a standby.
 
 The owner is **non-expiring**. A timeout, cancelled run or lost heartbeat never
 proves that a worker or VM command stopped. An unplanned owner restart therefore
-does not recover execution automatically. There is no force-takeover API; runtime
-fencing and reconciliation must be implemented before claiming crash failover.
+does not recover execution automatically. The explicit singleton recovery above
+requires verified runtime reclamation and an operator-controlled replacement;
+there is no timeout-based force-takeover API or automatic crash failover.
 
 Legacy direct controller replacement closes shared admission and grants, waits for
 local effect permits, then verifies durable jobs, leases, VM cleanup and remote

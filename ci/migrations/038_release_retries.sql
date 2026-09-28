@@ -15,7 +15,7 @@ ALTER TABLE ci_submission_validation
 
 -- Completed deployment steps inside a failed regional job must not execute
 -- again. Preserve the original receipt, including across repeated retries.
-CREATE TABLE ci_release_carried_deployment (
+CREATE TABLE IF NOT EXISTS ci_release_carried_deployment (
     job_id TEXT NOT NULL REFERENCES ci_job(id),
     step_index INTEGER NOT NULL,
     deployment_id TEXT NOT NULL REFERENCES ci_service_deployment(id),

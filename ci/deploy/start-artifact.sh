@@ -27,4 +27,7 @@ echo "Starting CI revision $CI_EXPECTED_SHA"
 mkdir -p "$state"/{logs,workspaces,artifacts}
 cd "$runtime"
 # Older rootfs images contain a start.sh that couples CI to NATS. Never invoke it.
+if [[ $# -eq 4 ]]; then
+    exec ./ci --hold-executor-recovery "$4"
+fi
 exec ./ci
