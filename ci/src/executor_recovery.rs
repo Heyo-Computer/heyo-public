@@ -202,6 +202,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::connect(url.as_str(), dir.path().join("logs"), Duration::from_secs(10)).await.unwrap();
         store.migrate().await.unwrap();
+        // Held boot and normal startup each migrate the same database.
+        store.migrate().await.unwrap();
         let old = ExecutorOwner::register(store.pool().clone(), "ci-eu1").await.unwrap();
         let plan = Plan { operation_id: Uuid::new_v4(), source_boot: old.boot_id(), source_generation: 1,
             deployment: "ci-eu1".into(), source_sandbox: "sb-old".into(), revision: "a".repeat(40),
