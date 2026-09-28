@@ -23,6 +23,11 @@ use tokio::task::JoinSet;
 
 const VERSION: u16 = 1;
 
+async fn stopped(shutdown: &mut ShutdownWatch) {
+    // Drop watch::Ref before returning: select branches may await child exit.
+    let _ = shutdown.wait_for(|stop| *stop).await;
+}
+
 #[derive(Serialize, Deserialize)]
 struct Bootstrap {
     version: u16,
@@ -74,7 +79,7 @@ impl Supervisor {
         let exit = loop {
             tokio::select! {
                 status = child.wait() => break status,
-                _ = shutdown.wait_for(|stop| *stop) => {
+                _ = stopped(shutdown) => {
                     if let Some(pid) = child.id() {
                         // Signal only our still-owned, unreaped child.
                         unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
@@ -138,7 +143,7 @@ impl BackgroundService for Supervisor {
                 std::process::exit(1);
             }
             tokio::select! {
-                _ = shutdown.wait_for(|stop| *stop) => return,
+                _ = stopped(&mut shutdown) => return,
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
         }
@@ -169,7 +174,7 @@ impl BackgroundService for CertificateWatch {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         loop {
             tokio::select! {
-                _ = shutdown.wait_for(|stop| *stop) => return,
+                _ = stopped(&mut shutdown) => return,
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {}
             }
             let snapshot = bootstrap(&self.dir).await.unwrap_or_else(|error| control_lost(&error));

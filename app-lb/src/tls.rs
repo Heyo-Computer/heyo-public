@@ -683,8 +683,9 @@ mod tests {
         let worker = CertStore::from_snapshot(manager.snapshot().unwrap()).unwrap();
         let wildcard = worker.lookup("one.sb.example.com").unwrap();
         assert_eq!(wildcard.chain.len(), 1, "the full chain is transferred");
+        assert_eq!(wildcard.leaf.to_pem().unwrap(), X509::stack_from_pem(&chain).unwrap()[0].to_pem().unwrap());
         assert!(worker.lookup("two.levels.sb.example.com").is_none());
-        assert!(worker.resolve(Some("unknown.example.com")).is_some());
+        assert_eq!(worker.resolve(Some("unknown.example.com")).unwrap().leaf.to_pem().unwrap(), fallback_pem);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -692,9 +693,10 @@ mod tests {
     fn snapshot_replacement_removes_stale_hosts_and_fallback() {
         let dir = tmpdir("snapshot-replace");
         let (old_crt, old_key) = self_signed("old.example.com", 90);
-        let manager = CertStore::new(&dir, None);
+        let manager = CertStore::new(&dir, Some(Arc::new(CertifiedKey::from_pem(&old_crt, &old_key).unwrap())));
         manager.insert("old.example.com", &old_crt, &old_key).unwrap();
         let worker = CertStore::from_snapshot(manager.snapshot().unwrap()).unwrap();
+        assert!(worker.resolve(Some("unknown.example.com")).is_some());
 
         let other_dir = tmpdir("snapshot-replace-other");
         let (new_crt, new_key) = self_signed("new.example.com", 90);

@@ -129,31 +129,47 @@ impl RemoteRequest {
                 write_frame(&mut stream, &message).await?;
                 read_frame(&mut stream).await
             }.await;
-            if let Err((mut stream, result)) = tx.send((stream, result)) {
-                if result.is_ok() && !terminal {
-                    if let Err(error) = cancel(&mut stream).await { crate::worker::control_lost(&error); }
-                } else if let Err(error) = result {
-                    crate::worker::control_lost(&error);
-                }
-            }
+            let _ = tx.send(Exchange { stream: Some(stream), result: Some(result), terminal });
         });
-        let (stream, result) = rx.await.map_err(|_| "request control exchange task lost".to_string())?;
-        if result.is_ok() { self.stream = Some(stream); }
+        let mut exchange = rx.await.map_err(|_| "request control exchange task lost".to_string())?;
+        let result = exchange.result.take().expect("exchange result present");
+        if result.is_ok() { self.stream = exchange.stream.take(); }
         result
+    }
+}
+
+// Cancellation may happen after the sender delivered the response but before
+// the HTTP future consumes it. The channel value must own cancellation too.
+struct Exchange {
+    stream: Option<UnixStream>,
+    result: Option<Result<ServerMessage, String>>,
+    terminal: bool,
+}
+impl Drop for Exchange {
+    fn drop(&mut self) {
+        match self.result.take() {
+            Some(Ok(_)) if !self.terminal => {
+                if let Some(stream) = self.stream.take() { cancel_owned(stream); }
+            }
+            Some(Err(error)) => crate::worker::control_lost(&error),
+            _ => {}
+        }
     }
 }
 
 impl Drop for RemoteRequest {
     fn drop(&mut self) {
         if self.completed { return; }
-        let Some(mut stream) = self.stream.take() else { return; };
-        // The stream itself is moved into the task, so it cannot be closed by
-        // this destructor before Cancel and its acknowledgement are exchanged.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if let Err(error) = cancel(&mut stream).await { crate::worker::control_lost(&error); }
-            });
-        }
+        if let Some(stream) = self.stream.take() { cancel_owned(stream); }
+    }
+}
+
+fn cancel_owned(mut stream: UnixStream) {
+    // Move ownership into the task; it survives the HTTP context's destructor.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            if let Err(error) = cancel(&mut stream).await { crate::worker::control_lost(&error); }
+        });
     }
 }
 
@@ -380,20 +396,12 @@ pub async fn serve(
                 }
             }
             ClientMessage::Complete(completion) => {
-                if let Err(error) = write_frame(&mut stream, &ServerMessage::Ack).await {
-                    hold_until_exit(&mut worker_exited, state).await;
-                    return Err(error);
-                }
                 finish(&head, &mut state, &metrics, access_log.as_ref(), security.as_ref(), completion);
-                return Ok(());
+                return write_frame(&mut stream, &ServerMessage::Ack).await;
             }
             ClientMessage::Cancel => {
-                if let Err(error) = write_frame(&mut stream, &ServerMessage::Ack).await {
-                    hold_until_exit(&mut worker_exited, state).await;
-                    return Err(error);
-                }
                 state.complete();
-                return Ok(());
+                return write_frame(&mut stream, &ServerMessage::Ack).await;
             }
             ClientMessage::Hello { .. } | ClientMessage::Begin(_) => {
                 let error = protocol_fail(&mut stream, "unexpected request-control message").await.unwrap_err();
@@ -509,6 +517,55 @@ mod tests {
         assert_eq!(copy.headers["x-bytes"].as_bytes(), &[0xff]);
         assert_eq!(copy.peer, head.peer);
         assert_eq!(copy.uri, head.uri);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_channel_delivery_still_notifies_manager() {
+        let (client, mut manager) = UnixStream::pair().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        assert!(tx.send(Exchange { stream: Some(client), result: Some(Ok(ServerMessage::Error { message: "no backend".into() })), terminal: false }).is_ok());
+        drop(rx);
+        let message = tokio::time::timeout(Duration::from_secs(2), read_frame::<ClientMessage>(&mut manager)).await.unwrap().unwrap();
+        assert!(matches!(message, ClientMessage::Cancel));
+        write_frame(&mut manager, &ServerMessage::Ack).await.unwrap();
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test]
+    async fn disconnected_rpc_keeps_real_reservation_until_child_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(crate::registry::Registry::new(dir.path().join("state")));
+        let deployment = registry.upsert(serde_json::from_value(serde_json::json!({
+            "id":"app", "routes":[{"host":"app.example"}], "upstreams":["127.0.0.1:8080"]
+        })).unwrap());
+        let backend = deployment.select(&[]).unwrap();
+        let secrets = Arc::new(crate::secrets::SecretStore::new(dir.path().join("secrets"), None));
+        let metrics = Arc::new(Metrics::new());
+        let control = Arc::new(RequestControl::new(
+            registry, metrics.clone(), Arc::new(crate::acme::ChallengeTable::new()),
+            Arc::new(crate::auth::Authenticator::new(vec![7; 32], secrets.clone(), None, None)),
+            Arc::new(crate::guard::Guard::new(dir.path().join("guard"), true)),
+            Arc::new(crate::feed::Feed::new()),
+            Arc::new(crate::auth_providers::AuthProviderStore::new(dir.path().join("providers"))), secrets,
+        ));
+        let (mut client, manager) = UnixStream::pair().unwrap();
+        let (exited, witness) = watch::channel(false);
+        let server = tokio::spawn(serve(manager, control, metrics, None, None, witness));
+        write_frame(&mut client, &ClientMessage::Hello { version: VERSION }).await.unwrap();
+        assert!(matches!(read_frame::<ServerMessage>(&mut client).await.unwrap(), ServerMessage::Hello { .. }));
+        let head = RequestHead { method: http::Method::GET, uri: "http://app.example/".parse().unwrap(), headers: http::HeaderMap::new(), peer: None, tls_terminated: false };
+        write_frame(&mut client, &ClientMessage::Begin(WireHead::from_head(&head).unwrap())).await.unwrap();
+        assert!(matches!(read_frame::<ServerMessage>(&mut client).await.unwrap(), ServerMessage::Decision { decision: WireDecision::Proxy, .. }));
+        write_frame(&mut client, &ClientMessage::NextPeer).await.unwrap();
+        assert!(matches!(read_frame::<ServerMessage>(&mut client).await.unwrap(), ServerMessage::Peer { .. }));
+        assert_eq!(backend.in_flight(), 1);
+        drop(client);
+        tokio::task::yield_now().await;
+        assert!(!server.is_finished());
+        assert_eq!(backend.in_flight(), 1, "control EOF is not drain evidence");
+        exited.send(true).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap().is_err());
+        assert_eq!(backend.in_flight(), 0);
     }
 
     #[tokio::test]
