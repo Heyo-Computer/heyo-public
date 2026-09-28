@@ -178,6 +178,7 @@ async fn maintenance_action(State(state): State<AppState>, Path((id, action)): P
             "pause" => crate::maintenance::pause(&state.store, id, &who.subject).await,
             "quiesce" => crate::maintenance::quiesce(&state.store, &state.dispatcher.executor, &state.dispatcher.lifecycle, id).await,
             "resume" => crate::maintenance::resume(&state.store, id).await,
+            "activate-recovery" => crate::executor_recovery::activate(&state.dispatcher, id).await.map_err(|e| e.to_string()),
             _ => Err("unknown maintenance action".into()),
         }
     };

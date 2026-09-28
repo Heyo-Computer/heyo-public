@@ -1,6 +1,7 @@
 //! Non-expiring, explicitly transferred ownership of CI external effects.
 //!
-//! There is intentionally no heartbeat, expiry, or recovery/takeover path.
+//! There is intentionally no heartbeat expiry or automatic takeover. Explicit
+//! operator recovery requires verified predecessor reclamation.
 //! A process registers as a standby without changing the current owner. Every
 //! external-effect operation must retain [`EffectPermit`] until the operation
 //! is completely finished; checking ownership and then dropping the permit is
@@ -61,6 +62,24 @@ pub enum VerifiedDurableContinuation<'a> {
 }
 
 impl ExecutorOwner {
+    /// Explicit recovery candidate only. This does not acquire execution or
+    /// weaken ordinary same-deployment registration.
+    pub async fn register_recovery_candidate(pool: PgPool, deployment_id: &str, plan: &crate::executor_recovery::Plan) -> Result<Self, String> {
+        let boot_id = Uuid::new_v4();
+        let mut tx = pool.begin().await.map_err(db)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(crate::lifecycle::DRAIN_LOCK).execute(&mut *tx).await.map_err(db)?;
+        let matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_executor_owner o JOIN ci_executor_boot b ON b.boot_id=o.boot_id WHERE o.boot_id=$1 AND o.generation=$2 AND b.deployment_id=$3 AND o.continuation_operation_id IS NULL AND NOT b.retired)")
+            .bind(plan.source_boot).bind(plan.source_generation).bind(deployment_id).fetch_one(&mut *tx).await.map_err(db)?;
+        if !matches { return Err("recovery predecessor identity changed".into()); }
+        sqlx::query("INSERT INTO ci_executor_boot(boot_id,deployment_id) VALUES($1,$2)")
+            .bind(boot_id).bind(deployment_id).execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("INSERT INTO ci_executor_recovery(operation_id,source_boot,source_generation,candidate_boot,plan,phase) VALUES($1,$2,$3,$4,$5,'holding')")
+            .bind(plan.operation_id).bind(plan.source_boot).bind(plan.source_generation).bind(boot_id)
+            .bind(serde_json::to_value(plan).map_err(|e|e.to_string())?).execute(&mut *tx).await.map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(Self { pool, boot_id, deployment_id: deployment_id.into(), local: Arc::new(RwLock::new(LocalState { retired: false })) })
+    }
+
     /// Register this unique process boot. The first registration initializes
     /// ownership; every later registration is a standby and cannot steal it.
     pub async fn register(pool: PgPool, deployment_id: &str) -> Result<Self, String> {
@@ -286,6 +305,8 @@ mod tests {
         sqlx::raw_sql(include_str!("../migrations/034_executor_owner.sql"))
             .execute(&pool).await.unwrap();
         sqlx::raw_sql(include_str!("../migrations/039_operator_maintenance.sql"))
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/040_executor_recovery.sql"))
             .execute(&pool).await.unwrap();
         pool
     }

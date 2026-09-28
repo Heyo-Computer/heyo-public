@@ -5,7 +5,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 // Do not infer teardown from failure, lease expiry, or an empty queue.
-async fn blockers(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<String>, String> {
+pub(crate) async fn blockers(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<String>, String> {
     sqlx::query_scalar(
         "SELECT name FROM (VALUES
         ('jobs', EXISTS(SELECT 1 FROM ci_job j JOIN ci_run r ON r.id=j.run_id WHERE j.status='running' OR (j.status IN ('pending','queued') AND r.status NOT IN ('success','failure','cancelled')))),

@@ -25,6 +25,7 @@ mod controller_rollout;
 mod debug_report;
 mod dispatch;
 mod executor;
+mod executor_recovery;
 mod expr;
 mod host_app_lb;
 mod host_bootstrap;
@@ -72,7 +73,37 @@ use vm::Vms;
 #[tokio::main]
 async fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if !args.is_empty() {
+    let recovery_path = (args.len() == 2 && args[0] == "--hold-executor-recovery").then(|| args[1].clone());
+    if !args.is_empty() && recovery_path.is_none() {
+        if args[0] == "--inspect-executor" && args.len() == 1 {
+            let result: anyhow::Result<serde_json::Value> = async {
+                let config = Config::from_env()?;
+                let store = Store::connect(&config.database_url, config.log_dir.clone(), config.db_statement_timeout).await?;
+                let owner: serde_json::Value = sqlx::query_scalar("SELECT jsonb_build_object('bootId',o.boot_id,'generation',o.generation,'deployment',b.deployment_id,'continuation',o.continuation_operation_id) FROM ci_executor_owner o JOIN ci_executor_boot b ON b.boot_id=o.boot_id WHERE o.singleton=TRUE")
+                    .fetch_one(store.pool()).await?;
+                let mut tx = store.pool().begin().await?;
+                let blockers = maintenance::blockers(&mut tx).await.map_err(anyhow::Error::msg)?;
+                Ok(serde_json::json!({"owner":owner,"blockers":blockers}))
+            }.await;
+            match result {
+                Ok(value) => println!("{value}"),
+                Err(error) => { eprintln!("executor inspection failed: {error}"); std::process::exit(1); }
+            }
+            return;
+        }
+        if args[0] == "--transfer-executor-recovery" && args.len() == 5 {
+            let result: anyhow::Result<()> = async {
+                let config = Config::from_env()?;
+                let plan = executor_recovery::load(args[1].as_ref())?;
+                let store = Store::connect(&config.database_url, config.log_dir.clone(), config.db_statement_timeout).await?;
+                executor_recovery::transfer(&store, &plan, args[2].parse()?, &args[3], &args[4]).await
+            }.await;
+            match result {
+                Ok(()) => println!("Ownership transferred to the pinned recovery-only boot; normal execution remains disabled."),
+                Err(error) => { eprintln!("executor recovery refused: {error}"); std::process::exit(1); }
+            }
+            return;
+        }
         if args[0] == "--reconcile-service-rollout" && args.len() == 3 {
             let result: anyhow::Result<()> = async {
                 let config = Config::from_env()?;
@@ -123,7 +154,7 @@ async fn main() {
             return;
         }
         if args[0] != "--check-workflows" || args.len() < 2 {
-            eprintln!("usage: ci [--check-workflows FILE ... | --prepare-host-bootstrap PLAN_JSON INSPECTION_JSON BUNDLE OUTPUT_JSON | --deliver-host-bootstrap TARGET inspect|admit INPUT_JSON BUNDLE JOURNAL_JSON | --check-host-bootstrap TARGET MANIFEST_JSON INTENT_SHA256]");
+            eprintln!("usage: ci [--inspect-executor | --hold-executor-recovery PLAN_JSON | --transfer-executor-recovery PLAN_JSON CANDIDATE_BOOT CANDIDATE_SANDBOX SPEC_ETAG | --check-workflows FILE ... | --prepare-host-bootstrap PLAN_JSON INSPECTION_JSON BUNDLE OUTPUT_JSON | --deliver-host-bootstrap TARGET inspect|admit INPUT_JSON BUNDLE JOURNAL_JSON | --check-host-bootstrap TARGET MANIFEST_JSON INTENT_SHA256]");
             std::process::exit(2);
         }
         let mut failed = false;
@@ -161,6 +192,17 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    let recovered_executor = if let Some(path) = recovery_path {
+        let result = async {
+            let plan = executor_recovery::load(path.as_ref())?;
+            executor_recovery::hold(&config, &plan).await
+        }.await;
+        match result {
+            Ok(owner) => Some(owner),
+            Err(error) => { eprintln!("executor recovery remains held: {error}"); std::process::exit(1); }
+        }
+    } else { None };
 
     if config.nats.credential_from_url {
         tracing::warn!(
@@ -293,8 +335,6 @@ async fn main() {
         bus.jobs_stream(),
         bus.events_stream()
     );
-    bus.clone().spawn_outbox_publisher(store.clone());
-
     let artifacts = match artifacts::sink_for(&config) {
         Ok(s) => Arc::from(s),
         Err(e) => {
@@ -331,11 +371,11 @@ async fn main() {
     };
     // Deployment IDs are scoped to their regional authority; both regions may
     // legitimately use the same ID for instances of the one CI application.
-    let executor_identity = config.managed_deployment.clone().unwrap_or_else(|| match (&config.controller_deployment, &config.controller_app_lb_url) {
-        (Some(id), Some(base)) => format!("{}/deployments/{id}", base.trim_end_matches('/')),
-        _ => config.instance_id.clone(),
-    });
-    let executor = if config.managed_deployment.is_some() {
+    let recovering = recovered_executor.is_some();
+    let executor_identity = executor_recovery::identity(&config);
+    let executor = if let Some(owner) = recovered_executor {
+        Ok(owner)
+    } else if config.managed_deployment.is_some() {
         executor::ExecutorOwner::register_managed(store.pool().clone(),&executor_identity).await
     } else {
         executor::ExecutorOwner::register(store.pool().clone(),&executor_identity).await
@@ -371,12 +411,48 @@ async fn main() {
     }
     objects.clone().spawn_refresh_loop();
 
-    spawn_log_sweeper(config.clone(), store.clone());
+    if recovering {
+        let d = dispatcher.clone();
+        tokio::spawn(async move {
+            loop {
+                let active = sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM ci_executor_recovery WHERE candidate_boot=$1 AND phase='complete')")
+                    .bind(d.executor.boot_id()).fetch_one(d.store.pool()).await;
+                match active {
+                    Ok(true) => break,
+                    Ok(false) => {},
+                    Err(error) => tracing::warn!(%error, "recovery activation remains unverified"),
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            start_execution(d).await;
+        });
+    } else {
+        start_execution(dispatcher.clone()).await;
+    }
 
-    // A previous process may have died holding VMs. Reclaim before taking work,
-    // or the pool leaks its capacity one restart at a time. This instance's own
-    // id is fresh, so VMs leased by the process this one replaced no longer look
-    // like somebody's live work.
+    let app = web::router(
+        config.clone(),
+        runners.clone(),
+        store.clone(),
+        dispatcher.clone(),
+    );
+    tracing::info!("listening on http://{}", config.listen_addr);
+
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+    {
+        tracing::error!("server stopped: {e}");
+        std::process::exit(1);
+    }
+    tracing::info!("shut down cleanly");
+}
+
+/// Recovery serves operator requests without starting queue/cleanup workers.
+/// Those workers start only after the explicit activation transaction commits.
+async fn start_execution(dispatcher: Arc<Dispatcher>) {
+    dispatcher.bus.clone().spawn_outbox_publisher(dispatcher.store.clone());
+    spawn_log_sweeper(dispatcher.config.clone(), dispatcher.store.clone());
     if let Ok(_effect) = dispatcher.executor.effect_permit().await {
         if let Err(e) = dispatcher.reclaim_pool().await {
             tracing::warn!("could not reclaim the VM pool: {e}");
@@ -407,22 +483,6 @@ async fn main() {
         }
     });
 
-    let app = web::router(
-        config.clone(),
-        runners.clone(),
-        store.clone(),
-        dispatcher.clone(),
-    );
-    tracing::info!("listening on http://{}", config.listen_addr);
-
-    if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-    {
-        tracing::error!("server stopped: {e}");
-        std::process::exit(1);
-    }
-    tracing::info!("shut down cleanly");
 }
 
 /// Delete step and VM logs older than `CI_LOG_RETENTION_DAYS`.

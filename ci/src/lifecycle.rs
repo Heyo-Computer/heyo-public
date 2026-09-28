@@ -8,7 +8,7 @@ use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 // Shared by final admission/grant transactions and exclusive drain transitions.
 // A process-local permit alone cannot fence a request on another HTTP replica.
 pub(crate) const DRAIN_LOCK: i64 = 0x0c19_6472;
-const PHASE_QUERY: &str = "SELECT phase FROM (SELECT phase,created_at FROM ci_controller_rollout WHERE phase<>'complete' UNION ALL SELECT phase,created_at FROM ci_application_retirement WHERE phase='draining' UNION ALL SELECT phase,created_at FROM ci_operator_maintenance WHERE phase<>'running') phases ORDER BY CASE WHEN phase IN ('prepared','pending') THEN 2 WHEN phase='draining' THEN 1 ELSE 0 END,created_at LIMIT 1";
+const PHASE_QUERY: &str = "SELECT phase FROM (SELECT phase,created_at FROM ci_controller_rollout WHERE phase<>'complete' UNION ALL SELECT phase,created_at FROM ci_application_retirement WHERE phase='draining' UNION ALL SELECT phase,created_at FROM ci_operator_maintenance WHERE phase<>'running' UNION ALL SELECT 'draining',created_at FROM ci_executor_recovery WHERE phase<>'complete') phases ORDER BY CASE WHEN phase IN ('prepared','pending') THEN 2 WHEN phase='draining' THEN 1 ELSE 0 END,created_at LIMIT 1";
 
 #[derive(Clone, Default)]
 pub struct Lifecycle {
