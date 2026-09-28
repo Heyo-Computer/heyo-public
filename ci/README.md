@@ -106,6 +106,37 @@ before using this migration for live CI. Database access must survive a change o
 VM address/interface; a firewall allowance tied to the retired VM is insufficient.
 Branch promotion authorizes deployment of the tested artifact, not GitHub merge/tag writes.
 
+### Operator maintenance pause
+
+The CI admin routes below provide a durable, reversible pause across processes
+sharing the CI database. They require an authenticated admin through the app-lb
+identity gate, including in development; repository submit tokens are insufficient.
+Keep `/maintenance` and its descendants out of app-lb `public_paths`. Scripted
+requests through the browser gate must use its authenticated session and
+`Accept: text/html`; these handlers return JSON status or an empty success response.
+
+1. `POST /maintenance/{uuid}/pause` closes new submissions, including submissions
+   still preparing source that have not committed. Already-admitted jobs and
+   cleanup may finish. Repeating the same active operation is idempotent.
+2. `GET /maintenance` reports the phase and durable blockers without advancing it.
+3. `POST /maintenance/{uuid}/quiesce` runs on the execution owner. It waits for local
+   effects, checks local work and durable obligations, and only then persists
+   `paused`, blocking new grants and external-effect permits. Running jobs, expired
+   but uncompleted native leases, pending cleanup, and unresolved failed maintenance
+   or deployment operations prevent this transition. A five-second HTTP timeout
+   is not evidence of success or failure: read status and retry the same ID.
+4. `POST /maintenance/{uuid}/resume` removes only that operation's pause. It does
+   not change ownership or clear other rollout/retirement/maintenance restrictions.
+   A stale resume cannot reopen a newer pause. Completed IDs cannot be reused.
+
+**This is not a VM replacement authorization.** `quiesced` means work drained
+under this protocol; `safeToReplace` remains false because pause does not transfer
+the non-expiring executor ownership. Replacing the owning singleton still needs
+a separately verified ownership handoff. This feature does not bootstrap itself
+into an older installed binary, and an older binary does not enforce this gate.
+Do not use it as a mixed-version or binary-rollback safety guarantee. Migration
+039 is additive and is not a request to alter live data manually.
+
 Release and deployment default to disabled. A merge requires both
 `RELEASE_ENABLED=true` and `RELEASE_SOURCE_SHA` equal to the exact submitted commit,
 plus the HeyoSecret-backed `GIT_AUTH_TOKEN`. CI checks the captured base, requires

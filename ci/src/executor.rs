@@ -130,6 +130,9 @@ impl ExecutorOwner {
         if local.retired {
             return Err("executor boot has transferred ownership".into());
         }
+        let paused: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_operator_maintenance WHERE phase='paused')")
+            .fetch_one(&self.pool).await.map_err(db)?;
+        if paused { return Err("operator maintenance has paused external effects".into()); }
         let (owner, continuation): (Uuid, Option<String>) = sqlx::query_as(
             "SELECT boot_id,continuation_operation_id FROM ci_executor_owner WHERE singleton=TRUE",
         )
@@ -281,6 +284,8 @@ mod tests {
         sqlx::raw_sql(include_str!("../migrations/034_executor_owner.sql"))
             .execute(&pool).await.unwrap();
         sqlx::raw_sql(include_str!("../migrations/034_executor_owner.sql"))
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/039_operator_maintenance.sql"))
             .execute(&pool).await.unwrap();
         pool
     }

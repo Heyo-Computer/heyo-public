@@ -36,6 +36,7 @@ mod host_maintenance;
 mod heyo_ui;
 mod image;
 mod lifecycle;
+mod maintenance;
 mod managed_update;
 mod nats_auth;
 mod native;
