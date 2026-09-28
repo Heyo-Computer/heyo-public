@@ -187,6 +187,14 @@ Activation requires the pinned owner, the settled named operation and no remaini
 jobs/leases/cleanup/remote-effect obligations. It atomically removes the restriction;
 only then do queue workers start. Verify public identity, state continuity, and
 execution before reopening ingress. Never clear a blocker by deleting its row.
+For an explicitly retired native job, retain `ci_host_work`, cancel the job and
+native lease, revoke its lease token, and record the runner in
+`ci_native_quarantine` with the S3 report and operator identity. That runner cannot
+receive new jobs, even if it re-registers. Explicit executor recovery can exclude
+only this isolated native work from its Linux activation check; it does not claim
+the remote process stopped. Ordinary handoff checks remain unchanged. A partially
+settled maintenance record still requires both its host and deployment records to
+be passed after exact receipt verification.
 An ambiguous transfer is retried with identical arguments; it cannot increment
 the owner generation twice. A crashed candidate cannot reuse its receipt in a
 new boot. Keep maintenance enabled and explicitly fence/recover again rather than

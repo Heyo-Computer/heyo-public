@@ -137,9 +137,9 @@ async fn transfer_verified(store: &Store, plan: &Plan, candidate: Uuid, proof: &
     }
     ensure!(record.get::<String,_>("phase") == "holding" && owner.get::<Uuid,_>("boot_id") == plan.source_boot
         && owner.get::<i64,_>("generation") == plan.source_generation && owner.get::<Option<String>,_>("continuation_operation_id").is_none(), "predecessor ownership changed or already has a continuation");
-    let intended: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.id=$1 AND s.run_id=$2 AND h.phase='failed')")
+    let intended: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.id=$1 AND s.run_id=$2 AND h.phase IN ('failed','passed'))")
         .bind(&plan.maintenance_operation).bind(&plan.maintenance_run).fetch_one(&mut *tx).await?;
-    ensure!(intended, "expected failed maintenance obligation is missing");
+    ensure!(intended, "expected maintenance obligation is missing");
     sqlx::query("UPDATE ci_executor_owner SET boot_id=$1,generation=generation+1,continuation_operation_id=$2,transferred_at=now() WHERE singleton=TRUE")
         .bind(candidate).bind(&plan.maintenance_operation).execute(&mut *tx).await?;
     sqlx::query("UPDATE ci_executor_boot SET retired=TRUE WHERE boot_id=$1").bind(plan.source_boot).execute(&mut *tx).await?;
@@ -170,10 +170,15 @@ async fn activate_state(store: &Store, boot: Uuid, id: Uuid) -> Result<()> {
         return Ok(());
     }
     ensure!(record.get::<String,_>("phase") == "reconciling" && owner.get::<Option<String>,_>("continuation_operation_id").as_deref() == Some(plan.maintenance_operation.as_str()), "recovery restriction changed");
-    let settled: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE id=$1 AND phase='passed')")
+    let settled: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.id=$1 AND h.phase='passed' AND s.status='passed')")
         .bind(&plan.maintenance_operation).fetch_one(&mut *tx).await?;
     ensure!(settled, "named maintenance obligation remains unresolved");
-    let remaining = crate::maintenance::blockers(&mut tx).await.map_err(anyhow::Error::msg)?;
+    let mut remaining = crate::maintenance::blockers(&mut tx).await.map_err(anyhow::Error::msg)?;
+    // Explicitly quarantined native hosts cannot receive grants. Their retained
+    // work is not Linux executor work, and is not falsely reported as stopped.
+    let unisolated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_work w WHERE NOT EXISTS(SELECT 1 FROM ci_native_job n JOIN ci_job j ON j.id=n.job_id JOIN ci_native_quarantine q ON q.runner_id=n.runner_id WHERE n.job_id=w.job_id AND n.runner_id=w.runner_hd_id AND j.attempt=w.attempt AND j.status='cancelled' AND n.state='cancelled' AND n.lease_token IS NULL))")
+        .fetch_one(&mut *tx).await?;
+    if !unisolated { remaining.retain(|category| category != "host_work"); }
     ensure!(remaining.is_empty(), "unresolved obligations: {}", remaining.join(", "));
     sqlx::query("UPDATE ci_executor_owner SET continuation_operation_id=NULL WHERE singleton=TRUE").execute(&mut *tx).await?;
     sqlx::query("UPDATE ci_executor_recovery SET phase='complete',updated_at=now() WHERE operation_id=$1").bind(id).execute(&mut *tx).await?;
@@ -229,10 +234,24 @@ mod tests {
         sqlx::raw_sql("UPDATE ci_host_maintenance SET phase='passed'; INSERT INTO ci_host_work(job_id,runner_hd_id,attempt) VALUES('job','host',1);")
             .execute(store.pool()).await.unwrap();
         assert!(activate_state(&store, candidate.boot_id(), plan.operation_id).await.is_err());
+        sqlx::query("UPDATE ci_service_deployment SET status='passed'").execute(store.pool()).await.unwrap();
+        assert!(activate_state(&store, candidate.boot_id(), plan.operation_id).await.is_err());
         store.end_host_work("job", "host", 1).await.unwrap();
+        // An isolated native runner remains recorded, but cannot block Linux
+        // recovery once the job and its credential are explicitly revoked.
+        sqlx::raw_sql("INSERT INTO ci_native_runner(id,name,labels,platform,arch) VALUES('windows','Windows','{}','windows','x86_64');
+            INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES('native','run','native','native','Native','cancelled');
+            INSERT INTO ci_native_job(job_id,run_id,required_labels,state,runner_id) VALUES('native','run','{}','cancelled','windows');
+            INSERT INTO ci_host_work(job_id,runner_hd_id,attempt) VALUES('native','windows',1);")
+            .execute(store.pool()).await.unwrap();
+        assert!(activate_state(&store, candidate.boot_id(), plan.operation_id).await.is_err());
+        sqlx::query("INSERT INTO ci_native_quarantine(runner_id,report_uri,requested_by) VALUES('windows','s3://reports/retired.json','admin')")
+            .execute(store.pool()).await.unwrap();
         assert!(activate_state(&store, old.boot_id(), plan.operation_id).await.is_err());
         activate_state(&store, candidate.boot_id(), plan.operation_id).await.unwrap();
         activate_state(&store, candidate.boot_id(), plan.operation_id).await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM ci_host_work WHERE job_id='native'").fetch_one(store.pool()).await.unwrap(), 1);
+        assert!(crate::native::poll(&store, crate::native::Poll { runner_id: "windows".into(), protocol_version: 1 }, "http://localhost", &crate::secrets::Secrets::unconfigured()).await.is_err());
         assert!(candidate.effect_permit().await.is_ok());
         assert!(old.effect_permit().await.is_err());
         assert_eq!(sqlx::query_scalar::<_,String>("SELECT status FROM ci_run WHERE id='run'").fetch_one(store.pool()).await.unwrap(), "failure");

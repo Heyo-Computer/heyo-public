@@ -369,12 +369,14 @@ pub async fn recover(d: &Dispatcher, run_id: &str, id: &str) -> Result<Value> {
         .bind(run_id).fetch_one(&mut *tx).await?;
     let jobs = sqlx::query("SELECT id,status,error FROM ci_job WHERE run_id=$1 ORDER BY id FOR UPDATE")
         .bind(run_id).fetch_all(&mut *tx).await?;
-    let row = sqlx::query("SELECT h.*,s.job_id,s.step_id FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.id=$1 AND s.run_id=$2 FOR UPDATE OF h")
+    let row = sqlx::query("SELECT h.*,s.job_id,s.step_id,s.status AS deployment_status FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.id=$1 AND s.run_id=$2 FOR UPDATE OF h")
         .bind(id).bind(run_id).fetch_one(&mut *tx).await?;
-    if row.get::<String,_>("phase") == "passed" {
+    if row.get::<String,_>("phase") == "passed" && row.get::<String,_>("deployment_status") == "passed" {
         return Ok(json!({"operation_id":id,"status":"already_passed"}));
     }
-    ensure!(status == "failure" && row.get::<String,_>("phase") == "failed", "only failed maintenance can be recovered");
+    ensure!(status == "failure" && (row.get::<String,_>("phase") == "failed"
+        || (effect.continuation_operation_id().is_some() && row.get::<String,_>("phase") == "passed"
+            && row.get::<String,_>("deployment_status") == "failed")), "only failed maintenance can be recovered");
     let job_id: String = row.get("job_id");
     ensure!(jobs.iter().all(|j| if j.get::<String,_>("id") == job_id {
         j.get::<String,_>("status") == "failure"
