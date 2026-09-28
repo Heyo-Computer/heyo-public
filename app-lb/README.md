@@ -19,6 +19,10 @@ It supervises one forwarding subprocess, which owns the HTTP/TLS listeners and
 streams request/response bodies. The private `--forwarding-worker` entry point
 branches before management stores are opened; it is not an operator command.
 Request decisions cross a versioned Unix-socket protocol in a mode-0700 directory.
+Control frames are limited to 1 MiB. Request heads exceeding that limit after
+encoding receive HTTP 431 before admission, rather than terminating a worker;
+oversized manager-generated responses receive HTTP 500. Application response
+bodies stream directly through the worker and are not subject to this limit.
 Workers receive memory-only TLS snapshots, refreshed every five seconds, and
 cannot persist them or issue certificates.
 

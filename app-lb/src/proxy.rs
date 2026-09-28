@@ -273,8 +273,14 @@ impl ProxyHttp for LbProxy {
             peer: session.client_addr().and_then(|a| a.as_inet().map(|a| *a)),
             tls_terminated: session.digest().is_some_and(|d| d.ssl_digest.is_some()),
         };
-        let (request, mut decision) = self.control.begin(head).await
-            .unwrap_or_else(|error| crate::worker::control_lost(&error));
+        let (request, mut decision) = match self.control.begin(head).await {
+            Ok(result) => result,
+            Err(crate::worker_rpc::BeginError::HeadersTooLarge) => {
+                write_plain(session, 431, "request headers exceed control transport limit\n").await?;
+                return Ok(true);
+            }
+            Err(crate::worker_rpc::BeginError::Control(error)) => crate::worker::control_lost(&error),
+        };
         ctx.request = Some(request);
         if matches!(decision, RemoteDecision::ReadLoginBody) {
             let mut body = Vec::new();

@@ -386,6 +386,10 @@ async fn two_real_gateways_scenario() -> Result<()> {
     let children = forwarding_children(manager_pid)?;
     assert_eq!(children.len(), 1, "exactly one forwarding child per manager");
     let old_worker = children[0];
+    assert_eq!(request(proxy_ports[1],"/oversized-head").header("x-large", "x".repeat(300_000))
+        .send().await?.status(), StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+    assert_eq!(request(proxy_ports[1],"/after-oversized-head").send().await?.error_for_status()?.text().await?, "eu1:fixture-v1");
+    assert_eq!(forwarding_children(manager_pid)?, vec![old_worker], "oversized headers must not restart the worker");
     let observer = &state.config.discovery_observers[1];
     let status_url = format!("{}/deployments/smoke/discovery-status", observer.base_url);
     let before: Value = client.get(&status_url).bearer_auth(&token).send().await?.error_for_status()?.json().await?;

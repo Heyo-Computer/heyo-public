@@ -32,20 +32,29 @@ pub struct Client {
     path: PathBuf,
 }
 
+pub enum BeginError { HeadersTooLarge, Control(String) }
+impl From<String> for BeginError {
+    fn from(error: String) -> Self { Self::Control(error) }
+}
+
 impl Client {
     pub fn new(path: PathBuf) -> Self { Self { path } }
 
-    pub async fn begin(&self, head: RequestHead) -> Result<(RemoteRequest, RemoteDecision), String> {
+    pub async fn begin(&self, head: RequestHead) -> Result<(RemoteRequest, RemoteDecision), BeginError> {
+        let begin = ClientMessage::Begin(WireHead::from_head(&head)?);
+        if serde_json::to_vec(&begin).map_err(|e| e.to_string())?.len() > MAX_FRAME {
+            return Err(BeginError::HeadersTooLarge);
+        }
         let mut stream = UnixStream::connect(&self.path).await.map_err(|e| format!("request control connect failed: {e}"))?;
         write_frame(&mut stream, &ClientMessage::Hello { version: VERSION }).await?;
         match read_frame::<ServerMessage>(&mut stream).await? {
             ServerMessage::Hello { version: VERSION } => {}
-            ServerMessage::Hello { version } => return Err(format!("request control protocol version mismatch: manager={version}, worker={VERSION}")),
-            ServerMessage::Error { message } => return Err(message),
-            _ => return Err("request control protocol error: expected handshake".into()),
+            ServerMessage::Hello { version } => return Err(format!("request control protocol version mismatch: manager={version}, worker={VERSION}").into()),
+            ServerMessage::Error { message } => return Err(message.into()),
+            _ => return Err(BeginError::Control("request control protocol error: expected handshake".into())),
         }
         let mut request = RemoteRequest { stream: Some(stream), backend_id: None, retry_allowed: false, failure_pending: false, completed: false };
-        let (decision, backend_id, retry_allowed) = response(request.call(ClientMessage::Begin(WireHead::from_head(&head)?)).await?)?;
+        let (decision, backend_id, retry_allowed) = response(request.call(begin).await?)?;
         request.backend_id = backend_id;
         request.retry_allowed = retry_allowed;
         Ok((request, decision))
@@ -149,7 +158,7 @@ impl Drop for Exchange {
     fn drop(&mut self) {
         match self.result.take() {
             Some(Ok(_)) if !self.terminal => {
-                if let Some(stream) = self.stream.take() { cancel_owned(stream); }
+                if let Some(stream) = self.stream.take() { cancel_owned(stream, false); }
             }
             Some(Err(error)) => crate::worker::control_lost(&error),
             _ => {}
@@ -160,14 +169,24 @@ impl Drop for Exchange {
 impl Drop for RemoteRequest {
     fn drop(&mut self) {
         if self.completed { return; }
-        if let Some(stream) = self.stream.take() { cancel_owned(stream); }
+        if let Some(stream) = self.stream.take() { cancel_owned(stream, self.failure_pending); }
     }
 }
 
-fn cancel_owned(mut stream: UnixStream) {
+fn cancel_owned(mut stream: UnixStream, failed: bool) {
     // Move ownership into the task; it survives the HTTP context's destructor.
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
+            if failed {
+                let recorded = async {
+                    write_frame(&mut stream, &ClientMessage::ConnectionFailed).await?;
+                    match read_frame::<ServerMessage>(&mut stream).await? {
+                        ServerMessage::FailureRecorded { .. } => Ok(()),
+                        _ => Err("connection failure was not acknowledged".to_string()),
+                    }
+                }.await;
+                if let Err(error) = recorded { crate::worker::control_lost(&error); }
+            }
             if let Err(error) = cancel(&mut stream).await { crate::worker::control_lost(&error); }
         });
     }
@@ -413,7 +432,14 @@ pub async fn serve(
 }
 
 async fn send_decision(stream: &mut UnixStream, decision: RequestDecision, state: &RequestState) -> Result<(), String> {
-    write_frame(stream, &ServerMessage::Decision { decision: WireDecision::from_decision(decision), backend_id: state.backend().map(|b| b.sandbox_id.clone()), retry_allowed: state.retry_allowed() }).await
+    let mut message = ServerMessage::Decision { decision: WireDecision::from_decision(decision), backend_id: state.backend().map(|b| b.sandbox_id.clone()), retry_allowed: state.retry_allowed() };
+    if serde_json::to_vec(&message).map_err(|e| e.to_string())?.len() > MAX_FRAME {
+        message = ServerMessage::Decision {
+            decision: WireDecision::Respond { status: 500, body: "control response exceeds transport limit\n".into(), content_type: "text/plain; charset=utf-8".into(), headers: vec![], cache_control: Some("no-store".into()) },
+            backend_id: None, retry_allowed: false,
+        };
+    }
+    write_frame(stream, &message).await
 }
 
 fn finish(head: &RequestHead, state: &mut RequestState, metrics: &Metrics, access_log: Option<&LogSink>, security: Option<&SecuritySink>, completion: Completion) {
@@ -464,6 +490,39 @@ pub(crate) async fn read_frame<T: for<'de> Deserialize<'de>>(stream: &mut UnixSt
 mod tests {
     use super::*;
     use crate::deployment::VmBackend;
+
+    #[tokio::test]
+    async fn oversized_headers_are_rejected_before_control_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::new(dir.path().join("absent"));
+        let mut head = RequestHead { method: http::Method::GET, uri: "/".parse().unwrap(), headers: http::HeaderMap::new(), peer: None, tls_terminated: false };
+        head.headers.insert("x-large", http::HeaderValue::from_bytes(&vec![b'x'; 300_000]).unwrap());
+        assert!(matches!(client.begin(head.clone()).await, Err(BeginError::HeadersTooLarge)));
+        head.headers.insert("x-large", http::HeaderValue::from_bytes(&vec![b'x'; 200_000]).unwrap());
+        assert!(matches!(client.begin(head).await, Err(BeginError::Control(_))));
+    }
+
+    #[tokio::test]
+    async fn oversized_local_response_fails_only_that_request() {
+        let (mut manager, mut client) = UnixStream::pair().unwrap();
+        let response = crate::request_control::ResponseData { status: 200, body: "x".repeat(MAX_FRAME), content_type: "text/plain", headers: vec![], cache_control: None };
+        send_decision(&mut manager, RequestDecision::Respond(response), &RequestState::default()).await.unwrap();
+        assert!(matches!(read_frame::<ServerMessage>(&mut client).await.unwrap(),
+            ServerMessage::Decision { decision: WireDecision::Respond { status: 500, .. }, .. }));
+    }
+
+    #[tokio::test]
+    async fn drop_records_pending_connect_failure_before_cancellation() {
+        let (client, mut manager) = UnixStream::pair().unwrap();
+        let mut request = RemoteRequest { stream: Some(client), backend_id: None, retry_allowed: true, failure_pending: false, completed: false };
+        assert!(request.connection_failed());
+        drop(request);
+        assert!(matches!(read_frame::<ClientMessage>(&mut manager).await.unwrap(), ClientMessage::ConnectionFailed));
+        write_frame(&mut manager, &ServerMessage::FailureRecorded { retry_allowed: true }).await.unwrap();
+        assert!(matches!(read_frame::<ClientMessage>(&mut manager).await.unwrap(), ClientMessage::Cancel));
+        write_frame(&mut manager, &ServerMessage::Ack).await.unwrap();
+        tokio::task::yield_now().await;
+    }
 
     #[tokio::test]
     async fn rejects_oversized_frame_before_allocating_body() {
