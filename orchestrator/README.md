@@ -4,6 +4,17 @@ Heyo's control plane for sandboxes, services, and agent-driven workflows.
 
 The orchestrator owns the source of truth for what should be running where. Other services hand it work — CICD asks it to spin up a sandbox to run a job, Cloud asks it to deploy a service — and the orchestrator plans, persists, and reconciles those requests against a backend (mvm-ctrl) that actually moves VMs. It also drives the agentic workflows used to compile parent jobs (discovery / planning / review / patch) against pluggable LLM providers.
 
+`/health` returns `x-heyo-revision` from **build-time** `HEYO_BUILD_GIT_SHA`
+(`unknown` for unstamped builds). Runtime deployment environment variables remain
+diagnostic metadata, not proof of which binary answered. The public CI workflow
+stamps the validated Git SHA and packages a relocatable `start.sh` with migrations
+for a read-only release mount. These artifacts alone do not activate regional CD.
+
+The opt-in [regional service rollout API](docs/regional-rollouts.md) persists
+region-by-region drain, replacement, observation, and rollback gates. It requires
+existing discovery-routed ingress and an observer for every app-lb instance;
+it does not by itself activate whole-region infrastructure upgrades.
+
 ## How it fits with CICD and HeyoSecret
 
 ```
@@ -99,7 +110,7 @@ Fill in at least:
 
 Set `ORCHESTRATOR_PROXY_BASE_DOMAINS` to a comma-separated list of wildcard proxy base domains when backend deployment URLs must be probed through `ORCHESTRATOR_BACKEND_API_URL` instead of public DNS.
 
-Rolling replicas are an explicit discovery-routed traffic mode. Configure `ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES` with a comma-separated allowlist. A replicated request must include the service's stable `route`; Orchestrator verifies that route through the active app-lb backend, rewrites ingress to that backend, and only then drains a previous replica. Asynchronous retirement persists drain intent but does not stop an old replica until the parent rollout has recorded success, so Orchestrator can safely roll itself. `replicaRegions` may assign each desired replica to a region and must contain exactly `desiredReplicas` entries. `placementPool` selects a Cloud-managed host pool without naming physical servers; Cloud additionally scopes that pool to its own configured environment. app-lb itself must never be in the discovery-routing allowlist.
+Rolling replicas are an explicit discovery-routed traffic mode. Configure `ORCHESTRATOR_DISCOVERY_ROUTED_SERVICES` with a comma-separated allowlist. A replicated request must include the service's stable `route`; Orchestrator verifies that route through the active app-lb backend, rewrites ingress to that backend, and only then drains a previous replica. Asynchronous retirement persists drain intent but does not stop an old replica until the parent rollout has recorded success, so Orchestrator can safely roll itself. `replicaRegions` may assign each desired replica to a region and must contain exactly `desiredReplicas` entries. Optional `deploymentEnvironment` (nonempty, at most 64 characters) requests Cloud environment filtering and is required when `placementPool` is present. Orchestrator passes both fields to Cloud and requires the placement response to confirm the exact environment and region, plus the pool when requested. The environment is durably and immutably bound to an occupied service ID; use distinct service IDs for staging and production. Existing unscoped requests remain supported, but an occupied legacy service ID cannot be silently adopted into a scoped environment. app-lb itself must never be in the discovery-routing allowlist.
 
 Retirement authority cannot carry across a newer replica rollout. Cleanup requires the owning rollout to remain current and successful, as well as an expired drain and a non-active target. An unfinished rollout remains protected even after its lease expires; lease expiry permits a new rollout claim, not deletion of the old instance. Deployment and retirement hold the same PostgreSQL per-service advisory lock, and retirement rechecks eligibility under that lock before making a Cloud stop/delete call. Different services can progress independently; concurrent operations on the same service must retry after the current operation finishes.
 
@@ -148,9 +159,54 @@ In CICD's environment, point `CICD_ORCHESTRATOR_URL` at this service (e.g. `http
 - `POST /orchestration/resources/deployments/{id}/exec` — run a command inside.
 - `POST /orchestration/services/archives/presign` (and `/finalize`) — authenticated direct upload for large Heyo-managed service archives; pass the finalized `archiveId` to the service deployment request.
 - `POST /orchestration/services/deployments` — deploy a Heyo-managed service using the snake_case app-lb-style service format described below. **Breaking change:** old flat camelCase requests are rejected, not converted or accepted through aliases.
+- `POST /orchestration/services/adoptions` — internal-key authenticated adoption of an existing application. The request pins `{serviceId,deploymentId,sourceRolloutRevision,artifactDigest,applicationRevision,binarySha256,runtimeSandboxId,runtimePort}`. Registration verifies the app-lb spec ETag, retained workspace, singleton VM, immutable artifact, public health identity and authenticated application lifecycle capability. It creates the shared app identity without replacing the running VM.
+- `POST /orchestration/services/{service_id}/updates` — accepts `{operationId,intentHash}` using the application's scoped lifecycle credential. The referenced CI release intent must already be prepared and match the adopted runtime authority. Acceptance is durable and idempotent; a restartable dispatcher activates that exact intent and reconciles its outcome. Progress appears in shared inventory under `update`. The read-only fleet credential cannot initiate updates.
+- `GET /orchestration/services?after=<service_id>` — internal-key authenticated shared inventory for regional control-plane views. Returns up to 100 services and `nextCursor`, including desired replicas/regions, recorded discovery membership, and latest regional rollout phase. Each page uses one read-only repeatable-read transaction. Missing discovery is `null`; database failure returns 503, never a local-file fallback. Deployment metadata and credentials are excluded.
 - `GET  /orchestration/services/{service_id}/discovery` — authenticated, versioned endpoint membership for app-lb, including each endpoint's region when known. Rolling deploys publish and health-gate one candidate, drain one old replica, and repeat. A failed candidate leaves the remaining healthy set serving. `retirePrevious=false` only adds capacity up to `desiredReplicas`.
 - `POST /internal/deployments/lifecycle` — callback from the backend reporting deploy state transitions.
 - `POST /orchestration/approvals/{approval_id}/decide` — gate an in-flight workflow.
+
+### Registering the existing CI controller
+
+Configure `external_service_bindings` in Orchestrator's configuration file, or
+use `ORCHESTRATOR_EXTERNAL_SERVICE_BINDINGS_JSON` as a fallback. An explicit
+file value, including an empty list, wins. Each binding supplies `service_id`,
+`authority` (app-lb admin origin), `namespace`, `region`, `deployment_id`,
+`health_origin`, `token_secret_path` (app-lb admin), and
+`lifecycle_token_secret_path` (the application's lifecycle exchange credential).
+Both credential fields are HeyoSecret references, not values.
+The caller cannot choose a remote authority or supply its credential.
+
+Register canonical service `ci` against the retained `ci-eu1` deployment only
+after reading its current app-lb spec and public `/healthz` identity. Do not use
+the legacy private `cicd` definition, invent a Cloud archive ID from a workspace
+digest, or replay a captured VM identity after a controller update. Registration
+requires a new service identity with no Cloud-managed state or operation history.
+It creates no VM and does not change the current app-lb routes, workspace,
+database, NATS consumers, artifacts, warm pool, or runner records.
+
+CI prepares an immutable release intent, then obtains durable acceptance from
+Orchestrator before it may close admissions or replace itself. CI remains the
+executor of job/lease draining and exact-binary verification; app-lb remains the
+executor of retained-workspace replacement. Orchestrator never creates a second
+CI VM through the Cloud archive path. Existing Cloud creation, regional rollout
+and delayed-retirement guards prevent competing writers.
+
+Shared Apps exposes the accepted update's phase, target revision, CI run and
+last observation time. An unreachable controller is reported as unknown, not
+successful. Job logs and release history remain in CI. This path does not provide
+active-active CI, regional failover, automatic rollback, or recovery independent
+of a controller that cannot boot. Registration attestation is historical evidence,
+not continuous runtime health.
+
+Install the lifecycle-capable CI and Orchestrator versions before adoption, and
+configure CI's `CI_APPLICATION_ID`, `CI_APPLICATION_ORCHESTRATOR_URL`, and
+HeyoSecret-backed `CI_APPLICATION_LIFECYCLE_TOKEN`. Add `/api/lifecycle` to CI's
+app-lb public machine paths; the endpoint requires its own scoped bearer. Do not
+delete the active `ci-eu1` deployment to clean inventory: deployment DELETE can
+also destroy suspended VMs that are absent from the ordinary VM list. Inventory
+cleanup must first establish that no runtime, workspace or route references the
+record.
 
 ### Service deployment files
 

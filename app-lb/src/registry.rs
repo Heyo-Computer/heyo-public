@@ -14,6 +14,28 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RouteHandoffRecord {
+    pub operation_id: String,
+    pub predecessor_fingerprint: String,
+    pub staged_fingerprint: String,
+    pub staged_spec: DeploymentSpec,
+    pub phase: RouteHandoffPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteHandoffPhase { Preparing, Prepared, Committed }
+
+#[derive(Debug)]
+pub enum HandoffError { NotFound, Conflict(String), Io(std::io::Error) }
 
 /// Route rules pre-sorted most-specific-first, so the first match wins.
 ///
@@ -220,9 +242,19 @@ pub struct Registry {
     /// objects are replaceable, so a mutex stored on one object cannot protect
     /// a drain from racing a spec replacement.
     change_lock: tokio::sync::Mutex<()>,
+    /// Controller effects/read leases precede existing registry/rollout locks.
+    /// Retirement takes the write side through durable freeze and inventory.
+    pub(crate) retirement_gate: Arc<tokio::sync::RwLock<()>>,
     /// Every deployment uses a deterministic temporary filename. Serialize
     /// writes so concurrent background and admin persistence cannot clobber it.
     persist_lock: std::sync::Mutex<()>,
+    /// Backend generations withdrawn by discovery but still observable while
+    /// requests admitted before the withdrawal hold their Arcs. Runtime-only:
+    /// a restart terminates those connections, so there is nothing to restore.
+    retired_discovery: std::sync::Mutex<HashMap<String, Vec<Arc<crate::deployment::VmBackend>>>>,
+    staged: std::sync::Mutex<HashMap<String, Arc<Deployment>>>,
+    #[cfg(test)]
+    pub(crate) fail_after_rename: std::sync::atomic::AtomicBool,
     /// Whether the last [`load`](Registry::load) left a file on disk that it
     /// could not turn into a deployment. Gates
     /// [`sweep_orphan_state`](Registry::sweep_orphan_state), which must not
@@ -237,7 +269,12 @@ impl Registry {
             routes: ArcSwap::from_pointee(RouteTable::default()),
             persist_path: persist_path.into(),
             change_lock: tokio::sync::Mutex::new(()),
+            retirement_gate: Arc::new(tokio::sync::RwLock::new(())),
             persist_lock: std::sync::Mutex::new(()),
+            retired_discovery: std::sync::Mutex::new(HashMap::new()),
+            staged: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             load_skipped: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -249,12 +286,179 @@ impl Registry {
         self.change_lock.lock().await
     }
 
+    /// Autoscaling skips a busy registry instead of waiting while holding a
+    /// create permit that a replacement may itself be draining.
+    pub(crate) fn try_change_guard(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.change_lock.try_lock().ok()
+    }
+
     pub fn deployments(&self) -> Arc<HashMap<Arc<str>, Arc<Deployment>>> {
         self.deployments.load_full()
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Deployment>> {
         self.deployments().get(id).cloned()
+    }
+
+    pub fn retirement_frozen(&self, id: &str) -> bool {
+        self.get(id).is_some_and(|d| d.state().retirement.is_some())
+    }
+
+    /// Unknown receipt identity cannot be excluded from any cleanup inventory.
+    /// Once recovered, retain only that allocation until its runtime is seen.
+    pub fn allocation_protects(&self, sandbox: &str) -> bool {
+        self.deployments().values().any(|d| d.state().create_attempts.iter().any(|a|
+            a.allocation.is_some() && !a.runtime_observed
+                && a.sandbox_id.as_deref().is_none_or(|id| id == sandbox)))
+    }
+
+    pub fn retirement_protects(&self, sandbox: &str, deployment: Option<&str>) -> bool {
+        deployment.is_some_and(|id| self.retirement_frozen(id)) || self.deployments().values().any(|d|
+            d.state().retirement.as_ref().is_some_and(|o|
+                o.request.targets.iter().any(|t|t.backend_sandbox_id==sandbox)
+                || o.inventory.iter().any(|id|id==sandbox)
+                || d.state().create_attempts.iter().any(|a|a.sandbox_id.as_deref()==Some(sandbox))
+                || crate::rollout::protected_ids(&d.state()).any(|id|id==sandbox)))
+    }
+
+    /// One controller process per state directory, including across restarts.
+    /// Keep this descriptor for the daemon's whole lifetime; never unlink it.
+    pub fn controller_lock(&self) -> std::io::Result<std::fs::File> {
+        let dir=self.state_dir();
+        let mut missing=Vec::new();
+        let mut ancestor=dir.as_path();
+        while !ancestor.as_os_str().is_empty() && !ancestor.exists() {
+            missing.push(ancestor.to_path_buf());
+            let Some(parent)=ancestor.parent() else {break};
+            ancestor=parent;
+        }
+        std::fs::create_dir_all(&dir)?;
+        for created in missing.iter().rev() {
+            let parent=created.parent().filter(|p|!p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        let file=std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(dir.join("controller.lock"))?;
+        file.try_lock().map_err(std::io::Error::other)?;
+        Ok(file)
+    }
+
+    pub fn require_complete_load(&self) -> std::io::Result<()> {
+        if self.load_skipped.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("unreadable deployment state may contain retirement intent; controller startup refused"));
+        }
+        Ok(())
+    }
+
+    pub fn staged(&self, id: &str) -> Option<Arc<Deployment>> {
+        self.staged.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
+    }
+
+    pub fn discovery_targets(&self) -> Vec<(String, String, bool)> {
+        let mut out: Vec<_> = self.deployments().values().filter_map(|d| d.spec.discovery.as_ref()
+            .map(|x| (d.spec.id.clone(), x.service_id.clone(), false))).collect();
+        out.extend(self.staged.lock().unwrap_or_else(|e| e.into_inner()).values().filter_map(|d|
+            d.spec.discovery.as_ref().map(|x| (d.spec.id.clone(), x.service_id.clone(), true))));
+        out
+    }
+
+    pub fn prepare_handoff(&self, operation_id: &str, expected: &str, staged_spec: DeploymentSpec)
+        -> Result<RouteHandoffRecord, HandoffError> {
+        let current = self.get(&staged_spec.id).ok_or(HandoffError::NotFound)?;
+        let current_fp = spec_fingerprint(&current.spec).map_err(HandoffError::Io)?;
+        let staged_fp = spec_fingerprint(&staged_spec).map_err(HandoffError::Io)?;
+        if let Some(existing) = current.state().route_handoff.clone() {
+            if existing.operation_id == operation_id && existing.predecessor_fingerprint == expected
+                && existing.staged_fingerprint == staged_fp { return Ok(existing); }
+            return Err(HandoffError::Conflict("deployment already has a different route handoff intent".into()));
+        }
+        if current_fp != expected { return Err(HandoffError::Conflict("expected predecessor fingerprint does not match".into())); }
+        validate_handoff(&current.spec, &staged_spec).map_err(HandoffError::Conflict)?;
+        let record = RouteHandoffRecord { operation_id: operation_id.into(), predecessor_fingerprint: expected.into(),
+            staged_fingerprint: staged_fp, staged_spec: staged_spec.clone(), phase: RouteHandoffPhase::Preparing,
+            prepared_boot_id: None, prepared_version: None };
+        let mut next = (*current.state()).clone();
+        next.route_handoff = Some(record.clone());
+        self.persist_snapshot(&current, &next).map_err(HandoffError::Io)?;
+        current.set_state(next);
+        self.staged.lock().unwrap_or_else(|e| e.into_inner()).insert(staged_spec.id.clone(), Arc::new(Deployment::new(staged_spec)));
+        Ok(record)
+    }
+
+    pub fn inspect_handoff(&self, id: &str) -> Option<RouteHandoffRecord> {
+        self.get(id)?.state().route_handoff.clone()
+    }
+
+    pub fn mark_handoff_prepared(&self, id: &str) -> Result<RouteHandoffRecord, HandoffError> {
+        let current = self.get(id).ok_or(HandoffError::NotFound)?;
+        let staged = self.staged(id).ok_or_else(|| HandoffError::Conflict("staged runtime unavailable".into()))?;
+        let evidence = staged.regional.as_ref().and_then(|r| r.preparation(!staged.spec.maintenance))
+            .filter(|p| p.prepared && p.adopted).ok_or_else(|| HandoffError::Conflict("regional runtime must be healthy and have adopted the active policy".into()))?;
+        let mut record = current.state().route_handoff.clone().ok_or_else(|| HandoffError::Conflict("no route handoff".into()))?;
+        if evidence.operation_id != record.operation_id {
+            return Err(HandoffError::Conflict("regional snapshot operation does not match route handoff".into()));
+        }
+        record.phase = RouteHandoffPhase::Prepared;
+        record.prepared_boot_id = Some(evidence.boot_id);
+        record.prepared_version = Some(evidence.version);
+        let mut next = (*current.state()).clone();
+        next.route_handoff = Some(record.clone());
+        self.persist_snapshot(&current, &next).map_err(HandoffError::Io)?;
+        current.set_state(next);
+        Ok(record)
+    }
+
+    pub fn commit_handoff(&self, id: &str, operation_id: &str) -> Result<RouteHandoffRecord, HandoffError> {
+        let predecessor = self.get(id).ok_or(HandoffError::NotFound)?;
+        let mut record = predecessor.state().route_handoff.clone().ok_or_else(|| HandoffError::Conflict("no route handoff".into()))?;
+        if record.operation_id != operation_id { return Err(HandoffError::Conflict("operation identity does not match".into())); }
+        if record.phase == RouteHandoffPhase::Committed { return Ok(record); }
+        if record.phase != RouteHandoffPhase::Prepared { return Err(HandoffError::Conflict("route handoff is not prepared".into())); }
+        if spec_fingerprint(&predecessor.spec).map_err(HandoffError::Io)? != record.predecessor_fingerprint {
+            return Err(HandoffError::Conflict("predecessor spec changed after preparation".into()));
+        }
+        if self.deployments().values().any(|other| other.spec.id != id && record.staged_spec.routes.iter().any(|new| {
+            let host = new.host.as_deref();
+            let path = new.path_prefix.as_deref().unwrap_or("/");
+            other.spec.routes.iter().any(|old| old.matches(host, path) || new.matches(old.host.as_deref(), old.path_prefix.as_deref().unwrap_or("/")))
+        })) {
+            return Err(HandoffError::Conflict("a competing deployment now overlaps the staged route".into()));
+        }
+        let staged = self.staged(id).ok_or_else(|| HandoffError::Conflict("staged runtime unavailable".into()))?;
+        let evidence = staged.regional.as_ref().and_then(|r| r.preparation(!staged.spec.maintenance))
+            .filter(|p| p.prepared && p.adopted).ok_or_else(|| HandoffError::Conflict("prepared evidence is stale or the active policy is not healthy".into()))?;
+        if evidence.operation_id != record.operation_id {
+            return Err(HandoffError::Conflict("regional snapshot operation does not match route handoff".into()));
+        }
+        if record.prepared_boot_id.as_deref() != Some(&evidence.boot_id) || record.prepared_version != Some(evidence.version) {
+            return Err(HandoffError::Conflict("prepared evidence changed; inspect and prepare again".into()));
+        }
+        record.phase = RouteHandoffPhase::Committed;
+        let mut next = (*staged.state()).clone();
+        next.route_handoff = Some(record.clone());
+        next.discovery_version = Some(evidence.version);
+        // Persist switch intent before publishing. A crash after this point
+        // reloads the regional spec (closed until a fresh matching snapshot).
+        self.persist_snapshot(&staged, &next).map_err(HandoffError::Io)?;
+        staged.set_state(next);
+        // Fence even requests holding a predecessor Arc. Already-admitted
+        // streams finish normally and remain visible in discovery status.
+        self.fence_discovery_removals(&predecessor, &[]);
+        self.install(Some(staged.clone()), id);
+        self.staged.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        Ok(record)
+    }
+
+    pub fn apply_staged_discovery(&self, old: &Arc<Deployment>, upstreams: Vec<String>) -> Option<Arc<Deployment>> {
+        let mut stages = self.staged.lock().unwrap_or_else(|e| e.into_inner());
+        if !stages.get(&old.spec.id).is_some_and(|d| Arc::ptr_eq(d, old)) { return None; }
+        let mut spec = old.spec.clone(); spec.upstreams = upstreams;
+        let mut next = Deployment::new(spec);
+        next.regional = old.regional.clone();
+        let next = Arc::new(next);
+        next.set_state((*old.state()).clone());
+        stages.insert(old.spec.id.clone(), next.clone());
+        Some(next)
     }
 
     /// Resolve a request to a deployment.
@@ -274,25 +478,64 @@ impl Registry {
     /// operator drains are carried for upstream addresses still present in the
     /// replacement: replaying a deployment must not silently put a maintenance
     /// target back into service.
-    pub fn upsert(&self, spec: DeploymentSpec) -> Arc<Deployment> {
+    pub fn upsert(&self, mut spec: DeploymentSpec) -> Arc<Deployment> {
         let previous = self.get(&spec.id);
+        if let Some(old)=previous.as_ref().filter(|d|d.state().retirement.is_some()) {return old.clone();}
+        if previous.as_ref().is_some_and(|old|
+            old.spec.discovery.as_ref().and_then(|d| d.region.as_ref())
+                != spec.discovery.as_ref().and_then(|d| d.region.as_ref()))
+            && spec.discovery.is_some() {
+            // A regional scope change cannot relabel cached endpoints from
+            // another region. Wait for a validated snapshot of the new scope.
+            spec.upstreams.clear();
+        }
+        if let Some(previous) = previous.as_ref().filter(|d| d.spec.discovery.is_some()) {
+            self.fence_discovery_removals(previous, &spec.upstreams);
+        }
         let previous_state = previous.as_ref().and_then(|previous| {
             (spec.is_static() && previous.spec.is_static()).then(|| {
                 let mut state = (*previous.state()).clone();
-                if previous.spec.discovery.as_ref().map(|value| &value.service_id)
-                    != spec.discovery.as_ref().map(|value| &value.service_id)
-                {
+                let same_discovery_service = previous
+                    .spec
+                    .discovery
+                    .as_ref()
+                    .map(|value| (&value.service_id, &value.region))
+                    == spec.discovery.as_ref().map(|value| (&value.service_id, &value.region));
+                if !same_discovery_service {
                     state.discovery_version = None;
+                    state.discovery_source_url = None;
                 }
-                state
-                    .upstream_drains
-                    .retain(|drain| spec.upstreams.contains(&drain.upstream));
+                // Discovery can temporarily withdraw an address and later
+                // return it. Do not turn that absence into an implicit operator
+                // uncordon. Ordinary static spec edits retain the historical
+                // behavior of forgetting intent for explicitly removed peers.
+                if spec.discovery.is_none() || !same_discovery_service {
+                    state
+                        .upstream_drains
+                        .retain(|drain| spec.upstreams.contains(&drain.upstream));
+                }
                 state
             })
         });
-        let deployment = Arc::new(Deployment::new(spec));
+        let mut deployment = Deployment::new(spec);
+        if let Some(previous) = &previous {
+            if previous.spec.namespace == deployment.spec.namespace && previous.spec.discovery == deployment.spec.discovery {
+                deployment.regional = previous.regional.clone();
+            } else if let Some(router) = &previous.regional {
+                router.fence();
+            }
+        }
+        let deployment = Arc::new(deployment);
         if let Some(state) = previous_state {
             deployment.set_state(state);
+        }
+        if let Some(previous) = &previous {
+            deployment.mutate_state(|s| {
+                s.rollouts = previous.state().rollouts.clone();
+                s.create_attempts = previous.state().create_attempts.clone();
+                s.allocation_history_complete = previous.state().allocation_history_complete;
+                s.rollout_revision = crate::rollout::revision();
+            });
         }
         if deployment.spec.is_static()
             && let Some(previous) = previous.filter(|previous| previous.spec.is_static())
@@ -327,6 +570,63 @@ impl Registry {
         deployment
     }
 
+    /// Replace a discovery-owned upstream set while fencing every withdrawn
+    /// backend generation. The caller holds [`change_guard`](Self::change_guard),
+    /// making this transition coherent with persistence and status reads.
+    pub fn apply_discovery_upstreams(
+        &self,
+        deployment: &Arc<Deployment>,
+        upstreams: Vec<String>,
+    ) -> Arc<Deployment> {
+        let mut spec = deployment.spec.clone();
+        spec.upstreams = upstreams;
+        self.upsert(spec)
+    }
+
+    fn fence_discovery_removals(&self, deployment: &Arc<Deployment>, upstreams: &[String]) {
+        let retained: HashSet<&str> = upstreams.iter().map(String::as_str).collect();
+        let removed: Vec<_> = deployment
+            .backends()
+            .iter()
+            .filter(|backend| !retained.contains(backend.peer.as_str()))
+            .cloned()
+            .collect();
+
+        // This happens before publishing the replacement (and therefore before
+        // snapshot acknowledgement). A request holding either the old
+        // Deployment or backend Arc now fails its authoritative admission gate.
+        for backend in &removed {
+            backend.set_draining(true);
+        }
+        if !removed.is_empty() {
+            let mut retired = self.retired_discovery.lock().unwrap_or_else(|e| e.into_inner());
+            let generations = retired.entry(deployment.spec.id.clone()).or_default();
+            generations.retain(|backend| backend.in_flight() != 0);
+            generations.extend(removed);
+        }
+    }
+
+    /// Current and not-yet-quiescent withdrawn discovery backend generations.
+    /// Duplicate peers are intentionally left for the API layer to aggregate.
+    pub fn discovery_backends(&self, id: &str) -> Vec<Arc<crate::deployment::VmBackend>> {
+        let mut result: Vec<_> = self
+            .get(id)
+            .map(|d| d.backends().iter().cloned().collect())
+            .unwrap_or_default();
+        let mut retired = self
+            .retired_discovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(backends) = retired.get_mut(id) {
+            backends.retain(|backend| backend.in_flight() != 0);
+            result.extend(backends.iter().cloned());
+            if backends.is_empty() {
+                retired.remove(id);
+            }
+        }
+        result
+    }
+
     /// Update a deployment's spec in place, **preserving its live VM pool**.
     ///
     /// Unlike `upsert` (which abandons the old pool for the autoscaler to reap),
@@ -342,12 +642,14 @@ impl Registry {
     /// that decision.
     pub fn update(&self, spec: DeploymentSpec) -> Option<Arc<Deployment>> {
         let old = self.get(&spec.id)?;
+        if old.state().retirement.is_some() {return None;}
         let new = Arc::new(Deployment::new(spec));
         // Runtime state is carried for the same reason the pool is: an edit is
         // not a reset. Dropping it here would strand every sandbox this
         // deployment had suspended — they are absent from the daemon's fleet
         // list, so nothing else remembers them.
         new.set_state((*old.state()).clone());
+        new.mutate_state(|s| s.rollout_revision = crate::rollout::revision());
         new.set_backends((*old.backends()).clone());
         new.set_pending((*old.pending()).clone());
         self.install(Some(new.clone()), &new.spec.id.clone());
@@ -356,6 +658,11 @@ impl Registry {
 
     pub fn remove(&self, id: &str) -> Option<Arc<Deployment>> {
         let removed = self.get(id)?;
+        if removed.state().retirement.is_some() {return None;}
+        if removed.state().create_attempts.iter().any(|a| a.allocation.is_some()) {return None;}
+        if removed.spec.discovery.is_some() {
+            self.fence_discovery_removals(&removed, &[]);
+        }
         self.install(None, id);
         Some(removed)
     }
@@ -372,6 +679,11 @@ impl Registry {
     /// two `store`s are ordered deployments-then-routes so a request that
     /// resolves an id always finds it — the reverse order has a window where the
     /// index names a deployment the map does not yet hold.
+    pub(crate) fn publish(&self, deployment: Arc<Deployment>) {
+        if self.retirement_frozen(&deployment.spec.id) {return;}
+        self.install(Some(deployment.clone()), &deployment.spec.id);
+    }
+
     fn install(&self, deployment: Option<Arc<Deployment>>, id: &str) {
         let current = self.deployments.load();
         let previous = current.get(id).cloned();
@@ -469,17 +781,49 @@ impl Registry {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, &path)?;
+        #[cfg(test)]
+        if self.fail_after_rename.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected failure after rename"));
+        }
         // The rename is not durable until the directory entry is synced. A
         // successful drain must not disappear after a host crash and silently
         // reopen traffic on restart.
         std::fs::File::open(dir)?.sync_all()
     }
 
+    /// Save the exact spec and completed history outside the startup registry.
+    /// Content addressing makes retries idempotent without rewriting old reports.
+    /// Caller holds the registry and lifecycle guards through record removal.
+    pub fn archive_record(&self, deployment: &Deployment) -> std::io::Result<()> {
+        let _guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.persist_snapshot_inner(deployment, &deployment.state())?;
+        let dir = self.state_dir();
+        let source = dir.join(state_file_name(&deployment.spec.id));
+        let bytes = std::fs::read(&source)?;
+        let archive = dir.join("retired");
+        std::fs::create_dir_all(&archive)?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        let target = archive.join(format!("{:x}.json", Sha256::digest(&bytes)));
+        match std::fs::hard_link(&source, &target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::read(&target)? != bytes {
+                    return Err(std::io::Error::other("retired record archive content mismatch"));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        std::fs::File::open(archive)?.sync_all()
+    }
+
     /// Drop one deployment's file. A missing file is success — deregistering
     /// something that was never persisted is not an error.
     pub fn forget(&self, id: &str) -> std::io::Result<()> {
+        if self.retirement_frozen(id) {
+            return Err(std::io::Error::other("retirement preserves the deployment record"));
+        }
         match std::fs::remove_file(self.state_dir().join(state_file_name(id))) {
-            Ok(()) => Ok(()),
+            Ok(()) => std::fs::File::open(self.state_dir())?.sync_all(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
@@ -582,8 +926,18 @@ impl Registry {
                 skipped = true;
                 continue;
             }
+            // Reload cannot replace a local freeze with an older disk image.
+            if self.retirement_frozen(&record.spec.id) {loaded += 1; continue;}
             let d = self.upsert(record.spec);
             d.set_state(record.state);
+            if let Some(handoff) = d.state().route_handoff.clone()
+                && handoff.phase != RouteHandoffPhase::Committed
+            {
+                // Preparation survives restart as intent only. The fresh Router
+                // has a new boot id and must obtain a coherent fresh snapshot.
+                self.staged.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                    d.spec.id.clone(), Arc::new(Deployment::new(handoff.staged_spec)));
+            }
             loaded += 1;
         }
         self.load_skipped
@@ -629,6 +983,37 @@ impl Registry {
         );
         Ok(())
     }
+}
+
+pub fn spec_fingerprint(spec: &DeploymentSpec) -> std::io::Result<String> {
+    let mut intent = spec.clone();
+    intent.normalize();
+    // Discovery refreshes membership independently of the operator's route
+    // intent. They must not invalidate an otherwise identical handoff retry.
+    if intent.discovery.is_some() { intent.upstreams.clear(); }
+    let bytes = serde_json::to_vec(&intent).map_err(std::io::Error::other)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn validate_handoff(flat: &DeploymentSpec, regional: &DeploymentSpec) -> Result<(), String> {
+    if regional.validate().is_err() { return Err("staged regional spec is invalid".into()); }
+    let Some(predecessor) = flat.discovery.as_ref() else { return Err("predecessor must be discovery-backed".into()); };
+    if predecessor.regional.is_some() || flat.gateway.is_some() {
+        return Err("predecessor must use flat discovery routing".into());
+    }
+    let Some(discovery) = regional.discovery.as_ref() else { return Err("staged spec requires discovery".into()); };
+    if discovery.region.is_none() || discovery.regional.is_none() || discovery.source.is_none() {
+        return Err("staged spec requires explicit regional scope, authority and peer authentication".into());
+    }
+    let mut expected = flat.clone();
+    expected.upstreams = regional.upstreams.clone();
+    let allowed = expected.discovery.as_mut().unwrap();
+    allowed.region = discovery.region.clone();
+    allowed.regional = discovery.regional.clone();
+    if expected != *regional {
+        return Err("handoff must preserve authority, credentials, service identity and non-routing configuration".into());
+    }
+    Ok(())
 }
 
 /// One deployment's on-disk record: its spec, plus the runtime state that has
@@ -677,6 +1062,7 @@ mod tests {
             id: id.into(),
             routes,
             vm: Some(VmSpec {
+                correlated_creates: false,
                 env_from: vec![],
                 workspace_archive: None,
                 image_download_url: None,
@@ -701,6 +1087,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,
@@ -724,12 +1111,181 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,
             update: None,
             auth: None,
         }
+    }
+
+    fn regional_spec(flat: &DeploymentSpec, boot_id: &str) -> (DeploymentSpec, crate::regional::Snapshot) {
+        let mut staged = flat.clone();
+        staged.upstreams.clear();
+        staged.discovery = Some(serde_json::from_value(serde_json::json!({
+            "service_id":"svc", "region":"eu1",
+            "source":{"url":"https://control.example/discovery","auth":{"secret":"discovery"}},
+            "regional":{"gateway_id":"eu","backend_server_id":"host-eu","environment":"prod","auth":{"secret":"peer"}}
+        })).unwrap());
+        let snapshot = serde_json::from_value(serde_json::json!({
+            "protocolVersion":1,"serviceId":"svc","environment":"prod","region":"eu1","gatewayId":"eu",
+            "bootId":boot_id,"version":7,"operationId":"handoff-1","phase":"bake","proposalGeneration":1,
+            "activeGeneration":1,"drainTarget":null,"closedThroughGeneration":0,
+            "policies":[{"generation":1,"policy":{"version":1,"regions":[{"region":"eu1","weight":1,
+                "gateways":[{"id":"eu","backendServerId":"host-eu","url":"https://eu.example"}]}]}}],
+            "endpoints":[]
+        })).unwrap();
+        (staged, snapshot)
+    }
+
+    fn handoff_flat_spec() -> DeploymentSpec {
+        let mut flat = static_spec("app", vec![host("app.example")], &["127.0.0.1:8000"]);
+        let (regional, _) = regional_spec(&flat, "unused");
+        flat.discovery = regional.discovery;
+        let discovery = flat.discovery.as_mut().unwrap();
+        discovery.region = None;
+        discovery.regional = None;
+        flat
+    }
+
+    #[test]
+    fn staged_handoff_keeps_flat_selection_then_commits_without_invalidating_held_requests() {
+        let state_file = scratch("route-handoff");
+        let registry = Registry::new(&state_file);
+        let flat = registry.upsert(handoff_flat_spec());
+        let held = flat.backends()[0].try_hold().unwrap();
+        let fingerprint = spec_fingerprint(&flat.spec).unwrap();
+        let temporary = crate::regional::Router::new();
+        let (staged_spec, _) = regional_spec(&flat.spec, &temporary.boot_id);
+        let first = registry.prepare_handoff("handoff-1", &fingerprint, staged_spec.clone()).unwrap();
+        assert_eq!(first.phase, RouteHandoffPhase::Preparing);
+        assert!(Arc::ptr_eq(&registry.route(Some("app.example"), "/").unwrap(), &flat));
+        assert_eq!(registry.prepare_handoff("handoff-1", &fingerprint, staged_spec.clone()).unwrap(), first);
+        let mut conflict = staged_spec.clone(); conflict.maintenance = true;
+        assert!(matches!(registry.prepare_handoff("handoff-1", &fingerprint, conflict), Err(HandoffError::Conflict(_))));
+
+        let staged = registry.staged("app").unwrap();
+        let router = staged.regional.as_ref().unwrap();
+        let (_, snapshot) = regional_spec(&flat.spec, &router.boot_id);
+        router.apply(snapshot, staged.spec.discovery.as_ref().unwrap().regional.as_ref().unwrap(), "svc", "eu1",
+            vec![Arc::new(crate::deployment::VmBackend::for_upstream("127.0.0.1:9000".into()))]).unwrap();
+        registry.mark_handoff_prepared("app").unwrap();
+        registry.commit_handoff("app", "handoff-1").unwrap();
+        let selected = registry.route(Some("app.example"), "/").unwrap();
+        assert!(selected.regional.is_some());
+        assert_eq!(flat.backends()[0].in_flight(), 1, "held predecessor keeps its own Arc and counter");
+        assert!(!flat.backends()[0].try_acquire(), "a request holding the old route cannot start new work");
+        assert!(registry.discovery_backends("app").iter().any(|b| b.peer == "127.0.0.1:8000" && b.in_flight() == 1));
+        drop(held);
+        assert_eq!(flat.backends()[0].in_flight(), 0);
+        assert!(!registry.discovery_backends("app").iter().any(|b| b.peer == "127.0.0.1:8000"));
+
+        let restarted = Registry::new(&state_file);
+        assert_eq!(restarted.load().unwrap(), 1);
+        let recovered = restarted.route(Some("app.example"), "/").unwrap();
+        assert!(recovered.regional.is_some());
+        assert!(recovered.regional.as_ref().unwrap().preparation(true).is_none(),
+            "restart must not fabricate the old boot's preparation evidence");
+        std::fs::remove_dir_all(state_file.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn handoff_requires_healthy_active_policy_and_current_boot() {
+        let path = scratch("handoff-policy");
+        let registry = Registry::new(&path);
+        let flat = registry.upsert(handoff_flat_spec());
+        let (spec, _) = regional_spec(&flat.spec, "unused");
+        registry.prepare_handoff("handoff-1", &spec_fingerprint(&flat.spec).unwrap(), spec).unwrap();
+        let staged = registry.staged("app").unwrap();
+        let router = staged.regional.as_ref().unwrap();
+        let (_, mut snapshot) = regional_spec(&flat.spec, &router.boot_id);
+        let regional = staged.spec.discovery.as_ref().unwrap().regional.as_ref().unwrap();
+        let backend = Arc::new(crate::deployment::VmBackend::for_upstream("127.0.0.1:9000".into()));
+        snapshot.active_generation = None;
+        router.apply(snapshot.clone(), regional, "svc", "eu1", vec![backend.clone()]).unwrap();
+        assert!(registry.mark_handoff_prepared("app").is_err(), "prepared alone does not permit cutover");
+        snapshot.active_generation = Some(1);
+        snapshot.version += 1;
+        backend.set_healthy(false);
+        router.apply(snapshot, regional, "svc", "eu1", vec![backend.clone()]).unwrap();
+        assert!(registry.mark_handoff_prepared("app").is_err(), "adopted alone does not permit cutover");
+        backend.set_healthy(true);
+        registry.mark_handoff_prepared("app").unwrap();
+        backend.set_healthy(false);
+        assert!(registry.commit_handoff("app", "handoff-1").is_err(), "commit rechecks readiness");
+        let restarted = Registry::new(&path);
+        assert_eq!(restarted.load().unwrap(), 1);
+        assert!(restarted.commit_handoff("app", "handoff-1").is_err());
+        let recovered = restarted.staged("app").unwrap();
+        let new_router = recovered.regional.as_ref().unwrap();
+        assert_ne!(new_router.boot_id, router.boot_id);
+        let (_, snapshot) = regional_spec(&flat.spec, &new_router.boot_id);
+        backend.set_healthy(true);
+        new_router.apply(snapshot, regional, "svc", "eu1", vec![backend]).unwrap();
+        assert!(restarted.commit_handoff("app", "handoff-1").is_err(), "fresh snapshot cannot reuse an old boot receipt");
+        restarted.mark_handoff_prepared("app").unwrap();
+        restarted.commit_handoff("app", "handoff-1").unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn handoff_failed_persistence_is_not_acknowledged_by_retry() {
+        let path = scratch("handoff-write-failure");
+        let registry = Registry::new(&path);
+        let flat = registry.upsert(handoff_flat_spec());
+        let fingerprint = spec_fingerprint(&flat.spec).unwrap();
+        let (spec, _) = regional_spec(&flat.spec, "unused");
+        registry.fail_after_rename.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(registry.prepare_handoff("handoff-1", &fingerprint, spec.clone()), Err(HandoffError::Io(_))));
+        assert!(registry.inspect_handoff("app").is_none());
+        assert!(registry.staged("app").is_none());
+        registry.prepare_handoff("handoff-1", &fingerprint, spec).unwrap();
+        let staged = registry.staged("app").unwrap();
+        let router = staged.regional.as_ref().unwrap();
+        let (_, snapshot) = regional_spec(&flat.spec, &router.boot_id);
+        router.apply(snapshot, staged.spec.discovery.as_ref().unwrap().regional.as_ref().unwrap(), "svc", "eu1",
+            vec![Arc::new(crate::deployment::VmBackend::for_upstream("127.0.0.1:9000".into()))]).unwrap();
+        registry.fail_after_rename.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(registry.mark_handoff_prepared("app"), Err(HandoffError::Io(_))));
+        assert_eq!(registry.inspect_handoff("app").unwrap().phase, RouteHandoffPhase::Preparing);
+        registry.mark_handoff_prepared("app").unwrap();
+        registry.fail_after_rename.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(registry.commit_handoff("app", "handoff-1"), Err(HandoffError::Io(_))));
+        assert!(Arc::ptr_eq(&registry.get("app").unwrap(), &flat));
+        assert!(staged.state().route_handoff.is_none());
+        assert_eq!(registry.inspect_handoff("app").unwrap().phase, RouteHandoffPhase::Prepared);
+        // Rename may have happened before the I/O error. Restart recovers the
+        // selected intent but cannot route from a prior boot's cached policy.
+        let restarted = Registry::new(&path);
+        restarted.load().unwrap();
+        assert!(restarted.get("app").unwrap().regional.as_ref().unwrap().preparation(true).is_none());
+        registry.commit_handoff("app", "handoff-1").unwrap();
+        assert_eq!(registry.commit_handoff("app", "handoff-1").unwrap().phase, RouteHandoffPhase::Committed);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn handoff_preserves_authority_and_non_routing_intent_but_not_cached_membership() {
+        let flat = handoff_flat_spec();
+        let (regional, _) = regional_spec(&flat, "unused");
+        validate_handoff(&flat, &regional).unwrap();
+        let mut refreshed = flat.clone();
+        refreshed.upstreams = vec!["127.0.0.1:8001".into()];
+        assert_eq!(spec_fingerprint(&flat).unwrap(), spec_fingerprint(&refreshed).unwrap());
+        for edit in 0..4 {
+            let mut wrong = regional.clone();
+            match edit {
+                0 => wrong.discovery.as_mut().unwrap().source.as_mut().unwrap().url = "https://other.example/discovery".into(),
+                1 => wrong.discovery.as_mut().unwrap().service_id = "other".into(),
+                2 => wrong.maintenance = true,
+                _ => wrong.user_id = Some("other-owner".into()),
+            }
+            assert!(validate_handoff(&flat, &wrong).is_err());
+        }
+        refreshed.discovery = None;
+        assert!(validate_handoff(&refreshed, &regional).is_err());
+        assert!(validate_handoff(&regional, &regional).is_err());
     }
 
     #[test]
@@ -1279,6 +1835,9 @@ mod tests {
         let mut cloud = static_spec("stage", vec![host("stage.example.com")], &[]);
         cloud.discovery = Some(DiscoverySpec {
             service_id: "cloud".into(),
+            region: None,
+            source: None,
+            regional: None,
         });
         let deployment = r.upsert(cloud);
         deployment.mutate_state(|state| state.discovery_version = Some(7));
@@ -1286,10 +1845,95 @@ mod tests {
         let mut auth = static_spec("stage", vec![host("stage.example.com")], &[]);
         auth.discovery = Some(DiscoverySpec {
             service_id: "auth".into(),
+            region: None,
+            source: None,
+            regional: None,
         });
         let deployment = r.upsert(auth);
 
         assert_eq!(deployment.state().discovery_version, None);
+    }
+
+    #[test]
+    fn changing_discovery_region_fences_cached_membership_without_losing_in_flight_work() {
+        let registry = Registry::new("unused.json");
+        let mut spec = static_spec("stage", vec![host("stage.example.com")], &["eu.example:8081"]);
+        spec.discovery = Some(DiscoverySpec { service_id: "stage".into(), region: Some("eu1".into()), source: None, regional: None });
+        let original = registry.upsert(spec.clone());
+        original.mutate_state(|state| {
+            state.discovery_version = Some(17);
+            state.discovery_source_url = Some("https://authority/discovery?region=eu1".into());
+        });
+        let backend = original.backends()[0].clone();
+        assert!(backend.try_acquire());
+        spec.discovery.as_mut().unwrap().region = Some("us3".into());
+        let replacement = registry.upsert(spec);
+        assert!(replacement.spec.upstreams.is_empty());
+        assert_eq!(replacement.state().discovery_version, None);
+        assert_eq!(replacement.state().discovery_source_url, None);
+        assert!(!backend.try_acquire());
+        assert_eq!(backend.in_flight(), 1);
+        assert_eq!(registry.discovery_backends("stage").len(), 1);
+        backend.release();
+        assert!(registry.discovery_backends("stage").is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_replacement_fences_and_observes_retired_generations() {
+        let r = Registry::new("unused.json");
+        let mut first = static_spec(
+            "stage",
+            vec![host("stage.example.com")],
+            &["a.example:80", "b.example:80"],
+        );
+        first.discovery = Some(DiscoverySpec { service_id: "stage".into(), region: None, source: None, regional: None });
+        let deployment = r.upsert(first);
+        deployment.mutate_state(|state| {
+            state.discovery_version = Some(1);
+            state.upstream_drains.push(crate::deployment::UpstreamDrain {
+                upstream: "b.example:80".into(),
+                reason: Some("maintenance".into()),
+                started_at: 10,
+            });
+        });
+        let old_a = deployment.backends().iter().find(|b| b.peer == "a.example:80").unwrap().clone();
+        let old_b = deployment.backends().iter().find(|b| b.peer == "b.example:80").unwrap().clone();
+        assert!(old_a.try_acquire(), "request is admitted before withdrawal");
+
+        let _guard = r.change_guard().await;
+        let second = r.apply_discovery_upstreams(
+            &deployment,
+            vec!["b.example:80".into(), "c.example:80".into()],
+        );
+        assert!(!old_a.try_acquire(), "a stale backend Arc must be fenced");
+        assert_eq!(old_a.in_flight(), 1, "the held request remains observable");
+        let second_backends = second.backends();
+        let second_b = second_backends
+            .iter()
+            .find(|b| b.peer == "b.example:80")
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&old_b, second_b),
+            "unchanged backends keep their generation"
+        );
+        assert!(second_b.is_draining(), "operator drain intent survives discovery");
+
+        let third = r.apply_discovery_upstreams(&second, vec!["c.example:80".into()]);
+        assert!(!old_b.try_acquire(), "a second update fences its newly removed backend");
+        let observed = r.discovery_backends("stage");
+        assert!(observed.iter().any(|b| Arc::ptr_eq(b, &old_a)));
+        assert!(observed.iter().any(|b| b.peer == "c.example:80" && !b.is_draining()));
+        assert_eq!(third.backends().len(), 1);
+        assert!(
+            third.upstream_drain("b.example:80").is_some(),
+            "temporary discovery absence must not erase operator intent"
+        );
+
+        old_a.release();
+        assert!(
+            r.discovery_backends("stage").iter().all(|b| !Arc::ptr_eq(b, &old_a)),
+            "a quiescent retired generation is pruned",
+        );
     }
 
     #[test]

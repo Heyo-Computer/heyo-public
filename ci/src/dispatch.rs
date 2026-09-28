@@ -85,6 +85,8 @@ static NONCE: AtomicU64 = AtomicU64::new(1);
 pub struct Submitted {
     pub run_ids: Vec<String>,
     pub warnings: Vec<String>,
+    /// The release run is the completion boundary for coordinated submissions.
+    pub submission: Option<String>,
 }
 
 /// Where one job runs, resolved from its `uses:` against the live pool.
@@ -160,6 +162,8 @@ impl QueueVerdict {
 }
 
 pub struct Dispatcher {
+    pub lifecycle: Arc<crate::lifecycle::Lifecycle>,
+    pub executor: Arc<crate::executor::ExecutorOwner>,
     pub config: Arc<Config>,
     pub store: Store,
     pub pool: Pool,
@@ -202,6 +206,17 @@ impl Dispatcher {
         actor: Option<&crate::web::identity::Identity>,
         repo: Option<&crate::store::Repo>,
     ) -> Result<Submitted, DispatchError> {
+        let _admission = self.lifecycle.admission(&self.store).await
+            .map_err(DispatchError::ControllerUnavailable)?;
+        self.submit_admitted(req, actor, repo).await
+    }
+
+    async fn submit_admitted(
+        &self,
+        req: &crate::trigger::SubmitRequest,
+        actor: Option<&crate::web::identity::Identity>,
+        repo: Option<&crate::store::Repo>,
+    ) -> Result<Submitted, DispatchError> {
         let run_seed = crate::vm::new_id();
         let workspace = crate::trigger::Workspace::for_run(&self.config, &run_seed);
         tokio::fs::create_dir_all(&self.config.workspace_dir)
@@ -210,6 +225,8 @@ impl Dispatcher {
 
         let size =
             crate::trigger::materialize(&req.source, &workspace, self.config.max_source_bytes)?;
+        let source_bytes = tokio::fs::read(&workspace.descriptor).await
+            .map_err(|e| DispatchError::Checkout(e.to_string()))?;
 
         // Read once, from the seed workspace, before any run is created: every
         // workflow file in this submit is looking at the same commit, and a
@@ -299,6 +316,8 @@ impl Dispatcher {
         };
 
         let mut run_ids = Vec::new();
+        let mut planned = Vec::new();
+        let mut release_run_id = None;
         let mut patterns_tried = Vec::new();
         // `--only` bookkeeping: which selectors found a workflow file at all.
         // Checked across every source, after the loop — a selector that matched
@@ -338,10 +357,16 @@ impl Dispatcher {
             for (path, text) in &files {
                 let wf = crate::workflow::Workflow::parse(path, text)
                     .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+                let is_release = wf.on.iter().any(|t| t == "release");
+                if is_release && wf.on.len() != 1 {
+                    return Err(DispatchError::Workflow(format!(
+                        "{path}: release must be a coordinator-only trigger"
+                    )));
+                }
                 // `--only`: the submit names the workflow files it wants, and
                 // every other file is left alone — not "declined", not warned
                 // about, simply not asked.
-                let named = if only.is_empty() {
+                let named = if only.is_empty() || is_release {
                     false
                 } else {
                     let mut hit = false;
@@ -356,7 +381,7 @@ impl Dispatcher {
                     }
                     true
                 };
-                if !wf.on.iter().any(|t| t == "submit") {
+                if !is_release && !wf.on.iter().any(|t| t == "submit") {
                     if named {
                         // Explicitly asked for, and unable to comply: that is
                         // an answer for the terminal, not a line in a log.
@@ -378,6 +403,11 @@ impl Dispatcher {
                 // a manual dispatch outranks a path filter. Said out loud in the
                 // response, so a run on an unexpected branch is never a mystery.
                 if let Err(why) = wf.on_submit.admits(req.branch(), &changes) {
+                    if is_release {
+                        return Err(DispatchError::Workflow(format!(
+                            "{path}: release workflow cannot filter submission membership"
+                        )));
+                    }
                     if named {
                         let by = if req.rerun.is_some() {
                             "the re-run"
@@ -393,6 +423,10 @@ impl Dispatcher {
                 }
                 let mut plan = crate::plan::Plan::build(&wf)
                     .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+                if is_release {
+                    crate::submission::validate_release_plan(&plan)
+                        .map_err(DispatchError::Workflow)?;
+                }
 
                 // Resolved once, here, and written into every job that did not
                 // name a network with `uses:`. The plan is persisted on the job
@@ -402,22 +436,15 @@ impl Dispatcher {
                 // stored rather than recomputed.
                 self.assign_network(&mut plan, source.network.as_deref(), &mut warnings)?;
 
-                // The first run reuses the workspace already materialized under
-                // the seed id; the rest get their own copy of the same archive,
-                // so no two runs share a directory a step could write into.
+                // Every run's descriptor is committed below with its metadata.
+                // No accepted run depends on this controller's staging directory.
                 let run_id = if run_ids.is_empty() {
                     run_seed.clone()
                 } else {
-                    let id = crate::vm::new_id();
-                    let ws = crate::trigger::Workspace::for_run(&self.config, &id);
-                    copy_tree(&workspace, &ws).await?;
-                    id
+                    crate::vm::new_id()
                 };
 
-                self.store
-                    .create_run(
-                        &run_id,
-                        &crate::store::RunRequest {
+                let request = crate::store::RunRequest {
                             workflow_id: source
                                 .id
                                 .clone()
@@ -467,17 +494,13 @@ impl Dispatcher {
                             }
                             .to_string(),
                             rerun_of: req.rerun.as_ref().map(|r| r.of.clone()),
-                        },
-                        &plan,
-                    )
-                    .await?;
-                // Before the first scheduling pass, so a job whose `needs:`
-                // succeeded last time sees that result and not a `pending`
-                // row it would wait on for ever.
-                if let Some(rerun) = req.rerun.as_ref().filter(|r| r.failed_only) {
-                    self.carry_over_successes(&run_id, &rerun.of).await?;
+                        };
+                if is_release && release_run_id.replace(run_id.clone()).is_some() {
+                    return Err(DispatchError::Workflow(
+                        "a submission must have exactly one on: release workflow".into()
+                    ));
                 }
-                self.advance_run(&run_id).await?;
+                planned.push((run_id.clone(), request, plan));
                 run_ids.push(run_id);
             }
         }
@@ -511,6 +534,23 @@ impl Dispatcher {
                 patterns_tried.join(", "),
             )));
         }
+        if release_run_id.is_some() {
+            for (id, _, plan) in &planned {
+                if Some(id) != release_run_id.as_ref() {
+                    crate::submission::validate_validation_plan(plan)
+                        .map_err(DispatchError::Workflow)?;
+                }
+            }
+            // Partial runs and diagnostic reruns can never authorize publication.
+            if !only.is_empty() || req.workflow_id.is_some() || req.rerun.is_some()
+                || planned.len() == 1
+            {
+                let id = release_run_id.take().unwrap();
+                planned.retain(|(run, _, _)| run != &id);
+                run_ids.retain(|run| run != &id);
+                warnings.push("validation only: partial, rerun, or empty submissions do not authorize merge/deployment".into());
+            }
+        }
         if run_ids.is_empty() && skipped.is_empty() {
             return Err(crate::trigger::TriggerError::NoWorkflows(format!(
                 "{} (nothing matched, or nothing triggering on `submit`)",
@@ -521,7 +561,32 @@ impl Dispatcher {
         // Reported whether or not anything else ran: with several workflows, the
         // interesting question is usually why the *other* one did not.
         warnings.extend(skipped.into_iter().map(|s| format!("no run started — {s}")));
-        Ok(Submitted { run_ids, warnings })
+        let mut tx = self.store.pool().begin().await
+            .map_err(|e| DispatchError::Workflow(format!("begin submission: {e}")))?;
+        crate::lifecycle::Lifecycle::admit_in(&mut tx).await.map_err(DispatchError::Workflow)?;
+        for (id, request, plan) in &planned {
+            Store::create_run_in(&mut tx, id, request, plan).await?;
+            Store::record_source_in(&mut tx, id, &source_bytes).await?;
+            if !only.is_empty() || req.workflow_id.is_some() || req.rerun.is_some() {
+                sqlx::query("UPDATE ci_run SET validation_only=true WHERE id=$1")
+                    .bind(id).execute(&mut *tx).await
+                    .map_err(|e| DispatchError::Workflow(format!("record partial submission: {e}")))?;
+            }
+        }
+        if let Some(release) = &release_run_id {
+            let validations = run_ids.iter().filter(|id| *id != release).cloned().collect::<Vec<_>>();
+            crate::submission::record(&mut tx, release, &validations).await
+                .map_err(DispatchError::Workflow)?;
+        }
+        tx.commit().await.map_err(|e| DispatchError::Workflow(format!("commit submission: {e}")))?;
+        // Nothing becomes schedulable before the complete membership commits.
+        for id in &run_ids {
+            if let Some(rerun) = req.rerun.as_ref().filter(|r| r.failed_only) {
+                self.carry_over_successes(id, &rerun.of).await?;
+            }
+            self.advance_run(id).await?;
+        }
+        Ok(Submitted { run_ids, warnings, submission: release_run_id })
     }
 
     /// Start a new run from a finished one's source — the dashboard's "Run
@@ -531,9 +596,9 @@ impl Dispatcher {
     /// name their logs, step operation ids derive from them and the daemon
     /// reattaches to an operation it has already seen, and the failed attempt
     /// is the thing somebody will want to read next to the one that passed.
-    /// What the two share is the source: every submit keeps its validated patch
-    /// descriptor beside the workspace, so the immutable revisions and patch
-    /// are replayed exactly. Checkout credentials are resolved afresh per job.
+    /// What the two share is the source: every submit commits its validated
+    /// descriptor with the run in Postgres, so another regional controller can
+    /// replay it exactly. Checkout credentials are resolved afresh per job.
     ///
     /// It goes through [`Self::submit`] with the original run's workflow file
     /// as its one `--only` selector, so it is planned, routed and secreted
@@ -551,6 +616,8 @@ impl Dispatcher {
         failed_only: bool,
         actor: Option<&crate::web::identity::Identity>,
     ) -> Result<Submitted, DispatchError> {
+        let _admission = self.lifecycle.admission(&self.store).await
+            .map_err(DispatchError::ControllerUnavailable)?;
         let run = self
             .store
             .get_run(run_id)
@@ -569,6 +636,11 @@ impl Dispatcher {
             .any(|job| !matches!(job.status.as_str(), "success" | "failure" | "skipped" | "cancelled")) {
             return Err(DispatchError::Workflow(
                 "jobs in this run are still active; wait for them to finish before re-running it".into()
+            ));
+        }
+        if self.store.has_unresolved_execution(run_id).await? {
+            return Err(DispatchError::Workflow(
+                "this run still owns unresolved execution; reconcile its workers before re-running it".into()
             ));
         }
         if self.store.service_deployments_of(run_id).await?.iter()
@@ -594,25 +666,31 @@ impl Dispatcher {
             )));
         }
 
-        let workspace = crate::trigger::Workspace::for_run(&self.config, run_id);
-        let Some((format, path)) = workspace.stored_source() else {
-            return Err(DispatchError::Workflow(format!(
-                "the source of run {run_id} is no longer under {} — it was submitted before \
-                 this instance kept sources, or the directory was cleaned — so there is \
-                 nothing to re-run; `git submit` the commit again instead",
-                self.config.workspace_dir.display()
-            )));
-        };
-        if format != crate::trigger::SourceFormat::GitPatch {
-            return Err(DispatchError::Workflow(format!(
-                "run {run_id} uses legacy source format {}; its historical source is retained, \
-                 but cannot be rerun. Upgrade `git submit` and resubmit the revision",
-                format.as_str()
-            )));
+        // A published release is not an ordinary partial submit. Re-planning
+        // it would remove the release workflow, and running the merge again
+        // could publish a second candidate. Admit a failed-only attempt from
+        // the persisted plans and immutable publication/submission evidence.
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM ci_submission WHERE release_run_id=$1)",
+        )
+        .bind(run_id)
+        .fetch_one(self.store.pool())
+        .await
+        .map_err(|e| DispatchError::Workflow(format!("inspect release submission: {e}")))?
+        {
+            if !failed_only {
+                return Err(DispatchError::Workflow(
+                    "full release reruns are unsupported because they could publish the merge again; use Re-run failed jobs on the latest failed release attempt".into(),
+                ));
+            }
+            let submitted = self.retry_published_release(run_id, actor).await?;
+            for id in &submitted.run_ids {
+                self.advance_run(id).await?;
+            }
+            return Ok(submitted);
         }
-        let bytes = tokio::fs::read(path)
-            .await
-            .map_err(|e| DispatchError::Checkout(format!("{}: {e}", path.display())))?;
+
+        let bytes = self.store.source_bytes(run_id).await?;
 
         let req = crate::trigger::SubmitRequest {
             repository: crate::trigger::RepositoryRef {
@@ -637,7 +715,7 @@ impl Dispatcher {
             workflow_id: None,
             only: vec![run.workflow_path.clone()],
             source: crate::trigger::SourceArchive {
-                format: format.as_str().to_string(),
+                format: crate::trigger::SourceFormat::GitPatch.as_str().to_string(),
                 content_base64: String::new(),
                 bytes: Some(bytes),
             },
@@ -647,7 +725,7 @@ impl Dispatcher {
                 changes: run.changes.clone(),
             }),
         };
-        let submitted = self.submit(&req, actor, repo.as_ref()).await?;
+        let submitted = self.submit_admitted(&req, actor, repo.as_ref()).await?;
         tracing::info!(
             "re-run of {run_id} ({}) by {}: {}",
             if failed_only {
@@ -659,6 +737,163 @@ impl Dispatcher {
             submitted.run_ids.join(", ")
         );
         Ok(submitted)
+    }
+
+    async fn retry_published_release(
+        &self,
+        run_id: &str,
+        actor: Option<&crate::web::identity::Identity>,
+    ) -> Result<Submitted, DispatchError> {
+        let retry = crate::vm::new_id();
+        let mut tx = self.store.pool().begin().await
+            .map_err(|e| DispatchError::Workflow(format!("begin release retry: {e}")))?;
+        crate::lifecycle::Lifecycle::admit_in(&mut tx).await.map_err(DispatchError::Workflow)?;
+        let source = sqlx::query(
+            "SELECT r.status,rel.status AS release_status
+               FROM ci_run r JOIN ci_submission sub ON sub.release_run_id=r.id
+               LEFT JOIN ci_release rel ON rel.run_id=r.id
+              WHERE r.id=$1 FOR UPDATE OF r,sub",
+        ).bind(run_id).fetch_optional(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("lock release retry source: {e}")))?
+            .ok_or_else(|| DispatchError::Workflow(
+                "release retry requires one unambiguous admitted submission".into()))?;
+        if source.get::<Option<String>, _>("release_status").as_deref() != Some("published") {
+            return Err(DispatchError::Workflow(
+                "release retry requires a confirmed published release; reconcile publication before retrying failed jobs".into(),
+            ));
+        }
+        if !matches!(source.get::<String, _>("status").as_str(), "failure" | "cancelled") {
+            return Err(DispatchError::Workflow(
+                "only a failed or cancelled published release can retry failed jobs".into(),
+            ));
+        }
+        let merge_complete: bool = sqlx::query_scalar(
+            "SELECT count(*)=1 AND bool_and(j.status='success') FROM ci_job j,
+             LATERAL jsonb_array_elements(j.plan->'steps') s
+             WHERE j.run_id=$1 AND s->>'uses'='ci/merge-release'",
+        ).bind(run_id).fetch_one(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("inspect publication job: {e}")))?;
+        if !merge_complete {
+            return Err(DispatchError::Workflow(
+                "reconcile the published merge job before retrying; release retry never repeats publication".into(),
+            ));
+        }
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ci_job WHERE run_id=$1 AND status NOT IN ('success','failure','skipped','cancelled'))
+                 OR EXISTS(SELECT 1 FROM ci_service_deployment WHERE run_id=$1 AND status NOT IN ('passed','failed'))
+                 OR EXISTS(SELECT 1 FROM ci_service_deployment d JOIN ci_service_rollout s ON s.id=d.id
+                            WHERE d.run_id=$1 AND d.status='failed' AND d.phase IS DISTINCT FROM 'settled_failure')",
+        ).bind(run_id).fetch_one(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("inspect release retry settlement: {e}")))?;
+        if active {
+            return Err(DispatchError::Workflow(
+                "release work is still active or an earlier rollout failure is not terminally settled; reconcile it before retrying".into(),
+            ));
+        }
+        let partial_effect: Option<String> = sqlx::query_scalar(
+            "SELECT j.job_key FROM ci_job j JOIN ci_step s ON s.job_id=j.id
+              WHERE j.run_id=$1 AND j.status<>'success' AND s.status='success'
+                AND s.uses IN ('ci/deploy-service','ci/deploy-app-lb','ci/deploy-controller',
+                               'ci/host-heyvm-maintenance','ci/bootstrap-host-heyvm',
+                               'ci/rollout-host-heyvmd','ci/rollout-service','ci/rollout-host-app-lb')
+                AND NOT (s.uses IN ('ci/rollout-service','ci/rollout-host-app-lb')
+                    AND COALESCE(j.plan->'native_labels','[]'::jsonb)='[]'::jsonb
+                    AND (EXISTS(SELECT 1 FROM ci_service_deployment d WHERE d.step_id=s.id AND d.status='passed')
+                         OR EXISTS(SELECT 1 FROM ci_release_carried_deployment c
+                                   JOIN ci_service_deployment d ON d.id=c.deployment_id
+                                   WHERE c.job_id=j.id AND c.step_index=s.idx AND d.status='passed')))
+              ORDER BY j.created_at LIMIT 1",
+        ).bind(run_id).fetch_optional(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("inspect completed release effects: {e}")))?;
+        if let Some(job) = partial_effect {
+            return Err(DispatchError::Workflow(format!(
+                "release job {job:?} already completed a deployment step before failing; reconcile that deployment instead of repeating the job"
+            )));
+        }
+
+        // The unique retry_of index is the concurrent duplicate guard. Since
+        // every accepted child is itself a submission, an old ancestor also
+        // remains permanently ineligible for replay.
+        let has_child: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ci_submission WHERE retry_of=$1)",
+        ).bind(run_id).fetch_one(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("inspect release retry lineage: {e}")))?;
+        if has_child {
+            return Err(DispatchError::Workflow(
+                "this release attempt already has a retry; retry failed jobs on the latest descendant instead".into(),
+            ));
+        }
+
+        sqlx::query(
+            "INSERT INTO ci_run(id,workflow_id,workflow_path,workflow_name,repo_url,git_ref,sha,before_sha,
+                                actor_subject,actor_email,source,status,repo_id,changes,rerun_of,default_branch,release_base_sha)
+             SELECT $2,workflow_id,workflow_path,workflow_name,repo_url,git_ref,sha,before_sha,$3,$4,
+                    'rerun','queued',repo_id,changes,$1,default_branch,release_base_sha FROM ci_run WHERE id=$1",
+        ).bind(run_id).bind(&retry).bind(actor.map(|a| &a.subject)).bind(actor.map(|a| &a.email))
+            .execute(&mut *tx).await.map_err(|e| DispatchError::Workflow(format!("create release retry: {e}")))?;
+        let copied_source = sqlx::query("INSERT INTO ci_run_source(run_id,descriptor) SELECT $2,descriptor FROM ci_run_source WHERE run_id=$1")
+            .bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("copy release source: {e}")))?;
+        if copied_source.rows_affected() != 1 {
+            return Err(DispatchError::Workflow(
+                "release retry requires the original persisted source descriptor".into(),
+            ));
+        }
+        let jobs = sqlx::query("SELECT job_key,status,outputs FROM ci_job WHERE run_id=$1 ORDER BY created_at,id")
+            .bind(run_id).fetch_all(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("read release jobs: {e}")))?;
+        sqlx::query(
+            "INSERT INTO ci_job(id,run_id,job_key,base_id,display,network,status,matrix,outputs,plan,carried_from,started_at,finished_at)
+             SELECT $2||'.'||job_key,$2,job_key,base_id,display,network,
+                    CASE WHEN status='success' THEN 'success' ELSE 'pending' END,matrix,
+                    CASE WHEN status='success' THEN outputs ELSE '{}'::jsonb END,plan,
+                    CASE WHEN status='success' THEN $1 ELSE NULL END,
+                    CASE WHEN status='success' THEN now() ELSE NULL END,
+                    CASE WHEN status='success' THEN now() ELSE NULL END
+               FROM ci_job WHERE run_id=$1",
+        ).bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("copy release job plans: {e}")))?;
+        sqlx::query(
+            "INSERT INTO ci_release_carried_deployment(job_id,step_index,deployment_id)
+             SELECT $2||'.'||j.job_key,s.idx,d.id FROM ci_job j
+               JOIN ci_step s ON s.job_id=j.id JOIN ci_service_deployment d ON d.step_id=s.id
+              WHERE j.run_id=$1 AND s.status='success' AND d.status='passed'
+                AND s.uses IN ('ci/rollout-service','ci/rollout-host-app-lb')
+             UNION
+             SELECT $2||'.'||j.job_key,c.step_index,c.deployment_id FROM ci_job j
+               JOIN ci_release_carried_deployment c ON c.job_id=j.id WHERE j.run_id=$1",
+        ).bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("preserve completed deployment receipts: {e}")))?;
+        sqlx::query("INSERT INTO ci_submission(release_run_id,validation_count,retry_of) SELECT $2,validation_count,$1 FROM ci_submission WHERE release_run_id=$1")
+            .bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("record release retry: {e}")))?;
+        let copied_validations = sqlx::query("INSERT INTO ci_submission_validation(release_run_id,validation_run_id,ordinal) SELECT $2,validation_run_id,ordinal FROM ci_submission_validation WHERE release_run_id=$1")
+            .bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("copy frozen validations: {e}")))?;
+        let expected: i64 = sqlx::query_scalar("SELECT validation_count::bigint FROM ci_submission WHERE release_run_id=$1")
+            .bind(&retry).fetch_one(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("verify frozen validations: {e}")))?;
+        if copied_validations.rows_affected() as i64 != expected {
+            return Err(DispatchError::Workflow(
+                "release retry found incomplete frozen validation membership".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status,error)
+             SELECT $2,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,'published',NULL FROM ci_release WHERE run_id=$1",
+        ).bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("copy published release: {e}")))?;
+        Store::add_event(&mut tx, &retry, None, None, None, "ci.run.status.v1", "queued", None).await?;
+        for job in jobs {
+            let key: String = job.get("job_key");
+            let status = if job.get::<String, _>("status") == "success" { "success" } else { "pending" };
+            Store::add_event(&mut tx, &retry, Some(&crate::store::job_id(&retry, &key)), Some(&key), None,
+                "ci.job.status.v1", status, None).await?;
+        }
+        tx.commit().await.map_err(|e| DispatchError::Workflow(format!("commit release retry: {e}")))?;
+        Ok(Submitted { run_ids: vec![retry.clone()], warnings: vec![
+            format!("release retry reuses published candidate and frozen validation artifacts from {run_id}")
+        ], submission: Some(retry) })
     }
 
     /// Fill a failed-only re-run's jobs with the results their counterparts
@@ -686,11 +921,31 @@ impl Dispatcher {
     /// the job's own id (`Nats-Msg-Id`), and moving a job from `pending` to
     /// `queued` is conditional on it still being `pending`.
     pub async fn advance_run(&self, run_id: &str) -> Result<RunStatus, DispatchError> {
-        let jobs = self.store.jobs_of(run_id).await?;
-        let needs = self.store.needs_context(run_id).await?;
+        match crate::submission::gate(&self.store, run_id).await.map_err(DispatchError::Workflow)? {
+            crate::submission::Gate::Waiting => return Ok(RunStatus::Queued),
+            crate::submission::Gate::Rejected(reason) => {
+                for job in self.store.jobs_of(run_id).await? {
+                    if job.status == "pending" {
+                        self.store.set_job_status(&job.id, JobStatus::Failure, Some(&reason)).await?;
+                    }
+                }
+                return self.store.roll_up_run(run_id).await.map_err(Into::into);
+            }
+            crate::submission::Gate::Unmanaged | crate::submission::Gate::Ready => {}
+        }
         // One read for the whole wave, not one per job: the commit a run is for
         // does not change between two jobs of the same run.
         let ci = Self::ci_scope(self.store.get_run(run_id).await?.as_ref());
+        // A skip/failure has no worker completion to schedule the next wave.
+        // Re-read dependency results until all such transitions have propagated.
+        while self.advance_run_wave(run_id, &ci).await? {}
+        Ok(self.store.roll_up_run(run_id).await?)
+    }
+
+    async fn advance_run_wave(&self, run_id: &str, ci: &Value) -> Result<bool, DispatchError> {
+        let jobs = self.store.jobs_of(run_id).await?;
+        let needs = self.store.needs_context(run_id).await?;
+        let mut changed = false;
 
         // A base id is only satisfied once *every* cell of it is terminal —
         // `needs: [build]` cannot mean "the first cell of build".
@@ -720,6 +975,7 @@ impl Dispatcher {
                             Some(&format!("stored plan could not be read: {e}")),
                         )
                         .await?;
+                    changed = true;
                     continue;
                 }
             };
@@ -735,12 +991,13 @@ impl Dispatcher {
             // Decide `if:` now that dependencies have results. A dependency that
             // failed makes the default guard false, which is what stops a deploy
             // job from shipping a broken build.
-            match self.should_run(&plan, &needs, &ci) {
+            match self.should_run(&plan, &needs, ci) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.store
                         .set_job_status(&job.id, JobStatus::Skipped, None)
                         .await?;
+                    changed = true;
                     continue;
                 }
                 Err(e) => {
@@ -752,6 +1009,7 @@ impl Dispatcher {
                             Some(&format!("could not evaluate `if:` — {e}")),
                         )
                         .await?;
+                    changed = true;
                     continue;
                 }
             }
@@ -769,6 +1027,7 @@ impl Dispatcher {
                     self.store
                         .set_job_status(&job.id, JobStatus::Failure, Some(&e.to_string()))
                         .await?;
+                    changed = true;
                     continue;
                 }
             };
@@ -817,7 +1076,7 @@ impl Dispatcher {
             }
         }
 
-        Ok(self.store.roll_up_run(run_id).await?)
+        Ok(changed)
     }
 
     /// The `ci` expression scope: which commit this run is for, and what it
@@ -861,8 +1120,8 @@ impl Dispatcher {
 
     /// Evaluate a job's `if:`.
     ///
-    /// The default when there is no `if:` is GitHub's: run only if nothing this
-    /// job needs failed. Writing an explicit `if:` opts out of that — which is
+    /// The default when there is no `if:` is GitHub's: run only if every dependency
+    /// succeeded. Writing an explicit `if:` opts out of that — which is
     /// how `if: always()` gets a cleanup job to run after a failure.
     fn should_run(&self, plan: &JobPlan, needs: &Value, ci: &Value) -> Result<bool, DispatchError> {
         let any_failed = plan.needs.iter().any(|n| {
@@ -876,7 +1135,7 @@ impl Dispatcher {
         });
 
         let Some(condition) = &plan.condition else {
-            return Ok(!any_failed);
+            return Ok(plan.needs.iter().all(|n| needs[n]["result"] == "success"));
         };
 
         let mut ctx = plan.base_context();
@@ -1093,6 +1352,10 @@ impl Dispatcher {
         let plan: JobPlan = serde_json::from_value(row.plan.clone())
             .map_err(|e| DispatchError::BadPlan(e.to_string()))?;
 
+        if crate::host_maintenance::owns_job(&self.store, &msg.job_id).await
+            .map_err(|e| DispatchError::StepFailed(e.to_string()))?
+            || crate::host_heyvm_bootstrap_coordinator::owns_job(&self.store, &msg.job_id).await
+            .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Ok(JobStatus::Running); }
         let (runner, existing_vm) = self.pick_runner(&plan).await?;
 
         // The one place a job's failure and its runner are both in hand. A
@@ -1129,15 +1392,27 @@ impl Dispatcher {
         // one nothing had touched looked the same on every page, and the
         // waiting-for-a-runner reaper could not tell them apart either.
         //
-        // False means the job went terminal while it sat on the queue —
-        // cancelled, or finished by a delivery whose ack was lost — and the
-        // right move is to stop here, before spending a VM on it.
+        // Another delivery may already own this job. Redelivery cannot grant
+        // a second execution, even if the first controller stopped heartbeating.
         if !self.store.claim_job(&msg.job_id, &runner, attempt).await? {
+            if crate::host_maintenance::cordoned(&self.store, &runner).await
+                .map_err(|e| DispatchError::StepFailed(e.to_string()))? {
+                return Err(DispatchError::MaintenancePaused);
+            }
+            if self.store.has_host_work(&msg.job_id).await? {
+                tracing::info!(job = %msg.job_key, "execution already claimed; dropping duplicate delivery");
+                return Ok(JobStatus::Running);
+            }
             tracing::info!(job = %msg.job_key, "no longer runnable; dropping delivery");
             return Ok(JobStatus::Success);
         }
         tracing::info!(job = %plan.key, runner = %runner, attempt, "acquiring a VM");
 
+        // CI owns disposable job machines, not a stopped VM cache. Keep parsing
+        // legacy `reuse` declarations, but never retain their disks or /30s.
+        if !plan.target.is_existing_vm() {
+            plan.vm.reuse = false;
+        }
         let needs_source = existing_vm.is_none()
             && (plan.vm.build.is_some() || !plan.vm.cache_key_files.is_empty());
         let prepared = if needs_source {
@@ -1154,6 +1429,7 @@ impl Dispatcher {
         //
         // On the *local* plan only. The stored plan keeps what the author wrote,
         // so a redelivery re-derives the name rather than inheriting one.
+        let disk_requirement = runner_disk_requirement(&plan.vm);
         if existing_vm.is_none() && let Some(build) = plan.vm.build.clone() {
             let image = self
                 .ensure_image(&runner, &plan, &build, prepared.as_ref().expect("build requires preparation"), msg)
@@ -1190,7 +1466,7 @@ impl Dispatcher {
                 let cache_keys = prepared.as_ref().map(|p| &p.cache_keys).unwrap_or(&empty);
                 let fingerprint = crate::pool::fingerprint(&plan.vm, cache_keys)?;
                 let (vm, reused) = self
-                    .acquire_vm(&runner, &plan, &fingerprint, &msg.job_id)
+                    .acquire_vm(&runner, &plan, &fingerprint, &msg.job_id, disk_requirement)
                     .await?;
                 (vm, reused, fingerprint)
             }
@@ -1202,7 +1478,13 @@ impl Dispatcher {
             .await?
         {
             // Something else finished this job while we were booting a VM.
-            self.release_vm(&plan, &vm, false).await;
+            if !plan.target.is_existing_vm() {
+                crate::vm_cleanup::handoff(self, &msg.job_id, &runner, attempt, vm.id(),
+                    JobStatus::Cancelled, None).await
+                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+            } else if self.release_vm(&plan, &vm, false).await {
+                self.store.end_host_work(&msg.job_id, &runner, attempt).await?;
+            }
             return Ok(JobStatus::Success);
         }
         tracing::info!(
@@ -1210,10 +1492,19 @@ impl Dispatcher {
             "running"
         );
 
-        let outcome = match self.checkout(msg, &plan, &vm).await {
-            Ok(()) => self.run_steps(msg, &plan, &vm).await,
-            Err(e) => Err(e),
-        };
+        let outcome = async {
+            vm.ensure_running(BOOT_TIMEOUT).await?;
+            self.ensure_sized(&plan, &runner, &vm).await?;
+            self.checkout(msg, &plan, &vm).await?;
+            self.run_steps(msg, &plan, &vm).await
+        }.await;
+        // Durable maintenance owns strict VM stop/release and final job status.
+        // Do not stop or repool here: another reconciler may already have done
+        // so and that VM might now belong to a different job.
+        if crate::host_maintenance::owns_job(&self.store, &msg.job_id).await
+            .map_err(|e| DispatchError::StepFailed(e.to_string()))?
+            || crate::host_heyvm_bootstrap_coordinator::owns_job(&self.store, &msg.job_id).await
+            .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Ok(JobStatus::Running); }
         // Before the release, always: a VM with `reuse: false` is destroyed on
         // the next line, and the console of the boot that just failed is exactly
         // what somebody wants when a job dies before its first step.
@@ -1222,7 +1513,6 @@ impl Dispatcher {
             .as_ref()
             .err()
             .is_some_and(DispatchError::indicates_guest_corruption);
-        self.release_vm(&plan, &vm, guest_corrupted).await;
 
         // A tunnel that dies mid-job fails the job rather than propagating —
         // the match below absorbs the error into a status — so the eviction in
@@ -1248,9 +1538,21 @@ impl Dispatcher {
             Err(_) => JobStatus::Failure,
         };
         let error = outcome.as_ref().err().map(|e| e.to_string());
-        self.store
-            .set_job_status(&msg.job_id, status, error.as_deref())
-            .await?;
+        if !plan.target.is_existing_vm() {
+            crate::vm_cleanup::handoff(self, &msg.job_id, &runner, attempt, vm.id(),
+                status, error.as_deref()).await
+                .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+            // The durable reconciler owns retries, including after restart.
+            // No more guest commands or direct release after this handoff.
+            if let Err(e) = crate::vm_cleanup::reconcile(self).await {
+                tracing::warn!("could not reconcile VM cleanup: {e}");
+            }
+        } else {
+            if self.release_vm(&plan, &vm, guest_corrupted).await && outcome.is_ok() {
+                self.store.end_host_work(&msg.job_id, &runner, attempt).await?;
+            }
+            self.store.set_job_status(&msg.job_id, status, error.as_deref()).await?;
+        }
         Ok(status)
     }
 
@@ -1263,8 +1565,7 @@ impl Dispatcher {
         msg: &JobMessage,
         deadline: Duration,
     ) -> Result<crate::image::PreparedSource, DispatchError> {
-        let source_workspace = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
-        let descriptor = crate::trigger::read_descriptor(&source_workspace)?;
+        let descriptor = self.store.source_descriptor(&msg.run_id).await?;
         let run = self.store.get_run(&msg.run_id).await?.ok_or_else(|| {
             DispatchError::Checkout(format!("run {} disappeared before source preparation", msg.run_id))
         })?;
@@ -1312,6 +1613,8 @@ impl Dispatcher {
         let driver = driver_name(plan.vm.driver);
 
         if let Some(node) = placement.node {
+            if crate::host_maintenance::cordoned(&self.store, &node.id).await
+                .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Err(DispatchError::MaintenancePaused); }
             if !node.status.is_dispatchable() {
                 return Err(DispatchError::RunnerOffline {
                     runner: node.name.clone(),
@@ -1335,17 +1638,20 @@ impl Dispatcher {
                     supported: supported.join(", "),
                 });
             }
+            if vm.is_none() {
+                self.reclaim_disk_space(&node.id, runner_disk_requirement(&plan.vm)).await?;
+            }
             return Ok((node.id.clone(), vm));
         }
-        // Unpinned: the first online host **that can run the job's driver**.
-        // The set is small and stable, so first-match stays predictable — but
-        // predictable used to mean "whichever host the cloud listed first",
-        // and when a macbook joined the network that was the macbook, handed a
-        // firecracker job macOS cannot run. Every skip is collected so the
-        // error names each host and why, instead of "no online runner" on a
-        // page showing three of them.
+        // Unpinned: compare fresh disk capacity on every compatible host.
+        // Liveness alone does not make a full host eligible for a new VM.
+        let required = runner_disk_requirement(&plan.vm);
+        let mut candidates = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
+        let mut maintenance = false;
         for candidate in placement.network.dispatchable() {
+            if crate::host_maintenance::cordoned(&self.store, &candidate.id).await
+                .map_err(|e| DispatchError::StepFailed(e.to_string()))? { maintenance = true; continue; }
             match self.runners.supported_drivers(&candidate.id).await {
                 Ok(Some(supported)) if !host_can_run(Some(&supported), driver) => {
                     skipped.push(format!(
@@ -1354,10 +1660,12 @@ impl Dispatcher {
                         supported.join(", ")
                     ));
                 }
-                // Known-capable, or old enough that it cannot say: it gets the
-                // job. Refusing every un-upgraded daemon would take down a
-                // working fleet to enforce a check it cannot answer.
-                Ok(_) => return Ok((candidate.id.clone(), vm)),
+                Ok(_) => match self.reclaim_disk_space(&candidate.id, required).await {
+                    Ok(free) => {
+                        candidates.push((candidate.id.clone(), free));
+                    }
+                    Err(e) => skipped.push(format!("{} capacity unavailable: {e}", candidate.name)),
+                },
                 Err(e) => {
                     tracing::warn!(
                         runner = %candidate.name,
@@ -1367,6 +1675,10 @@ impl Dispatcher {
                 }
             }
         }
+        if let Some(runner) = roomiest_runner(candidates, required) {
+            return Ok((runner, vm));
+        }
+        if maintenance { return Err(DispatchError::MaintenancePaused); }
         if skipped.is_empty() {
             return Err(DispatchError::NoOnlineRunner(
                 placement.network.network_name.clone(),
@@ -1434,7 +1746,10 @@ impl Dispatcher {
             {
                 crate::image::Claim::Ready => {
                     tracing::info!(job = %plan.key, runner, "image {name} is already on this host");
-                    return Ok(name);
+                    // Validate with the source builder even on catalog hits.
+                    // It rebuilds a missing file in this attempt, and joins an
+                    // existing build instead of failing the job on stale state.
+                    break;
                 }
                 crate::image::Claim::Build => break,
                 crate::image::Claim::InProgress => {
@@ -1454,7 +1769,8 @@ impl Dispatcher {
             }
         }
 
-        // This job owns the build.
+        // This job owns a build claim or is verifying a cached image. The
+        // daemon collapses concurrent requests for identical verified inputs.
         tracing::info!(
             job = %plan.key, runner,
             "asking the runner to build image {name} from {}", build.dockerfile
@@ -1566,6 +1882,7 @@ impl Dispatcher {
         plan: &JobPlan,
         fingerprint: &str,
         job_id: &str,
+        required: u64,
     ) -> Result<(Vm, bool), DispatchError> {
         let options = self.runners.options_for(runner).await?;
 
@@ -1627,13 +1944,30 @@ impl Dispatcher {
                         vm = %sandbox_id,
                         "pooled VM is unusable; destroying it and building a fresh one: {e}"
                     );
-                    if let Err(e) = vm.destroy().await {
-                        tracing::warn!(vm = %sandbox_id, "could not destroy: {e}");
+                    match vm.destroy().await {
+                        Ok(())
+                            if matches!(
+                                vm.info().await,
+                                Err(VmError::Daemon {
+                                    source: heyo_sdk::HeyoError::NotFound(_),
+                                    ..
+                                })
+                            ) =>
+                        {
+                            self.pool.forget(&sandbox_id).await?;
+                        }
+                        Ok(()) => return Err(DispatchError::StepFailed(
+                            format!("daemon did not confirm destruction of {sandbox_id}; retaining pool ownership")
+                        )),
+                        Err(e) => return Err(e.into()),
                     }
-                    let _ = self.pool.forget(&sandbox_id).await;
                 }
             }
         }
+
+        // A warm claim above needs no new disks. A cold create must recheck:
+        // image building or another job may have consumed admission headroom.
+        self.reclaim_disk_space(runner, required).await?;
 
         let name = sandbox_name(
             &plan.base_id,
@@ -1673,16 +2007,38 @@ impl Dispatcher {
             "creating VM {name}"
         );
 
-        let created = self
+        let mut created = self
             .vms
             .create(
-                options,
+                options.clone(),
                 &name,
                 &plan.vm,
                 self.config.heyvm.vm_ttl,
-                BOOT_TIMEOUT,
             )
             .await;
+
+        // A /24 supplies only 64 /30 TAP links. Stopped reusable CI caches
+        // retain those links, so an explicit capacity verdict may evict one
+        // idle cache on this exact runner and retry this create once. Unknown,
+        // transport and timeout failures are intentionally not destructive.
+        if created.as_ref().is_err_and(VmError::is_subnet_capacity)
+            && let Some(cache) = self.pool.take_oldest_idle(runner).await?
+        {
+            tracing::info!(
+                runner,
+                sandbox = %cache.sandbox_id,
+                "evicting idle CI cache for VM subnet headroom"
+            );
+            let (destroyed, failed) = self.destroy_swept(vec![cache]).await;
+            if destroyed == 1 && failed.is_empty() {
+                created = self.vms.create(
+                    options,
+                    &name,
+                    &plan.vm,
+                    self.config.heyvm.vm_ttl,
+                ).await;
+            }
+        }
 
         // Whichever way it went, the placeholder goes: it stands for an attempt
         // in flight, and on success `register` below writes the real row under
@@ -1724,15 +2080,8 @@ impl Dispatcher {
                 self.lease(),
             )
             .await?;
-        if let Err(e) = self.ensure_sized(plan, runner, &vm).await {
-            // Parked, not destroyed, although it has never built anything: the
-            // next delivery on the ladder claims it and checks again, so a
-            // resize from /vms in between is all it takes for the retry to go
-            // through — and if the runner simply cannot size VMs, a fresh one
-            // would be no better than this one, only slower to say so.
-            self.release_vm(plan, &vm, false).await;
-            return Err(e);
-        }
+        // Boot and sizing checks run after start_job records this exact VM;
+        // their failures must enter the same durable cleanup as failed steps.
         Ok((vm, false))
     }
 
@@ -1903,12 +2252,29 @@ impl Dispatcher {
             return;
         }
 
-        let text = match vm.logs(self.config.vm_log_lines).await {
-            Ok(text) if text.trim().is_empty() => {
-                "[ci] the daemon reported no console output for this VM\n".to_string()
+        let capture = async {
+            let run = self.store.get_run(&msg.run_id).await?
+                .ok_or_else(|| anyhow::anyhow!("run no longer exists"))?;
+            let environment = plan.env.get("CI_ENVIRONMENT").map(String::as_str).unwrap_or("default");
+            let resolved = self.secrets.resolve(&crate::secrets::Secrets::prefix(&run.workflow_id, environment)).await?;
+            let masker = resolved.masker();
+            let mut text = match vm.info().await {
+                Ok(info) => format!("[ci] VM {} status={:?} size={:?}\n", info.id, info.status, info.size_class),
+                Err(error) => format!("[ci] VM metadata unavailable: {error}\n"),
+            };
+            text.push_str(&format!("[ci] console capture limit: {} lines\n", self.config.vm_log_lines));
+            match vm.logs(self.config.vm_log_lines).await {
+                Ok(log) => text.push_str(&log),
+                Err(error) => text.push_str(&format!("[ci] VM console unavailable: {error}\n")),
             }
-            Ok(text) => text,
-            Err(e) => format!("[ci] could not read this VM's logs: {e}\n"),
+            Ok::<_, anyhow::Error>(masker.mask(&text))
+        };
+        let text = match tokio::time::timeout(Duration::from_secs(40), capture).await {
+            Ok(Ok(text)) => text,
+            // Do not archive an unredacted guest console when secret resolution
+            // fails. Record the gap and continue resource cleanup.
+            Ok(Err(_)) => "[ci] VM diagnostics unavailable: could not resolve safe redaction context\n".into(),
+            Err(_) => "[ci] VM diagnostics timed out after 40s; cleanup will continue\n".into(),
         };
 
         let path = self.store.log_path(&msg.run_id, &plan.key, -2, &sid);
@@ -1935,7 +2301,7 @@ impl Dispatcher {
         wanted: &str,
     ) -> Result<String, DispatchError> {
         let options = self.runners.options_for(runner).await?;
-        let sandboxes = heyo_sdk::Sandbox::list(options).await.map_err(|e| {
+        let sandboxes = heyo_sdk::Sandbox::list(options.options.clone()).await.map_err(|e| {
             DispatchError::Vm(crate::vm::VmError::Daemon {
                 sandbox: wanted.to_string(),
                 what: "listing sandboxes on the node",
@@ -1976,7 +2342,7 @@ impl Dispatcher {
     /// would hand the next attempt — which prefers an idle VM with the same
     /// fingerprint on the same runner — the same broken ext4, and the job
     /// would burn every delivery on one sick machine.
-    async fn release_vm(&self, plan: &JobPlan, vm: &Vm, guest_corrupted: bool) {
+    async fn release_vm(&self, plan: &JobPlan, vm: &Vm, guest_corrupted: bool) -> bool {
         // A VM named in `uses:` is not ours. It was not created for this job,
         // it is not in the pool, and somebody else's long-lived machine must not
         // be destroyed because a workflow happened to set `reuse: false` in a
@@ -1992,7 +2358,7 @@ impl Dispatcher {
                      target this instance does not own — leaving it as it is"
                 );
             }
-            return;
+            return true;
         }
         if guest_corrupted {
             tracing::warn!(
@@ -2003,11 +2369,14 @@ impl Dispatcher {
         if !plan.vm.reuse || guest_corrupted {
             if let Err(e) = vm.destroy().await {
                 tracing::warn!(vm = vm.id(), "could not destroy: {e}");
+                // An uncertain teardown is still active drain evidence.
+                return false;
             }
             if let Err(e) = self.pool.forget(vm.id()).await {
                 tracing::warn!(vm = vm.id(), "could not forget: {e}");
+                return false;
             }
-            return;
+            return true;
         }
         // The TTL is what the VM boots with next time — `start` counts it from
         // then — and it honors the workflow's own `ttl_seconds` when that is
@@ -2034,16 +2403,19 @@ impl Dispatcher {
         // which a concurrent claim sees the VM running, then has it stopped
         // out from under its first step.
         if let Err(e) = vm.stop().await {
-            // A running idle VM is what the pool used to hold; it still works,
-            // it just costs memory until the TTL takes it.
+            // Keep the claim: maintenance must not interpret an unverified
+            // stop as a drained host. Its cordon also prevents orphan release.
             tracing::warn!(
                 vm = vm.id(),
-                "could not stop the VM; leaving it running: {e}"
+                "could not stop the VM; retaining its claim: {e}"
             );
+            return false;
         }
         if let Err(e) = self.pool.release(vm.id()).await {
             tracing::warn!(vm = vm.id(), "could not release into the pool: {e}");
+            return false;
         }
+        true
     }
 
     /// Put the submitted tree into the guest.
@@ -2075,31 +2447,15 @@ impl Dispatcher {
         self.store.start_step(&sid, &sid).await?;
         let log_path = self.store.log_path(&msg.run_id, &plan.key, -1, &sid);
 
-        let workspace = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
-        let Some((format, _archive)) = workspace.stored_source() else {
-            let detail = format!(
-                "no submitted source is on disk for run {} under {}",
-                msg.run_id,
-                self.config.workspace_dir.display()
-            );
-            self.store
-                .append_log(&sid, &log_path, &format!("[ci] {detail}\n"))
-                .await?;
-            self.store
-                .finish_step(&sid, StepStatus::Failure, Some(1), Some(&detail))
-                .await?;
-            return Err(DispatchError::Checkout(detail));
+        let descriptor = match self.store.source_descriptor(&msg.run_id).await {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                let detail = error.to_string();
+                self.store.append_log(&sid, &log_path, &format!("[ci] {detail}\n")).await?;
+                self.store.finish_step(&sid, StepStatus::Failure, Some(1), Some(&detail)).await?;
+                return Err(error.into());
+            }
         };
-        if format != crate::trigger::SourceFormat::GitPatch {
-            let detail = format!(
-                "legacy source format {} cannot be checked out; upgrade `git submit` and resubmit",
-                format.as_str()
-            );
-            self.store.append_log(&sid, &log_path, &format!("[ci] {detail}\n")).await?;
-            self.store.finish_step(&sid, StepStatus::Failure, Some(1), Some(&detail)).await?;
-            return Err(DispatchError::Checkout(detail));
-        }
-        let descriptor = crate::trigger::read_descriptor(&workspace)?;
         let run = self.store.get_run(&msg.run_id).await?.ok_or_else(|| {
             DispatchError::Checkout(format!("run {} disappeared before checkout", msg.run_id))
         })?;
@@ -2298,6 +2654,7 @@ impl Dispatcher {
                         self.store
                             .append_log(&sid, &log_path, &masker.mask(&note))
                             .await?;
+                        if action == "ci/host-heyvm-maintenance" { return Ok(json!({})); }
                         self.store
                             .finish_step(&sid, StepStatus::Success, Some(0), None)
                             .await?;
@@ -2473,6 +2830,25 @@ impl Dispatcher {
         let required = |key: &str| with(key).filter(|v| !v.trim().is_empty())
             .ok_or_else(|| DispatchError::StepFailed(format!("{action} requires with.{key}")));
 
+        if matches!(action, "ci/merge-release" | "ci/publish-service-archive" |
+            "ci/promote-service-archive" | "ci/deploy-service" | "ci/deploy-app-lb" | "ci/deploy-controller" | "ci/host-heyvm-maintenance" | "ci/bootstrap-host-heyvm" | "ci/rollout-host-heyvmd" | "ci/rollout-service" | "ci/rollout-host-app-lb") {
+            crate::submission::authorize_publication(&self.store, &msg.run_id).await
+                .map_err(DispatchError::StepFailed)?;
+        }
+
+        if matches!(action, "ci/rollout-service" | "ci/rollout-host-app-lb") {
+            let completed: Option<String> = sqlx::query_scalar(
+                "SELECT d.id FROM ci_release_carried_deployment c
+                 JOIN ci_step s ON s.job_id=c.job_id AND s.idx=c.step_index
+                 JOIN ci_service_deployment d ON d.id=c.deployment_id
+                 WHERE s.id=$1 AND d.status='passed'",
+            ).bind(sid).fetch_optional(self.store.pool()).await
+                .map_err(|e| DispatchError::StepFailed(format!("read carried deployment receipt: {e}")))?;
+            if let Some(id) = completed {
+                return Ok((format!("[ci] retained completed deployment {id}; no deployment repeated\n"), json!({})));
+            }
+        }
+
         match action {
             "ci/merge-release" => {
                 let manifests: Vec<String> = serde_json::from_str(&required("manifests")?)
@@ -2480,8 +2856,7 @@ impl Dispatcher {
                 let tags = with("tags").map(|raw| serde_json::from_str(&raw)
                     .map_err(|_| DispatchError::StepFailed("with.tags must be a JSON object mapping manifest paths to tag prefixes".into())))
                     .transpose()?.unwrap_or_default();
-                let source = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
-                let release = crate::release::merge(&self.store, msg, plan, &source.root,
+                let release = crate::release::merge(&self.store, msg, plan,
                     &manifests, &tags, &required("token")?).await.map_err(DispatchError::StepFailed)?;
                 Ok((format!("[ci] merged and published release {} on {}\nVersions: {}\n",
                     release.release_sha, release.git_ref, release.versions), serde_json::json!({
@@ -2508,27 +2883,47 @@ impl Dispatcher {
                 Ok((format!("[ci] clean checkout of release {}\n", release.prepared.release_sha),
                     serde_json::json!({"sha": release.prepared.release_sha})))
             }
-            "ci/publish-service-archive" => {
-                let sha: Option<String> = sqlx::query_scalar("SELECT release_sha FROM ci_job WHERE id=$1")
-                    .bind(&msg.job_id).fetch_one(self.store.pool()).await
-                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
-                let sha = sha.ok_or_else(|| DispatchError::StepFailed("service archive must be built after ci/checkout-release in this job".into()))?;
+            "ci/publish-service-archive" | "ci/promote-service-archive" => {
                 let base = required("url")?;
                 let path = required("path")?;
                 let name = required("name")?;
                 let user = required("user-id")?;
                 let token = required("token")?;
-                let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
-                if std::path::Path::new(&path).is_absolute() || std::path::Path::new(&path).components()
-                    .any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
-                    return Err(DispatchError::StepFailed("archive path must be relative to the job working directory".into()));
-                }
-                let bytes = vm.download_file(&format!("{sid}.archive"), &format!("{workdir}/{path}"), step_timeout(step, plan)).await?;
+                let (sha, bytes) = if action == "ci/promote-service-archive" {
+                    let release = crate::release::get(&self.store, &msg.run_id).await
+                        .map_err(DispatchError::StepFailed)?.filter(|r| r.status == "published")
+                        .ok_or_else(|| DispatchError::StepFailed("artifact promotion requires a confirmed merged release".into()))?;
+                    let stored = crate::submission::artifact(&self.store, &msg.run_id,
+                        &required("workflow")?, &required("artifact")?, with("job").as_deref())
+                        .await.map_err(DispatchError::Artifact)?;
+                    let bytes = self.artifacts.get(&stored).await
+                        .map_err(|e| DispatchError::Artifact(e.to_string()))?;
+                    if stored.digest.as_deref() != Some(hex::encode(sha2::Sha256::digest(&bytes)).as_str()) {
+                        return Err(DispatchError::Artifact("validated promotion artifact digest mismatch".into()));
+                    }
+                    let archive = crate::service_archive::validated_archive(&bytes, &path)
+                        .map_err(DispatchError::Artifact)?;
+                    (release.prepared.release_sha, archive)
+                } else {
+                    let sha: Option<String> = sqlx::query_scalar("SELECT release_sha FROM ci_job WHERE id=$1")
+                        .bind(&msg.job_id).fetch_one(self.store.pool()).await
+                        .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                    let sha = sha.ok_or_else(|| DispatchError::StepFailed("service archive must be built after ci/checkout-release in this job".into()))?;
+                    let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
+                    if std::path::Path::new(&path).is_absolute() || std::path::Path::new(&path).components()
+                        .any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+                        return Err(DispatchError::StepFailed("archive path must be relative to the job working directory".into()));
+                    }
+                    (sha, vm.download_file(&format!("{sid}.archive"), &format!("{workdir}/{path}"), step_timeout(step, plan)).await?)
+                };
+                let archive_sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+                let heyvm_sha256 = crate::host_maintenance::executable_digest(&bytes).ok();
                 let archive = crate::service_archive::publish(&base, &token, &user, sid, &name, bytes)
                     .await.map_err(DispatchError::StepFailed)?;
                 let mut tx = self.store.pool().begin().await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
-                sqlx::query("INSERT INTO ci_service_archive(step_id,run_id,job_id,archive_id,sha,orchestrator_url) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(step_id) DO UPDATE SET archive_id=excluded.archive_id,sha=excluded.sha,orchestrator_url=excluded.orchestrator_url")
+                sqlx::query("INSERT INTO ci_service_archive(step_id,run_id,job_id,archive_id,sha,orchestrator_url,archive_user_id,archive_sha256,heyvm_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(step_id) DO UPDATE SET archive_id=excluded.archive_id,sha=excluded.sha,orchestrator_url=excluded.orchestrator_url,archive_user_id=excluded.archive_user_id,archive_sha256=excluded.archive_sha256,heyvm_sha256=excluded.heyvm_sha256")
                     .bind(sid).bind(&msg.run_id).bind(&msg.job_id).bind(&archive).bind(&sha).bind(base.trim_end_matches('/'))
+                    .bind(&user).bind(&archive_sha256).bind(&heyvm_sha256)
                     .execute(&mut *tx).await.map_err(|e| DispatchError::StepFailed(e.to_string()))?;
                 let event = Store::add_event(&mut tx, &msg.run_id, Some(&msg.job_id), Some(&msg.job_key), Some(sid),
                     "ci.service_archive.published.v1", "published", None).await?;
@@ -2592,6 +2987,54 @@ impl Dispatcher {
                     step_timeout(step, plan), masker).await
                     .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
             }
+            "ci/rollout-host-app-lb" => {
+                crate::host_app_lb::deploy(self, msg, sid, &required("target")?, &required("token")?,
+                    &required("workflow")?, &required("artifact")?, step_timeout(step, plan), masker).await
+                    .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
+            }
+            "ci/rollout-service" => {
+                crate::host_maintenance::token_secret(step.with.get("token").map(String::as_str).unwrap_or(""))
+                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                let mount_path = required("mount-path")?;
+                let target = crate::service_rollout::Target {
+                    url: required("url")?, deployment: required("deployment")?, namespace: required("namespace")?,
+                    revision_env: required("revision-env")?, start_command: format!("{mount_path}/start.sh"),
+                    working_directory: mount_path.clone(), mount_path,
+                };
+                crate::service_rollout::deploy(self, msg, sid, target, &required("token")?,
+                    &required("workflow")?, &required("artifact")?, step_timeout(step, plan), masker).await
+                    .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
+            }
+            "ci/deploy-controller" => {
+                if self.config.managed_deployment.is_some() {
+                    crate::managed_update::request(self,msg,sid,&required("archive-id")?).await
+                        .map(|note|(note,json!({}))).map_err(|e|DispatchError::StepFailed(e.to_string()))
+                } else {
+                    crate::controller_rollout::request(self, msg, sid, &required("artifact")?, with("workflow").as_deref()).await
+                        .map(|note| (note, json!({}))).map_err(DispatchError::StepFailed)
+                }
+            }
+            "ci/host-heyvm-maintenance" => {
+                required("token")?;
+                let secret = crate::host_maintenance::token_secret(step.with.get("token").map(String::as_str).unwrap_or(""))
+                    .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                // Persist outputs from earlier steps before handing completion
+                // to the reconciler; downstream jobs may start immediately
+                // after its atomic successful completion.
+                let outputs: serde_json::Map<String, Value> = plan.outputs.iter()
+                    .map(|(key, value)| (key.clone(), json!(masker.mask(&ctx.substitute(value))))).collect();
+                self.store.set_job_outputs(&msg.job_id, &Value::Object(outputs)).await?;
+                crate::host_maintenance::request(self, msg, plan, sid, &required("runner")?, &required("url")?,
+                    &required("archive-id")?, &secret, step_timeout(step, plan)).await
+                    .map(|note| (note, json!({}))).map_err(|e| DispatchError::StepFailed(e.to_string()))
+            }
+            "ci/bootstrap-host-heyvm" | "ci/rollout-host-heyvmd" => {
+                required("token")?;
+                let component=if step.uses.as_deref()==Some("ci/rollout-host-heyvmd"){"heyvmd"}else{"heyvm"};
+                crate::host_heyvm_bootstrap_coordinator::request(self,msg,plan,sid,&required("target")?,
+                    step.with.get("token").map(String::as_str).unwrap_or(""),&required("workflow")?,&required("artifact")?,step_timeout(step,plan),component).await
+                    .map(|note|(note,json!({}))).map_err(|e|DispatchError::StepFailed(e.to_string()))
+            }
             "ci/upload-artifact" => {
                 let name = with("name").ok_or_else(|| {
                     DispatchError::Artifact("ci/upload-artifact needs `with.name`".into())
@@ -2607,6 +3050,12 @@ impl Dispatcher {
                 // `with:` values are strings so they can be substituted. Only
                 // the two spellings a person would write are accepted; a
                 // typo must not silently mean "private".
+                // The stable tag this upload should become, if the workflow
+                // names one. Validated when it is set, not here, so one code
+                // path decides what the store will accept.
+                let alias = with("alias")
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| !a.is_empty());
                 let public = match with("public").as_deref().map(str::trim) {
                     None | Some("") | Some("false") => false,
                     Some("true") => true,
@@ -2695,6 +3144,7 @@ impl Dispatcher {
                     name: name.clone(),
                     description,
                     public,
+                    alias,
                 };
 
                 // The fast path: the guest pushes the tarball to the store
@@ -2813,17 +3263,22 @@ impl Dispatcher {
                 let name = required("name")?;
                 let path = required("path")?;
                 let producer = with("job").filter(|v| !v.trim().is_empty());
+                let artifact_run = match with("workflow") {
+                    Some(workflow) => crate::submission::artifact_run(&self.store, &msg.run_id, &workflow)
+                        .await.map_err(DispatchError::Artifact)?,
+                    None => msg.run_id.clone(),
+                };
                 let workdir = plan.vm.working_directory.as_deref().unwrap_or(DEFAULT_WORKDIR);
                 let remote = artifact_download_path(workdir, &path)?;
                 // Scope at the query boundary: workflow input can name an
-                // artifact and (only for duplicate names) its producer, never
-                // a run, URI, path in the sink, or remote URL.
+                // artifact and its producer, never an arbitrary run, URI or URL.
+                // Cross-run lookup requires frozen successful submission membership.
                 let rows = sqlx::query(
                     "SELECT a.run_id,a.name,a.sink,a.digest,a.size_bytes,a.uri,a.public_url,
                             j.job_key,j.status,j.finished_at IS NOT NULL AS finished
                        FROM ci_artifact a JOIN ci_job j ON j.id=a.job_id
                       WHERE a.run_id=$1 AND a.name=$2 ORDER BY a.created_at",
-                ).bind(&msg.run_id).bind(&name).fetch_all(self.store.pool()).await
+                ).bind(&artifact_run).bind(&name).fetch_all(self.store.pool()).await
                     .map_err(|e| DispatchError::Artifact(format!("looking up artifact {name:?}: {e}")))?;
                 let candidates = rows.iter().map(|r| Ok(DownloadCandidate {
                     run_id: r.get("run_id"), name: r.get("name"), job_key: r.get("job_key"),
@@ -2838,7 +3293,7 @@ impl Dispatcher {
                         uri: r.get("uri"), public_url: r.get("public_url"),
                     },
                 })).collect::<Result<Vec<_>, DispatchError>>()?;
-                let selected = select_download(&msg.run_id, &name, producer.as_deref(), &candidates)?;
+                let selected = select_download(&artifact_run, &name, producer.as_deref(), &candidates)?;
                 let bytes = self.artifacts.get(&selected.stored).await
                     .map_err(|e| DispatchError::Artifact(format!("downloading artifact {name:?}: {e}")))?;
                 vm.upload_bytes(sid, &remote, &bytes).await?;
@@ -2847,7 +3302,7 @@ impl Dispatcher {
             }
             other => Err(DispatchError::Artifact(format!(
                 "`uses: {other}` is not a built-in action. Available: \
-                 ci/upload-artifact, ci/download-artifact, ci/merge-release, ci/checkout-release, ci/publish-service-archive, ci/deploy-service, ci/publish-rootfs, ci/deploy-app-lb. Composite actions from a repository are not \
+                 ci/upload-artifact, ci/download-artifact, ci/merge-release, ci/checkout-release, ci/publish-service-archive, ci/deploy-service, ci/publish-rootfs, ci/deploy-app-lb, ci/deploy-controller. Composite actions from a repository are not \
                  supported."
             ))),
         }
@@ -2979,29 +3434,6 @@ fn artifact_download_path(workdir: &str, path: &str) -> Result<String, DispatchE
     Ok(std::path::Path::new(workdir).join(relative).to_string_lossy().into_owned())
 }
 
-/// Give a second run of the same submission its own workspace.
-///
-/// Copy the source descriptor and regenerate its bounded workflow metadata.
-/// No repository is fetched or copied by the CI service.
-async fn copy_tree(
-    from: &crate::trigger::Workspace,
-    to: &crate::trigger::Workspace,
-) -> Result<(), DispatchError> {
-    let (format, path) = from
-        .stored_source()
-        .ok_or_else(|| DispatchError::Checkout("the first run's source is gone".into()))?;
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| DispatchError::Checkout(e.to_string()))?;
-    let source = crate::trigger::SourceArchive {
-        format: format.as_str().to_string(),
-        content_base64: String::new(),
-        bytes: Some(bytes),
-    };
-    crate::trigger::materialize(&source, to, usize::MAX)?;
-    Ok(())
-}
-
 /// Run one job under `CI_MAX_JOB_SECONDS`, measured from now — the moment the
 /// job was taken off the queue — and never from when it was queued.
 ///
@@ -3052,6 +3484,22 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
         };
 
         loop {
+            // Do not pull during a global drain's quiesced phase. In particular,
+            // a stale delivery must not hold an effect permit while waiting for
+            // the rollout that needs that same permit to finish.
+            if dispatcher.lifecycle.work(&dispatcher.store).await.is_err() {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            // Acquire before pulling: a standby must never remove a delivery
+            // from the shared consumer merely to hold or redeliver it.
+            let effect = match dispatcher.executor.effect_permit().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
             let (msg, permit) = match pull_with_capacity(&consumer, Arc::clone(&slots)).await {
                 Ok(Some(delivery)) => delivery,
                 Ok(None) => continue,
@@ -3075,6 +3523,7 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                 // host at a time, each getting its full budget from pickup.
                 Route::Runner(_) => {
                     let _permit = permit;
+                    let _effect = effect;
                     process_delivery(Arc::clone(&dispatcher), msg, job, attempt).await;
                 }
                 // The network's shared queue is where "any host" jobs wait, and
@@ -3090,6 +3539,7 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                     let dispatcher = Arc::clone(&dispatcher);
                     tokio::spawn(async move {
                         let _permit = permit;
+                        let _effect = effect;
                         process_delivery(dispatcher, msg, job, attempt).await;
                     });
                 }
@@ -3152,15 +3602,30 @@ async fn process_delivery(
         })
     };
 
+    // Quiescence can race an already outstanding pull. Return that delivery
+    // without beginning execution, releasing the caller's effect permit so
+    // handoff can finish. The pull-loop gate prevents repeatedly taking it
+    // while closed and consuming the entire redelivery budget.
+    let _work = match dispatcher.lifecycle.work(&dispatcher.store).await {
+        Ok(permit) => permit,
+        Err(e) => {
+            heartbeat.abort();
+            tracing::debug!(job = %job.job_key, "returning delivery across executor handoff: {e}");
+            if let Err(error) = msg.ack_with(AckKind::Nak(Some(Duration::from_secs(30)))).await {
+                tracing::warn!(job = %job.job_key, %error, "could not return delivery; broker acknowledgement timeout retains recovery");
+            }
+            return;
+        }
+    };
+
     // `CI_MAX_JOB_SECONDS` is enforced here, and only here. It used to
     // reach JetStream as `ack_wait` and nothing else, so once the ack
     // window stopped being derived from it the setting would have become
     // decorative — a documented ceiling on a job that bounded nothing.
     //
     // A job cut off this way leaves its VM claimed, because `run_job`
-    // never reaches its own release. The lease reclaims it once this
-    // dispatcher stops renewing, which is exactly the case leases exist
-    // for.
+    // never reaches its own release. Its durable executor obligation blocks
+    // reuse: dropping this future does not prove remote execution stopped.
     //
     // The clock starts *here*, on pickup. A job that sat on a queue
     // behind another build has spent none of its budget waiting: a
@@ -3168,8 +3633,16 @@ async fn process_delivery(
     // queue fans out, but either way the ceiling is measured from the
     // moment the job is taken, not from when it was submitted.
     let ceiling = dispatcher.config.max_job_duration;
-    let outcome =
-        bounded_from_pickup(ceiling, &job.job_key, dispatcher.run_job(&job, attempt)).await;
+    let outcome = loop {
+        let result = bounded_from_pickup(ceiling, &job.job_key, dispatcher.run_job(&job, attempt)).await;
+        if matches!(result, Err(DispatchError::MaintenancePaused)) {
+            // Preserve this delivery and its retry budget. Re-select on every
+            // pass so unpinned work can use another runner immediately.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        break result;
+    };
     // Before the ack, always — including on the error paths below, which
     // is why it is aborted here rather than in each arm.
     heartbeat.abort();
@@ -3188,6 +3661,28 @@ async fn process_delivery(
             let _ = msg.ack().await;
         }
         Err(e) => {
+            // Once an executor has claimed the job, even a timeout can mean
+            // that a remote command is still running. Keep the claim and its
+            // drain obligation; neither NATS redelivery nor lease expiry may
+            // retry these effects. Pre-claim placement errors still use the
+            // ordinary retry ladder below.
+            match dispatcher.store.has_host_work(&job.job_id).await {
+                Ok(true) => {
+                    let detail = format!("Execution outcome requires reconciliation; automatic retry withheld: {e}");
+                    tracing::warn!(job = %job.job_key, "{detail}");
+                    if let Err(error) = dispatcher.store.note_job_error(&job.job_id, &detail).await {
+                        tracing::error!(job = %job.job_key, %error, "could not persist unresolved execution");
+                        return;
+                    }
+                    let _ = msg.ack().await;
+                    return;
+                }
+                Err(error) => {
+                    tracing::error!(job = %job.job_key, %error, "execution ownership unknown; refusing retry");
+                    return;
+                }
+                Ok(false) => {}
+            }
             // Retryable up to `MAX_DELIVER`. Past that JetStream stops
             // redelivering, so the job is marked failed here rather than
             // left `running` forever with nothing coming back to it.
@@ -3390,6 +3885,17 @@ impl Dispatcher {
             // network, whatever its `uses:` said.
             let plan: Option<JobPlan> = serde_json::from_value(job.plan.clone()).ok();
             let placed = plan.as_ref().and_then(|p| Self::place(&pool, p).ok());
+            if let Some(placement) = &placed {
+                let runners: Vec<_> = if let Some(node) = placement.node { vec![node] }
+                    else { placement.network.runners.iter().collect() };
+                let mut maintenance = false;
+                for runner in runners {
+                    // A database failure is uncertainty, not evidence that a
+                    // deliberately held delivery should be discarded.
+                    maintenance |= crate::host_maintenance::cordoned(&self.store, &runner.id).await.unwrap_or(true);
+                }
+                if maintenance { continue; }
+            }
 
             // A host that came online between the query and now will take the
             // job, and failing it here would kill work about to start.
@@ -3702,6 +4208,29 @@ impl Dispatcher {
             .collect()
     }
 
+    /// Reclaim only idle CI caches, oldest first, until this host can admit
+    /// the requested VM. Never estimate recovered space from virtual disk size.
+    async fn reclaim_disk_space(&self, runner: &str, required: u64) -> Result<u64, DispatchError> {
+        let mut free = self.runners.free_disk_bytes(runner).await?;
+        while free < required {
+            let Some(vm) = self.pool.take_oldest_idle(runner).await? else {
+                return Err(DispatchError::DiskPressure(format!(
+                    "{runner} has {free} free disk bytes and no idle caches left; this job requires {required}"
+                )));
+            };
+            tracing::info!(runner, sandbox = %vm.sandbox_id, free, required,
+                "evicting idle CI cache for VM disk headroom");
+            let (_, failed) = self.destroy_swept(vec![vm]).await;
+            if !failed.is_empty() {
+                return Err(DispatchError::DiskPressure(format!(
+                    "{runner} idle-cache cleanup failed: {}", failed.join("; ")
+                )));
+            }
+            free = self.runners.free_disk_bytes(runner).await?;
+        }
+        Ok(free)
+    }
+
     /// Destroy VMs that have been taken out of circulation, and forget them.
     ///
     /// The row goes only once the daemon confirms — a row removed while the
@@ -3712,22 +4241,44 @@ impl Dispatcher {
         let mut destroyed = 0;
         let mut failed = Vec::new();
         for vm in taken {
-            let result = async {
+            let result = tokio::time::timeout(Duration::from_secs(30), async {
+                // Serialize deletion across controller processes. Keep the
+                // durable intent on error or cancellation, including after a
+                // daemon delete succeeds but this transaction cannot commit.
+                let mut tx = self.store.pool().begin().await?;
+                let owned: Option<Option<String>> = sqlx::query_scalar(
+                    "SELECT last_job FROM ci_vm_pool WHERE sandbox_id=$1
+                     AND runner_hd_id=$2 AND status='draining' AND eviction_requested
+                     FOR UPDATE SKIP LOCKED",
+                ).bind(&vm.sandbox_id).bind(&vm.runner_hd_id)
+                    .fetch_optional(&mut *tx).await?;
+                if owned.is_none() { return Ok::<_, anyhow::Error>(false); }
+                if let Some(job) = owned.flatten() {
+                    crate::debug_report::enqueue(&mut tx, &job, &vm.sandbox_id).await?;
+                }
                 let options = self.runners.options_for(&vm.runner_hd_id).await?;
                 let handle = self.vms.open(options, vm.sandbox_id.clone()).await?;
                 handle.destroy().await?;
-                Ok::<_, DispatchError>(())
-            }
-            .await;
+                anyhow::ensure!(matches!(handle.info().await,
+                    Err(VmError::Daemon { source: heyo_sdk::HeyoError::NotFound(_), .. })),
+                    "daemon has not confirmed cache VM removal");
+                sqlx::query("DELETE FROM ci_vm_pool WHERE sandbox_id=$1")
+                    .bind(&vm.sandbox_id).execute(&mut *tx).await?;
+                tx.commit().await?;
+                Ok(true)
+            }).await;
+            let result = result.unwrap_or_else(|_| Err(anyhow::anyhow!("cache eviction timed out")));
 
             match result {
-                Ok(()) => {
-                    if let Err(e) = self.pool.forget(&vm.sandbox_id).await {
-                        tracing::warn!(vm = %vm.sandbox_id, "destroyed but not forgotten: {e}");
-                    }
+                Ok(true) => {
                     destroyed += 1;
                 }
+                Ok(false) => {}
                 Err(e) => {
+                    // Keep the durable eviction, but do not retry forever on
+                    // the same dead loopback tunnel. Existing VM operations
+                    // retain their own connection, just as in vm_cleanup.
+                    self.runners.evict(&vm.runner_hd_id).await;
                     tracing::warn!(vm = %vm.sandbox_id, "could not destroy: {e}");
                     failed.push(format!("{}: {e}", vm.sandbox_id));
                 }
@@ -3738,8 +4289,12 @@ impl Dispatcher {
 
     /// Destroy one pooled VM by id.
     pub async fn destroy_pooled_vm(&self, sandbox_id: &str) -> Result<String, DispatchError> {
+        self.destroy_run_cache(sandbox_id, None).await
+    }
+
+    pub async fn destroy_run_cache(&self, sandbox_id: &str, run_id: Option<&str>) -> Result<String, DispatchError> {
         let ours = self.served_runner_ids();
-        let Some(taken) = self.pool.take_one_for_sweep(sandbox_id, &ours).await? else {
+        let Some(taken) = self.pool.take_run_cache_for_sweep(sandbox_id, &ours, run_id).await? else {
             return Err(DispatchError::VmNotSweepable(sandbox_id.to_string()));
         };
         let (destroyed, failed) = self.destroy_swept(vec![taken]).await;
@@ -3832,6 +4387,29 @@ impl Dispatcher {
     /// sibling that dies is reclaimed within a lease period instead of leaking
     /// until somebody happens to restart this process.
     pub fn spawn_lease_loop(self: Arc<Self>) {
+        let images = self.clone();
+        // Slow image IO must not hold up VM lease/TTL renewal.
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Ok(_effect) = images.executor.effect_permit().await else { continue };
+                let Ok(_work) = images.lifecycle.work(&images.store).await else { continue };
+                for runner in images.served_runner_ids() {
+                    let result = async {
+                        let options = images.runners.options_for(&runner).await?;
+                        images.images.evict_one(&runner, Duration::ZERO, options).await?;
+                        Ok::<_, DispatchError>(())
+                    };
+                    match tokio::time::timeout(Duration::from_secs(30), result).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!(%runner, "CI image cleanup unresolved: {e}"),
+                        Err(_) => tracing::warn!(%runner, "CI image cleanup timed out; catalog retained"),
+                    }
+                }
+            }
+        });
         // Comfortably inside the lease, so a slow database or a paused process
         // gets several chances before its VMs are taken. Losing a lease that is
         // still in use would put two instances on one VM, which is much worse
@@ -3842,6 +4420,8 @@ impl Dispatcher {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                let Ok(_effect) = self.executor.effect_permit().await else { continue };
+                let Ok(_work) = self.lifecycle.work(&self.store).await else { continue };
                 if let Err(e) = self.pool.renew_leases(self.lease()).await {
                     // Not fatal, and not worth giving up a VM over: the lease
                     // has time left, and the next tick may well succeed.
@@ -3873,7 +4453,9 @@ impl Dispatcher {
     /// fail a live build or forget a machine that still exists.
     async fn sweep_idle_pool(&self) {
         let ours = self.served_runner_ids();
-        let idle_secs = self.config.heyvm.vm_idle.as_secs() as i64;
+        // Retire legacy idle job caches immediately; active/service ownership
+        // remains protected by the pool's claim and maintenance checks.
+        let idle_secs = 0;
         let taken = async {
             let live = self.pool.recent_fingerprints(&ours, idle_secs).await?;
             self.pool.take_for_sweep(&ours, &live, idle_secs).await
@@ -4027,6 +4609,7 @@ fn output_marker(step_id: &str) -> String {
 fn driver_name(driver: heyo_sdk::SandboxDriver) -> &'static str {
     match driver {
         heyo_sdk::SandboxDriver::Firecracker => "firecracker",
+        heyo_sdk::SandboxDriver::FirecrackerContainerd => "firecracker_containerd",
         heyo_sdk::SandboxDriver::Kvm => "kvm",
         heyo_sdk::SandboxDriver::Libvirt => "libvirt",
     }
@@ -4040,6 +4623,22 @@ fn host_can_run(supported: Option<&[String]>, driver: &str) -> bool {
         Some(list) => list.iter().any(|d| d == driver),
         None => true,
     }
+}
+
+/// A conservative lower bound: data disk, two declared rootfs copies (image
+/// and VM), and 5 GiB left for host operation. Auto-sized images/build scratch
+/// are unknown here; this is admission headroom, not a storage reservation.
+fn runner_disk_requirement(spec: &crate::vm::VmSpec) -> u64 {
+    let data = u64::from(spec.disk_size_gb.unwrap_or(0)) * (1 << 30);
+    let rootfs = spec.build.as_ref().and_then(|b| b.size_mb).unwrap_or(0)
+        .saturating_mul(1 << 20).saturating_mul(2);
+    data.saturating_add(rootfs).saturating_add(5 * (1 << 30))
+}
+
+fn roomiest_runner(candidates: Vec<(String, u64)>, required: u64) -> Option<String> {
+    candidates.into_iter().filter(|(_, free)| *free >= required).max_by(|a, b| {
+        a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0))
+    }).map(|(id, _)| id)
 }
 
 /// The TTL a VM is parked with, and so boots with on its next claim: the longer
@@ -4208,6 +4807,9 @@ fn or_none(items: &[String]) -> String {
 
 #[derive(Debug)]
 pub enum DispatchError {
+    MaintenancePaused,
+    ControllerUnavailable(String),
+    DiskPressure(String),
     Native(String),
     Store(crate::store::StoreError),
     Pool(crate::pool::PoolError),
@@ -4404,6 +5006,7 @@ impl std::fmt::Display for DispatchError {
             Self::BadPlan(e) => write!(f, "the stored plan could not be read: {e}"),
             Self::Condition(e) => write!(f, "an `if:` condition could not be evaluated: {e}"),
             Self::UnknownJob(id) => write!(f, "no job {id} exists"),
+            Self::MaintenancePaused => write!(f, "runner is cordoned for host maintenance; job remains queued"),
             Self::UnknownRunner { wanted, network } => write!(
                 f,
                 "no runner {wanted:?} is a host member of network {network:?}. Add it \
@@ -4455,6 +5058,7 @@ impl std::fmt::Display for DispatchError {
                  that was running — the command in the guest finishes or hits its own \
                  timeout, since the daemon cannot abort it — and nothing after it ran."
             ),
+            Self::DiskPressure(message) => write!(f, "{message}"),
             Self::VmNotSweepable(id) => write!(
                 f,
                 "{id} cannot be destroyed from here. It is either unknown, on a host \
@@ -4518,6 +5122,7 @@ impl std::fmt::Display for DispatchError {
             Self::Artifact(r) => write!(f, "{r}"),
             Self::Trigger(e) => write!(f, "{e}"),
             Self::Workflow(e) => write!(f, "{e}"),
+            Self::ControllerUnavailable(e) => write!(f, "{e}"),
         }
     }
 }
@@ -5807,6 +6412,35 @@ mod tests {
         assert_eq!(super::driver_name(heyo_sdk::SandboxDriver::Kvm), "kvm");
     }
 
+    #[test]
+    fn disk_placement_prefers_capacity_not_discovery_order() {
+        let gib = 1 << 30;
+        for eu1 in [0, 21 * gib, 80 * gib] {
+            let hosts = vec![("eu1".into(), eu1), ("us3".into(), 2808 * gib)];
+            let reverse = hosts.iter().cloned().rev().collect();
+            assert_eq!(super::roomiest_runner(hosts, 65 * gib).as_deref(), Some("us3"));
+            assert_eq!(super::roomiest_runner(reverse, 65 * gib).as_deref(), Some("us3"));
+        }
+        assert_eq!(super::roomiest_runner(vec![("full".into(), 64)], 65), None);
+        assert_eq!(super::roomiest_runner(vec![("exact".into(), 65)], 65).as_deref(), Some("exact"));
+        assert_eq!(super::roomiest_runner(vec![], 65), None);
+        for hosts in [vec![("b".into(), 70), ("a".into(), 70)], vec![("a".into(), 70), ("b".into(), 70)]] {
+            assert_eq!(super::roomiest_runner(hosts, 65).as_deref(), Some("a"));
+        }
+    }
+
+    #[test]
+    fn disk_placement_budgets_image_copy_data_and_host_headroom() {
+        let mut spec = crate::vm::VmSpec::default();
+        spec.disk_size_gb = Some(40);
+        spec.build = Some(crate::vm::ImageBuild {
+            dockerfile: "Dockerfile".into(), context: None, size_mb: Some(10240),
+        });
+        assert_eq!(super::runner_disk_requirement(&spec), 69_793_218_560);
+        spec.build.as_mut().unwrap().size_mb = Some(u64::MAX);
+        assert_eq!(super::runner_disk_requirement(&spec), u64::MAX);
+    }
+
     /// A workflow that declares a long `ttl_seconds` keeps its warm VM that
     /// long while idle; one that declares nothing (or something shorter) gets
     /// the instance default. Repooling with the short default was how a warm
@@ -5920,8 +6554,8 @@ mod tests {
     //
     // The whole path: a run is created, the scheduler queues its jobs, a
     // consumer pulls one, a real VM boots on the local heyvmd, the steps run,
-    // and the results land in Postgres. Then a second run proves the VM is
-    // reused, and a third proves a changed `cache_key_files` entry busts it.
+    // and the results land in Postgres. A second run must use a fresh VM even
+    // with the same fingerprint; changed inputs must change the fingerprint.
     //
     //   CI_TEST_DATABASE_URL=postgres://… CI_TEST_NATS_URL=nats://127.0.0.1:4222 \
     //     cargo test --bin ci -- --ignored --nocapture end_to_end
@@ -5976,6 +6610,8 @@ mod tests {
         );
 
         Arc::new(Dispatcher {
+            lifecycle: Arc::new(crate::lifecycle::Lifecycle::default()),
+            executor: Arc::new(crate::executor::ExecutorOwner::register(store.pool().clone(), &format!("dispatch-test-{}", uuid::Uuid::new_v4())).await.expect("executor")),
             config: config.clone(),
             store: store.clone(),
             pool: Pool::new(store.pool().clone()),
@@ -5990,6 +6626,901 @@ mod tests {
             // takes anyway.
             objects: Arc::new(crate::objects::Workflows::new(&config)),
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
+    async fn delivery_racing_quiescence_releases_the_handoff_permit() {
+        let base = std::env::var("CI_TEST_DATABASE_URL").unwrap();
+        let admin = sqlx::PgPool::connect(&base).await.unwrap();
+        let schema = format!("delivery_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&admin).await.unwrap();
+        admin.close().await;
+        let mut url = reqwest::Url::parse(&base).unwrap();
+        url.query_pairs_mut().append_pair("options", &format!("-c search_path={schema}"));
+        unsafe { std::env::set_var("CI_TEST_DATABASE_URL", url.as_str()); }
+        let root = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(root.path()).await;
+        unsafe { std::env::set_var("CI_TEST_DATABASE_URL", base); }
+        sqlx::raw_sql("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES('run','test','ci.yml','running');
+            INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES('job','run','deploy','deploy','Deploy','success');
+            INSERT INTO ci_step(id,job_id,idx,name,uses,status) VALUES('step','job',0,'Request','ci/deploy-controller','success');
+            INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES('op','step','run','job','ci','hash','running','source','main');
+            INSERT INTO ci_controller_rollout(id,request,phase) VALUES('op','{}','quiesced');")
+            .execute(d.store.pool()).await.unwrap();
+        let route = Route::Network("handoff-network".into());
+        let consumer = d.bus.consumer_for(&route).await.unwrap();
+        let job = JobMessage { run_id: "run".into(), job_id: "job".into(), job_key: "deploy".into() };
+        d.bus.publish_job(&route, &job).await.unwrap();
+        let (message, _slot) = pull_with_capacity(&consumer, Arc::new(tokio::sync::Semaphore::new(1))).await.unwrap().unwrap();
+        let effect = d.executor.effect_permit().await.unwrap();
+        let running = d.clone();
+        let task = tokio::spawn(async move {
+            let _effect = effect;
+            process_delivery(running, message, job, 1).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), task).await.expect("closed work cannot wait for rollout while retaining the handoff permit").unwrap();
+        let fence = tokio::time::timeout(Duration::from_secs(2), d.executor.handoff_fence()).await.unwrap().unwrap();
+        d.lifecycle.verify_handoff_quiesced(&d.store, "op").await.unwrap();
+        assert_eq!(d.store.get_job("job").await.unwrap().unwrap().status, "success");
+        drop(fence);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; run alone; no VM execution"]
+    async fn managed_release_reconciles_after_job_exit_and_replays_uncertain_submission() {
+        use axum::{routing::{get,post},Router,Json,http::{HeaderMap,StatusCode}};
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let command=serde_json::json!({"operationId":"release","archiveId":"archive-v2",
+            "archiveSha256":"a".repeat(64),"runtimeRevision":"revision-v2"});
+        let posts=Arc::new(AtomicUsize::new(0));
+        let mode=Arc::new(AtomicUsize::new(0));
+        let receipt=serde_json::json!({"operationId":"release","serviceId":"ci","request":command,
+            "status":"running","verified":false,"targets":[
+                {"deploymentId":"new-us","region":"us3","revision":"revision-v2"},
+                {"deploymentId":"new-eu","region":"eu1","revision":"revision-v2"}]});
+        let p=posts.clone(); let expected=command.clone(); let submitted=receipt.clone();
+        let m=mode.clone(); let mut completed=receipt.clone();
+        completed["status"]=serde_json::json!("passed"); completed["verified"]=serde_json::json!(true);
+        for t in completed["targets"].as_array_mut().unwrap() {
+            t["bootId"]=serde_json::json!(uuid::Uuid::new_v4());
+            t["backendServerId"]=serde_json::json!(format!("host-{}",t["region"]));
+            t["backendSandboxId"]=t["deploymentId"].clone();
+        }
+        let api=Router::new().route("/orchestration/services/ci/managed-updates",post(move |headers:HeaderMap,Json(body):Json<serde_json::Value>| {
+            let p=p.clone(); let expected=expected.clone(); let response=submitted.clone(); async move {
+                assert_eq!(headers["authorization"],"Bearer lifecycle-test"); assert_eq!(body,expected);
+                if p.fetch_add(1,Ordering::SeqCst)==0 {(StatusCode::SERVICE_UNAVAILABLE,Json(serde_json::Value::Null))}
+                else {(StatusCode::ACCEPTED,Json(response))}
+            }
+        })).route("/orchestration/services/ci/managed-updates/release",get(move || {
+            let mode=m.load(Ordering::SeqCst); let mut response=completed.clone(); async move {
+                if mode==0 {response["targets"][1]["deploymentId"]=serde_json::json!("wrong-eu");}
+                Json(response)
+            }
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {axum::serve(listener,api).await.unwrap()});
+        let base=std::env::var("CI_TEST_DATABASE_URL").unwrap();
+        let admin=sqlx::PgPool::connect(&base).await.unwrap();
+        let schema=format!("managed_release_{}",uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&admin).await.unwrap();
+        let mut url=reqwest::Url::parse(&base).unwrap();
+        url.query_pairs_mut().append_pair("options",&format!("-c search_path={schema}"));
+        unsafe {
+            std::env::set_var("CI_TEST_DATABASE_URL",url.as_str());
+            std::env::set_var("HEYO_DEPLOYMENT_ID","old-us");
+            std::env::set_var("HEYO_SERVICE_ID","ci");
+            std::env::set_var("CI_APPLICATION_ORCHESTRATOR_URL",address);
+            std::env::set_var("CI_APPLICATION_LIFECYCLE_TOKEN","lifecycle-test");
+        }
+        let root=tempfile::tempdir().unwrap(); let d=test_dispatcher(root.path()).await;
+        unsafe {
+            std::env::set_var("CI_TEST_DATABASE_URL",base);
+            for key in ["HEYO_DEPLOYMENT_ID","HEYO_SERVICE_ID","CI_APPLICATION_ORCHESTRATOR_URL","CI_APPLICATION_LIFECYCLE_TOKEN"] {std::env::remove_var(key);}
+        }
+        sqlx::raw_sql("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES('run','test','ci.yml','running');
+            INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES('job','run','deploy','deploy','Deploy','running');
+            INSERT INTO ci_step(id,job_id,idx,name,status) VALUES('step','job',0,'Request','success');")
+            .execute(d.store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_managed_update(operation_id,step_id,run_id,job_id,service_id,request) VALUES('release','step','run','job','ci',$1)")
+            .bind(&command).execute(d.store.pool()).await.unwrap();
+        crate::managed_update::reconcile(&d).await.unwrap(); assert_eq!(posts.load(Ordering::SeqCst),0);
+        d.store.set_job_status("job",crate::store::JobStatus::Success,None).await.unwrap();
+        assert!(crate::managed_update::reconcile(&d).await.is_err());
+        assert_eq!(posts.load(Ordering::SeqCst),1);
+        // The failed HTTP observation must not retain the local effect permit.
+        drop(tokio::time::timeout(Duration::from_secs(1),d.executor.handoff_fence()).await.unwrap().unwrap());
+        crate::managed_update::reconcile(&d).await.unwrap(); assert_eq!(posts.load(Ordering::SeqCst),2);
+        assert_eq!(d.store.get_run("run").await.unwrap().unwrap().status,"running");
+        assert!(crate::managed_update::reconcile(&d).await.is_err(),"changed regional identity cannot complete the release");
+        mode.store(1,Ordering::SeqCst);
+        crate::managed_update::reconcile(&d).await.unwrap();
+        assert_eq!(d.store.get_run("run").await.unwrap().unwrap().status,"success");
+        crate::managed_update::reconcile(&d).await.unwrap(); assert_eq!(posts.load(Ordering::SeqCst),2);
+        server.abort();
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
+    async fn published_release_failed_only_retry_preserves_identity_and_single_flight() {
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let validation = crate::workflow::Workflow::parse("build.yml", "jobs:\n  build:\n    steps: [{run: cargo test}]\n").unwrap();
+        let release = crate::workflow::Workflow::parse("release.yml", r#"
+on: release
+jobs:
+  merge:
+    steps: [{uses: ci/merge-release, with: {manifests: '[]'}}]
+  us:
+    needs: [merge]
+    steps: [{uses: ci/rollout-service}]
+  eu:
+    needs: [us]
+    steps: [{uses: ci/rollout-host-app-lb}, {uses: ci/rollout-service}]
+"#).unwrap();
+        let validation_plan = crate::plan::Plan::build(&validation).unwrap();
+        let release_plan = crate::plan::Plan::build(&release).unwrap();
+        let source_run = format!("release-{}", crate::vm::new_id());
+        let validation_run = format!("validation-{}", crate::vm::new_id());
+        let sha = "a".repeat(40);
+        let request = crate::store::RunRequest { repo_url: "https://example.test/repo.git".into(),
+            git_ref: "refs/heads/main".into(), sha: sha.clone(), changes: crate::paths::Changes::unknown("frozen"), ..Default::default() };
+        let mut tx = d.store.pool().begin().await.unwrap();
+        Store::create_run_in(&mut tx, &validation_run, &request, &validation_plan).await.unwrap();
+        Store::create_run_in(&mut tx, &source_run, &request, &release_plan).await.unwrap();
+        sqlx::query("INSERT INTO ci_run_source(run_id,descriptor) VALUES($1,'frozen-source'),($2,'frozen-source')")
+            .bind(&validation_run).bind(&source_run).execute(&mut *tx).await.unwrap();
+        crate::submission::record(&mut tx, &source_run, std::slice::from_ref(&validation_run)).await.unwrap();
+        tx.commit().await.unwrap();
+        let validation_job = d.store.jobs_of(&validation_run).await.unwrap().remove(0);
+        d.store.create_step(&crate::store::step_id(&validation_job.id, 0), &validation_job.id, 0, "test", None).await.unwrap();
+        d.store.finish_step(&crate::store::step_id(&validation_job.id, 0), StepStatus::Success, Some(0), None).await.unwrap();
+        d.store.set_job_status(&validation_job.id, JobStatus::Success, None).await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='success' WHERE id=$1").bind(&validation_run).execute(d.store.pool()).await.unwrap();
+        let jobs = d.store.jobs_of(&source_run).await.unwrap();
+        for job in &jobs {
+            d.store.set_job_status(&job.id, if job.job_key == "eu" { JobStatus::Failure } else { JobStatus::Success }, None).await.unwrap();
+        }
+        let eu_job = jobs.iter().find(|j| j.job_key == "eu").unwrap();
+        let completed_step = crate::store::step_id(&eu_job.id, 0);
+        d.store.create_step(&completed_step, &eu_job.id, 0, "app-lb", Some("ci/rollout-host-app-lb")).await.unwrap();
+        d.store.finish_step(&completed_step, StepStatus::Success, Some(0), None).await.unwrap();
+        let operation = format!("host-{source_run}");
+        sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES($1,$2,$3,$4,'app-lb-eu1','hash','passed',$5,'refs/heads/main')")
+            .bind(&operation).bind(&completed_step).bind(&source_run).bind(&eu_job.id).bind(&sha)
+            .execute(d.store.pool()).await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id=$1").bind(&source_run).execute(d.store.pool()).await.unwrap();
+        let prepared = json!({"source_sha":sha,"release_sha":sha,"git_ref":"refs/heads/main","versions":{},"tags":[]});
+        sqlx::query("INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status) VALUES($1,'request',$2,$2,'refs/heads/main','{}',$2,$3,'published')")
+            .bind(&source_run).bind(&sha).bind(&prepared).execute(d.store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_artifact(id,run_id,job_id,name,sink,digest,size_bytes,uri) VALUES('frozen-artifact',$1,$2,'bundle','artifacts',$3,17,'blob')")
+            .bind(&validation_run).bind(&validation_job.id).bind("b".repeat(64)).execute(d.store.pool()).await.unwrap();
+
+        assert!(d.rerun(&source_run, false, None).await.err().unwrap().to_string().contains("full release reruns are unsupported"));
+        let admitted = d.retry_published_release(&source_run, None).await.unwrap();
+        let retry = &admitted.run_ids[0];
+        assert_eq!(crate::submission::validations(&d.store, retry).await.unwrap(), [validation_run.clone()]);
+        assert_eq!(crate::submission::artifact_run(&d.store, retry, "build.yml").await.unwrap(), validation_run);
+        assert_eq!(d.store.source_bytes(retry).await.unwrap(), b"frozen-source");
+        let copied = crate::release::get(&d.store, retry).await.unwrap().unwrap();
+        assert_eq!(copied.status, "published");
+        assert_eq!(copied.prepared.release_sha, sha);
+        let retry_jobs = d.store.jobs_of(retry).await.unwrap();
+        assert_eq!(retry_jobs.iter().find(|j| j.job_key == "us").unwrap().status, "success");
+        assert_eq!(retry_jobs.iter().find(|j| j.job_key == "eu").unwrap().status, "pending");
+        let retry_eu = retry_jobs.iter().find(|j| j.job_key == "eu").unwrap();
+        let retained: Vec<(i32, String)> = sqlx::query_as("SELECT step_index,deployment_id FROM ci_release_carried_deployment WHERE job_id=$1")
+            .bind(&retry_eu.id).fetch_all(d.store.pool()).await.unwrap();
+        assert_eq!(retained, vec![(0, operation.clone())], "retain only app-lb, not the failed service step");
+        assert!(d.retry_published_release(&source_run, None).await.err().unwrap().to_string().contains("latest descendant"));
+
+        d.store.set_job_status(&retry_eu.id, JobStatus::Failure, None).await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id=$1").bind(retry).execute(d.store.pool()).await.unwrap();
+        let (first, duplicate) = tokio::join!(d.retry_published_release(retry, None), d.retry_published_release(retry, None));
+        assert_ne!(first.is_ok(), duplicate.is_ok(), "only one concurrent retry may be admitted");
+        let descendant = first.or(duplicate).unwrap().run_ids.remove(0);
+        let inherited: String = sqlx::query_scalar("SELECT deployment_id FROM ci_release_carried_deployment WHERE job_id=$1 AND step_index=0")
+            .bind(crate::store::job_id(&descendant, "eu")).fetch_one(d.store.pool()).await.unwrap();
+        assert_eq!(inherited, operation, "receipt survives more than one retry");
+
+        sqlx::query("UPDATE ci_release SET status='unknown' WHERE run_id=$1").bind(retry).execute(d.store.pool()).await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id=$1").bind(retry).execute(d.store.pool()).await.unwrap();
+        assert!(d.retry_published_release(retry, None).await.err().unwrap().to_string().contains("confirmed published"));
+        assert!(crate::submission::authorize_publication(&d.store, &validation_run).await.is_err(),
+            "reusing validation membership must not relax validation-only publication restrictions");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
+    async fn accepted_source_can_be_rerun_from_another_controller_without_its_disk() {
+        unsafe { std::env::set_var("CI_NATIVE_RUNNER_SECRET", "test-shared-source"); }
+        let first_disk = tempfile::tempdir().unwrap();
+        let second_disk = tempfile::tempdir().unwrap();
+        let first = test_dispatcher(first_disk.path()).await;
+        let second = test_dispatcher(second_disk.path()).await;
+        let source = serde_json::to_vec(&json!({
+            "baseRevision": "a".repeat(40), "targetTree": "b".repeat(40), "patchBase64": "AAEC",
+            "workflows": {".ci/workflows/build.yml": "name: shared-source\njobs:\n  build:\n    runs-on: [macos-intel]\n    steps: [{run: echo shared}]\n"}
+        })).unwrap();
+        let mut req: crate::trigger::SubmitRequest = serde_json::from_value(json!({
+            "repository": {"url": "https://example.test/shared.git", "name": "shared"},
+            "ref": "refs/heads/main", "after": "a".repeat(40),
+            "source": {"format": "git-patch", "contentBase64": ""}
+        })).unwrap();
+        req.source.bytes = Some(source.clone());
+        let accepted = first.submit(&req, None, None).await.unwrap();
+        assert_eq!(accepted.run_ids.len(), 1);
+        let run = &accepted.run_ids[0];
+        assert_eq!(second.store.source_bytes(run).await.unwrap(), source);
+        first.store.cancel_run(run).await.unwrap();
+        drop(first_disk);
+        let rerun = second.rerun(run, false, None).await.unwrap();
+        assert_eq!(rerun.run_ids.len(), 1);
+        assert_eq!(second.store.source_bytes(&rerun.run_ids[0]).await.unwrap(), source);
+        assert_eq!(second.store.get_run(&rerun.run_ids[0]).await.unwrap().unwrap().rerun_of.as_deref(), Some(run.as_str()));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
+    async fn cancellation_cannot_bypass_execution_ownership_by_rerunning() {
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let wf = crate::workflow::Workflow::parse("retry.yml", "jobs:\n  build:\n    steps: [{run: echo test}]\n").unwrap();
+        let plan = crate::plan::Plan::build(&wf).unwrap();
+        for native in [false, true] {
+            let run = crate::vm::new_id();
+            d.store.create_run(&run, &crate::store::RunRequest::default(), &plan).await.unwrap();
+            let job = d.store.jobs_of(&run).await.unwrap().remove(0);
+            if native {
+                sqlx::query("INSERT INTO ci_native_job(job_id,run_id,required_labels,state,lease_expires_at) VALUES($1,$2,'{}','leased',now()-interval '1 hour')")
+                    .bind(&job.id).bind(&run).execute(d.store.pool()).await.unwrap();
+            } else {
+                assert!(d.store.claim_job(&job.id, "hd-local", 1).await.unwrap());
+            }
+            d.store.cancel_run(&run).await.unwrap();
+            assert!(d.rerun(&run, false, None).await.err().expect("rerun must be refused").to_string().contains("unresolved execution"));
+            assert!(d.store.reruns_of(&run).await.unwrap().is_empty());
+            // Model verified release to exercise both sides of the barrier.
+            if native {
+                sqlx::query("UPDATE ci_native_job SET state='completed' WHERE job_id=$1")
+                    .bind(&job.id).execute(d.store.pool()).await.unwrap();
+            } else { d.store.end_host_work(&job.id, "hd-local", 1).await.unwrap(); }
+            assert!(!d.store.has_unresolved_execution(&run).await.unwrap());
+            let error = d.rerun(&run, false, None).await.err().expect("fixture source is absent").to_string();
+            assert!(error.contains("source of run"), "ownership cleared, so the absent fixture source is now the blocker: {error}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
+    async fn failed_dependency_settles_transitive_jobs_without_skipping_cleanup() {
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let wf = crate::workflow::Workflow::parse("cascade.yml", r#"
+jobs:
+  z-build:
+    strategy:
+      matrix:
+        cell: [one, two]
+    steps: [{run: 'true'}]
+  y-first:
+    needs: [z-build]
+    steps: [{run: 'true'}]
+  b-second:
+    needs: [y-first]
+    steps: [{run: 'true'}]
+  a-third:
+    needs: [b-second]
+    steps: [{run: 'true'}]
+  cleanup:
+    needs: [a-third]
+    if: ${{ always() }}
+    steps: [{run: 'true'}]
+  independent:
+    steps: [{run: 'true'}]
+"#).unwrap();
+        let plan = crate::plan::Plan::build(&wf).unwrap();
+        let run = format!("cascade-{}", crate::vm::new_id());
+        d.store.create_run(&run, &crate::store::RunRequest {
+            workflow_id: "cascade".into(), source: "test".into(), ..Default::default()
+        }, &plan).await.unwrap();
+        let jobs = d.store.jobs_of(&run).await.unwrap();
+        let cells: Vec<_> = jobs.iter().filter(|j| j.base_id == "z-build").collect();
+        assert_eq!(cells.len(), 2);
+        d.store.set_job_status(&cells[0].id, JobStatus::Failure, Some("build failed")).await.unwrap();
+        d.store.set_job_status(&cells[1].id, JobStatus::Running, None).await.unwrap();
+        d.advance_run(&run).await.unwrap();
+        let states = d.store.jobs_of(&run).await.unwrap();
+        assert_eq!(states.iter().find(|j| j.base_id == "y-first").unwrap().status, "pending", "wait for all matrix cells");
+        assert_eq!(states.iter().find(|j| j.base_id == "independent").unwrap().status, "queued");
+        d.store.set_job_status(&cells[1].id, JobStatus::Success, None).await.unwrap();
+        d.advance_run(&run).await.unwrap();
+        let states = d.store.jobs_of(&run).await.unwrap();
+        for name in ["y-first", "b-second", "a-third"] {
+            assert_eq!(states.iter().find(|j| j.base_id == name).unwrap().status, "skipped", "{name}");
+        }
+        assert_eq!(states.iter().find(|j| j.base_id == "cleanup").unwrap().status, "queued");
+        assert!(!states.iter().any(|j| j.status == "pending"));
+        assert_eq!(d.store.get_run(&run).await.unwrap().unwrap().status, "failure");
+        // A failed run is still unsafe to rerun while independent/cleanup jobs run.
+        assert!(d.rerun(&run, true, None).await.err().unwrap().to_string().contains("still active"));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; fake source builder"]
+    async fn cached_image_is_rebuilt_before_the_current_job_creates_a_vm() {
+        use axum::{Json, Router, routing::post};
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = posts.clone();
+        let name = "ci-img-012345abcdef";
+        let app = Router::new().route("/sources/src-rebuild/image", post(move || {
+            let calls = calls.clone();
+            async move {
+                let prior = calls.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"name":name,"status":if prior==0 { "building" } else { "ready" }}))
+            }
+        }).get(move || async move { Json(json!({"name":name,"status":"ready","size_bytes":8192})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        unsafe { std::env::set_var("CI_TEST_DAEMON", format!("http://{}", listener.local_addr().unwrap())); }
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let workflow = crate::workflow::Workflow::parse("rebuild.yml", "jobs:\n  build:\n    steps: [{run: echo test}]\n").unwrap();
+        let plan = crate::plan::Plan::build(&workflow).unwrap();
+        let run = crate::vm::new_id();
+        d.store.create_run(&run, &crate::store::RunRequest { repo_url: "https://example.test/repo.git".into(), ..Default::default() }, &plan).await.unwrap();
+        let job = d.store.jobs_of(&run).await.unwrap().remove(0);
+        assert!(d.store.claim_job(&job.id, "hd-local", 1).await.unwrap());
+        d.images.claim(name, "hd-local", "wf", &job.id, crate::image::BUILD_LEASE).await.unwrap();
+        d.images.mark_ready(name, "hd-local", 1024).await.unwrap();
+        let prepared = crate::image::PreparedSource { source_id: "src-rebuild".into(), cache_keys: Default::default(),
+            image: Some(crate::image::PreparedImage { name: name.into(), input_digest: "0".repeat(64) }) };
+        let build = serde_json::from_value(json!({"dockerfile":"Dockerfile"})).unwrap();
+        let msg = JobMessage { run_id: run.clone(), job_id: job.id.clone(), job_key: job.job_key.clone() };
+        let resolved = d.ensure_image("hd-local", &plan.jobs[0], &build, &prepared, &msg).await.unwrap();
+        assert_eq!(resolved, name);
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "a ready DB row must not bypass the daemon");
+        assert_eq!(d.images.inventory(&["hd-local".into()]).await.unwrap()[0].size_bytes, 8192);
+        // Active executor evidence blocks retention even with a zero window.
+        d.images.evict_one("hd-local", Duration::ZERO, d.runners.options_for("hd-local").await.unwrap()).await.unwrap();
+        assert_eq!(d.images.status_of(name, "hd-local").await.unwrap().as_deref(), Some("ready"));
+        d.ensure_image("hd-local", &plan.jobs[0], &build, &prepared, &msg).await.unwrap();
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
+        assert_eq!(d.images.inventory(&["hd-local".into()]).await.unwrap()[0].size_bytes, 8192,
+            "a ready receipt without size must not erase known accounting");
+        d.store.end_host_work(&job.id, "hd-local", 1).await.unwrap();
+        d.images.forget(name, "hd-local").await.unwrap();
+        sqlx::query("DELETE FROM ci_run WHERE id=$1").bind(&run).execute(d.store.pool()).await.unwrap();
+        d.bus.js_delete_streams().await.unwrap();
+        server.abort();
+        unsafe { std::env::remove_var("CI_TEST_DAEMON"); }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs empty disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; tests global drain with fake heyvm HTTP"]
+    async fn durable_vm_cleanup_recovers_without_guessing_ownership() {
+        use crate::vm_cleanup::{handoff, reconcile};
+        use axum::{Json, Router, extract::{Path, State}, http::StatusCode, response::IntoResponse, routing::{get, post}};
+        #[derive(Default)]
+        struct Remote { stopped: bool, removed: bool, wrong: bool, lost: bool, ineffective: bool, stops: usize, deletes: usize }
+        let remote = Arc::new(std::sync::Mutex::new(Remote::default()));
+        let app = Router::new()
+            .route("/storage", get(|| async { Json(json!({"free_bytes":1u64 << 50})) }))
+            .route("/capabilities", get(|| async { Json(json!({"supportedDrivers":["firecracker"]})) }))
+            .route("/deployed-sandboxes/{id}", get(|State(remote): State<Arc<std::sync::Mutex<Remote>>>, Path(id): Path<String>| async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let r = remote.lock().unwrap();
+                if r.removed { return StatusCode::NOT_FOUND.into_response(); }
+                Json(json!({"id":if r.wrong { "another-vm".to_string() } else { id },
+                    "status":if r.stopped { "stopped" } else { "running" }, "status_changed_at":"2026-09-17T00:00:00Z"})).into_response()
+            }).delete(|State(remote): State<Arc<std::sync::Mutex<Remote>>>| async move {
+                let mut r = remote.lock().unwrap();
+                assert!(r.stopped, "deletion requires verified stop");
+                r.deletes += 1; r.removed = true;
+                if r.lost { StatusCode::BAD_GATEWAY.into_response() } else { Json(json!({})).into_response() }
+            }))
+            .route("/sandbox/{id}/stop", post(|State(remote): State<Arc<std::sync::Mutex<Remote>>>| async move {
+                let mut r = remote.lock().unwrap(); r.stops += 1;
+                if !r.ineffective { r.stopped = true; }
+                if r.lost { StatusCode::BAD_GATEWAY.into_response() } else { Json(json!({})).into_response() }
+            })).with_state(remote.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        unsafe { std::env::set_var("CI_TEST_DAEMON", format!("http://{}", listener.local_addr().unwrap())); }
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        for scenario in ["lost-stop", "ineffective-stop", "wrong-id", "changed-owner", "changed-attempt", "cancel", "destroy-loss", "concurrent"] {
+            *remote.lock().unwrap() = Remote::default();
+            let workflow = crate::workflow::Workflow::parse("cleanup.yml", "jobs:\n  build:\n    steps: [{run: echo test}]\n").unwrap();
+            let plan = crate::plan::Plan::build(&workflow).unwrap();
+            let run = crate::vm::new_id(); let sandbox = format!("sb-{run}");
+            d.store.create_run(&run, &crate::store::RunRequest { repo_url: "https://example.test/repo.git".into(), ..Default::default() }, &plan).await.unwrap();
+            let job = d.store.jobs_of(&run).await.unwrap().remove(0);
+            assert!(d.store.claim_job(&job.id, "hd-local", 1).await.unwrap());
+            d.store.start_job(&job.id, "hd-local", &sandbox, "fp", 1).await.unwrap();
+            d.pool.register(&sandbox, "hd-local", "fp", "wf", None, &job.id, d.lease()).await.unwrap();
+            // A bad handoff must not publish a terminal job or a cleanup intent.
+            assert!(handoff(&d, &job.id, "hd-local", 2, &sandbox, JobStatus::Failure, None).await.is_err());
+            let status: String = sqlx::query_scalar("SELECT status FROM ci_job WHERE id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap();
+            assert_eq!(status, "running");
+            if scenario == "cancel" {
+                d.store.set_job_status(&job.id, JobStatus::Cancelled, None).await.unwrap();
+                reconcile(&d).await.unwrap();
+                assert_eq!(remote.lock().unwrap().stops, 0, "cancellation is not a handoff");
+            }
+            handoff(&d, &job.id, "hd-local", 1, &sandbox, JobStatus::Failure, Some("executor finished")).await.unwrap();
+            // An intent written by the prior controller requested a stopped
+            // cache; after upgrade it must still be deleted, not repooled.
+            sqlx::query("UPDATE ci_vm_cleanup SET destroy=false WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
+            d.pool.renew_leases(d.lease()).await.unwrap();
+            assert!(sqlx::query_scalar::<_,bool>("SELECT leased_until='infinity'::timestamptz FROM ci_vm_pool WHERE sandbox_id=$1")
+                .bind(&sandbox).fetch_one(d.store.pool()).await.unwrap(), "process heartbeat must not replace cleanup ownership");
+            let status: String = sqlx::query_scalar("SELECT status FROM ci_job WHERE id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap();
+            assert_eq!(status, if scenario == "cancel" { "cancelled" } else { "failure" });
+            assert!(handoff(&d, &job.id, "hd-local", 1, &sandbox, JobStatus::Success, None).await.is_err());
+            assert_eq!(sqlx::query_scalar::<_,String>("SELECT status FROM ci_job WHERE id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap(), status);
+            let rollout = format!("rollout-{run}");
+            d.store.create_step(&rollout, &job.id, 0, "controller", None).await.unwrap();
+            sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES($1,$1,$2,$3,'ci','test','running','test','main')")
+                .bind(&rollout).bind(&run).bind(&job.id).execute(d.store.pool()).await.unwrap();
+            sqlx::query("INSERT INTO ci_controller_rollout(id,request,phase) VALUES($1,'{}','draining')")
+                .bind(&rollout).execute(d.store.pool()).await.unwrap();
+            assert!(d.lifecycle.work(&d.store).await.is_ok(), "cleanup is allowed during drain");
+            assert!(!d.lifecycle.quiesce(&d.store, &rollout).await.unwrap());
+            let message: String = sqlx::query_scalar("SELECT message FROM ci_service_deployment WHERE id=$1").bind(&rollout).fetch_one(d.store.pool()).await.unwrap();
+            assert!(message.contains(&sandbox));
+            // Restart + expired lease must not hand a cleanup-owned VM to a job.
+            sqlx::query("UPDATE ci_vm_pool SET leased_until=now()-interval '1 hour' WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
+            assert_eq!(d.pool.release_orphans(&["hd-local".into()], "restarted-instance").await.unwrap(), 0);
+            match scenario {
+                "lost-stop" => remote.lock().unwrap().lost = true,
+                "ineffective-stop" => remote.lock().unwrap().ineffective = true,
+                "wrong-id" => remote.lock().unwrap().wrong = true,
+                "destroy-loss" => { let mut r = remote.lock().unwrap(); r.stopped = true; r.lost = true; }
+                "changed-owner" => { sqlx::query("UPDATE ci_vm_pool SET claimed_by_job=NULL WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap(); }
+                "changed-attempt" => { sqlx::query("UPDATE ci_job SET attempt=2 WHERE id=$1").bind(&job.id).execute(d.store.pool()).await.unwrap(); }
+                _ => {}
+            }
+            if scenario == "concurrent" {
+                let (a,b) = tokio::join!(reconcile(&d), reconcile(&d)); a.unwrap(); b.unwrap();
+                assert_eq!(remote.lock().unwrap().stops, 1);
+            } else { reconcile(&d).await.unwrap(); }
+            if !matches!(scenario, "cancel" | "concurrent") {
+                let error: Option<String> = sqlx::query_scalar("SELECT last_error FROM ci_vm_cleanup WHERE sandbox_id=$1").bind(&sandbox).fetch_one(d.store.pool()).await.unwrap();
+                assert!(error.is_some(), "retry must explain failure: {scenario}");
+                assert_eq!(sqlx::query_scalar::<_,String>("SELECT status FROM ci_vm_pool WHERE sandbox_id=$1").bind(&sandbox).fetch_one(d.store.pool()).await.unwrap(), "claimed");
+                if matches!(scenario, "wrong-id" | "changed-owner" | "changed-attempt") { assert_eq!(remote.lock().unwrap().stops, 0); }
+                { let mut r = remote.lock().unwrap(); r.lost = false; r.ineffective = false; r.wrong = false; }
+                // Restore only deliberately corrupted disposable test evidence.
+                sqlx::query("UPDATE ci_vm_pool SET claimed_by_job=$2 WHERE sandbox_id=$1").bind(&sandbox).bind(&job.id).execute(d.store.pool()).await.unwrap();
+                sqlx::query("UPDATE ci_job SET attempt=1 WHERE id=$1").bind(&job.id).execute(d.store.pool()).await.unwrap();
+                sqlx::query("UPDATE ci_vm_cleanup SET next_attempt_at=now() WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
+                let restarted = test_dispatcher(workspace.path()).await;
+                reconcile(&restarted).await.unwrap();
+                if scenario == "lost-stop" { assert_eq!(remote.lock().unwrap().stops, 1, "readback recovers lost stop without repeating it"); }
+                if scenario == "destroy-loss" { assert_eq!(remote.lock().unwrap().deletes, 1); }
+            }
+            assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM ci_vm_cleanup WHERE sandbox_id=$1").bind(&sandbox).fetch_one(d.store.pool()).await.unwrap(), 0);
+            assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM ci_host_work WHERE job_id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap(), 0);
+            let status: Option<String> = sqlx::query_scalar("SELECT status FROM ci_vm_pool WHERE sandbox_id=$1").bind(&sandbox).fetch_optional(d.store.pool()).await.unwrap();
+            assert_eq!(status, None, "even legacy reuse handoffs must delete the VM");
+            let report: serde_json::Value = sqlx::query_scalar("SELECT payload FROM ci_debug_report WHERE job_id=$1 AND sandbox_id=$2")
+                .bind(&job.id).bind(&sandbox).fetch_one(d.store.pool()).await.unwrap();
+            assert_eq!(report["job"]["status"], if scenario == "cancel" { "cancelled" } else { "failure" });
+            assert_eq!(report["job"]["sandbox"], sandbox);
+            assert!(sqlx::query_scalar::<_,bool>("SELECT uploaded_at IS NULL FROM ci_debug_report WHERE job_id=$1 AND sandbox_id=$2")
+                .bind(&job.id).bind(&sandbox).fetch_one(d.store.pool()).await.unwrap(), "S3 unavailability must not retain the VM");
+            assert!(d.lifecycle.quiesce(&d.store, &rollout).await.unwrap(), "verified cleanup unblocks drain");
+            sqlx::query("DELETE FROM ci_controller_rollout WHERE id=$1").bind(&rollout).execute(d.store.pool()).await.unwrap();
+            sqlx::query("DELETE FROM ci_service_deployment WHERE id=$1").bind(&rollout).execute(d.store.pool()).await.unwrap();
+            sqlx::query("DELETE FROM ci_vm_pool WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
+            sqlx::query("DELETE FROM ci_debug_report WHERE job_id=$1").bind(&job.id).execute(d.store.pool()).await.unwrap();
+            sqlx::query("DELETE FROM ci_run WHERE id=$1").bind(&run).execute(d.store.pool()).await.unwrap();
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; fake Cloud and heyvm HTTP"]
+    async fn host_maintenance_drains_recovers_and_fails_closed() {
+        use crate::host_maintenance as maintenance;
+        use axum::{Json, Router, extract::{Path, State}, http::StatusCode, response::IntoResponse, routing::{get, post}};
+        #[derive(Default)]
+        struct Remote { posts: Vec<Value>, stops: Vec<String>, status: String, wrong: bool, lost: bool, hidden: bool, old: bool, stop_failure: bool }
+        let remote = Arc::new(std::sync::Mutex::new(Remote::default()));
+        let app = Router::new()
+            .route("/v1/secrets", get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String,String>>| async move {
+                Json(json!({"secrets":[{"path":format!("{}/CLOUD_KEY",q["prefix"])}]}))
+            }))
+            .route("/v1/secrets/read", post(|| async { Json(json!({"valueBase64":"ZmFrZS1rZXk="})) }))
+            .route("/storage", get(|| async { Json(json!({"free_bytes":1u64 << 50})) }))
+            .route("/capabilities", get(|| async { Json(json!({"supportedDrivers":["firecracker","kvm","avf"]})) }))
+            .route("/sandbox/{id}/stop", post(|State(remote): State<Arc<std::sync::Mutex<Remote>>>, Path(id): Path<String>| async move {
+                let mut r = remote.lock().unwrap();
+                if r.stop_failure { return StatusCode::SERVICE_UNAVAILABLE.into_response(); }
+                r.stops.push(id); Json(json!({})).into_response()
+            }))
+            .route("/internal/mvm-ctrl/backend-servers/host-heyvm/upgrades", post(
+                |State(remote): State<Arc<std::sync::Mutex<Remote>>>, headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+                    assert_eq!(headers["authorization"], "Bearer fake-key");
+                    let mut r = remote.lock().unwrap();
+                    if r.old { return StatusCode::NOT_FOUND.into_response(); }
+                    assert!(!r.stops.is_empty(), "own VM must stop before POST");
+                    assert_eq!(body["backendServerId"], "cloud-backend-982");
+                    assert_ne!(body["backendServerId"], "hd-local");
+                    assert_eq!(body["sha256"], "b".repeat(64));
+                    if let Some(previous) = r.posts.first() { assert_eq!(&body, previous, "retry payload must be exact"); }
+                    r.posts.push(body.clone());
+                    if r.lost { return StatusCode::BAD_GATEWAY.into_response(); }
+                    Json(json!({"maintenanceId":body["maintenanceId"],"backendServerId":body["backendServerId"],"status":"accepted"})).into_response()
+                }))
+            .route("/internal/mvm-ctrl/backend-servers/host-heyvm/upgrade/{id}", get(
+                |State(remote): State<Arc<std::sync::Mutex<Remote>>>, Path(id): Path<String>| async move {
+                    // Give competing reconcilers time to contend for ownership.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let r = remote.lock().unwrap();
+                    if r.hidden || r.posts.is_empty() { return StatusCode::NOT_FOUND.into_response(); }
+                    let p = &r.posts[0]; assert_eq!(id, p["maintenanceId"]);
+                    Json(json!({"maintenanceId":id,"backendServerId":p["backendServerId"],"operationType":"host_heyvm_upgrade_receipt_v1",
+                        "target":p["target"],"requestedBy":p["requestedBy"],"targetSha256":if r.wrong { json!("wrong") } else { p["sha256"].clone() },
+                        "artifactArchiveId":p["artifactArchiveId"],"artifactUserId":p["artifactUserId"],"status":r.status,
+                        "completedAt":if matches!(r.status.as_str(), "completed" | "failed") { json!("2026-09-16T00:00:00Z") } else { Value::Null }})).into_response()
+                })).with_state(remote.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let target = maintenance::Target { repository: "https://example.test/repo.git".into(), runner_hd_id: "hd-local".into(),
+            backend_server_id: "cloud-backend-982".into(), cloud_url: base.clone(), orchestrator_url: "https://orch.test".into(),
+            artifact_user_id: "archive-owner".into(), target: "stage-eu1-host-heyvm".into(), region: Some("eu1".into()) };
+        unsafe {
+            std::env::set_var("CI_TEST_DAEMON", &base);
+            std::env::set_var("CI_HOST_MAINTENANCE_TARGETS", json!({"selected":target}).to_string());
+            std::env::set_var("CI_HEYOSECRET_URL", &base);
+            std::env::set_var("CI_HEYOSECRET_TOKEN", "test-only");
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let mut networks = d.runners.snapshot().networks.clone();
+        networks[0].runners.push(crate::runners::Runner { id: "hd-other".into(), name: "other".into(), status: crate::runners::RunnerStatus::Online, last_seen_at: None });
+        d.runners.set_test_pool(crate::runners::Pool { networks, default_network_id: "local".into(), default_node_id: "hd-local".into(), ..Default::default() });
+        for scenario in ["success", "failed", "identity", "cancel-before", "cancel-after", "deadline", "old-cloud"] {
+            *remote.lock().unwrap() = Remote { status: "maintenance".into(), lost: true, ..Default::default() };
+            let workflow = crate::workflow::Workflow::parse("maintenance.yml", "jobs:\n  upgrade:\n    steps: [{uses: ci/promote-service-archive}, {uses: ci/host-heyvm-maintenance}]\n  existing:\n    steps: [{run: echo existing}]\n  waiting:\n    steps: [{run: echo waiting}]\n  other:\n    steps: [{run: echo other}]\n").unwrap();
+            let plan = crate::plan::Plan::build(&workflow).unwrap();
+            let run = crate::vm::new_id(); let sha = "a".repeat(40);
+            d.store.create_run(&run, &crate::store::RunRequest { repo_url: target.repository.clone(), git_ref: "refs/heads/main".into(), sha: sha.clone(), ..Default::default() }, &plan).await.unwrap();
+            let jobs = d.store.jobs_of(&run).await.unwrap();
+            let job = jobs.iter().find(|j| j.job_key == "upgrade").unwrap();
+            let existing = jobs.iter().find(|j| j.job_key == "existing").unwrap();
+            let waiting = jobs.iter().find(|j| j.job_key == "waiting").unwrap();
+            let other = jobs.iter().find(|j| j.job_key == "other").unwrap();
+            let job_plan: JobPlan = serde_json::from_value(job.plan.clone()).unwrap();
+            let msg = crate::bus::JobMessage { run_id: run.clone(), job_id: job.id.clone(), job_key: job.job_key.clone() };
+            let sandbox = format!("sb-{run}");
+            assert!(d.store.claim_job(&job.id, "hd-local", 1).await.unwrap());
+            d.store.start_job(&job.id, "hd-local", &sandbox, "fp", 1).await.unwrap();
+            d.pool.register(&sandbox, "hd-local", "fp", "wf", None, &job.id, d.lease()).await.unwrap();
+            assert!(d.store.claim_job(&existing.id, "hd-local", 1).await.unwrap());
+            let publication = crate::store::step_id(&job.id, 0); let sid = crate::store::step_id(&job.id, 1);
+            d.store.create_step(&publication, &job.id, 0, "Publish", Some("ci/promote-service-archive")).await.unwrap();
+            d.store.create_step(&sid, &job.id, 1, "Maintenance", Some("ci/host-heyvm-maintenance")).await.unwrap();
+            d.store.start_step(&sid, &sid).await.unwrap();
+            let prepared = json!({"source_sha":sha,"release_sha":sha,"git_ref":"refs/heads/main","versions":{}});
+            sqlx::query("INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status) VALUES($1,'test',$2,$2,'refs/heads/main','{}',$2,$3,'published')")
+                .bind(&run).bind(&sha).bind(prepared).execute(d.store.pool()).await.unwrap();
+            sqlx::query("INSERT INTO ci_service_archive(step_id,run_id,job_id,archive_id,sha,orchestrator_url,archive_user_id,archive_sha256,heyvm_sha256) VALUES($1,$2,$3,$4,$5,'https://orch.test','archive-owner',$6,$7)")
+                .bind(&publication).bind(&run).bind(&job.id).bind(&run).bind(&sha).bind("c".repeat(64)).bind("b".repeat(64)).execute(d.store.pool()).await.unwrap();
+            // An existing row isn't publication success; caller-supplied IDs and unknown mappings also fail before cordon.
+            assert!(maintenance::request(&d, &msg, &job_plan, &sid, "selected", &base, &run, "CLOUD_KEY", Duration::from_secs(120)).await.is_err());
+            d.store.finish_step(&publication, StepStatus::Success, Some(0), None).await.unwrap();
+            for (alias, archive, url) in [("unknown", run.as_str(), base.as_str()), ("selected", "external-archive", base.as_str()), ("selected", run.as_str(), "https://wrong-cloud.test")] {
+                assert!(maintenance::request(&d, &msg, &job_plan, &sid, alias, url, archive, "CLOUD_KEY", Duration::from_secs(120)).await.is_err());
+            }
+            for (revision, owner, orch) in [("wrong-sha", "archive-owner", "https://orch.test"),
+                (sha.as_str(), "wrong-owner", "https://orch.test"), (sha.as_str(), "archive-owner", "https://wrong-orch.test")] {
+                sqlx::query("UPDATE ci_service_archive SET sha=$2,archive_user_id=$3,orchestrator_url=$4 WHERE step_id=$1")
+                    .bind(&publication).bind(revision).bind(owner).bind(orch).execute(d.store.pool()).await.unwrap();
+                assert!(maintenance::request(&d, &msg, &job_plan, &sid, "selected", &base, &run, "CLOUD_KEY", Duration::from_secs(120)).await.is_err());
+            }
+            sqlx::query("UPDATE ci_service_archive SET sha=$2,archive_user_id='archive-owner',orchestrator_url='https://orch.test' WHERE step_id=$1")
+                .bind(&publication).bind(&sha).execute(d.store.pool()).await.unwrap();
+            assert!(!maintenance::cordoned(&d.store, "hd-local").await.unwrap());
+            // Serialize competing maintenance admission/claims using the real shared lock.
+            let mut gate = d.store.pool().begin().await.unwrap();
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('hd-local',222))").execute(&mut *gate).await.unwrap();
+            let release_gate = async { tokio::time::sleep(Duration::from_millis(30)).await; gate.commit().await.unwrap(); };
+            let (a,b,claimed,()) = tokio::join!(
+                maintenance::request(&d, &msg, &job_plan, &sid, "selected", &base, &run, "CLOUD_KEY", Duration::from_secs(120)),
+                maintenance::request(&d, &msg, &job_plan, &sid, "selected", &base, &run, "CLOUD_KEY", Duration::from_secs(120)),
+                d.store.claim_job(&waiting.id, "hd-local", 1), release_gate);
+            a.unwrap(); b.unwrap(); let claimed = claimed.unwrap();
+            let id = hex::encode(sha2::Sha256::digest(sid.as_bytes()));
+            assert_eq!(id.len(), 64);
+            assert!(maintenance::cordoned(&d.store, "hd-local").await.unwrap());
+            assert!(!d.store.claim_job(&other.id, "hd-local", 1).await.unwrap());
+            assert!(d.store.claim_job(&other.id, "hd-other", 1).await.unwrap(), "another runner remains usable");
+            let mut pinned = job_plan.clone(); pinned.target.node = Some("local".into());
+            assert!(matches!(d.pick_runner(&pinned).await, Err(DispatchError::MaintenancePaused)), "pinned placement must honor the fence");
+            assert_eq!(d.pick_runner(&job_plan).await.unwrap().0, "hd-other", "unpinned placement must choose the unfenced runner");
+            assert_eq!(d.run_job(&msg, 2).await.unwrap(), JobStatus::Running, "duplicate delivery must not reacquire a VM");
+            maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
+            assert!(remote.lock().unwrap().posts.is_empty());
+            // Expired own lease must not be reclaimed before a verified stop.
+            sqlx::query("UPDATE ci_vm_pool SET leased_by='dead-process',leased_until=now()-interval '1 hour' WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
+            d.reclaim_pool().await.unwrap();
+            assert_eq!(d.pool.get(&sandbox).await.unwrap().unwrap().status, "claimed");
+            if scenario == "success" {
+                // Simulate process loss after stop but before the atomic pool
+                // release/phase commit. Retry must still own this exact VM.
+                sqlx::query("ALTER TABLE ci_host_maintenance ADD CONSTRAINT test_release_crash CHECK (phase<>'draining')").execute(d.store.pool()).await.unwrap();
+                assert!(maintenance::release(&d, &id).await.is_err());
+                sqlx::query("ALTER TABLE ci_host_maintenance DROP CONSTRAINT test_release_crash").execute(d.store.pool()).await.unwrap();
+                assert_eq!(d.pool.get(&sandbox).await.unwrap().unwrap().status, "claimed");
+                assert!(remote.lock().unwrap().posts.is_empty());
+            }
+            let (a,b) = tokio::join!(maintenance::release(&d, &id), maintenance::release(&d, &id)); a.unwrap(); b.unwrap();
+            assert_eq!(remote.lock().unwrap().stops, vec![sandbox.clone(); if scenario == "success" { 2 } else { 1 }]);
+            assert_eq!(d.pool.get(&sandbox).await.unwrap().unwrap().status, "idle");
+            assert_eq!(d.store.get_job(&job.id).await.unwrap().unwrap().status, "running");
+            if scenario == "success" { d.store.migrate().await.unwrap(); } // restart must not recreate released work
+            maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
+            assert!(remote.lock().unwrap().posts.is_empty(), "existing running work must drain");
+            d.store.set_job_status(&existing.id, JobStatus::Cancelled, None).await.unwrap();
+            d.store.set_job_status(&other.id, JobStatus::Success, None).await.unwrap();
+            if claimed { d.store.set_job_status(&waiting.id, JobStatus::Success, None).await.unwrap(); }
+            else { d.store.set_job_status(&waiting.id, JobStatus::Skipped, None).await.unwrap(); }
+            d.store.end_host_work(&other.id, "hd-other", 1).await.unwrap();
+            d.store.end_host_work(&waiting.id, "hd-local", 1).await.unwrap();
+            d.store.end_host_work(&existing.id, "hd-local", 99).await.unwrap();
+            maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
+            let phase: String = sqlx::query_scalar("SELECT phase FROM ci_host_maintenance WHERE id=$1").bind(&id).fetch_one(d.store.pool()).await.unwrap();
+            assert_eq!(phase, "draining", "cancellation during VM acquisition and a stale delivery must not erase active host work");
+            d.store.end_host_work(&existing.id, "hd-local", 1).await.unwrap();
+            d.store.set_job_status(&existing.id, JobStatus::Success, None).await.unwrap();
+            if scenario == "success" {
+                let active = format!("sb-active-{run}");
+                d.pool.register(&active, "hd-local", "fp", "wf", None, &existing.id, d.lease()).await.unwrap();
+                let vm = d.vms.open(d.runners.options_for("hd-local").await.unwrap(), active.clone()).await.unwrap();
+                let mut reusable = job_plan.clone(); reusable.vm.reuse = true;
+                remote.lock().unwrap().stop_failure = true;
+                d.release_vm(&reusable, &vm, false).await;
+                assert_eq!(d.pool.get(&active).await.unwrap().unwrap().status, "claimed", "failed stop must retain drain evidence even when job finished");
+                maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
+                assert!(remote.lock().unwrap().posts.is_empty());
+                assert!(d.pool.take_for_sweep(&["hd-local".into()], &[], 0).await.unwrap().is_empty(), "maintenance does not delete idle caches");
+                remote.lock().unwrap().stop_failure = false;
+                d.release_vm(&reusable, &vm, false).await;
+                assert_eq!(d.pool.get(&active).await.unwrap().unwrap().status, "idle");
+                d.pool.forget(&active).await.unwrap();
+            }
+            if scenario == "cancel-before" { d.store.cancel_run(&run).await.unwrap(); }
+            if scenario == "deadline" { sqlx::query("UPDATE ci_host_maintenance SET deadline=now()-interval '1 second' WHERE id=$1").bind(&id).execute(d.store.pool()).await.unwrap(); }
+            if scenario == "old-cloud" { remote.lock().unwrap().old = true; }
+            maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap(); // durable submitting boundary
+            let (a,b) = tokio::join!(maintenance::poll(&d.store, &id, "fake-key", Some(&target)), maintenance::poll(&d.store, &id, "fake-key", Some(&target))); a.unwrap(); b.unwrap();
+            if matches!(scenario, "cancel-before" | "deadline" | "old-cloud") {
+                assert!(remote.lock().unwrap().posts.is_empty());
+            } else {
+                assert_eq!(remote.lock().unwrap().posts.len(), 1, "concurrent reconcilers issue one attempt");
+                // Reconnect after lost POST response; even a transient missing GET
+                // replays only the persisted ID and exact semantic payload.
+                let restarted = Store::connect(&std::env::var("CI_TEST_DATABASE_URL").unwrap(), workspace.path().join("restart"), Duration::from_secs(30)).await.unwrap();
+                remote.lock().unwrap().hidden = true;
+                maintenance::poll(&restarted, &id, "fake-key", Some(&target)).await.unwrap();
+                assert_eq!(remote.lock().unwrap().posts.len(), 2);
+                { let mut r = remote.lock().unwrap(); r.hidden = false; r.status = if scenario == "failed" { "failed" } else { "completed" }.into(); r.wrong = scenario == "identity"; }
+                if scenario == "cancel-after" { d.store.cancel_run(&run).await.unwrap(); }
+                let (a,b) = tokio::join!(maintenance::poll(&restarted, &id, "fake-key", Some(&target)), maintenance::poll(&restarted, &id, "fake-key", Some(&target))); a.unwrap(); b.unwrap();
+            }
+            let success = scenario == "success";
+            assert_eq!(maintenance::cordoned(&d.store, "hd-local").await.unwrap(), !success, "{scenario}");
+            let expected = if success { "success" } else if scenario.starts_with("cancel") { "cancelled" } else { "failure" };
+            assert_eq!(d.store.get_job(&job.id).await.unwrap().unwrap().status, expected, "{scenario}");
+            assert_eq!(d.store.get_run(&run).await.unwrap().unwrap().status, expected, "{scenario}");
+            let posts = remote.lock().unwrap().posts.len();
+            remote.lock().unwrap().status = "completed".into();
+            maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
+            assert_eq!(remote.lock().unwrap().posts.len(), posts);
+            assert_eq!(maintenance::cordoned(&d.store, "hd-local").await.unwrap(), !success, "failure must be sticky");
+            if scenario == "identity" {
+                assert!(maintenance::recover(&d, "wrong-run", &id).await.is_err());
+                assert!(maintenance::recover(&d, &run, &id).await.is_err(), "foreign receipt cannot release fence");
+                remote.lock().unwrap().wrong = false;
+                // An executed skipped job must not be reset, even with a valid receipt.
+                sqlx::query("UPDATE ci_job SET status='skipped' WHERE id=$1").bind(&existing.id).execute(d.store.pool()).await.unwrap();
+                assert!(maintenance::recover(&d, &run, &id).await.is_err());
+                sqlx::query("UPDATE ci_job SET status='success' WHERE id=$1").bind(&existing.id).execute(d.store.pool()).await.unwrap();
+                sqlx::query("UPDATE ci_job SET status='skipped',started_at=NULL,queued_at=NULL,sandbox_id=NULL WHERE id=$1")
+                    .bind(&waiting.id).execute(d.store.pool()).await.unwrap();
+                let result = maintenance::recover(&d, &run, &id).await.unwrap();
+                assert_eq!(result["status"], "recovered");
+                assert!(!maintenance::cordoned(&d.store, "hd-local").await.unwrap());
+                assert_eq!(d.store.get_job(&job.id).await.unwrap().unwrap().status, "success");
+                assert_eq!(d.store.get_job(&waiting.id).await.unwrap().unwrap().status, "queued");
+                assert_eq!(remote.lock().unwrap().posts.len(), posts, "recovery must never re-POST upgrade");
+                assert_eq!(maintenance::recover(&d, &run, &id).await.unwrap()["status"], "already_passed");
+                let events: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_event_outbox WHERE run_id=$1 AND event_type='ci.host.maintenance.recovered.v1'")
+                    .bind(&run).fetch_one(d.store.pool()).await.unwrap();
+                assert_eq!(events, 1, "recovery is idempotent and audited");
+            }
+            // Disposable fixture cleanup only; production has no automatic uncordon.
+            sqlx::query("DELETE FROM ci_host_maintenance WHERE id=$1").bind(&id).execute(d.store.pool()).await.unwrap();
+            d.pool.forget(&sandbox).await.unwrap();
+        }
+        server.abort();
+        unsafe {
+            std::env::remove_var("CI_HEYOSECRET_URL");
+            std::env::remove_var("CI_HEYOSECRET_TOKEN");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL and CI_TEST_NATS_URL"]
+    async fn subnet_pressure_retries_only_after_confirmed_cache_deletion() {
+        use axum::{Json, Router, extract::Path, http::StatusCode, routing::{get, post}};
+        for (capacity, confirmed, expected_creates, expected_deletes) in [
+            (true, true, 2, 1), (true, false, 1, 1), (false, true, 1, 0),
+        ] {
+            let creates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let deletes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let calls = creates.clone();
+            let removed = deletes.clone();
+            let app = Router::new()
+                .route("/storage", get(|| async { Json(serde_json::json!({"free_bytes": 1000})) }))
+                .route("/sandbox-deploy", post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        // The second rejection bounds the retry. This fixture
+                        // must never need a real guest to prove admission order.
+                        let error = if capacity { "Firecracker virtual network test has no usable /30 TAP subnet" }
+                            else { "image not found" };
+                        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": error})))
+                    }
+                }))
+                .route("/deployed-sandboxes/{id}", get(move || async move {
+                    if confirmed { StatusCode::NOT_FOUND } else { StatusCode::SERVICE_UNAVAILABLE }
+                }).delete(move |Path(id): Path<String>| {
+                    let removed = removed.clone();
+                    async move {
+                        removed.lock().unwrap().push(id);
+                        StatusCode::NO_CONTENT
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            unsafe { std::env::set_var("CI_TEST_DAEMON", format!("http://{}", listener.local_addr().unwrap())); }
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let workspace = tempfile::tempdir().unwrap();
+            let d = test_dispatcher(workspace.path()).await;
+            let run = format!("capacity-{}", crate::vm::new_id());
+            let job = format!("{run}-job");
+            let cache = format!("{run}-cache");
+            let foreign = format!("{run}-foreign");
+            let runner = format!("{run}-runner");
+            sqlx::query("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES($1,'test','test.yml','success')")
+                .bind(&run).execute(d.store.pool()).await.unwrap();
+            sqlx::query("INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES($1,$2,$1,$1,$1,'success')")
+                .bind(&job).bind(&run).execute(d.store.pool()).await.unwrap();
+            for (id, runner) in [(&cache, runner.as_str()), (&foreign, "hd-other")] {
+                d.pool.register(id, runner, "old-fp", "test", None, &job, d.lease()).await.unwrap();
+                d.pool.release(id).await.unwrap();
+            }
+            let mut plan = plan_targeting(None);
+            plan.vm.reuse = false;
+            assert!(d.acquire_vm(&runner, &plan, "new-fp", &job, 1).await.is_err());
+            assert_eq!(creates.load(Ordering::SeqCst), expected_creates);
+            assert_eq!(deletes.lock().unwrap().len(), expected_deletes);
+            if expected_deletes == 1 { assert_eq!(*deletes.lock().unwrap(), vec![cache.clone()]); }
+            assert_eq!(d.pool.get(&cache).await.unwrap().is_none(), capacity && confirmed);
+            assert_eq!(d.pool.get(&foreign).await.unwrap().unwrap().status, "idle");
+            d.pool.forget(&cache).await.unwrap();
+            d.pool.forget(&foreign).await.unwrap();
+            server.abort();
+        }
+        unsafe { std::env::remove_var("CI_TEST_DAEMON"); }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL and CI_TEST_NATS_URL"]
+    async fn disk_pressure_rechecks_space_and_stops_at_budget() {
+        use axum::{Json, Router, extract::Path, http::StatusCode, routing::get};
+        use std::sync::atomic::AtomicU64;
+        let free = Arc::new(AtomicU64::new(50));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let confirm = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let confirmed = confirm.clone();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let storage = free.clone();
+        let disk = free.clone();
+        let errors = fail.clone();
+        let calls = deleted.clone();
+        let app = Router::new()
+            .route("/storage", get(move || {
+                let storage = storage.clone();
+                async move { Json(serde_json::json!({"free_bytes": storage.load(Ordering::SeqCst)})) }
+            }))
+            .route("/deployed-sandboxes/{id}", get(move || {
+                let confirmed = confirmed.clone();
+                async move {
+                    if confirmed.load(Ordering::SeqCst) { StatusCode::NOT_FOUND }
+                    else { StatusCode::SERVICE_UNAVAILABLE }
+                }
+            }).delete(move |Path(id): Path<String>| {
+                let (disk, errors, calls) = (disk.clone(), errors.clone(), calls.clone());
+                async move {
+                    calls.lock().unwrap().push(id);
+                    if errors.load(Ordering::SeqCst) { return StatusCode::FORBIDDEN; }
+                    disk.fetch_add(25, Ordering::SeqCst);
+                    StatusCode::NO_CONTENT
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        unsafe { std::env::set_var("CI_TEST_DAEMON", url); }
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let runner = format!("pressure-{}", crate::vm::new_id());
+        let cached = heyo_sdk::HeyoClient::new(heyo_sdk::HeyoClientOptions {
+            base_url: Some(std::env::var("CI_TEST_DAEMON").unwrap()),
+            api_key: None, timeout: None,
+        }).unwrap();
+        d.runners.tunnel_cache_for_test().await.insert(runner.clone(), cached.clone());
+        d.runners.tunnel_cache_for_test().await.insert("unrelated-runner".into(), cached);
+        let run = format!("run-{runner}");
+        sqlx::query("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES($1,'test','test.yml','success')")
+            .bind(&run).execute(d.store.pool()).await.unwrap();
+        for (id, age) in [("new", 1.0), ("middle", 2.0), ("old", 3.0)] {
+            let id = format!("{runner}-{id}");
+            let job = format!("job-{id}");
+            sqlx::query("INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES($1,$2,$1,$1,$1,'success')")
+                .bind(&job).bind(&run).execute(d.store.pool()).await.unwrap();
+            d.pool.register(&id, &runner, "fp", "wf", None, &job, d.lease()).await.unwrap();
+            d.pool.release(&id).await.unwrap();
+            sqlx::query("UPDATE ci_vm_pool SET last_used_at = now() - make_interval(secs => $2) WHERE sandbox_id = $1")
+                .bind(id).bind(age).execute(d.store.pool()).await.unwrap();
+        }
+        assert_eq!(d.reclaim_disk_space(&runner, 50).await.unwrap(), 50);
+        assert!(deleted.lock().unwrap().is_empty(), "exactly enough space must not evict");
+        assert_eq!(d.reclaim_disk_space(&runner, 100).await.unwrap(), 100);
+        assert_eq!(*deleted.lock().unwrap(), vec![format!("{runner}-old"), format!("{runner}-middle")]);
+        assert!(d.runners.tunnel_cache_for_test().await.contains_key(&runner));
+        assert!(d.pool.get(&format!("{runner}-old")).await.unwrap().is_none());
+        assert_eq!(d.pool.get(&format!("{runner}-new")).await.unwrap().unwrap().status, "idle");
+        // Failure must retain ownership and stop rather than deleting more caches.
+        fail.store(true, Ordering::SeqCst);
+        assert!(d.reclaim_disk_space(&runner, 101).await.is_err());
+        assert!(!d.runners.tunnel_cache_for_test().await.contains_key(&runner), "failed eviction must reconnect on retry");
+        assert!(d.runners.tunnel_cache_for_test().await.contains_key("unrelated-runner"));
+        assert_eq!(d.pool.get(&format!("{runner}-new")).await.unwrap().unwrap().status, "draining");
+        let error = d.reclaim_disk_space(&runner, 101).await.unwrap_err();
+        assert!(error.to_string().contains("no idle caches left"), "{error}");
+
+        // A new controller finds the persistent eviction even though it is
+        // fresh and its fingerprint is still wanted. A successful DELETE is
+        // not enough if the follow-up absence check fails.
+        let restarted = test_dispatcher(workspace.path()).await;
+        fail.store(false, Ordering::SeqCst);
+        confirm.store(false, Ordering::SeqCst);
+        let retry = restarted.pool.take_for_sweep(&[runner.clone()], &["fp".into()], 86400)
+            .await.unwrap();
+        assert_eq!(retry.len(), 1);
+        let (count, errors) = restarted.destroy_swept(retry).await;
+        assert_eq!(count, 0);
+        assert_eq!(errors.len(), 1);
+        assert!(restarted.pool.get(&format!("{runner}-new")).await.unwrap().is_some());
+        confirm.store(true, Ordering::SeqCst);
+        let retry = restarted.pool.take_for_sweep(&[runner.clone()], &["fp".into()], 86400)
+            .await.unwrap();
+        let (count, errors) = restarted.destroy_swept(retry).await;
+        assert_eq!(count, 1);
+        assert!(errors.is_empty());
+        assert!(restarted.pool.get(&format!("{runner}-new")).await.unwrap().is_none());
+        server.abort();
+        unsafe { std::env::remove_var("CI_TEST_DAEMON"); }
     }
 
     /// Lay down a run's workflow workspace and source descriptor, the way a real
@@ -6217,7 +7748,7 @@ jobs:
             .iter()
             .find(|s| s.name == "Prove the image was built")
             .expect("the step ran");
-        let log = d.store.read_log(proof).await.unwrap_or_default();
+        let log = d.store.read_log(proof).await.unwrap().unwrap_or_default();
         assert!(log.contains("a-copied-file"), "COPY did not land: {log:?}");
         assert!(log.contains("and-a-run-layer"), "RUN did not land: {log:?}");
         assert!(
@@ -6231,7 +7762,7 @@ jobs:
             .iter()
             .find(|s| s.name.starts_with("Image ci-img-"))
             .expect("the build log is attached to the job");
-        let build_log = d.store.read_log(img_step).await.unwrap_or_default();
+        let build_log = d.store.read_log(img_step).await.unwrap().unwrap_or_default();
         for want in ["building image ci-img-", "is ready after"] {
             assert!(
                 build_log.contains(want),
@@ -6275,7 +7806,7 @@ jobs:
 
     #[tokio::test]
     #[ignore = "needs Postgres, NATS and a local heyvmd"]
-    async fn end_to_end_a_run_executes_reuses_its_vm_and_busts_on_a_changed_file() {
+    async fn end_to_end_runs_use_disposable_vms_and_fingerprint_changed_files() {
         let root = std::env::temp_dir().join(format!("ci-e2e-{}", crate::vm::new_id()));
         let d = test_dispatcher(&root).await;
 
@@ -6333,12 +7864,14 @@ jobs:
             .store
             .read_log(named("Say hello"))
             .await
+            .unwrap()
             .unwrap_or_default();
         assert!(log0.contains("hello from ci"), "step 1 log: {log0:?}");
         let log1 = d
             .store
             .read_log(named("Use the step output"))
             .await
+            .unwrap()
             .unwrap_or_default();
         assert!(
             log1.contains("greeting was hi"),
@@ -6363,7 +7896,7 @@ jobs:
         let vm1 = build.sandbox_id.clone().expect("a sandbox was used");
         let fp1 = build.fingerprint.clone().expect("a fingerprint");
 
-        // ---- run 2: same lockfile, so the same VM is inherited.
+        // ---- run 2: same lockfile, but CI must not retain or reuse the VM.
         let run2_id = crate::vm::new_id();
         seed_workspace(&d, &run2_id, &[("lockfile.txt", "v1")]);
         let (run2, status2) = run_workflow_with_id(&d, E2E_YAML, &run2_id).await;
@@ -6382,13 +7915,13 @@ jobs:
             Some(fp1.as_str()),
             "an unchanged lockfile must produce the same fingerprint"
         );
-        assert_eq!(
+        assert_ne!(
             build2.sandbox_id.as_deref(),
             Some(vm1.as_str()),
-            "the warm VM must be reused"
+            "even an unchanged fingerprint must get a disposable VM"
         );
 
-        // ---- run 3: the lockfile changed, so the pool is busted.
+        // ---- run 3: changed source still changes the recorded fingerprint.
         let run3_id = crate::vm::new_id();
         seed_workspace(&d, &run3_id, &[("lockfile.txt", "v2-changed")]);
         let (run3, status3) = run_workflow_with_id(&d, E2E_YAML, &run3_id).await;

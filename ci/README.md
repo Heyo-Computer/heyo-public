@@ -22,6 +22,19 @@ workflow's worth of them per commit.
 - Optionally **app-lb** for workflow objects and sign-in, **heyosecret** for
   secrets, and the **artifacts** store.
 
+### SDK package
+
+CI pins our public `heyo-sdk` 0.1.12 release, including the proxy
+connection-lifecycle fix. Downloading it requires no publishing token or private
+sibling checkout. Its source is maintained in `sdk-rs` in the Heyo repository;
+CI does not carry a second source copy.
+
+The published package comes from
+[SDK source revision 4fd3e85](https://github.com/Heyo-Computer/heyo/commit/4fd3e85fb0d12d4537b4448824b8b43dc18827c6).
+Its registry SHA256 matches the package verified before publication:
+`880dffb6c86fab2a1b0a98efab9cb38f5a193c67a47a8037445ca9f21fcf8344`.
+Cargo enforces that checksum through `ci/Cargo.lock`.
+
 ## Run
 
 ```bash
@@ -57,14 +70,31 @@ Linux tests and release compilation have separate steps with explicit 60-minute
 limits: the two-hour job limit does not override the default 30-minute step limit.
 
 The `ci-linux` artifact also supports branch deployment without a merge or rebuild.
-On an existing CI/NATS runtime image, pin that successful run's artifact digest
+On a CI runtime image, pin that successful run's artifact digest
 as a read-only app-lb mount at `/opt/ci-release`, with `strip_components: 1`.
 `deploy/start-artifact.sh` verifies `CI_EXPECTED_SHA` and `SHA256SUMS`, installs
-the CI binary into the runtime, and starts its existing supervisor on every boot.
+the CI binary into the runtime, and executes CI directly on every boot. It never
+calls a baked-in supervisor that might start or stop NATS. `CI_NATS_URL` is required;
+NATS must run as an independent service with its own persistent JetStream volume.
 It requires a separately mounted persistent state directory with a
 `.managed-state` marker containing `ci-state-v1`; it refuses an empty or rootfs
 fallback rather than silently losing CI history. Arguments are the release,
 runtime, and state directories. This boot wrapper is included in new artifacts.
+Self-deployment installs this CI-only boot command and refuses a missing or
+loopback broker URL. It preserves the broker configuration rather than changing
+or replacing NATS during CI deployment.
+
+For a previously bundled installation, fence submissions and stop producers and
+consumers before moving broker state. Inventory streams, consumers, pending
+messages and acknowledgement positions; take a verified JetStream backup and
+restore it into the independent broker's dedicated persistent volume. Preserve
+account/subject names and credentials. Never concurrently mount CI's existing
+writable workspace into the broker VM, and never copy a live JetStream directory
+as if it were a consistent backup. Retain the old data untouched for rollback.
+Verify the restored stream/consumer state and authenticated connectivity before
+switching `CI_NATS_URL` and launching CI alone. After accepting new writes, the
+old backup is no longer a lossless rollback target. Test CI restart with broker
+identity, uptime and pending messages unchanged before reopening submissions.
 
 For an existing rootfs-only installation, wait for jobs to finish, fence public
 traffic with app-lb's 503 maintenance mode, and confirm no work remains before
@@ -94,12 +124,96 @@ Configure `ORCHESTRATOR_URL`,
 workflow's HeyoSecret scope. The workflow inserts only the finalized archive ID
 into that spec. The target must supply external Postgres/NATS and durable CI
 workspace/log/artifact storage. This archive does **not** replace the stateful
-CI/NATS bundle by itself: it contains no broker. For the new us3 installation,
-`ci/Dockerfile.firecracker` packages CI and NATS together and
-`.heyo/regions/us3/ci.json` defines the app-lb deployment. Subsequent artifact
-promotions retain the managed CI workspace and external database.
+CI/NATS bundle by itself: it contains no broker. For a new us3 installation,
+`ci/Dockerfile.firecracker` packages CI only and `.heyo/regions/us3/ci.json`
+defines the app-lb deployment with an explicit external broker placeholder.
+Provision independent NATS before starting CI. Subsequent artifact promotions
+retain the managed CI workspace, external database and broker configuration.
 
 ## Submitting a build
+
+This repository's `ci` workflow only validates and produces an artifact.
+`git submit --only ci` never merges or deploys. Once the installed platform meets
+the prerequisites described under [coordinated submissions](#one-submission-across-validation-workflows-and-deployment),
+an unrestricted submission also selects `.ci/workflows/regional-release.yml`.
+That workflow owns the single merge after all selected validations pass, then
+deploys sequentially to us3, eu1, and finally the CI controller. The merge uses
+the registered HeyoSecret `GIT_AUTH_TOKEN`, with no version bump or tags. The
+captured trunk must still match at publication; a moved trunk requires revalidation.
+
+CI runtime changes also require `ci/deploy-controller`. It prepares a durable
+release intent and obtains acceptance from Orchestrator's shared application
+update API. Only Orchestrator's authenticated activation can advance a prepared
+intent into a rollout. CI then closes new submissions (HTTP 503) and lets existing jobs finish before
+replacing the controller. The requesting job finishes first; the **run remains
+running** until the replacement resumes reconciliation and its public health
+endpoint identifies the expected revision and executable SHA256. Documentation
+and workflow-only changes need no controller replacement unless the release
+workflow explicitly selects one. A passing validation run is not deployment
+completion; inspect the coordinated release run.
+
+Self-deployment is opt-in and currently supports **one Firecracker controller
+with a persistent workspace**, not active-active controllers or regional DB
+writer handoff. Configure the following through the service's HeyoSecret-backed
+configuration before enabling the workflow:
+
+- `CI_CONTROLLER_DEPLOYMENT`: the app-lb deployment ID of this controller.
+- `CI_CONTROLLER_REPOSITORY`: the only repository allowed to replace it.
+- `CI_APPLICATION_ID`: the adopted shared application identity, normally `ci`.
+- `CI_APPLICATION_ORCHESTRATOR_URL`: the shared application authority origin.
+- `CI_APPLICATION_LIFECYCLE_TOKEN`: a HeyoSecret-backed credential scoped to
+  this application's update exchange. Orchestrator's binding references the same
+  credential. It is not the app-lb admin, repository submit or native runner token.
+- `CI_CONTROLLER_APP_LB_URL` and `CI_CONTROLLER_APP_LB_TOKEN`: its app-lb admin
+  endpoint and a credential restricted to that deployment. These are separate
+  from `CI_APP_LB_URL/TOKEN`, which enable workflow-object discovery; enabling
+  self-deployment must not change how existing repositories find workflows.
+- `CI_PUBLIC_URL`: must match the deployment's configured public URL.
+- `CI_EXPECTED_SHA`: set by promotion; health also hashes the running executable.
+
+Expose `/api/lifecycle` and its descendants through app-lb's public machine
+paths. These endpoints require `CI_APPLICATION_LIFECYCLE_TOKEN` themselves:
+`GET /api/lifecycle` advertises the configured identity, and
+`GET/POST /api/lifecycle/updates/{id}` reads/activates a previously prepared
+release intent. POST takes `{intentHash}` and cannot invent a release or artifact.
+Orchestrator persists acceptance before calling POST; both acceptance and
+activation reject changed replays. A prepared intent permits normal work and
+cannot mutate app-lb without activation. Cancellation and the existing drain
+deadline still apply. In-flight updates from an older binary retain their phase
+and finish without creating a second operation.
+
+The deployment must have min/max replicas of one, no warm pool, and exactly one
+read-only `/opt/ci-release` artifact mount with `strip_components: 1`, using the
+controller's HTTP artifact store. Its startup command must install that mounted
+binary. Only the mount digest/ref and expected revision change during promotion;
+database, NATS, workspace, routes and other service configuration are preserved.
+The archive must contain `dist/ci`, `dist/REVISION` and `dist/SHA256SUMS` and come
+from a successful job building the exact confirmed merged release.
+
+**Bootstrap order matters:** first deploy app-lb's conditional deployment updates
+(GET ETag / PUT If-Match), then install a CI controller supporting this action
+through the existing drained deployment path, then enable the configured workflow.
+An older controller cannot deploy its own first implementation of this action.
+Missing capabilities or configuration fail the deployment rather than claim success.
+
+`git submit --only ci --submit-empty` also remains validation-only: it cannot
+retry controller replacement. Use the coordinated release policy for deployment;
+do not treat an individual validation rerun or a successful artifact upload as
+authorization to publish or as evidence that a replacement occurred.
+
+The durable rollout waits for jobs, claimed/building VMs, unresolved host-work
+obligations, native executions and other unresolved deployments. Expired leases
+and terminal parent runs do not prove that a remote command stopped. Native
+leases remain reserved after expiry; another runner cannot take over that job.
+Unresolved execution blocks replacement until positively reconciled. No
+historical rows are deleted to bypass this barrier.
+Before the first replacement attempt,
+`CI_MAX_JOB_SECONDS` bounds the drain; timeout or cancellation leaves the
+controller unchanged and reopens submissions. After an ambiguous replacement
+attempt, admission stays closed until reconciliation proves the outcome. Inspect
+the run's service-deployment status and controller logs; do not clear the durable
+barrier or retry a blind replacement. Cancellation after submission cannot undo
+the external update, and the cancelled run stays cancelled after reconciliation.
 
 ```bash
 ./install-git-submit.sh                  # installs `git-submit` onto PATH
@@ -261,6 +375,10 @@ jobs:
           # is printed in the step log and shown on the run page. Nothing
           # else opens: tags, manifests and listings still need the key.
           public: true
+          # Optional; `artifacts` sink only. A second, stable tag moved onto
+          # this upload, so something downstream can follow the newest build
+          # by name instead of being repointed at each run's own tag.
+          alias: app-live
 
   deploy:
     uses: prod-runners              # any online host in that network
@@ -286,12 +404,27 @@ uses: prod-runners/bigbox/sb-1a34   # that existing VM; `vm:` is unused and
 # absent                            # the repository's assigned network, any host
 ```
 
-An unpinned job goes to the first online host **whose daemon supports the
-job's `vm.driver`** (`GET /capabilities` on the daemon, learned once per host):
+An unpinned job goes to the online compatible host with **the most free disk
+space**, not the first host discovered. Driver eligibility uses
+`GET /capabilities` on the daemon, learned once per host:
 a macOS daemon that joined the network advertises `apple_container`/`apple_virt`
 and is skipped by a `driver: firecracker` job instead of being handed a VM it
 cannot boot. A *pinned* job gets the same check as a named error. A daemon too
 old to answer `/capabilities` is given the benefit of the doubt.
+
+Before each unpinned placement, CI reads `/storage` over its existing authenticated
+daemon connection—the same free-space source app-lb exposes through `/disks`.
+Missing, failed, or malformed capacity measurements exclude that host; a full host
+is not treated as available merely because its heartbeat is online. Hosts must
+have room for the declared data disk, twice the declared image-build rootfs size
+(image plus VM copy), and 5 GiB of host headroom. Equal free space is broken by
+runner ID, independently of discovery order. Explicit host/VM pins are unchanged.
+
+This is a disk admission estimate, not a resource reservation or CPU/RAM load
+balancer. Auto-sized/named images, build scratch space, and concurrent allocations
+can require additional space. The check is conservative for warm VMs whose disks
+already exist. It does not change queues, create a scheduler service, or require
+an app-lb endpoint or configuration change.
 
 **`uses:` carries everything needed to place the job**, and the third form is
 why that matters. A sandbox does not record which host it is on — `SandboxInfo`
@@ -445,10 +578,23 @@ for an image already in the catalog answers `ready` without building — so even
 a lost claim collapses into one docker build rather than two racing for the
 same tag.
 
-Nothing sweeps images. A rootfs is expensive to rebuild and cheap to keep, and
-unlike a pooled VM it carries no state from the run that made it. To force a
-rebuild, delete it on the host (`rm ~/.heyo/images/firecracker/ci-img-*.ext4`);
-the next job finds the file gone, forgets the row and builds it again.
+CI sweeps unused source-built base images without a cache-retention window,
+separately from VM deletion. Each minute, CI considers at most one image per
+served runner and refuses cleanup while that runner has active job work or
+maintenance. Failed deletions stay recorded and retry after five minutes.
+
+Deletion uses heyvmd's protected `POST /images/:name/evict` contract. The daemon
+requires the source builder's matching ownership digest, serializes against
+builds and VM creation across processes, and protects references from stopped
+as well as running sandboxes. Busy, referenced, unmanaged, or uncertain images
+are retained. Older daemons without this endpoint cannot reclaim images; a
+404 is not a deletion receipt. Deploy compatible heyvmd on runner hosts before
+expecting disk reclamation. Upgrade other CLI writers sharing that catalog too.
+
+CI verifies cached images through the source builder before creating a VM, so
+a missing file is rebuilt within the current job. Do not delete base-image
+files directly on a live host or substitute `heyvm prune --images`: those
+paths do not provide this ownership/reference-checking contract.
 
 **A named VM is somebody else's machine**, and the executor treats it that way.
 It is resolved on the pinned node by id or name, started if it is merely stopped,
@@ -533,18 +679,35 @@ the author declares the driver, image, size and setup hooks — and, via
 (instead of `timeout-minutes:`) is a parse error naming the job, not a field that
 quietly does nothing.
 
-**A released VM is parked, not left running.** It is stopped — the daemon
-keeps its rootfs and its cache disk; only `destroy` removes those — and started
-again by the next job that claims it. Before this a pooled VM idled *running*
-until the daemon's TTL reaped it, which made the warm cache a matter of cadence:
-the next push had to land inside the TTL (an hour by default, four for
-`app-obs.yml`) or it booted a blank VM and paid the full cold build. For a
-repository pushed to a few times a day, most gaps are longer than that, so
-most builds were cold, and a `xlarge` sat on 16 GB of the host in between.
-Stopped, the VM costs disk and nothing else, the reaper ignores it, and
-`CI_VM_IDLE_SECS` (default a week) is what retires it — see the pool section.
-The TTL it is parked with is still the longer of `CI_VM_TTL_SECONDS` and the
-job's `vm.ttl_seconds`, because that is what it boots with next time.
+**CI-owned job VMs are deleted, not parked.** Success, failure and cancellation
+all hand the VM to durable cleanup after diagnostic capture. The daemon must
+confirm stop and deletion before CI forgets ownership. Failed cleanup retries
+after controller restart. Legacy `vm.reuse` declarations still parse but do not
+retain job VMs; existing idle caches are swept without a retention window.
+Explicit existing-VM `uses:` targets and service/maintenance resources are not
+ordinary disposable job VMs and remain under their owner's lifecycle.
+
+**Debug reports go to private S3 storage, not retained VMs.** CI snapshots job
+identity/revision, outcome, timestamps, operation IDs, all retained step logs,
+and captured VM metadata/console into a transactional outbox before cleanup.
+Console capture is bounded by `CI_VM_LOG_LINES` and 40 seconds; unavailable
+diagnostics are recorded explicitly. Environment values, raw commands and
+workspace contents are not exported. Known job secrets are redacted from the
+console; if secret resolution fails, that console is omitted rather than leaked.
+
+Configure `CI_S3_BUCKET`, optional `CI_S3_PREFIX` (default `ci`),
+`CI_S3_REGION`, and `CI_S3_ENDPOINT`. This report destination is independent of
+`CI_ARTIFACT_SINK`; regular artifacts can continue using the artifact service.
+AWS credentials come from the standard AWS credential chain, provisioned through
+the service's HeyoSecret configuration. Use a private bucket with public access
+blocked. No public ACL or public URL is requested. Report keys are
+`<prefix>/<run>/<job>/debug-<attempt>-<sandbox>.json`.
+
+S3 failures retain the report in shared Postgres for bounded upload retries but
+**never retain the VM**. After upload, the outbox releases its payload and keeps
+the S3 receipt. The authenticated `GET /api/runs/{run}` response includes
+`debug_reports` with upload state, URI and retry error. Missing S3 configuration
+is reported as an error; it is not silently replaced with disk storage.
 
 ### This repository's own
 
@@ -671,7 +834,43 @@ about somebody stopping the run, so it does not convert a cancellation into a
 success — and the executor does not write `failure` over it, which would make a
 deliberate stop read as a broken build.
 
+### VM cleanup survives a failed connection
+
+After execution finishes, CI atomically records the terminal job outcome and a
+`ci_vm_cleanup` obligation for its exact runner, VM and attempt. The same handoff
+handles a VM acquired after its job was cancelled. The VM stays claimed until a
+fresh daemon read confirms that exact VM is stopped. Non-reusable or corrupted
+VMs also require confirmed removal before CI forgets their pool record.
+
+Cleanup retries during normal operation and controller drain, including after
+controller restart. A failed request evicts the cached runner connection and
+records its error and next retry time. Each pass handles one due obligation with
+a 20-second timeout; the background loop runs every 30 seconds. Concurrent
+workers serialize on the durable obligation. Expired leases do not make these
+VMs available to another job. Controller deployment messages name cleanup VMs
+blocking drain; confirmed cleanup releases that barrier automatically.
+
+Placement also evicts its cached runner connection when a capacity measurement
+fails, so the next delivery redials instead of repeating a request over a dead
+tunnel. A valid zero/low free-space reading does not evict the connection or
+bypass the job's disk requirement.
+
+Cancellation, failed-job status and lease age **do not authorize cleanup** on
+their own. CI must have the executor's durable handoff and matching pool
+ownership. Existing named/service VMs are excluded. Upgrade all dispatchers
+sharing a VM pool before relying on this protection: older orphan-reclaim code
+does not understand cleanup obligations. Legacy claims, interrupted acquisition
+and crashes before handoff are not retroactively declared safe; they still need
+ownership reconciliation. Do not clear their claims or delete VMs based only on
+a `ci-` name or terminal job status.
+
 ## Re-running a run
+
+Jobs without an explicit `if:` require every dependency to succeed. Failure,
+cancellation, and skipped dependencies propagate through the entire dependent
+chain before scheduling stops; matrix dependencies wait for every cell. An
+explicit `if: always()` can still schedule cleanup, and independent jobs are
+not skipped. A failed run cannot be rerun while those jobs are active.
 
 Two buttons on a finished run's page, and the routes behind them:
 
@@ -697,6 +896,17 @@ not bypass repository policy or release/deployment gates. If a request loses
 its response, check `reruns` in `GET /api/runs/{id}` before posting again:
 every accepted request creates a new run, not an idempotent reset.
 
+Published releases use a separate **failed-jobs-only** retry path. The retry
+atomically inherits the original job plans, source, published commit and frozen
+validation/artifact membership. Successful regional jobs are carried over;
+completed `ci/rollout-host-app-lb` and `ci/rollout-service` steps inside failed
+Linux jobs retain their original deployment receipts and do not deploy again.
+Failed service candidates must have confirmed reclamation before retry admission.
+Other partially completed deployment actions require reconciliation rather than
+blind replay. Full release reruns and unconfirmed publication are rejected.
+Each release attempt admits at most one retry; further retries target the latest
+failed descendant. Ordinary partial submissions remain validation-only.
+
 **A re-run is a new run**, with `rerun_of` pointing at the one it re-plays and
 the original's page listing what re-played it — never a reset of the old run.
 Run and job ids name their logs and derive the step operation ids the daemon
@@ -704,10 +914,20 @@ reattaches to, and the failed attempt is what somebody will want to read beside
 the one that passed.
 
 **What it runs is the source the submit described.** The CI service never clones
-or stores a repository credential. It durably keeps the immutable revisions and
-patch descriptor under `CI_WORKSPACE_DIR`; the selected runner reconstructs and
-verifies that tree using a freshly resolved job-scoped HeyoSecret. A run whose
-descriptor is gone says so and asks for a new submit. The re-run goes through
+or stores a repository credential during submission. It commits the immutable
+revisions, patch and workflow descriptor in `ci_run_source` in the same Postgres
+transaction as the run and jobs. The selected runner reconstructs and verifies
+that tree using a freshly resolved job-scoped HeyoSecret. Release publication
+also reads this shared descriptor before making its authorized temporary checkout.
+
+`CI_WORKSPACE_DIR` holds local submission staging files, not accepted source
+authority. On startup, retained `<run>.source.json` files for existing runs are
+validated and imported into shared storage without deleting the originals.
+Exact re-import is safe; conflicting or invalid descriptors stop startup instead
+of replacing accepted history. Source reads, native-runner checkout and reruns
+then use Postgres exclusively. A run without an imported descriptor reports the
+missing source explicitly; it never falls back to a different revision.
+An ordinary validation re-run goes through
 the same path as a submit, with the run's own
 workflow file as its `--only` selector, so it is planned, routed and given
 secrets exactly as the original was. As with `--only`, the `on.submit` branch
@@ -715,7 +935,12 @@ and path filters do not apply — and the run inherits the original's recorded
 change set, so job-level `changed()` filters decide as they did the first time.
 Same authority as cancel: `CI_ADMIN_EMAILS` through app-lb's gate, when set.
 
-## The warm VM pool
+## Legacy warm-pool bookkeeping
+
+The following fingerprint and cache-management surfaces describe legacy pool
+records. New execution is ephemeral as described above: it does not claim warm
+VMs, park failed jobs, or wait a week to reclaim capacity. The existing pool
+table remains the ownership ledger until deletion is confirmed.
 
 ```
 fingerprint = sha256( canonical_json(vm block, minus cache_key_files)
@@ -785,12 +1010,65 @@ behind, sitting beside the one that replaced it. Claimed VMs are refused in the
 query; `draining` keeps a taken VM out of circulation until the daemon confirms
 it is gone.
 
+Machine callers can reclaim one cache with
+`POST /api/runs/{run_id}/cache/{sandbox_id}/destroy`, authenticated with that
+repository's submit bearer token. Read-only HMAC signatures are not accepted.
+The pool atomically checks that the VM is idle (or already eviction-requested),
+belongs to a served runner, and was last used by a terminal job of this exact
+run. Reuse by another run removes the old caller's authority. A conflict returns
+409 without eviction; transport failure preserves the durable eviction intent.
+Success is returned only after the daemon confirms removal and CI removes the
+pool row. This does not authorize deleting service VMs or clearing maintenance
+fences. Stopped caches also retain network allocations, not just disk space;
+disk-pressure eviction alone does not guarantee room for service rollouts.
+
+Disk pressure overrides this retention window during VM admission. Before
+comparing compatible hosts (and for a pinned host), CI evicts that host's oldest
+idle caches one at a time until measured free space meets the incoming job's
+disk budget: its data disk, two declared rootfs copies, and 5 GiB host headroom.
+Free space is read again after every deletion, and checked again before a cold
+VM creation. Claimed, building, and already-draining VMs are never victims;
+only CI pool rows on that host qualify. A failed deletion stays tracked as
+draining and stops that cleanup attempt. An explicit, persisted eviction intent
+makes the lease-loop sweep retry it after failures or controller restarts, even
+if its fingerprint is still wanted. A failed eviction also discards that runner's
+cached tunnel so the next attempt reconnects instead of reusing a dead loopback
+connection indefinitely. Other runners and connections held by active VM
+operations are unaffected. Deletion holds a database row lock across
+the bounded daemon call and requires a follow-up not-found response before
+forgetting the pool row. Resize operations also use `draining`, but carry no
+eviction intent and are never selected for deletion. Pre-existing ambiguous
+draining rows are not automatically adopted as eviction requests.
+
+If no idle caches remain and space is
+still insufficient, the host cannot admit a new VM. This is admission headroom,
+not a disk reservation against concurrent allocations or unknown build scratch.
+
+Firecracker network pressure uses the same bounded eviction policy. A `/24`
+contains 64 `/30` TAP links, and stopped reusable VMs retain their link while
+they remain cached (normally up to `CI_VM_IDLE_SECS`). When the backend
+explicitly rejects a cold create with its "no usable /30 TAP subnet" capacity
+verdict, CI atomically takes the oldest idle CI cache on that same runner,
+destroys it, confirms that the daemon reports it absent, and retries the create
+once. A failed deletion retains the pool record and stops recovery; CI neither
+deletes another cache nor retries creation. Transport failures, timeouts, and
+other ambiguous create errors never trigger eviction. Running or claimed VMs,
+idle rows whose last owning job is not terminal, maintenance-fenced runners,
+service VMs, caches on another runner, and anything outside CI's pool are not
+eligible.
+
 A claim that cannot *reach* a pooled VM — the tunnel, the daemon not answering
 — hands the row back and fails the delivery so the ladder retries; discarding a
 warm cache because the runner blinked is the most expensive thing this code can
 do. A daemon that answers and does not know the VM, or cannot start it, is a
 verdict: the VM is destroyed and a fresh one built. Destroyed rather than merely
 forgotten, because a forgotten stopped VM is disk nothing will ever reclaim.
+
+Runner connections retain ownership of their forwarding listener throughout
+source preparation, image builds, VM execution, and teardown. Evicting a failed
+cached connection makes subsequent work redial without closing the listener
+under other active jobs. This does not recover a genuinely broken remote link
+or replay a command whose outcome is unknown.
 
 ### A VM being created is on the page too
 
@@ -842,31 +1120,30 @@ run left this behind", which is the question cleanup is asking.
 The pool table survives a restart. Without it a crash orphans every VM until its
 TTL, and the next run builds a second pool beside the one already sitting there.
 
-### A claimed VM is held by a lease, not by a job
+### Lease expiry is not execution takeover authority
 
-Each instance takes a **random id at startup** and stamps it, with an expiry, on
-every VM it claims — renewing on a timer while it holds them. Reclaim keys on
-that expiry.
+Each instance has a random startup identity and renews its VM leases. A missed
+renewal can mean either process death or a network partition while the process
+still drives a VM. It does not authorize reusing that VM.
 
-The obvious alternative does not work, and this is the bug it caused: asking
-whether the *job* is still `running` cannot distinguish "another instance is
-running it" from "the process that was running it died". A restart leaves the row
-`running` either way, so reclaim had to leave the VM alone — an orchestrator
-could not take back even its own VMs. They stayed `claimed` until the sandbox TTL
-reaped them (`CI_VM_TTL_SECONDS`, an hour by default), and the row leaked until
-some later restart happened to find the job terminal.
+Claiming a job atomically records `ci_host_work` and transitions the job to
+`running`. A concurrent claim or queue redelivery cannot replace that owner.
+While the obligation exists, lease expiry cannot repool its VM or delete a
+pending-create record. Cancellation does not remove this evidence either.
+Normal execution hands release to verified VM cleanup. Errors after a claim
+retain the obligation and report that reconciliation is required instead of
+automatically replaying potentially completed external effects. Errors before
+claiming work still use the retry ladder.
 
-A lease is a fact about the holder rather than an inference from the work. Three
-properties follow:
-
-- **A restarted instance reclaims its own previous life**, because the id is
-  fresh per process — a stable one would inherit the dead process's leases and
-  reclaim nothing.
-- **An instance never reclaims what it is holding**, whatever the clock says. A
-  slow database must not make a process fight itself; two dispatchers on one
-  sandbox is far worse than a VM reclaimed a minute late.
-- **Reclaim runs on a timer, not only at startup**, so a dead sibling's VMs come
-  back within a lease period instead of waiting for somebody to restart this one.
+The same rule applies to native runners: expiry rejects stale reports but does
+not reassign the execution or free its runner capacity. These guards are
+prerequisites for regional CI, not a complete multi-controller implementation.
+Source and logs use shared storage. Final submission transactions and native
+execution grants serialize with shared drain transitions, so a request that
+passed an earlier process-local check cannot commit through a closed gate.
+Already-admitted native jobs can obtain grants during draining; quiescence waits
+for those transactions and blocks later grants. Executor handoff and recovery
+remain required before running a second CI controller against production state.
 
 `uses: default` resolves through **`~/.heyo/daemon.json`** — heyvmd mints
 `backend_id` there on first start and registers and heartbeats under it, so it is
@@ -1013,6 +1290,19 @@ size, and the whole transfer is bounded by the step's `timeout-minutes` — so a
 genuinely enormous artifact fails as the step's timeout, with the chunk count in
 the log, rather than as a daemon-side kill with a thousand lines of base64.
 
+`alias:` is the moving half of an artifact's name. Every upload is tagged
+`ci-<workflow>-<run>-<job>-<name>`, which addresses that one build for as long
+as the store keeps it and is exactly wrong for "serve the newest": a deployment
+pinned to `ci-…-00000004-release-retail` keeps serving that build until somebody
+repoints it by hand, which is how a site ends up months behind its pipeline.
+With `alias: retail-live` the run also moves that tag onto the manifest it just
+stored, so a deployment names `retail-live` once and each pull takes the last
+green run. The alias fails the step if it cannot be set — unlike a label, it is
+what a deployment *resolves through*, and a run that stored bytes while leaving
+the alias on the previous build has published nothing. `ci-` is refused as a
+prefix, so an alias can never overwrite a per-run tag, and the name is validated
+rather than mangled: `retail live` is an error, not a silent `retail-live`.
+
 `public: true` on the step asks the `artifacts` sink to mark the blob public
 once it is named: `PUT /public/{digest}`, which opens anonymous `GET`/`HEAD
 /blobs/{digest}` for that digest and nothing else. The resulting
@@ -1124,6 +1414,86 @@ Binding also **reconciles an existing consumer**: JetStream returns the durable
 that is already there and ignores the config passed with it, so an upgrade would
 otherwise keep the old window and none of this would take effect.
 
+### Shared executor ownership is not automatic failover
+
+CI replicas sharing PostgreSQL register distinct process boots. One boot owns
+external effects; the others can serve shared run/source/log reads, submission,
+rerun and transactional completion writes. Queue execution, native grants,
+artifact uploads, VM changes and infrastructure reconcilers require the owner's
+permit. Managed replicas forward mutations once to the exact owner's boot through
+the per-application authenticated Orchestrator instance transport. The original
+caller authentication is preserved; wrong boots, forwarding loops and unavailable
+transport fail closed. Existing handler effect permits remain required. Unmanaged
+replicas still return 503 for owner-only operations on a standby.
+
+The owner is **non-expiring**. A timeout, cancelled run or lost heartbeat never
+proves that a worker or VM command stopped. An unplanned owner restart therefore
+does not recover execution automatically. There is no force-takeover API; runtime
+fencing and reconciliation must be implemented before claiming crash failover.
+
+Legacy direct controller replacement closes shared admission and grants, waits for
+local effect permits, then verifies durable jobs, leases, VM cleanup and remote
+operation fences. It transfers to a named, recently ready boot at a different
+deployment authority before replacing itself. The successor may perform only
+that exact recorded rollout until public revision verification and the atomic
+completion commit release normal execution. Both regions use the same canonical
+HeyoSecret service-role credential for that recorded authority. Readiness refresh
+only filters handoff candidates; it never revokes or grants ownership.
+
+Managed retirement uses a separate job-independent command and receipt ledger.
+The running target boot validates the immutable request and obtains its own local
+effect fence. Owner retirement closes shared admission, drains admitted work and
+durable remote obligations, and transfers only to a ready boot in the platform's
+pinned surviving set outside the retiring region. Standby retirement serializes
+with the same owner-row lock as successor selection. Receipt, retirement and owner
+generation commit together; replay cannot transfer twice. Normal admission resumes
+on the successor before the platform continues HTTP withdrawal and replacement.
+Retained old boots cannot issue effects. No timeout grants ownership.
+
+Configure `source.applicationLifecycle` in managed service metadata with `port`
+and `tokenSecretPath`; resolve `CI_APPLICATION_LIFECYCLE_TOKEN` from that same
+per-app HeyoSecret and configure `CI_APPLICATION_ORCHESTRATOR_URL`. Orchestrator
+injects `HEYO_SERVICE_ID`, `HEYO_DEPLOYMENT_ID` and `HEYO_REGION`. CI exposes
+authenticated `/api/lifecycle` identity and asynchronous
+`/api/lifecycle/retirements/{commandId}` command/status endpoints. Transport uses
+raw streaming bodies and base64url-no-pad metadata capped at 16KiB; this is not a
+16MiB body envelope. The native artifact endpoint retains its separate 512MiB
+limit. Full large-artifact transport parity has not been tested.
+
+**This is not a completed or deployed managed two-region application.** The
+legacy and v3 hierarchical managed controllers execute the pre-withdrawal barrier.
+New managed deployments capture immutable per-endpoint creation recipes with
+versioned secret references before creation and bind authenticated runtime receipts.
+Lifecycle rollback creates fresh baseline identities; it cannot reactivate retained
+retired boots. Existing endpoints without proven recipes fail closed. Scalar
+previous metadata and `envRefCount` are not a creation recipe.
+
+Managed `ci/deploy-controller` requires `with.archive-id` from the existing
+publish/promote-service-archive path for the confirmed release SHA. It records an
+intent, lets the release job finish, then asynchronously submits the ordinary
+Orchestrator managed update. The CI run remains pending until platform bake and
+exact boot/runtime verification of every regional target complete. An uncertain
+submission replays the same operation and command. This does not use the old
+direct app-lb self-replacement dispatcher. Composed full-stack acceptance remains
+outstanding; the external-service binding is still single-deployment and must not
+be used to label the singleton as a two-region service.
+
+**Initial managed CI startup fails closed on an empty executor-owner table.** An
+older singleton can still schedule without participating in this protocol. Empty
+ownership, empty Orchestrator discovery, or a successful stop with unknown runtime
+status do not prove it fenced. There is no bootstrap bypass flag. A supported
+legacy cutover must first establish authoritative non-restarting runtime fencing,
+preserve and reconcile shared database/job/source/log/artifact state, and provide
+a durable verified initial-owner handoff. That cutover/initialization capability is
+not implemented; do not initialize the owner table manually to bypass this gate.
+
+The exact-runtime Cloud transport must never wake stopped instances, retry, follow
+redirects or silently substitute another backend. The public client checks echoed
+backend identities and CI checks the target boot; existing Cloud exec/proxy is not
+a fallback. Private backend safety verification and composed real-process/live
+acceptance remain required. See the single acceptance checklist in
+`docs/MULTI_REGION_DESIGN.md` for local evidence and remaining gates.
+
 ### Migrations
 
 `migrations/*.sql` are re-executed on every startup with no tracking table —
@@ -1162,11 +1532,177 @@ local-only loop.
 
 ### Storage
 
-Postgres for runs, jobs, steps, artifacts and the pool; **step logs go to disk**
-with the path and byte count on the row. A build log is megabytes, and putting it
-in a column means every listing query drags all of it across the wire.
+Postgres holds runs, jobs, steps, source descriptors, artifact metadata and the
+pool. Step logs use a separate shared chunk table, so status queries do not fetch
+log bodies. Appends and byte counts commit atomically; native completion commits
+its logs with the completion evidence. Retention deletes shared chunks and clears
+their metadata in one transaction. Database failures are not empty logs.
 
-### Validation, merge, version bump, build and deployment
+When upgrading from local log storage, drain and stop the old controller before
+starting the new binary with access to its retained log paths. Startup imports
+those files into Postgres without deleting the originals. Missing or unreadable
+files block startup. Once imported, another regional instance needs no local log
+files. Do not mix old disk-writing controllers with shared-storage controllers
+or roll back the binary without a compatible log-storage plan. This storage
+change alone does not authorize a second executor or prove regional failover.
+
+### One submission across validation workflows and deployment
+
+A repository can define exactly one trusted workflow with `on: release`, alongside
+its `on: submit` validation workflows. CI persists the selected validations and
+the release run together. The release run waits for every selected validation;
+failed, cancelled, skipped, carried-over, or error-tolerant evidence blocks it.
+The membership survives controller restarts. `git submit` prints a submission
+completion link; the submit response's `submission` field identifies this release
+run, and its run-status response includes the validation run IDs in `validations`.
+Individual successful validation runs do **not** mean deployment has finished.
+
+The release workflow must have one unconditional merge job containing only
+`ci/merge-release`, with `manifests: '[]'` and no tags. Every deployment job must
+depend on that merge, directly or transitively. This preserves the exact validated
+commit and lets deployment reuse its artifacts. A `ci/deploy-controller` step must
+be last and its job must depend on all other release jobs. Sequence regional
+deployments with `needs`; a failed regional job then prevents the next one.
+
+Validation workflows in a coordinated submission cannot contain merge or deploy
+actions. `--only`, explicit workflow selections, and individual reruns are
+validation-only and cannot publish or deploy. The submit client computes changed
+paths across the full trunk-to-feature diff, including earlier feature commits.
+For a failed deployment of an already-merged revision, reconcile its remote
+operation first, then use a full `git submit --submit-empty --ref <revision>`.
+This creates fresh validation runs and a new coordinator rather than rewriting
+the failed run or substituting evidence in its frozen validation membership.
+
+This repository's `.ci/workflows/regional-release.yml` sequences public app-lb
+and Orchestrator updates as `merge → us3 → eu1 → controller`. The three build
+workflows are validation-only; a coordinator change selects all three so every
+referenced artifact is built from the same submission. Component-only changes
+select only their matching deployments, including CI when the shared host-bundle
+parser changes. Private Auth/Cloud/heyvm deployment remains a separate repository
+workflow. NATS is not part of CI's artifact or replacement.
+
+Before activating coordinated submissions, both regional app-lb hosts must have
+the verified native bootstrap and correlated rollout APIs installed, the CI
+controller must support the rollout actions, and service rootfs artifacts must
+be pinned. Provision repository-scoped `CI_HOST_APP_LB_TARGETS` entries named
+`app-lb-us3` and `app-lb-eu1` with each host's exact deployment/namespace/public
+health mapping. The registered workflow resolves `GIT_AUTH_TOKEN`,
+`APP_LB_US3_TOKEN`, and `APP_LB_EU1_TOKEN` through its HeyoSecret-backed secrets;
+no values belong in YAML. The existing controller-deployment mapping owns the
+final CI replacement. Until these prerequisites are verified, use only
+validation-only submissions such as `git submit --only ci`; a pushed workflow
+or passing build does not establish regional deployment readiness.
+
+For artifact reuse, `ci/download-artifact` accepts `with.workflow` naming the exact
+validation workflow path. CI resolves it only within this submission's frozen,
+successful membership, never from an arbitrary run ID or a latest-artifact tag.
+`ci/promote-service-archive` takes `workflow`, `artifact`, optional producer `job`,
+and `path` naming a packaged tarball inside that artifact, plus Orchestrator `url`,
+`token`, `user-id`, and archive `name`. It verifies the artifact digest, uploads the
+selected bytes through the service archive API, and records release provenance.
+Its outputs are `archive-id` and `sha`; pass the archive ID to `ci/deploy-service`.
+Package runtime dependencies and startup scripts during validation, not deployment.
+`ci/deploy-controller` also accepts `workflow` for its validated binary artifact.
+
+This follows the private CICD contract: all validation, then merge, then required
+deployments, with controller replacement last. Host-daemon maintenance is a
+separate contract: it must stop new placement, drain leases, release its own job
+sandbox before waiting, update, verify, and uncordon. A generic service deployment
+does not implement that host maintenance protocol.
+
+Install a controller supporting `on: release` **before** migrating live workflows.
+Older controllers do not coordinate this trigger. Existing standalone workflows
+remain supported; the repository's bootstrap CI workflow retains its own release
+steps until that migration. These engine capabilities do not by themselves enable
+or verify a production two-region rollout.
+
+### Host heyvm maintenance (opt-in)
+
+`ci/host-heyvm-maintenance` must be the last step of a CI-owned VM job, with no
+`continue-on-error` on the action or job. It requires the normal publication gate,
+a confirmed merged release, and a successfully published service archive from
+that exact release. Arbitrary external archive IDs cannot authorize maintenance.
+Publication records the archive owner, compressed archive digest, and SHA256 of
+the unambiguous regular ELF `heyvm` executable inside the archive; Cloud's
+`sha256` refers to **that executable**, not the tarball.
+
+The operator must configure `CI_HOST_MAINTENANCE_TARGETS` as a JSON object:
+
+```json
+{"eu1":{"repository":"https://github.com/your-org/your-repo.git",
+  "runner_hd_id":"hd-app-lb-runner-id","backend_server_id":"cloud-backend-id",
+  "cloud_url":"https://cloud.example","orchestrator_url":"https://orch.example",
+  "artifact_user_id":"archive-owner","target":"stage-eu1-host-heyvm","region":"eu1"}}
+```
+
+When the environment variable is absent, the controller reads the same JSON
+from the fixed HeyoSecret path `ci-controller/host-maintenance-targets`. An
+explicit environment value takes precedence. Repository workflow secrets cannot
+replace this operator-owned mapping.
+
+Runner `hd` IDs and Cloud `backendServerId` are **different namespaces**. The
+mapping explicitly attests their association and the archive database/storage
+association: Orchestrator's `CLOUD_INTERNAL_URL` must use the **same Cloud archive
+database and storage** as `cloud_url`. CI cannot discover or prove this from a
+public hostname. `target` is an opaque daemon-layout selector, not a revision;
+the current daemon supports the legacy `stage-eu1-host-heyvm` layout only. Do not
+infer that a us3 host supports it from the region name.
+
+```yaml
+- uses: ci/host-heyvm-maintenance
+  timeout-minutes: 30
+  with:
+    runner: eu1                     # trusted mapping alias, not either backend ID
+    url: ${{ vars.CLOUD_URL }}       # must equal the mapping's cloud_url
+    token: ${{ secrets.CLOUD_KEY }}  # direct secret reference, re-resolved on restart
+    archive-id: ${{ steps.publish.outputs.archive-id }}
+```
+
+CI durably fences claims and placement on that runner only, stops/releases its own
+job VM before draining other running jobs and active pool leases, then uses
+`POST /internal/mvm-ctrl/backend-servers/host-heyvm/upgrades` with a persisted
+64-character `maintenanceId`. It reconciles through singular
+`GET /internal/mvm-ctrl/backend-servers/host-heyvm/upgrade/{maintenanceId}`. HTTPS
+is mandatory and bearer redirects are disabled. No idle/service VMs are deleted
+to accelerate drain. Queued work retains its delivery and retry budget; unpinned
+work can select another runner. The step, job and run do not succeed on admission.
+Only an exact `completed` operation with matching backend, target, archive owner,
+archive ID, executable digest and operation identity releases the fence.
+Both `host_heyvm_upgrade` and Cloud's operation-bound
+`host_heyvm_upgrade_receipt_v1` receipts use these checks; unknown types fail closed.
+
+Cancellation, timeout, missing identity, changed configuration and terminal
+failure **retain the CI cordon**, even if Cloud uncordons its own backend. An
+expired/unknown lease blocks drain rather than proving the VM stopped. Operators
+must reconcile the persisted operation and host before explicitly repairing an
+unresolved fence; this action has no automatic failure-unlock or force option.
+`ci_host_work` records each claimed delivery/runner until verified release.
+Cancelled VM acquisition, interrupted delivery, or failed stop can leave durable
+drain evidence requiring operator reconciliation; terminal job status alone is
+not proof that host work stopped. Retries cannot clear another delivery's record.
+Deadlines include VM release and drain, survive restart, and cap HTTP retries.
+
+When Cloud completed an upgrade but CI rejected its receipt, a repository submit
+bearer can POST `/api/runs/{run_id}/maintenance/{operation_id}/recover`.
+Recovery GETs the original Cloud operation, checks every identity and the trusted
+mapping, and requires the original published release. It never POSTs an upgrade.
+Only a failed run with this one failed job and no unresolved execution is eligible;
+cancelled runs or skipped jobs that previously executed are refused. Recovery
+records the original error and receipt in `ci.host.maintenance.recovered.v1`,
+marks the proven operation successful, releases its fence and resumes untouched
+skipped jobs in the same run. Existing logs, attempt IDs and status events remain.
+A repeated call does not repeat maintenance or recovery. This is distinct from
+`rerun-failed`: a published-release retry preserves its original publication,
+but cannot authorize a new merge or bypass unresolved maintenance.
+
+Deploy the new Cloud endpoint **and every Cloud worker's cross-instance operation
+locking** before enabling this action. Older Cloud cannot execute the plural POST,
+and CI never falls back to the legacy non-idempotent singular POST. This feature
+does not authorize any production host upgrade or establish regional readiness.
+All CI dispatchers sharing these runners must also run this fencing-aware engine;
+drain or explicitly reconcile work started by older engines before enabling it.
+
+### Standalone validation, merge, version bump, build and deployment
 
 The opt-in [release workflow example](release-example.yml) connects these stages
 using built-in actions. It is outside `.ci/workflows/` and does not enable live
@@ -1184,8 +1720,8 @@ explicit `with.tags` policy.
   `origin/HEAD` and its remote-tracking tip. Fetch trunk before submission. That
   base must be an ancestor of the submitted source, and target trunk must still
   equal that base at publication. The submitted feature branch is not advanced.
-  Ordinary `before` change detection is unchanged; missing release metadata
-  prevents release publication but does not prevent ordinary builds.
+  Missing release metadata prevents release publication but does not prevent
+  ordinary builds.
   Publication fast-forwards target trunk to the source plus a deterministic
   version commit, never merges unvalidated concurrent trunk changes. Resubmit and
   revalidate if trunk moved. Use the Git-patch submission format; legacy bundles
@@ -1226,7 +1762,323 @@ but failed/uncertain finalization never authorizes a deployment. Publication,
 release and deployment state write NATS outbox events transactionally. These
 actions do not change app-lb, namespaces, existing VM pages, or Retail.
 
+### One-time native heyvm host bootstrap
+
+`ci/bootstrap-host-heyvm` is a release-only, final-step action used to install the
+managed host heyvm service before normal host maintenance is available. It accepts
+only `target`, a direct `${{ secrets.NAME }}` app-lb namespace-admin `token`, and
+the frozen validation `workflow` and `artifact` names. The coordinator must run in
+a CI-owned VM on a runner other than the target. The artifact must have been
+uploaded as a public artifact to CI's configured HTTP artifact sink and contain
+exactly one `*heyvm.tar.gz` with exactly one ELF `heyvm`.
+
+Set `CI_HOST_HEYVM_BOOTSTRAP_TARGETS`, or preferably store the same JSON at the
+operator-only HeyoSecret path `ci-controller/host-heyvm-bootstrap-targets` (the
+environment variable wins):
+
+```json
+{"eu1":{"repository":"https://github.com/Heyo-Computer/heyo.git","app_lb_admin_url":"https://eu1.heyo.computer/app-lb-admin","app_lb_deployment":"app-lb-eu1","app_lb_namespace":"default","runner_hd_id":"target-runner-id","backend_server_id":"eu1-backend-id","executable":"/usr/local/bin/heyvm","unit":"heyvm.service","state_dir":"/var/lib/heyvm-host-update","config_json_path":"/etc/heyvm-host-update.json","systemd_drop_in_path":"/etc/systemd/system/heyvm.service.d/host-update.conf","local_health_url":"http://127.0.0.1:4455/health","target_alias":"eu1","region":"eu1"}}
+```
+
+Prerequisites are app-lb's authenticated admin launcher and job-history APIs, a
+namespace-admin token in the workflow secret named by `token`, the target runner
+registered with this controller, and a confirmed merged release whose exact
+successful frozen validation produced the artifact. Delivery is durably armed
+before its single launcher POST; restart recovery only adopts exactly one update
+job. Cancellation, timeout, mapping drift, missing identity, ambiguous launcher
+history, failure, or rollback retain the target fence. Only an exact authenticated
+success receipt uncordons it.
+
+The coordinator polls `/deployments/{launcher}/jobs` and selects the persisted
+job ID, preserving namespace-scoped access. It does not require fleet-wide
+`/jobs/{id}` access. Missing or duplicate job IDs and mismatched deployment or
+job-kind identities retain the fence; the selected job still requires the exact
+success receipt before uncordoning.
+
+The initial eu1 installation is explicitly a **one-time** use: run one release job
+with `target: eu1`, verify its deployment event reaches `passed`, then use normal
+`ci/host-heyvm-maintenance` for subsequent upgrades. Do not rerun bootstrap to
+repair a retained fence; reconcile the persisted operation and launcher job.
+
+### Managed heyvmd rollout
+
+`ci/rollout-host-heyvmd` uses the same durable coordinator, runner fence, drain,
+single app-lb launcher delivery, receipt reconciliation, and explicit recovery
+contract as `ci/bootstrap-host-heyvm`. Its inputs are the same closed set:
+`target`, direct `${{ secrets.NAME }}` `token`, frozen validation `workflow`, and
+public `artifact`. Unlike the bootstrap action, it selects the exact root
+`heyvmd` ELF from the validated inner `heyvm-*-unknown-linux-gnu-x86_64.tar.gz`;
+it never installs or renames `heyvm`.
+
+The trusted operator mapping remains at
+`ci-controller/host-heyvm-bootstrap-targets`. A heyvmd target adds the required
+`process_manager`, whose only accepted values are `systemd` and `supervisor`.
+`unit` is the existing systemd unit (for example `heyvmd-eu1.service`) or the
+existing Supervisor program name (for example `heyvmd-ci`). `executable` must be
+the existing `/usr/local/bin/heyvmd`. All other fields are unchanged from the
+mapping above; config/drop-in paths remain required for schema compatibility but
+are not read or modified by heyvmd rollout. The action does not modify units or
+VMs.
+
+Systemd `KillMode=process` remains required for heyvm. For heyvmd only,
+`KillMode=control-group` is also accepted when the unit's cgroup and every child
+cgroup contain only its main daemon PID. Missing cgroup evidence or any other
+process blocks the operation. Local-runner development mode cannot verify a
+regional tunnel and is rejected for daemon rollout.
+
+The installer durably journals and retains the previous binary, verifies the
+predecessor disk/running identity, atomically replaces only the daemon binary,
+restarts through the selected manager, and verifies changed PID/start time plus
+the exact disk and `/proc/PID/exe` hashes. Failure restores and restarts the old
+binary; rollback failure is terminal and retained. A local health response alone
+cannot release the fence: after the exact launcher receipt, CI evicts its old
+runner tunnel and must establish a fresh authenticated tunnel probe to that
+runner. Failed reconnection keeps the operation polling and the runner fenced.
+
+Complete operator mapping examples (replace identities and URLs with the trusted
+values for each region) are:
+
+```json
+{
+  "heyvmd-eu1": {"repository":"https://github.com/Heyo-Computer/heyo.git","app_lb_admin_url":"https://eu1.heyo.computer/app-lb-admin","app_lb_deployment":"app-lb-eu1","app_lb_namespace":"default","runner_hd_id":"<eu1-hd-id>","backend_server_id":"<eu1-backend-id>","executable":"/usr/local/bin/heyvmd","unit":"heyvmd-eu1.service","state_dir":"/var/lib/heyvmd-host-update","config_json_path":"/etc/heyvmd-host-update-unused.json","systemd_drop_in_path":"/etc/systemd/system/heyvmd-eu1.service.d/host-update-unused.conf","local_health_url":"http://127.0.0.1:<eu1-backend-port>/health","target_alias":"heyvmd-eu1","region":"eu1","process_manager":"systemd"},
+  "heyvmd-us3": {"repository":"https://github.com/Heyo-Computer/heyo.git","app_lb_admin_url":"https://us3.heyo.computer/app-lb-admin","app_lb_deployment":"app-lb-us3","app_lb_namespace":"default","runner_hd_id":"<us3-hd-id>","backend_server_id":"<us3-backend-id>","executable":"/usr/local/bin/heyvmd","unit":"heyvmd-ci","state_dir":"/var/lib/heyvmd-host-update","config_json_path":"/etc/heyvmd-host-update-unused.json","systemd_drop_in_path":"/etc/supervisor/conf.d/heyvmd-host-update-unused.conf","local_health_url":"http://127.0.0.1:<us3-backend-port>/health","target_alias":"heyvmd-us3","region":"us3","process_manager":"supervisor"}
+}
+```
+
+The parent release workflow invokes one final step per target with this input
+shape: `uses: ci/rollout-host-heyvmd`, `with.target` equal to the mapping key,
+`with.token` a direct app-lb namespace-admin secret expression, and
+`with.workflow` / `with.artifact` naming the frozen validation artifact that
+contains both Linux executables.
+
+After restarting the service, bootstrap retries transient health connection
+failures and HTTP 502/503/504 responses for 30 seconds. A reachable endpoint with
+the wrong backend identity still fails immediately. Rollback journals retain
+the original exception type and installer source line, plus a separate rollback
+failure when applicable; command arguments and exception messages are not logged.
+
+For a failed attempt whose installer succeeded, explicitly invoke
+`POST /api/runs/{run_id}/bootstrap/{operation_id}/recover` with that repository's
+submit bearer token. This is a production scheduling-state change, not a status
+query. It requires the original successful launcher receipt and unchanged trusted
+target mapping, then launches a fresh **read-only** app-lb verification job to check
+the host journal, active executable, config, drop-in, permissions, environment,
+and health identity. It never downloads or reinstalls the binary or restarts the
+service. Missing history, drift, or conflicting operations retain the fence.
+
+Successful recovery atomically releases this operation's fence and emits
+`ci.host.bootstrap.recovered.v1` in the run's `/events` API. The original failed
+run, job, step, and deployment history remain failed; the recovery response and
+audit event are the evidence of recovery. Repeating a completed recovery returns
+`already_passed` without running another verification job. A request interrupted
+before commit retains the fence; inspect events before retrying. Verification
+launcher records are retained for audit, not automatically deleted.
+
+### Host app-lb executable rollout
+
+`ci/rollout-host-app-lb` is a release-only action with `target`, secret `token`,
+`workflow` (frozen validation workflow path), and `artifact` (bundle name).
+Job/step `continue-on-error` is rejected for this action.
+It does not accept paths, service names, commands, revisions, or digests from
+the workflow. The operator supplies `CI_HOST_APP_LB_TARGETS` as JSON. When
+that environment variable is absent, the action reads the same JSON from
+the fixed HeyoSecret path `ci-controller/host-app-lb-targets`, using the
+controller's existing HeyoSecret configuration. This operator-owned path is
+outside workflow secret prefixes; job variables cannot select or override it.
+Missing or invalid configuration refuses the rollout. Explicit environment
+configuration takes precedence, including invalid values (no fallback).
+
+Example mapping:
+
+```json
+{
+  "eu1": {
+    "repository": "https://github.com/Heyo-Computer/heyo-public.git",
+    "url": "https://admin.eu1.heyo.work",
+    "deployment": "app-lb-host-controller",
+    "namespace": "default",
+    "health_url": "https://admin.eu1.heyo.work/healthz"
+  }
+}
+```
+
+This example does not enable a target or release workflow. The host requires
+the matching operator-owned [host update mapping](../app-lb/README.md#correlated-host-executable-rollout)
+and bootstrapped correlated API/helper support. API and health URLs require
+HTTPS; redirects are never followed. Host and CI must agree on the configured
+artifact store and public health URL. The validated blob must be public for
+the helper's credential-free pinned download.
+
+The action uses successful frozen artifact membership at the exact confirmed
+merged SHA, verifies the bounded bundle and derives its executable digest from
+`dist/app-lb`, `dist/REVISION`, and `dist/SHA256SUMS`. It stores the immutable
+request, original executable/configuration hashes and deadline in Postgres
+before POST. Secrets and live host configuration are not persisted.
+
+Every reconciliation first GETs the same operation ID. Admission and systemd
+launch success do not complete a job: CI requires exact operation identity,
+verified replacement completion and a separate public 2xx health response with
+the exact immutable `x-heyo-revision`. Cancellation/deadline fences late success
+and prevents further admission, but does not roll back already accepted work.
+An uncertain helper launch/switch remains blocked for operator reconciliation,
+never retried as a different operation or through legacy commands.
+
+This action does not provide regional ordering by itself. Parent release jobs
+must use sequential `needs` edges and must not tolerate rollout failure. No
+repository workflows are enabled by this primitive.
+
+#### Preparing the initial native bootstrap manifest
+
+`ci --prepare-host-bootstrap plan.json inspection.json app-lb.tar.gz manifest.json`
+is an offline operator command. It does not load CI service configuration or
+connect to Postgres, NATS, or a host. It prepares a private, atomically published
+manifest without overwriting an existing file, and prints only its path,
+canonical SHA256 and `prepared` status. Preparation is **not deployment or
+release authorization**.
+
+The plan contains `operation_id`, the expected 40-hex build `revision`, the exact
+native host `config`, `mapping_path`, and `files`. Each file has `path`, numeric
+`mode`, and exactly one of `after_base64`, `preserve: true`, or
+`supervisor_environment: true`. Omit inactive keys. Do not supply `before_sha256`:
+the command derives it from the native `inspect` response. The ordered file list
+must match both `config.config_files` and the inspection, including the mapping
+file. That mapping requires explicit non-secret `after_base64` bytes that decode
+to the same `config`. Literal modes are 384 (0600) or 420 (0644); preservation
+and the native Supervisor edit require the inspected existing mode.
+
+Use `preserve` or the native Supervisor edit for secret-bearing files; never
+copy their contents into `after_base64`, inspection output, or logs. The command
+retains hashes and typed edits without reading the original host file contents.
+It verifies the supplied bundle's revision and executable checksum, derives the
+artifact/helper/executable digests, and emits compact recursively sorted native
+manifest JSON. JSON inputs/output are bounded to 4 MiB and 32 config files;
+the shared host-bundle parser enforces archive limits.
+
+Obtain the bundle from trusted CI evidence and the inspection from an authorized
+native host inspection; this offline command cannot authenticate their source
+or establish that the inspection is still current. Native admission must still
+check root ownership, paths, current source generation, all file hashes and
+loaded service identity. Delivery/reconciliation is a separate bootstrap step:
+this command does not send or retry legacy update POSTs. After replacement, use
+the authenticated bootstrap-operation GET for completion, not the mapped legacy
+update endpoint, which is deliberately disabled.
+
+`ci --check-host-bootstrap TARGET manifest.json INTENT_SHA256` performs that
+completion check once, without loading the CI database or broker. `TARGET` must
+exist in operator-owned `CI_HOST_APP_LB_TARGETS`; supply its namespace-admin
+credential through `CI_HOST_APP_LB_TOKEN` from the managed secret configuration,
+not a command argument. Existing operator Basic credentials are also supported
+through `CI_HOST_APP_LB_USER` and `CI_HOST_APP_LB_PASSWORD` when no bearer token
+is supplied; no new token or access-control change is required. These credentials
+are sent only to the mapped admin endpoint, never public health or artifacts.
+The manifest bytes must match the previously recorded
+hash and the target's deployment, namespace and public health URL.
+
+The command checks the authenticated native receipt's operation, intent, source,
+target, journal and helper-unit identities, completed status, and verified
+readiness; it then independently requests public health without credentials and
+requires one exact revision header. Both requests forbid redirects and have
+timeouts; the receipt is capped at 64 KiB. Only verified completion exits zero.
+Missing/old endpoints, busy helpers, mismatched receipts and unavailable health
+exit nonzero without sending any POST, changing IDs, or retrying installation.
+It can be rerun for the same manifest/intent. The native GET can persist success
+and release its fence; this is an authenticated reconciliation action, not an
+unauthenticated status probe. Initial launch delivery remains separate.
+
+`ci --deliver-host-bootstrap TARGET inspect plan.json app-lb.tar.gz inspect-delivery.json`
+registers an operation-specific static launcher and invokes the pinned native
+inspection. Save its JSON output as the inspection input above. Poll with the
+**same command and journal** if the job is still running. Then prepare the
+manifest and invoke
+`ci --deliver-host-bootstrap TARGET admit manifest.json app-lb.tar.gz admit-delivery.json`.
+This uses the same managed target/token configuration as completion checking.
+Only use public artifacts tied to successful trusted CI evidence.
+
+This is an explicitly authorized bootstrap operation, not an ordinary release
+fallback. One designated coordinator owns each operation and its journals; no
+other writer may alter its launchers. Each phase gets a new, never-reused static
+deployment ID with an exact `.invalid` hostname, maintenance 503, and an
+unresolvable upstream. It creates no VM and changes no existing service route.
+The fixed transport requires root and Python 3, downloads without credentials or
+redirects, verifies the exact archive/executable, writes only root-owned staging
+files, and invokes native `inspect` or `admit`. It never installs a service or
+restarts a process itself. Preserve/native edits keep existing secrets on-host;
+never put secret literal bytes in these logged launcher recipes.
+
+The caller fsyncs its immutable recipe before registration and `delivery_armed`
+before its single update POST. Matching existing recipes are not rewritten;
+conflicts fail closed. An armed phase is GET-only on every later invocation,
+even if a crash happened before sending or the response was lost. Keep the
+journals and launchers; do not generate a new journal/ID to retry uncertainty.
+A crashed coordinator also leaves a local lock directory for explicit operator
+reconciliation. A successful legacy job is only transport evidence: use
+`--check-host-bootstrap` to attest the actual replacement and release its fence.
+
+For an explicitly reconciled failure **before launch**, the delivery CLI accepts
+`ci --deliver-host-bootstrap TARGET replan NEW_MANIFEST BUNDLE NEW_DELIVERY_JOURNAL EXPECTED_OLD_INTENT_SHA256`.
+The native replan capability must be present in the pinned bundle. It requires
+the same operation/source/config/files and checks the old exact intent,
+`reconciliation_required/preserving` phase, unchanged originals, intact backups,
+and absence of a launched helper. Only helper/target artifact identity changes.
+It archives the old record under the same state directory and preserves its
+backups. This is not permission to retry an ambiguous launch or switch, change
+the source assertions, or choose a fresh state directory to bypass a fence.
+
 ### Service deployments
+
+For candidate-first updates of existing stateless app-lb services, use
+`ci/rollout-service` in a release workflow. It reuses a successful validation
+bundle at the exact merged SHA, rather than rebuilding after merge. Inputs are
+`url`, secret `token`, `deployment`, `namespace`, `mount-path`, `revision-env`,
+`workflow` (the validation workflow path), and `artifact` (its uploaded bundle
+name). The HTTP artifact bundle must contain `dist/start.sh` and all runtime
+dependencies. The script must run from its release directory, not assume
+`/workspace`. CI mounts the verified bundle read-only with one path component
+stripped, executes `<mount-path>/start.sh`, and sets the requested revision
+environment variable. Existing routes, runtime settings and secret references
+are preserved; a conflicting secret revision override is refused.
+When adding the first release mount, CI reuses the rootfs artifact's auth
+reference only when both artifacts use the same store URL (ignoring trailing
+slashes). Existing mount credentials are preserved. A different store needs an
+explicitly configured release-mount auth reference; credentials are never copied
+across stores. Only secret references, not their values, enter the rollout intent.
+
+The token must be a direct `${{ secrets.NAME }}` reference. After cancellation,
+deadline expiry, or controller restart, CI keeps polling the exact persisted
+operation using the original job's workflow/environment secret scope, including
+while draining. Only a matching terminal app-lb receipt releases the drain fence;
+failed operations additionally require a durable `failed-rollout-reclamation-v1`
+settlement proving candidate resource reclamation. CI records that evidence in
+the deployment event and `settled_failure` phase; a legacy `failed` status alone
+does not satisfy handoff. This requires backend reclamation support before
+app-lb can settle failures with candidate allocations.
+Missing operations, authentication failures, identity mismatches and ambiguous
+remote outcomes remain unresolved. Recovery never starts a candidate or rewrites
+the original run/job result. An operator upgrading a controller that predates this
+reconciler can run `ci --reconcile-service-rollout RUN_ID OPERATION_ID` with the
+controller's configured database and HeyoSecret bindings. This uses the same
+receipt-only recovery path, without migrations, job admission or broker startup.
+
+This action requires app-lb's conditional candidate rollout API, a pinned
+rootfs artifact, pinned read-only mounts and an HTTP readiness path. Catalog
+image names alone cannot prove rootfs identity. Workspace/writable deployments
+and alternate ingress are not supported by this rollout path. Upgrade app-lb
+before enabling the action; CI never falls back to stop-first mutation APIs.
+CI sets `health.expected_header` to `x-heyo-revision` with the exact release SHA.
+The service must return that identity stamped into its build, not echoed from
+runtime environment variables. A generic healthy response from an old listener
+must not authorize cutover. app-lb requires a 2xx status and the exact header.
+
+CI persists the source revision, source/target configuration hashes, exact
+artifact and deadline before submission, without storing live secrets. Queue
+replay first looks up the exact operation. A missing operation can be submitted
+again only while the original source revision and configuration still match;
+app-lb must deduplicate that operation ID. Admission is not success: CI waits
+for identity-matched `succeeded`, verified readiness and previous-generation
+retirement. Cancellation or timeout stops waiting, not the remote operation.
+Reconcile an uncertain operation before submitting a replacement. Chain
+regional jobs with `needs` so the next region cannot start before this verified
+completion; a parallel job graph does not provide sequential regional CD.
 
 For an existing app-lb VM deployment, use `ci/publish-rootfs` followed by
 `ci/deploy-app-lb`. Publication takes `path` (a relative raw ext4 file) and
@@ -1276,7 +2128,8 @@ tenant-scoped customer deployment credential.
 
 `deploy.archive_id` must identify a finalized **Orchestrator service archive**,
 uploaded through its existing archive APIs. It is not a `ci/upload-artifact`
-tag/digest; automatic transfer between the two stores is not implemented here.
+tag/digest; use `ci/promote-service-archive` to transfer a validated submission's
+packaged archive, or `ci/publish-service-archive` for a standalone release build.
 Use the repository-owned service spec for real startup, health, route, and
 secret-reference settings. The action overwrites `deploy.deployment_id`, `async`,
 and `revision_guard` with its stable step identity and the CI run's repository,
@@ -1352,8 +2205,9 @@ to download an earlier successful job's stored archive in the same run. Declare
 the producer in `needs`; set `with.job` to its expanded job key if multiple
 producers used the same artifact name. Missing, ambiguous, unfinished, or failed
 producers are refused. Downloads verify size and SHA256 when recorded, preserve
-the uploaded tar.gz bytes, and do not unpack them. Disk and `artifacts` stores
-support downloads; the S3 sink remains unimplemented. Downloading an artifact
+the uploaded tar.gz bytes, and do not unpack them. Disk, S3 and `artifacts` stores
+support downloads. S3 reads are restricted to the configured bucket/prefix.
+Downloading an artifact
 does not make it an approved release or service archive.
 
 This is CI execution history, not deployment authorization. The release actions
@@ -1413,13 +2267,11 @@ CI_TEST_STREAM_PREFIXES=citest cargo test -- --ignored delete_leftover
 Working: workflow parsing and planning (matrix, `needs`, `if`, `max-parallel`),
 branch and path filters with the `changed()` condition, runner discovery, the VM
 pool, the job queue, `git submit` with per-repository tokens, secrets with
-masking, disk and `artifacts` sinks, the dashboard with live logs, and workflow
+masking, disk, S3 and `artifacts` sinks, the dashboard with live logs, and workflow
 objects.
 
 Not built yet:
 
-- **The S3 artifact sink.** Declared and selectable; fails loudly naming the
-  alternatives rather than reporting an artifact stored that is not there.
 - **Composite `uses:` actions.** Artifact, release and deployment actions above are built in. Fetching
   an `action.yml` from a repository is a different feature with a different trust
   model.

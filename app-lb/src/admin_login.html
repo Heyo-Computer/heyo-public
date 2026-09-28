@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en" {{HTML_ATTRS}}><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Heyo control plane</title>
+<link rel="stylesheet" href="/__ui/heyo.css">
+<script defer src="/__ui/theme.js"></script>
+<style>
+body { display:grid; min-height:100vh; place-items:center; margin:0; }
+main { width:min(26rem, calc(100% - 3rem)); }
+form, label { display:grid; gap:.6rem; }
+form { gap:1.2rem; }
+input, button { font:inherit; padding:.8rem; min-width:0; }
+p { line-height:1.5; color:var(--text-muted); }
+#error { color:var(--danger); }
+</style></head>
+<body><main>
+<h1>Heyo control plane</h1>
+<p>Sign in with your Heyo administrator account. The same account works in every configured region.</p>
+<form id="login">
+  <label>Email<input name="email" type="email" autocomplete="username" maxlength="320" required></label>
+  <label>Password<input name="password" type="password" autocomplete="current-password" maxlength="4096" required></label>
+  <button>Sign in</button>
+</form>
+<p id="error" role="alert"></p>
+<script>
+document.querySelector('#login').addEventListener('submit', async e => {
+  e.preventDefault();
+  const form = e.currentTarget, button = form.querySelector('button'), error = document.querySelector('#error');
+  error.textContent = '';
+  if (location.protocol !== 'https:') { error.textContent = 'Sign-in requires HTTPS.'; return; }
+  button.disabled = true;
+  try {
+    const r = await fetch('/login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email:form.elements.email.value, password:form.elements.password.value})
+    });
+    if (!r.ok) throw new Error('Sign-in refused or unavailable. Use a Heyo platform administrator account.');
+    location.assign('/dashboard');
+  } catch (e) { error.textContent = e.message; }
+  finally { form.elements.password.value = ''; button.disabled = false; }
+});
+</script></main></body></html>

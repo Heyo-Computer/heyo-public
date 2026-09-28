@@ -1,4 +1,5 @@
 {
+  "rollout_revision": "persisted-opaque-revision",
   "spec": {
     "id": "legacy",
     "routes": [

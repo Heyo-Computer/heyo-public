@@ -241,6 +241,19 @@ pub struct Config {
     /// spare holds its size class's RAM while parked. Env
     /// `PG_VM_POOL_WARM_SPARES` (capped at 16).
     pub warm_spares: usize,
+    /// How many of the spare VMs to keep deliberately **stopped**, reserved as
+    /// image-restore vehicles. An image restore overwrites its vehicle's data
+    /// disk wholesale, so it needs a stopped sandbox, not a running one —
+    /// handing it a booted warm spare means stopping the VM the pool just
+    /// booted and waiting for Firecracker to release the disk, ~4.8s of the
+    /// ~6.9s a compacted-image thaw used to take. A chilled spare skips both:
+    /// the restore writes the disk and starts the VM once.
+    ///
+    /// Stopped VMs hold no RAM, so these do not compete with `warm_spares` for
+    /// memory — they cost one thin data disk each. Env
+    /// `PG_VM_POOL_CHILLED_VEHICLES`, default 2, forced to 0 when the spare
+    /// pool is off (there is no replenisher to maintain them).
+    pub chilled_vehicles: usize,
     /// Automatic disk-slack reclamation: periodically offline-trim stopped VMs'
     /// sparse data disks so freed guest blocks return to the host (Firecracker's
     /// virtio-blk has no discard passthrough, so they never come back on their
@@ -591,18 +604,21 @@ pub struct DiskGrowConfig {
     /// the on/off switch; sensible range 50–95.
     pub pct: f64,
     /// Guest-filesystem used% at or above which a **warm** VM's device is
-    /// grown without waiting for it to go idle — stop, resize, start, dropping
+    /// grown without waiting for it to go idle — online under the running VM
+    /// when the daemon supports it, else stop, resize, start, dropping
     /// whatever sessions it had.
     ///
     /// Why a second, higher threshold rather than reusing [`Self::pct`]: the
     /// idle-stop grow is free (the VM is stopping anyway), so it can afford to
-    /// fire early. This one costs every live session on the schema, so it must
-    /// fire late — only once the filesystem is genuinely at the wall.
+    /// fire early. The offline fallback costs every live session on the
+    /// schema, so the default fires late — only once the filesystem is
+    /// genuinely at the wall. Where every host's heyvmd has the online resize
+    /// route, that cost is gone and this can be lowered (70–80) to grow early.
     ///
     /// Without it a schema under continuous write load can never grow at all.
     /// The guest's own watcher extends the filesystem *inside* the device and
     /// then exits ("filesystem spans $DATA_DEV; watcher done"); past that only
-    /// a host-side device resize helps, the resize is offline-only, and the
+    /// a host-side device resize helps, the resize was offline-only, and the
     /// one trigger for it was an idle stop that a busy schema never reaches.
     /// The database wedges on `No space left on device` and stays wedged until
     /// its traffic happens to pause for a whole idle timeout.
@@ -1001,6 +1017,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_PRESSURE_CHECK_SECS",
     "PG_VM_POOL_S3_BUCKET",
     "PG_VM_POOL_S3_PREFIX",
+    "PG_VM_POOL_S3_LEGACY_PREFIX",
     "PG_VM_POOL_S3_REGION",
     "PG_VM_POOL_S3_ENDPOINT",
     "PG_VM_POOL_S3_ACCESS_KEY_ID",
@@ -1248,6 +1265,17 @@ impl Config {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(0);
+        // Zero without a spare pool: the chilled shelf is maintained by the
+        // replenisher, so with no replenisher the knob would only promise
+        // vehicles nothing ever builds.
+        let chilled_vehicles = if warm_spares == 0 {
+            0
+        } else {
+            std::env::var("PG_VM_POOL_CHILLED_VEHICLES")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(2)
+        };
         let offload_workers = match std::env::var("PG_VM_POOL_OFFLOAD_WORKERS") {
             Ok(v) => match v.trim().parse::<usize>() {
                 Ok(n) => n.clamp(1, 16),
@@ -1388,6 +1416,7 @@ impl Config {
             dump_net: DumpNetConfig::from_env()?,
             compact,
             warm_spares,
+            chilled_vehicles,
             reclaim,
             run_dir,
             orphan_sweep,
@@ -1509,7 +1538,11 @@ impl ArchiveConfig {
         };
         let region = nonempty("PG_VM_POOL_S3_REGION").unwrap_or_else(|| "us-east-1".to_string());
         let prefix = std::env::var("PG_VM_POOL_S3_PREFIX")
-            .unwrap_or_else(|_| "pg-vm-pool/".to_string());
+            .unwrap_or_else(|_| crate::s3::DEFAULT_PREFIX.to_string());
+        let legacy_prefix = crate::s3::legacy_prefix_for(
+            &prefix,
+            std::env::var("PG_VM_POOL_S3_LEGACY_PREFIX").ok(),
+        );
         let endpoint = nonempty("PG_VM_POOL_S3_ENDPOINT");
 
         Ok(Some(Self {
@@ -1519,6 +1552,7 @@ impl ArchiveConfig {
             s3: crate::s3::S3Config {
                 bucket,
                 prefix,
+                legacy_prefix,
                 region,
                 // Filled in on the first HEAD if S3 says the bucket lives
                 // somewhere other than `region`.

@@ -8,8 +8,6 @@ COPY .ci/ .ci/
 RUN cargo test --locked --manifest-path ci/Cargo.toml -- --test-threads=1 \
     && cargo build --locked --release --manifest-path ci/Cargo.toml --bin ci
 
-FROM nats:2.11 AS broker
-
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-server iproute2 ca-certificates curl git python3 libssl3 \
@@ -19,9 +17,7 @@ RUN mkdir -p /run/sshd /etc/ssh/sshd_config.d \
     && passwd -d root && ssh-keygen -A
 
 COPY --from=builder /app/ci/target/release/ci /opt/ci/ci
-COPY --from=broker /nats-server /opt/ci/nats-server
 COPY ci/deploy/trial-start.sh /opt/ci/start.sh
-COPY ci/deploy/trial-nats.conf /opt/ci/nats.conf
 COPY heyosecret/init.sh /init.sh
 RUN sed -i 's/hostname heyosecret/hostname ci/' /init.sh \
     && chmod 755 /init.sh /opt/ci/start.sh \

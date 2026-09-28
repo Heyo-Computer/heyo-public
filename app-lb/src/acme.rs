@@ -844,6 +844,7 @@ mod tests {
             health: Default::default(),
             upstreams: vec!["127.0.0.1:8080".into()],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,

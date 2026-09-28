@@ -333,7 +333,16 @@ async fn admission_slot(
         }
         None => Err(BringupShed {
             schema: schema.to_string(),
-            waited: queued.elapsed(),
+            // Since the client's cold start began, not just this attempt's
+            // turn in the queue: a client that sat behind another client's
+            // attempt at the same schema is shed the moment its own turn
+            // comes, and "no slot after 60ms" would hide the 15s it waited.
+            waited: match (deadline, admission_wait()) {
+                (Some(deadline), Some(wait)) => {
+                    wait + Instant::now().saturating_duration_since(deadline)
+                }
+                _ => queued.elapsed(),
+            },
             queued: bringups_waiting(),
         }
         .into()),
@@ -770,6 +779,14 @@ pub async fn ensure_vm(
              restore {restore_took:?}, slots {bootstrap_took:?}",
         );
 
+        // Time to a serving Postgres, per restore source — the same span the
+        // line above breaks into phases, and the same bound `VmCreate` uses:
+        // successful bring-ups only, admission wait excluded. A bring-up with
+        // nothing to restore is already covered by `VmCreate`.
+        if let Some(source) = restore {
+            crate::events::record_timing(restore_timing(source), bringup_started.elapsed());
+        }
+
         Ok(Arc::new(SchemaEntry::new(
             sandbox,
             target,
@@ -784,7 +801,10 @@ pub async fn ensure_vm(
 
     if result.is_err() {
         match provenance {
-            Provenance::Spare => {
+            // Chilled or running, a claimed spare goes back through the pool:
+            // `release_failed` kills it AND drops the claim, so the
+            // replenisher rebuilds instead of the id staying claimed forever.
+            Provenance::Spare | Provenance::ChilledSpare => {
                 if let Some((pool, _)) = spares {
                     pool.release_failed(&sandbox_id).await;
                 }
@@ -1931,8 +1951,14 @@ async fn restore_from_s3(
         match s3.head_object(&http, &key, ARCHIVE_HEAD_TIMEOUT).await {
             Ok(None) => bail!(
                 "schema {schema} is marked archived but s3://{}/{key} does not exist — \
-                 there is no archive to restore",
-                s3.bucket
+                 there is no archive to restore{}",
+                s3.bucket,
+                s3.fallback_prefix()
+                    .map(|p| format!(
+                        " (the legacy prefix {p} is read only when this host's prefix is \
+                         known to hold nothing for the schema)"
+                    ))
+                    .unwrap_or_default()
             ),
             Ok(Some(id)) if id.content_length < MIN_ARCHIVE_BYTES => bail!(
                 "schema {schema}: the archive at s3://{}/{key} is only {} bytes — it was \
@@ -2447,7 +2473,7 @@ async fn power_cycle(
 /// Never fails — every failure mode becomes descriptive text.
 async fn boot_evidence(cfg: &Config, sandbox: &Sandbox) -> String {
     let cmd = "v=$(cat /workspace/pgdata/PG_VERSION 2>/dev/null || echo '?'); \
-               s=$(postgres --version 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo '?'); \
+               s=$(ls /usr/lib/postgresql 2>/dev/null | sort -n | tail -1); [ -n \"$s\" ] || s='?'; \
                echo \"pgdata=v$v server=v$s pg-procs=$(pgrep -c postgres 2>/dev/null || echo 0)\"; \
                tail -n 4 /workspace/pg-startup.log 2>/dev/null; \
                tail -n 3 \"$(ls -t /workspace/pgdata/log/*.log 2>/dev/null | head -1)\" 2>/dev/null \
@@ -2588,7 +2614,25 @@ async fn probe_pg_window(pool: &Pool, window: Duration) -> PgProbe {
 pub(crate) enum Provenance {
     Existing,
     Spare,
+    /// A spare claimed off the pool's *chilled* shelf: already stopped, so an
+    /// image restore can overwrite its disk without stopping anything first.
+    /// Disposed of exactly like [`Provenance::Spare`] — it is a claimed spare,
+    /// and a failed restore leaves its disk just as ambiguous.
+    ChilledSpare,
     Created,
+}
+
+impl Provenance {
+    /// Whether the VM is already stopped and the caller may skip its own stop.
+    /// Only a chilled spare promises this; everything else arrives running.
+    ///
+    /// Disposal does *not* go through a helper like this one: both spare
+    /// variants must be released through the pool rather than killed behind
+    /// its back, and spelling them out at each `match` is what makes the
+    /// compiler point at those sites when a variant is added.
+    pub(crate) fn is_stopped(self) -> bool {
+        matches!(self, Provenance::ChilledSpare)
+    }
 }
 
 /// The warm-spare pool and the set of sandbox ids already bound to a schema,
@@ -2672,6 +2716,21 @@ pub(crate) async fn resolve_sandbox(
         .map(|sb| (sb, Provenance::Created))
 }
 
+/// Which total a restore of this source records. Kept apart rather than
+/// summed into one "restore" figure: a dump reloads through Postgres while an
+/// image swaps a disk under a booted VM, and the S3 pair pays a download the
+/// local pair does not — one percentile over all four would describe no
+/// restore anyone actually waited for.
+fn restore_timing(source: &RestoreSource) -> crate::events::Timing {
+    use crate::events::Timing;
+    match source {
+        RestoreSource::S3(_) => Timing::RestoreS3Dump,
+        RestoreSource::S3Image(_) => Timing::RestoreS3Image,
+        RestoreSource::Local { .. } => Timing::RestoreLocalDump,
+        RestoreSource::LocalImage(_) => Timing::RestoreLocalImage,
+    }
+}
+
 /// A booted, ready VM for an image restore to use as its *vehicle*: the caller
 /// stops it immediately, overwrites its data disk with the restored image, and
 /// boots it on the real data.
@@ -2697,11 +2756,31 @@ pub(crate) async fn claim_restore_vehicle(
     spares: Spares<'_>,
     pinned: bool,
 ) -> Result<(Sandbox, Provenance)> {
+    // A chilled vehicle first: it is already stopped, which is the state this
+    // restore wants and the only one it can use without paying for a
+    // transition. Taking a *running* spare means stopping it (~2.1s for the
+    // daemon to SIGKILL Firecracker and ack) and then waiting for the disk fd
+    // to be released before the swap — ~4.8s of a ~6.9s thaw, spent undoing a
+    // boot whose every result the restore is about to overwrite.
+    if let Some((pool, bound)) = spares
+        && let Some(sb) = pool.take_chilled(bound).await
+    {
+        info!(
+            "schema {schema}: claiming chilled vehicle {} for the image restore (already \
+             stopped — no stop, no disk-release wait)",
+            sb.sandbox_id()
+        );
+        return Ok((sb, Provenance::ChilledSpare));
+    }
+    // Fallback: a running spare, stopped on the client's time. Still far
+    // cheaper than a create, and the only stop-free alternative would be a
+    // sandbox created without booting, which the daemon does not offer.
     if let Some((pool, bound)) = spares
         && let Some(sb) = pool.take(bound).await
     {
         info!(
-            "schema {schema}: claiming warm spare {} as the image-restore vehicle",
+            "schema {schema}: no chilled vehicle free — claiming running warm spare {} and \
+             stopping it for the image restore",
             sb.sandbox_id()
         );
         return Ok((sb, Provenance::Spare));
@@ -2784,6 +2863,257 @@ async fn resize_disk_at(base_url: &str, sandbox_id: &str, target_gb: u64) -> Res
         );
     }
     Ok(())
+}
+
+/// What an online device grow came to. See [`resize_disk_online`].
+#[derive(Debug)]
+pub(crate) enum OnlineGrow {
+    /// The device and the guest filesystem on it both reached the target and
+    /// the daemon verified it from inside the guest. Nothing was stopped.
+    Grown,
+    /// The online route could not do it, for a reason the offline resize can
+    /// get past: an older daemon without the route (404), a VM that is not
+    /// running (409), or a failure partway through (5xx, or no answer). Each
+    /// leaves the VM as the offline path expects to find it — at worst a
+    /// backing file or device larger than its filesystem, which the offline
+    /// resize's host-side `resize2fs` finishes.
+    FallBack(String),
+}
+
+/// Grow a **running** sandbox's data device to `target_gb` without stopping
+/// it, through the daemon's online workspace resize
+/// (`POST /sandboxes/{id}/resize-online` with `disk_size_gb`).
+///
+/// The daemon extends the backing file, tells Firecracker the drive grew,
+/// runs `resize2fs` in the guest and verifies both sizes before answering, so
+/// `Grown` means the space is usable now. Sessions, the tunnel and the
+/// housekeeping pool are untouched.
+///
+/// `Err` only for a request the daemon refused as invalid (400: a shrink, a
+/// size past its cap, host storage below its reserve). The offline resize
+/// would refuse it the same way, so falling back would just fail slower.
+pub(crate) async fn resize_disk_online(sandbox_id: &str, target_gb: u64) -> Result<OnlineGrow> {
+    resize_disk_online_at(daemon_base_url(), sandbox_id, target_gb).await
+}
+
+/// [`resize_disk_online`] against an explicit daemon base URL.
+async fn resize_disk_online_at(
+    base_url: &str,
+    sandbox_id: &str,
+    target_gb: u64,
+) -> Result<OnlineGrow> {
+    anyhow::ensure!(
+        (1..=u64::from(DAEMON_MAX_DISK_GB)).contains(&target_gb),
+        "disk_size_gb must be within 1–{DAEMON_MAX_DISK_GB} GiB (daemon limit)"
+    );
+    let url = format!("{base_url}/sandboxes/{sandbox_id}/resize-online");
+    // No cold boot inside: the daemon bounds its in-guest grow and
+    // verification at 120s + 60s, and the file extend is one fallocate.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(240))
+        .build()
+        .context("building HTTP client for daemon online resize")?;
+    let resp = match client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(format!("{{\"disk_size_gb\":{target_gb}}}"))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Ok(OnlineGrow::FallBack(format!(
+                "online resize request failed: {e}"
+            )))
+        }
+    };
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(OnlineGrow::Grown);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let body = body.trim();
+    match status {
+        reqwest::StatusCode::BAD_REQUEST => {
+            bail!("daemon online workspace resize returned {status}: {body}")
+        }
+        reqwest::StatusCode::NOT_FOUND if body.is_empty() => Ok(OnlineGrow::FallBack(
+            "the deployed heyvmd has no online resize route".to_string(),
+        )),
+        _ => Ok(OnlineGrow::FallBack(format!(
+            "daemon online workspace resize returned {status}: {body}"
+        ))),
+    }
+}
+
+/// Remaining slots in heyvm's process-wide create gate, or `None` when it has
+/// not been sampled (or the daemon did not report one).
+///
+/// The gate is a `Semaphore` whose width defaults to **4** regardless of host
+/// size, and its permit is held across a create *and* its boot. It is
+/// therefore the real bound on create throughput — not CPU, RAM or disk, all
+/// of which sit idle while creates queue FIFO behind it. A burst deeper than
+/// the gate turns into a queue whose wait is bounded by nothing
+/// (`HEYVMD_CREATE_TIMEOUT_SECS` bounds one slot's execution, not the line
+/// behind it), which is how a create p99 reaches minutes on an idle-looking
+/// host. Worth a tile next to spare depth for exactly that reason: it is the
+/// difference between "the host is busy" and "we are queued".
+static CREATE_GATE_AVAILABLE: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
+
+/// Sample the daemon's create-gate depth. Called once per warm-spare pass —
+/// the pool is both the biggest source of concurrent creates and the thing
+/// most starved when the gate is full, so its cadence is the right one.
+pub(crate) async fn refresh_create_gate() {
+    let url = format!("{}/health", daemon_base_url());
+    let read = async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .ok()?;
+        let body: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+        body.get("createGate")?.get("available")?.as_i64()
+    };
+    let value = read.await.unwrap_or(-1);
+    CREATE_GATE_AVAILABLE.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Last sampled create-gate depth; `None` when unknown.
+pub(crate) fn create_gate_available() -> Option<i64> {
+    match CREATE_GATE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        v if v < 0 => None,
+        v => Some(v),
+    }
+}
+
+/// Does the local daemon understand `data_image_path` on create — i.e. can it
+/// build a VM straight onto an image we already hold, with no vehicle to
+/// borrow, stop and overwrite?
+///
+/// Probed once and cached. It **must** be an explicit positive. heyvm's request
+/// structs carry no `deny_unknown_fields`, so a daemon that predates the field
+/// does not reject it — it silently drops it and provisions a *blank* disk.
+/// Optimistically sending it would turn every restore against an older daemon
+/// into a VM serving an empty cluster while reporting success, which is
+/// indistinguishable from data loss. Anything short of a daemon naming the
+/// capability sends us down the vehicle path: slower, and correct.
+pub(crate) async fn daemon_adopts_data_images() -> bool {
+    static CAP: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    *CAP.get_or_init(|| async {
+        let url = format!("{}/health", daemon_base_url());
+        let probe = async {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .ok()?;
+            let body: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+            Some(
+                body.get("capabilities")?
+                    .as_array()?
+                    .iter()
+                    .any(|c| c.as_str() == Some("data_image_path")),
+            )
+        };
+        let supported = probe.await.unwrap_or(false);
+        if supported {
+            info!(
+                "daemon advertises data_image_path: image restores will build a VM directly on \
+                 the restored disk (no vehicle, no stop, no copy)"
+            );
+        } else {
+            info!(
+                "daemon does not advertise data_image_path: image restores keep using the \
+                 chilled-vehicle path"
+            );
+        }
+        supported
+    })
+    .await
+}
+
+/// Create a VM whose data disk **is** `image` — the daemon renames the file
+/// into the new sandbox and boots on it once.
+///
+/// The SDK has no field for this (it predates the route), so this speaks raw
+/// HTTP to the daemon's synchronous `POST /sandboxes`, exactly as
+/// [`resize_disk_at`] does for the workspace resize. Field names are heyvm's
+/// `CreateSandboxRequest` (snake_case, no rename_all); `size_class` and
+/// `backend_type` are both `rename_all = "lowercase"` on each side, so the
+/// SDK's `as_str()` is the right wire value.
+///
+/// `adopt: "move"` hands the file over: on the run dir's own filesystem that
+/// is a `rename(2)`, so the image is attached without copying a byte. The
+/// caller must therefore treat `image` as consumed once this returns.
+pub(crate) async fn create_vm_on_image(
+    cfg: &Config,
+    name: &str,
+    keepalive: bool,
+    image: &std::path::Path,
+) -> Result<Sandbox> {
+    let _slot = bringup_slot(name).await;
+    let started = Instant::now();
+    let body = serde_json::json!({
+        "name": name,
+        "image": cfg.image,
+        "backend_type": "firecracker",
+        "size_class": cfg.size_class.as_str(),
+        "open_ports": [VM_PG_PORT],
+        // Always 0: the pooler owns VM lifecycle, as in `create_vm`.
+        "ttl_seconds": 0,
+        "data_image_path": image.to_string_lossy(),
+        "data_image_adopt": "move",
+    });
+    let url = format!("{}/sandboxes", daemon_base_url());
+    let client = reqwest::Client::builder()
+        .timeout(DEPLOY_HTTP_TIMEOUT)
+        .build()
+        .context("building HTTP client for the adopt-image create")?;
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .context("calling the daemon's create-on-image")?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "daemon create-on-image returned {status}: {} (a 404 means this daemon has no \
+             /sandboxes route; a 422 naming data_image_path means it predates the field)",
+            text.trim()
+        );
+    }
+    let id = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("id").and_then(|i| i.as_str().map(str::to_string)))
+        .ok_or_else(|| anyhow::anyhow!("daemon create-on-image returned no sandbox id: {text}"))?;
+    let sandbox = Sandbox::connect(id.clone(), local_opts())
+        .with_context(|| format!("connecting to adopted-image VM {id}"))?;
+    if let Some(schema) = name.strip_prefix("pg-") {
+        crate::pending::record(schema, &id).await;
+    }
+    crate::inventory::insert(name, &id);
+    // The synchronous create returns only once the guest has been started, so
+    // this is a confirmation rather than a wait — but it is the same guard
+    // `create_vm` uses, and a daemon that 201s an unstarted VM must not slip
+    // through to a client.
+    let ready_timeout = cfg.ready_timeout;
+    if let Err(e) = wait_ready(&sandbox, ready_timeout, name).await {
+        warn!("{name}: adopted-image VM {id} never became ready; killing it");
+        let _ = tokio::time::timeout(Duration::from_secs(30), sandbox.kill()).await;
+        crate::inventory::remove_id(&id);
+        if let Some(schema) = name.strip_prefix("pg-") {
+            crate::pending::clear(schema).await;
+        }
+        return Err(e).with_context(|| format!("waiting for adopted-image VM {name}"));
+    }
+    if keepalive && let Err(e) = sandbox.set_ttl(0).await {
+        warn!("failed to pin keep-alive VM {name} (set_ttl 0): {e:#}");
+    }
+    crate::events::record_timing(crate::events::Timing::VmCreate, started.elapsed());
+    info!("created VM {name} on the restored disk in {:?}", started.elapsed());
+    Ok(sandbox)
 }
 
 /// Best-effort stop of whatever VM a failed offload bring-up may have left
@@ -3246,6 +3576,18 @@ async fn wait_pg_ready(pool: &Pool, timeout: Duration, name: &str) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `swap_and_boot` skips its stop on this answer alone, so only the
+    /// variant that is genuinely handed over stopped may say yes. A `Spare`
+    /// answering true here would send a `cp` at the disk of a running
+    /// Firecracker.
+    #[test]
+    fn only_a_chilled_vehicle_reports_itself_already_stopped() {
+        assert!(Provenance::ChilledSpare.is_stopped());
+        assert!(!Provenance::Spare.is_stopped());
+        assert!(!Provenance::Created.is_stopped());
+        assert!(!Provenance::Existing.is_stopped());
+    }
 
     #[test]
     fn physical_exec_preserves_one_shell_body_and_exit_status() {
@@ -4079,6 +4421,88 @@ mod tests {
         assert_eq!(seen[0].1, r#"{"disk_size_gb":8}"#);
     }
 
+    /// Spin an in-process daemon stub for the online route; answers every
+    /// request with `status` and `body`.
+    async fn online_resize_stub(
+        status: axum::http::StatusCode,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+        use axum::extract::Path as AxPath;
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+        let log = seen.clone();
+        let app = axum::Router::new().route(
+            "/sandboxes/{id}/resize-online",
+            axum::routing::post(move |AxPath(id): AxPath<String>, req_body: String| {
+                log.lock().unwrap().push((id, req_body));
+                async move { (status, body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(axum::serve(listener, app).into_future());
+        (base, seen)
+    }
+
+    #[tokio::test]
+    async fn resize_disk_online_posts_the_daemon_wire_format() {
+        let (base, seen) = online_resize_stub(axum::http::StatusCode::OK, "{}").await;
+        let grown = resize_disk_online_at(&base, "sb-abc123", 8).await.unwrap();
+        assert!(matches!(grown, OnlineGrow::Grown), "{grown:?}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "sb-abc123");
+        assert_eq!(seen[0].1, r#"{"disk_size_gb":8}"#);
+    }
+
+    /// Everything the offline resize can get past falls back to it; only a
+    /// request the daemon calls invalid is an error, since offline would
+    /// refuse it too.
+    #[tokio::test]
+    async fn resize_disk_online_falls_back_unless_the_request_is_invalid() {
+        use axum::http::StatusCode;
+        for (status, body) in [
+            (StatusCode::CONFLICT, "sandbox sb-x is not running; resize it offline"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "in-guest filesystem grow failed (exit 127)"),
+            (StatusCode::NOT_FOUND, "Sandbox not found: sb-x"),
+        ] {
+            let (base, _) = online_resize_stub(status, body).await;
+            match resize_disk_online_at(&base, "sb-x", 8).await.unwrap() {
+                OnlineGrow::FallBack(why) => {
+                    assert!(why.contains(status.as_str()) && why.contains(body), "{why}")
+                }
+                other => panic!("{status} must fall back, got {other:?}"),
+            }
+        }
+
+        let (base, _) = online_resize_stub(
+            StatusCode::BAD_REQUEST,
+            "workspace disk cannot shrink from 8 to 4 GiB",
+        )
+        .await;
+        let err = resize_disk_online_at(&base, "sb-x", 8).await.unwrap_err().to_string();
+        assert!(err.contains("400") && err.contains("cannot shrink"), "{err}");
+    }
+
+    /// A daemon that predates the route answers an empty-bodied 404 — the
+    /// capability probe. It must read as "resize offline", not as a failure.
+    #[tokio::test]
+    async fn resize_disk_online_treats_a_missing_route_as_unsupported() {
+        // This stub serves only the offline route.
+        let (base, _) = resize_stub(axum::http::StatusCode::OK, "{}").await;
+        match resize_disk_online_at(&base, "sb-x", 8).await.unwrap() {
+            OnlineGrow::FallBack(why) => assert!(why.contains("no online resize route"), "{why}"),
+            other => panic!("a missing route must fall back, got {other:?}"),
+        }
+        // No daemon at all falls back too; the offline call then reports it.
+        match resize_disk_online_at("http://127.0.0.1:9", "sb-x", 8).await.unwrap() {
+            OnlineGrow::FallBack(why) => assert!(why.contains("request failed"), "{why}"),
+            other => panic!("an unreachable daemon must fall back, got {other:?}"),
+        }
+        let (base, seen) = online_resize_stub(axum::http::StatusCode::OK, "{}").await;
+        assert!(resize_disk_online_at(&base, "sb-x", 251).await.is_err());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn resize_disk_surfaces_daemon_errors_with_body() {
         let (base, _) = resize_stub(
@@ -4329,6 +4753,34 @@ const REPL_MARKER: &str = "/workspace/heyvm-replication";
 /// grants and every replication status view are per-database objects, so they
 /// need their own connection. Built fresh per call rather than pooled: these
 /// are operator-paced actions and a monitor tick, not a hot path.
+/// Whether `schema`'s database holds any user relation — the SQL answer to
+/// the question [`crate::imgarchive::cluster_contents_of`] answers offline,
+/// used where a running Postgres is in hand (the dump archive path).
+///
+/// `None` when the question couldn't be answered at all: an unreachable
+/// database is never a reason to call a workbook empty.
+pub(crate) async fn has_user_relations(
+    cfg: &Config,
+    target: &SocketAddr,
+    schema: &str,
+) -> Option<bool> {
+    let ask = async {
+        let client = db_client(cfg, target, schema).await.ok()?;
+        let row = client
+            .query_one(
+                "SELECT count(*) FROM pg_class c                  JOIN pg_namespace n ON n.oid = c.relnamespace                  WHERE c.relkind IN ('r', 'p', 'm', 'f')                  AND n.nspname NOT IN ('pg_catalog', 'information_schema')",
+                &[],
+            )
+            .await
+            .ok()?;
+        let relations: i64 = row.get(0);
+        Some(relations > 0)
+    };
+    tokio::time::timeout(Duration::from_secs(30), ask)
+        .await
+        .ok()?
+}
+
 pub(crate) async fn db_client(
     cfg: &Config,
     target: &SocketAddr,

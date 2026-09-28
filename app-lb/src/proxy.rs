@@ -8,302 +8,66 @@
 //! Nothing here may block: VM boots happen only in the autoscaler. The one wait
 //! is the cold-start `Notify`, which yields.
 
-use crate::acme::ChallengeTable;
-use crate::auth::{Authenticator, Decision, Identity, RequestInfo};
+#[cfg(test)]
 use crate::deployment::{Deployment, VmBackend};
-use crate::guard::{Decision as GuardVerdict, Guard, RequestFacts};
+#[cfg(test)]
 use crate::metrics::Metrics;
-use crate::obs::{Access, LogSink};
-use crate::siem::SecuritySink;
-use crate::registry::Registry;
+use crate::worker_rpc::{Client, Completion, RemoteDecision, RemoteRequest};
 use async_trait::async_trait;
 use pingora_core::prelude::HttpPeer;
+use pingora_core::protocols::TcpKeepalive;
 use pingora_core::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
-use std::net::SocketAddr;
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// How many upstreams one request may try before giving up.
-const MAX_ATTEMPTS: usize = 3;
-
 #[derive(Default)]
 pub struct Ctx {
-    /// The backend currently serving, if we've incremented its counter.
-    backend: Option<Arc<VmBackend>>,
-    deployment: Option<Arc<Deployment>>,
-    /// Upstreams already tried (by peer address); `upstream_peer` must not hand
-    /// these back.
-    failed: Vec<String>,
-    attempts: usize,
+    request: Option<RemoteRequest>,
     /// When the request entered the proxy, for latency. Set in `request_filter`
     /// so the measured span covers cold-start waits too, and `None` before then
     /// so a request rejected pre-routing simply isn't timed.
     started_at: Option<Instant>,
-    /// Who the caller is, for a deployment behind a sign-in gate. Decided in
-    /// `request_filter` and applied to the upstream request later, so the gate
-    /// runs once per request rather than once per upstream attempt.
-    identity: Option<Identity>,
-    /// The matched route prefix when that route opted into removing it before
-    /// proxying. Routing happens before Pingora builds the upstream request.
-    route_prefix: Option<String>,
 }
-
-impl Ctx {
-    /// Release the in-flight slot exactly once.
-    ///
-    /// Taking the backend out makes this idempotent, which matters because
-    /// `logging` runs on every path and must never double-release.
-    fn release(&mut self) {
-        if let Some(b) = self.backend.take() {
-            b.release();
-        }
-    }
-}
-
-/// The URL prefix Let's Encrypt fetches to validate an HTTP-01 challenge.
-const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 
 pub struct LbProxy {
-    registry: Arc<Registry>,
-    metrics: Arc<Metrics>,
-    /// Outstanding HTTP-01 challenge responses, published by the ACME manager.
-    /// Empty (and the lookup therefore a single miss) whenever ACME is off.
-    challenges: Arc<ChallengeTable>,
-    /// Runs the sign-in gate for deployments that declare one. Inert for the
-    /// rest: a deployment without `auth` never reaches it.
-    auth: Arc<Authenticator>,
-    /// Where the access log goes. `None` unless `APP_LB_OBS_URL` is configured,
-    /// in which case `logging` does no extra work at all.
-    access_log: Option<LogSink>,
-    /// Where the same requests go to be analysed for attacks. Independent of
-    /// `access_log` on purpose: the SIEM is on unless `APP_LB_SIEM=0`, and must
-    /// not inherit "off whenever no log collector is configured".
-    security: Option<SecuritySink>,
-    /// The other half of that pair: the SIEM decides something is an attack,
-    /// this refuses it. Not an `Option` — an empty rule set is one `is_empty`
-    /// check, and making enforcement conditional on the SIEM being on would
-    /// mean `APP_LB_SIEM=0` silently unblocked every address an operator had
-    /// blocked.
-    guard: Arc<Guard>,
-    /// The per-namespace event feed, for the deployments that `expose` it on
-    /// their own routes, and for the cold-start-timeout issue hook.
-    feed: Arc<crate::feed::Feed>,
-    /// The declared auth providers, resolved live for a gate that inherits one
-    /// with `auth.provider_ref`. Read only on the gated path; a deployment
-    /// without a reference never touches it.
-    auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
+    control: Client,
 }
 
 impl LbProxy {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        registry: Arc<Registry>,
-        metrics: Arc<Metrics>,
-        challenges: Arc<ChallengeTable>,
-        auth: Arc<Authenticator>,
-        access_log: Option<LogSink>,
-        security: Option<SecuritySink>,
-        guard: Arc<Guard>,
-        feed: Arc<crate::feed::Feed>,
-        auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
-    ) -> Self {
-        Self {
-            registry,
-            metrics,
-            challenges,
-            auth,
-            access_log,
-            security,
-            guard,
-            feed,
-            auth_providers,
-        }
-    }
-
-    /// Resolve a gate that may inherit its identity from a namespace provider.
-    ///
-    /// A gate with no `provider_ref` is returned untouched. One with a reference
-    /// is merged with the named provider in `namespace` — identity from the
-    /// provider, the route-scoped fields from the gate — into a plain,
-    /// self-contained [`AuthGate`] the rest of the pipeline treats exactly like
-    /// an inline one, including [`policy_fingerprint`], so an edit to the
-    /// provider re-signs the sessions issued under the old policy.
-    ///
-    /// A reference that names no provider in the namespace is an `Err`, and the
-    /// caller refuses the request: a gate that cannot be built must fail closed,
-    /// never fall open to serving the deployment with no gate at all.
-    ///
-    /// [`AuthGate`]: crate::config::AuthGate
-    /// [`policy_fingerprint`]: crate::config::AuthGate::policy_fingerprint
-    fn resolve_gate(
-        &self,
-        gate: crate::config::AuthGate,
-        namespace: &str,
-    ) -> std::result::Result<crate::config::AuthGate, String> {
-        let Some(name) = gate.provider_ref.as_deref() else {
-            return Ok(gate);
-        };
-        match self.auth_providers.get(namespace, name) {
-            Some(provider) => Ok(provider.resolve(&gate)),
-            None => Err(format!(
-                "this deployment's sign-in gate inherits the auth provider {name:?}, \
-                 which is not declared in its namespace\n"
-            )),
-        }
-    }
-
-    /// Consult the guard. `Some(body)` means refuse the request with a 403.
-    ///
-    /// The body says nothing about *why*. A refusal that names the rule tells an
-    /// attacker which of their properties was matched and therefore which one to
-    /// change — the operator has the dashboard for that, and they are the only
-    /// party entitled to the answer.
-    fn enforce(
-        &self,
-        session: &Session,
-        host: &Option<String>,
-        path: &str,
-        routed: Option<&Arc<Deployment>>,
-    ) -> Option<String> {
-        let req = session.req_header();
-        // The socket peer, never `X-Forwarded-For`. Keying enforcement on a
-        // client-supplied header would let anyone get anyone else refused, and
-        // let the attacker exempt themselves by setting it.
-        let client = session
-            .client_addr()
-            .and_then(|a| a.as_inet().map(|inet| inet.ip()));
-        let facts = RequestFacts {
-            client,
-            host: host.as_deref(),
-            path,
-            method: req.method.as_str(),
-            deployment: routed.map(|d| d.spec.id.as_str()),
-            // Capped before it is scanned: the header is attacker-controlled and
-            // the substring search is O(header × pattern).
-            //
-            // `get(..n)`, not `&v[..n]`. Slicing would panic on a byte that is
-            // not a char boundary, and a panic here takes down a worker on
-            // attacker-supplied input. `to_str` only succeeds for visible ASCII
-            // today, so the fallback is unreachable — which is exactly the kind
-            // of reasoning that stops being true after somebody else's upgrade.
-            user_agent: req
-                .headers
-                .get(http::header::USER_AGENT)
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.get(..MAX_SCANNED_UA).unwrap_or(v)),
-        };
-
-        match self.guard.decide(&facts, crate::deployment::now_secs()) {
-            GuardVerdict::Pass => None,
-            GuardVerdict::Block(rule) => {
-                tracing::info!(
-                    rule = %rule.id,
-                    matched = %rule.describe(),
-                    client = ?client,
-                    %path,
-                    "refused by a guard rule",
-                );
-                Some("blocked\n".to_string())
-            }
-            // `APP_LB_GUARD_ENFORCE=0`. Warn rather than debug: the whole point
-            // of a dry run is that somebody is watching for exactly this line.
-            GuardVerdict::WouldBlock(rule) => {
-                tracing::warn!(
-                    rule = %rule.id,
-                    matched = %rule.describe(),
-                    client = ?client,
-                    %path,
-                    "would have refused this request (APP_LB_GUARD_ENFORCE=0)",
-                );
-                None
-            }
-        }
+    pub fn new(control: Client) -> Self {
+        Self { control }
     }
 }
 
-/// How much of `User-Agent` a rule may match against.
-const MAX_SCANNED_UA: usize = 512;
+/// Keepalive on every upstream connection, so a backend that vanishes without
+/// a word is noticed. A destroyed Firecracker VM takes its tap device with it:
+/// no RST ever arrives, and a request waiting on a response has nothing
+/// unacknowledged in flight, so without probes the socket sits in ESTABLISHED
+/// forever — holding the caller, the backend's `in_flight` slot, and anything
+/// queued behind that caller. Probes are answered by a live peer's kernel, so a
+/// slow response or a long-lived stream is unaffected; a dead peer is dropped
+/// within about a minute of its last word.
+const UPSTREAM_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const UPSTREAM_KEEPALIVE_COUNT: usize = 3;
+/// `TCP_USER_TIMEOUT`: the same bound for data that was sent and never
+/// acknowledged — a pooled keep-alive connection reused after its VM died.
+#[cfg(target_os = "linux")]
+const UPSTREAM_USER_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The request's target host.
-///
-/// HTTP/2 carries no `Host` header — clients send `:authority`, which pingora
-/// surfaces on the URI — so both have to be checked or h2 traffic never routes.
-/// The port is stripped so `demo.local:6188` matches a `demo.local` rule.
-fn request_host(req: &RequestHeader) -> Option<String> {
-    let raw = req
-        .uri
-        .authority()
-        .map(|a| a.as_str().to_string())
-        .or_else(|| {
-            req.headers
-                .get(http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        })?;
-
-    let host = raw.rsplit_once('@').map_or(raw.as_str(), |(_, h)| h);
-    // Don't split IPv6 literals (`[::1]:80`) on the wrong colon.
-    let host = if let Some(end) = host.find(']') {
-        &host[..=end]
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
-}
-
-/// Resolve a `host:port` (or `ip:port`) upstream to a concrete address, async so
-/// a DNS lookup never blocks the proxy runtime. An `ip:port` literal resolves
-/// without touching DNS; a hostname is resolved here and re-resolved on every
-/// request, so DNS changes are picked up. `None` on failure or an empty result.
-async fn resolve_peer(peer: &str) -> Option<SocketAddr> {
-    tokio::net::lookup_host(peer).await.ok()?.next()
-}
-
-fn http_peer(backend: &VmBackend, address: SocketAddr) -> HttpPeer {
-    HttpPeer::new(address, backend.tls, backend.sni.clone())
-}
-
-/// The key authorization to serve for `path`, if it names an outstanding
-/// HTTP-01 challenge.
-///
-/// `None` for anything else — including a challenge-shaped path whose token is
-/// unknown — so this can only ever intercept a request when a challenge for that
-/// exact token is genuinely in flight. Everything else falls through to routing.
-fn acme_challenge_response(challenges: &ChallengeTable, path: &str) -> Option<String> {
-    challenges.get(path.strip_prefix(ACME_CHALLENGE_PREFIX)?)
-}
-
-fn matched_strip_prefix(
-    deployment: &Deployment,
-    host: Option<&str>,
-    path: &str,
-) -> Option<String> {
-    deployment
-        .spec
-        .routes
-        .iter()
-        .filter(|route| route.strip_prefix && route.matches(host, path))
-        .max_by_key(|route| route.specificity())
-        .and_then(|route| route.path_prefix.clone())
-}
-
-fn strip_uri_prefix(uri: &http::Uri, prefix: &str) -> String {
-    let suffix = uri.path().strip_prefix(prefix).unwrap_or(uri.path());
-    let mut rewritten = if suffix.is_empty() {
-        "/".to_string()
-    } else if suffix.starts_with('/') {
-        suffix.to_string()
-    } else {
-        format!("/{suffix}")
-    };
-    if let Some(query) = uri.query() {
-        rewritten.push('?');
-        rewritten.push_str(query);
-    }
-    rewritten
+fn http_peer(selected: crate::request_control::Peer) -> HttpPeer {
+    let mut peer = HttpPeer::new(selected.address, selected.tls, selected.sni);
+    peer.options.tcp_keepalive = Some(TcpKeepalive {
+        idle: UPSTREAM_KEEPALIVE_IDLE,
+        interval: UPSTREAM_KEEPALIVE_INTERVAL,
+        count: UPSTREAM_KEEPALIVE_COUNT,
+        #[cfg(target_os = "linux")]
+        user_timeout: UPSTREAM_USER_TIMEOUT,
+    });
+    peer
 }
 
 async fn write_plain(session: &mut Session, code: u16, message: &str) -> Result<()> {
@@ -321,63 +85,30 @@ async fn write_plain(session: &mut Session, code: u16, message: &str) -> Result<
         .await
 }
 
-fn maintenance_response(deployment: &Deployment) -> Option<(u16, &'static str)> {
-    deployment
-        .spec
-        .maintenance
-        .then_some((503, "deployment is under maintenance\n"))
+async fn write_control_response(
+    session: &mut Session,
+    status: u16,
+    body: String,
+    content_type: String,
+    headers: Vec<(String, String)>,
+    cache_control: Option<String>,
+) -> Result<()> {
+    let mut header = ResponseHeader::build(status, Some(8))?;
+    header.insert_header(http::header::CONTENT_LENGTH, body.len().to_string())?;
+    header.insert_header(http::header::CONTENT_TYPE, content_type)?;
+    if let Some(cache) = cache_control {
+        header.insert_header(http::header::CACHE_CONTROL, cache)?;
+    }
+    for (name, value) in headers {
+        header.append_header(name, value)?;
+    }
+    session.write_response_header(Box::new(header), false).await?;
+    session.write_response_body(Some(bytes::Bytes::from(body)), true).await
 }
 
 /// The newest events an exposed or admin-served feed returns. Half the ring:
 /// a reader wants "recent", and the full ring is the debugging view.
-pub const FEED_PAGE: usize = 100;
-
-/// Write an RSS document. The one non-plain response the proxy authors itself.
-pub async fn write_rss(session: &mut Session, doc: &str) -> Result<()> {
-    let mut header = ResponseHeader::build(200, Some(3))?;
-    header.insert_header(http::header::CONTENT_LENGTH, doc.len().to_string())?;
-    header.insert_header(http::header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")?;
-    // Feed readers poll on their own schedule; a shared cache re-serving a
-    // stale feed for a few minutes is fine and keeps a popular feed cheap.
-    header.insert_header(http::header::CACHE_CONTROL, "public, max-age=300")?;
-    session
-        .write_response_header(Box::new(header), false)
-        .await?;
-    session
-        .write_response_body(Some(bytes::Bytes::copy_from_slice(doc.as_bytes())), true)
-        .await
-}
-
-/// Write a response the sign-in gate decided on: a redirect to the provider, the
-/// end of a callback, or a refusal.
-async fn write_gate_response(session: &mut Session, r: crate::auth::Response) -> Result<()> {
-    let mut header = ResponseHeader::build(r.status, Some(6))?;
-    header.insert_header(http::header::CONTENT_LENGTH, r.body.len().to_string())?;
-    header.insert_header(http::header::CONTENT_TYPE, r.content_type)?;
-    if let Some(location) = &r.location {
-        header.insert_header(http::header::LOCATION, location)?;
-    }
-    // Nothing in the sign-in flow may be cached: a stored redirect would replay
-    // a spent authorization code, and a stored 403 would outlive the allow-list
-    // change that fixes it.
-    header.insert_header(http::header::CACHE_CONTROL, "no-store")?;
-    header.insert_header("X-Frame-Options", "DENY")?;
-    header.insert_header("Referrer-Policy", "same-origin")?;
-    for cookie in &r.cookies {
-        // Appended, not inserted: a callback sets the session cookie *and*
-        // clears the flow cookie, and one `Set-Cookie` cannot carry both.
-        header.append_header(http::header::SET_COOKIE, cookie)?;
-    }
-    session
-        .write_response_header(Box::new(header), false)
-        .await?;
-    session
-        .write_response_body(
-            Some(bytes::Bytes::copy_from_slice(r.body.as_bytes())),
-            true,
-        )
-        .await
-}
+pub use crate::request_control::FEED_PAGE;
 
 /// Answer a request routed to a `site` deployment, out of its directory.
 ///
@@ -519,81 +250,6 @@ async fn serve_site(session: &mut Session, spec: &crate::config::SiteSpec, path:
     Ok(())
 }
 
-/// Collect what the gate needs out of the live request.
-fn request_info<'a>(
-    session: &'a Session,
-    host: &'a str,
-    path: &'a str,
-    secure: bool,
-    fronts_admin_api: bool,
-) -> RequestInfo<'a> {
-    let req = session.req_header();
-    let cookies = req
-        .headers
-        .get_all(http::header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .map(str::to_string)
-        .collect();
-    // A browser navigating asks for HTML; an API client asks for JSON or says
-    // nothing. The difference decides whether an unauthenticated request is
-    // redirected or refused with a 401 it can act on.
-    let wants_html = req
-        .headers
-        .get(http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|a| a.contains("text/html"));
-
-    // The credential an app-token gate looks for. Read here rather than in
-    // `auth.rs` so the gate stays a pure function of a plain struct.
-    let bearer = req
-        .headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-
-    RequestInfo {
-        host,
-        path,
-        query: req.uri.query(),
-        cookies,
-        secure,
-        wants_html,
-        fronts_admin_api,
-        bearer,
-        // The socket peer, for the SIEM's per-source sign-in rules. Never an
-        // `X-Forwarded-For`: keying a detector on a client-supplied header is an
-        // alert-spoofing primitive on an unauthenticated path.
-        client: session
-            .client_addr()
-            .and_then(|addr| addr.as_inet().map(|inet| inet.ip())),
-    }
-}
-
-/// Whether the client reached app-lb over TLS.
-///
-/// The TLS digest is the truth for a connection app-lb terminated itself.
-/// `x-forwarded-proto` is consulted only as a fallback, for a deployment behind
-/// something that already terminated TLS — it is a client-settable header, and
-/// the cost of believing a false one is a `Secure` cookie the browser then
-/// refuses to send back, not a leaked session.
-fn is_secure_request(session: &Session) -> bool {
-    if session
-        .digest()
-        .is_some_and(|d| d.ssl_digest.is_some())
-    {
-        return true;
-    }
-    session
-        .req_header()
-        .headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|p| p.eq_ignore_ascii_case("https"))
-}
-
 #[async_trait]
 impl ProxyHttp for LbProxy {
     type CTX = Ctx;
@@ -609,182 +265,56 @@ impl ProxyHttp for LbProxy {
         // whole time app-lb held the request, cold-start wait included.
         ctx.started_at = Some(Instant::now());
 
-        let (host, path) = {
-            let req = session.req_header();
-            (request_host(req), req.uri.path().to_string())
+        let req = session.req_header();
+        let head = crate::request_control::RequestHead {
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            headers: req.headers.clone(),
+            peer: session.client_addr().and_then(|a| a.as_inet().map(|a| *a)),
+            tls_terminated: session.digest().is_some_and(|d| d.ssl_digest.is_some()),
         };
-
-        // ACME HTTP-01 validation, answered before routing on purpose. The CA
-        // sends an arbitrary `Host` and the hostname being certified often has
-        // no matching deployment yet, so routing this would 404 and fail the
-        // order. An unknown token falls through to normal routing, so this
-        // cannot shadow a real route unless a challenge is genuinely
-        // outstanding for that exact token.
-        if let Some(key_authorization) = acme_challenge_response(&self.challenges, &path) {
-            tracing::debug!(%path, "answering ACME http-01 challenge");
-            write_plain(session, 200, &key_authorization).await?;
-            return Ok(true);
-        }
-
-        // Routed before the guard runs, purely so a rule can name a deployment:
-        // `registry.route` is a lock-free read of an `ArcSwap`, so this costs a
-        // blocked request nothing worth measuring, and without it a
-        // deployment-scoped rule could never match.
-        let routed = self.registry.route(host.as_deref(), &path);
-
-        // Enforcement. Deliberately *after* the ACME block above: a rule must
-        // not be able to break certificate renewal, and answering the challenge
-        // first is a carve-out that needs no special case of its own. An unknown
-        // challenge token falls through to here like anything else.
-        if let Some(refusal) = self.enforce(session, &host, &path, routed.as_ref()) {
-            // Attributed to the deployment it was aimed at, so a wall of blocks
-            // shows up in that deployment's numbers rather than nowhere.
-            ctx.deployment = routed;
-            write_plain(session, 403, &refusal).await?;
-            return Ok(true);
-        }
-
-        let Some(deployment) = routed else {
-            tracing::debug!(?host, %path, "no deployment matches request");
-            write_plain(session, 404, "no deployment matches this request\n").await?;
-            return Ok(true); // response already written; stop proxying
-        };
-
-        // Maintenance is a deployment data-plane fence, not an admin outage.
-        // Keep the route present and answer 503 so retrying clients wait while
-        // operators continue to use the separate admin listener (including
-        // exec). Do this before auth and backend selection: maintenance must
-        // neither turn into a terminal 401/403 nor wake a scaled-to-zero VM.
-        if let Some((status, message)) = maintenance_response(&deployment) {
-            ctx.deployment = Some(deployment);
-            write_plain(session, status, message).await?;
-            return Ok(true);
-        }
-
-        ctx.route_prefix = matched_strip_prefix(&deployment, host.as_deref(), &path);
-
-        // The sign-in gate, for the deployments that declare one. It runs after
-        // routing (the gate is the deployment's own configuration) and before
-        // anything touches a backend — including the cold-start wait, so an
-        // unauthenticated request never boots a VM.
-        if let Some(gate) = deployment.spec.auth.clone() {
-            // Inherit the identity half from a namespace provider if this gate
-            // names one. Resolution is live — read on every request, so an edit
-            // to the provider reaches here at once — and fails *closed*: a gate
-            // whose provider no longer resolves refuses the request rather than
-            // serving the deployment ungated.
-            let gate = match self.resolve_gate(gate, &deployment.spec.namespace) {
-                Ok(g) => g,
-                Err(msg) => {
-                    tracing::warn!(
-                        deployment = %deployment.spec.id,
-                        namespace = %deployment.spec.namespace,
-                        "auth gate references an unresolvable provider; refusing the request",
-                    );
-                    write_plain(session, 500, &msg).await?;
-                    ctx.deployment = Some(deployment);
-                    return Ok(true);
-                }
-            };
-
-            // A gate needs a hostname to build its callback URL against; a
-            // request routed purely by path prefix with no Host header cannot
-            // complete a sign-in, and saying so beats redirecting to a URL the
-            // provider will refuse.
-            let Some(host) = host.as_deref() else {
-                write_plain(
-                    session,
-                    400,
-                    "this deployment requires sign-in, which needs a Host header\n",
-                )
-                .await?;
-                ctx.deployment = Some(deployment);
+        let (request, mut decision) = match self.control.begin(head).await {
+            Ok(result) => result,
+            Err(crate::worker_rpc::BeginError::HeadersTooLarge) => {
+                write_plain(session, 431, "request headers exceed control transport limit\n").await?;
                 return Ok(true);
-            };
-
-            let secure = is_secure_request(session);
-            // Consume credentials only on the gate-owned login endpoint, never
-            // on an application request. Bound the body before buffering it.
-            let login_post = path == gate.login_path()
-                && session.req_header().method == http::Method::POST
-                && gate.jwt_policy().is_some_and(|p| p.login_endpoint.is_some());
-            let mut login_body = Vec::new();
-            if login_post {
-                while let Some(chunk) = session.read_request_body().await? {
-                    if login_body.len() + chunk.len() > 8192 {
-                        write_plain(session, 413, "sign-in request is too large\n").await?;
-                        ctx.deployment = Some(deployment);
-                        return Ok(true);
-                    }
-                    login_body.extend_from_slice(&chunk);
-                }
             }
-            // Origin checks and logout redirects need the browser's authority,
-            // including a non-default port; routing intentionally strips it.
-            let auth_host = if gate.jwt_policy().is_some_and(|p| p.login_endpoint.is_some()) {
-                session.req_header().uri.authority().map(|a| a.as_str())
-                    .or_else(|| session.req_header().headers.get(http::header::HOST).and_then(|v| v.to_str().ok()))
-                    .unwrap_or(host)
-            } else {
-                host
-            };
-            let info = request_info(
-                session,
-                auth_host,
-                &path,
-                secure,
-                self.auth.fronts_admin_api(&deployment.spec),
-            );
-            let decision = if login_post {
-                let request_origin = session.req_header().headers.get("origin").and_then(|v| v.to_str().ok());
-                Decision::Answered(self.auth.heyo_login_submit(&gate, &deployment.spec.id, &info, request_origin, &login_body).await)
-            } else {
-                self.auth.decide(&gate, &deployment.spec.id, &deployment.spec.namespace, &info).await
-            };
-            match decision {
-                Decision::Allow(identity) => ctx.identity = *identity,
-                Decision::Answered(response) => {
-                    write_gate_response(session, response).await?;
-                    // Recorded against the deployment: a wall of 302s or 403s
-                    // here is exactly the symptom of a misconfigured gate, and
-                    // it should show up in its metrics.
-                    ctx.deployment = Some(deployment);
-                    return Ok(true);
+            Err(crate::worker_rpc::BeginError::Control(error)) => crate::worker::control_lost(&error),
+        };
+        ctx.request = Some(request);
+        if matches!(decision, RemoteDecision::ReadLoginBody) {
+            let mut body = Vec::new();
+            while let Some(chunk) = session.read_request_body().await? {
+                if body.len() + chunk.len() > crate::request_control::MAX_LOGIN_BODY {
+                    body.resize(crate::request_control::MAX_LOGIN_BODY + 1, 0);
+                    break;
                 }
+                body.extend_from_slice(&chunk);
             }
+            let request = ctx.request.as_mut().expect("request admitted");
+            decision = request.continue_login(&body).await
+                .map_err(|error| control_error(request, error))?;
         }
-
-        // A deployment that carries `feed.expose` serves its namespace's feed
-        // at that path — the only door from the data plane to a feed. After the
-        // gate on purpose, like the site branch below: a gated deployment
-        // exposes its feed exactly as far as its gate admits, and an ungated
-        // one has decided the feed is public.
-        if let Some(expose) = deployment.spec.feed.as_ref().and_then(|f| f.expose.as_deref())
-            && path == expose
-        {
-            let link = match &host {
-                Some(h) if is_secure_request(session) => format!("https://{h}{path}"),
-                Some(h) => format!("http://{h}{path}"),
-                None => path.clone(),
-            };
-            let events = self.feed.recent(&deployment.spec.namespace, FEED_PAGE);
-            let doc = crate::feed::rss(&deployment.spec.namespace, &link, &events);
-            ctx.deployment = Some(deployment);
-            write_rss(session, &doc).await?;
-            return Ok(true);
+        // Pingora tracks header names separately; preserve its bookkeeping in
+        // this transport adapter even though authority evaluated owned headers.
+        for name in crate::gateway::HEADERS.into_iter().chain([
+            crate::regional::GENERATION, crate::regional::ENVIRONMENT,
+            crate::regional::PROBE, crate::regional::ACTIVE_PROBE,
+        ]) {
+            session.req_header_mut().remove_header(name);
         }
-
-        // A site has no backend to pick: app-lb answers it here, off disk. This
-        // sits after the gate on purpose — a private site is private, and files
-        // must not be readable by anyone who skips sign-in.
-        if let Some(site) = deployment.spec.site.clone() {
-            ctx.deployment = Some(deployment);
-            serve_site(session, &site, &path).await?;
-            return Ok(true);
+        match decision {
+            RemoteDecision::Respond { status, body, content_type, headers, cache_control } => {
+                write_control_response(session, status, body, content_type, headers, cache_control).await?;
+                return Ok(true);
+            }
+            RemoteDecision::ServeSite { spec, path } => {
+                serve_site(session, &spec, &path).await?;
+                return Ok(true);
+            }
+            RemoteDecision::Proxy => return Ok(false),
+            RemoteDecision::ReadLoginBody => unreachable!("login continuation returns a terminal decision"),
         }
-
-        ctx.deployment = Some(deployment);
-        Ok(false)
     }
 
     /// Attach the caller's identity for a gated deployment — and strip the same
@@ -795,62 +325,21 @@ impl ProxyHttp for LbProxy {
         upstream: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        if let Some(prefix) = ctx.route_prefix.as_deref() {
-            let rewritten = strip_uri_prefix(&upstream.uri, prefix);
-            let mut parts = upstream.uri.clone().into_parts();
-            parts.path_and_query = Some(rewritten.parse().map_err(|error| {
-                Error::explain(
-                    ErrorType::InternalError,
-                    format!("failed to rewrite upstream path: {error}"),
-                )
-            })?);
-            upstream.set_uri(http::Uri::from_parts(parts).map_err(|error| {
-                Error::explain(
-                    ErrorType::InternalError,
-                    format!("failed to build rewritten upstream URI: {error}"),
-                )
-            })?);
-        }
-
-        let Some(gate) = ctx.deployment.as_ref().and_then(|d| d.spec.auth.as_ref()) else {
-            return Ok(());
-        };
-        // Unconditional, before anything is set: on a gated deployment these
-        // header names belong to app-lb, and an inbound one is either a mistake
-        // or an attempt to impersonate a signed-in user.
-        for name in crate::auth::IDENTITY_HEADERS {
-            upstream.remove_header(name);
-        }
-
-        // The session's own credential, when the gate minted one. Separate from
-        // `forward_identity`, and deliberately: that switch says whether the
-        // upstream is told *who* this is, while this says whether it is handed
-        // something it can verify. An API that authenticates for itself needs
-        // the second and may not care about the first.
-        //
-        // Replaces whatever the client sent rather than deferring to it. By the
-        // time a session admits a request, `decide` has already tried and
-        // rejected any bearer in the hand — so anything still in the header is
-        // a credential app-lb declined, and forwarding that instead would be
-        // handing the upstream a rejected one.
-        if let Some(token) = ctx.identity.as_ref().and_then(|i| i.session_token.as_deref()) {
-            upstream.insert_header(http::header::AUTHORIZATION, format!("Bearer {token}"))?;
-        }
-
-        if let (true, Some(identity)) = (gate.forward_identity, ctx.identity.as_ref()) {
-            upstream.insert_header("x-auth-request-user", crate::auth::header_safe(&identity.subject))?;
-            // Omitted rather than sent empty. A Google identity always has an
-            // address; a JWT one may not — a token issued to a service has no
-            // person behind it — and `x-auth-request-email: ` upstream reads as
-            // "signed in as nobody" rather than as "not applicable".
-            let email = crate::auth::header_safe(&identity.email);
-            if !email.is_empty() {
-                upstream.insert_header("x-auth-request-email", email)?;
-            }
-            if let Some(name) = &identity.name {
-                let name = crate::auth::header_safe(name);
-                if !name.is_empty() {
-                    upstream.insert_header("x-auth-request-name", name)?;
+        let request = ctx.request.as_mut().expect("request admitted");
+        let modifications = request.forwarding_modifications(&upstream.uri).await
+            .map_err(|error| control_error(request, error))?;
+        for modification in modifications {
+            match modification {
+                crate::request_control::HeaderModification::Remove(name) => {
+                    upstream.remove_header(&name);
+                }
+                crate::request_control::HeaderModification::Set(name, value) => {
+                    upstream.insert_header(name, value)?;
+                }
+                crate::request_control::HeaderModification::RewriteUri(rewritten) => {
+                    let mut parts = upstream.uri.clone().into_parts();
+                    parts.path_and_query = Some(rewritten.parse().map_err(|error| Error::explain(ErrorType::InternalError, format!("failed to rewrite upstream path: {error}")))?);
+                    upstream.set_uri(http::Uri::from_parts(parts).map_err(|error| Error::explain(ErrorType::InternalError, format!("failed to build rewritten upstream URI: {error}")))?);
                 }
             }
         }
@@ -859,85 +348,22 @@ impl ProxyHttp for LbProxy {
 
     async fn upstream_peer(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let deployment = ctx
-            .deployment
-            .clone()
-            .ok_or_else(|| Error::explain(ErrorType::InternalError, "no deployment in ctx"))?;
-
-        ctx.attempts += 1;
-        if ctx.attempts > MAX_ATTEMPTS {
-            return Err(Error::explain(
-                ErrorType::ConnectProxyFailure,
-                "exhausted upstream retries",
-            ));
+        let request = ctx.request.as_mut().expect("request admitted");
+        let selected = request.next_peer().await
+            .map_err(|error| control_error(request, error))?;
+        let mut peer = http_peer(selected.peer);
+        // Pingora 0.9 otherwise strips this authenticated PostgreSQL tunnel's
+        // handshake as a non-WebSocket upgrade. Keep the default sanitization
+        // for all other requests and unsupported upgrade protocols.
+        if session.req_header().headers.get(http::header::UPGRADE)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"pg-fc-sql/1")) {
+            peer.options.http_upstream_request_policy.h1_upgrade =
+                pingora_core::upstreams::peer::H1UpgradePolicy::Preserve;
         }
-
-        // Give back any slot from a failed attempt before reserving another.
-        ctx.release();
-
-        // Pick a backend, atomically reserve it, and resolve its address to a
-        // concrete `SocketAddr`. Reserving before the await is load-bearing: a
-        // cordon can then either prevent this request or see it in `in_flight`,
-        // but can never report drained and have this request appear afterward.
-        // We
-        // resolve here — with async DNS — rather than handing the `host:port`
-        // string to `HttpPeer::new`, because that constructor resolves with a
-        // *blocking* `to_socket_addrs().unwrap()` that would stall the runtime on
-        // a static hostname and panic if it failed to resolve. A backend whose
-        // address doesn't resolve is treated like a connect failure: marked
-        // unhealthy and skipped, so a bad static upstream fails over to a good one
-        // (and the autoscaler's health re-probe restores it once it resolves).
-        let addr = loop {
-            let backend = match deployment.select(&ctx.failed) {
-                Some(b) => b,
-                None => {
-                    // Nothing ready. If the deployment can still grow, hold the
-                    // request while a VM boots rather than failing the caller.
-                    // (A static deployment never grows, so this returns at once.)
-                    match wait_for_capacity(&deployment, &ctx.failed, &self.metrics, &self.feed).await {
-                        Some(b) => b,
-                        None => {
-                            return Err(Error::explain(
-                                ErrorType::ConnectProxyFailure,
-                                "no healthy backend available for deployment",
-                            ));
-                        }
-                    }
-                }
-            };
-
-            // `select` is an intentionally approximate, lock-free shortlist.
-            // A health change or cordon may have won since then; retry instead
-            // of admitting work against that stale decision.
-            if !backend.try_acquire() {
-                ctx.failed.push(backend.peer.clone());
-                continue;
-            }
-            ctx.backend = Some(backend.clone());
-
-            match resolve_peer(&backend.address).await {
-                Some(addr) => break addr,
-                None => {
-                    tracing::warn!(
-                        peer = %backend.peer,
-                        "upstream address did not resolve; marking unhealthy",
-                    );
-                    backend.set_healthy(false);
-                    ctx.failed.push(backend.peer.clone());
-                    ctx.release();
-                    // Loop: pick another backend (or give up when none remain).
-                }
-            }
-        };
-
-        let backend = ctx
-            .backend
-            .as_ref()
-            .expect("selected backend remains in context");
-        Ok(Box::new(http_peer(backend, addr)))
+        Ok(Box::new(peer))
     }
 
     async fn response_filter(
@@ -948,8 +374,8 @@ impl ProxyHttp for LbProxy {
     ) -> Result<()> {
         // Makes it possible to see which VM served a request, which is how the
         // load-spreading and retry behaviour get verified.
-        if let Some(b) = &ctx.backend {
-            upstream_response.insert_header("x-vm-id", &b.sandbox_id)?;
+        if let Some(id) = ctx.request.as_ref().and_then(RemoteRequest::backend_id) {
+            upstream_response.insert_header("x-vm-id", id)?;
         }
         Ok(())
     }
@@ -963,22 +389,8 @@ impl ProxyHttp for LbProxy {
         ctx: &mut Self::CTX,
         mut e: Box<Error>,
     ) -> Box<Error> {
-        if let Some(b) = &ctx.backend {
-            tracing::warn!(
-                sandbox = %b.sandbox_id,
-                addr = %b.peer,
-                "upstream connect failed; marking unhealthy",
-            );
-            b.set_healthy(false);
-            ctx.failed.push(b.peer.clone());
-        } else {
-            tracing::warn!(peer = %peer, "upstream connect failed with no backend in ctx");
-        }
-        // This attempt never got off the ground, so give the slot back now
-        // rather than holding it through the retry.
-        ctx.release();
-
-        if ctx.attempts < MAX_ATTEMPTS {
+        tracing::warn!(peer = %peer, "upstream connect failed");
+        if ctx.request.as_mut().is_some_and(RemoteRequest::connection_failed) {
             e.set_retry(true);
         }
         e
@@ -987,157 +399,23 @@ impl ProxyHttp for LbProxy {
     /// Runs on every request, success or failure. If this ever misses a path,
     /// `in_flight` leaks upward and the deployment pins at max replicas.
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX) {
-        // Which backend served, read before `release` — it takes the backend out
-        // of the ctx, so anything that needs its identity must ask first.
-        // `sandbox_id` is the sandbox for a managed VM and the `host:port` for a
-        // static upstream, which is exactly how app-obs keys a backend. Skipped
-        // when nothing is shipping, so an app-lb without app-obs allocates
-        // nothing extra per request.
-        // Either consumer needs it: with `APP_LB_OBS_ACCESS_LOG=0` and the SIEM
-        // on, checking only `access_log` here would leave every alert without a
-        // backend, which reads as a bug in the SIEM rather than as this line.
-        let observing = self.access_log.is_some() || self.security.is_some();
-        let backend = match observing {
-            true => ctx.backend.as_ref().map(|b| b.sandbox_id.clone()),
-            false => None,
-        };
-        ctx.release();
-
-        let status = session.response_written().map(|r| r.status.as_u16());
-
-        // Record latency and outcome for any request that got as far as being
-        // routed. A request rejected before routing (404, no deployment) has no
-        // `started_at`/`deployment` and is intentionally left out of a
-        // deployment's numbers.
-        if let (Some(started), Some(deployment)) = (ctx.started_at, ctx.deployment.as_ref()) {
-            self.metrics
-                .record_request(&deployment.spec.id, status, started.elapsed());
-        }
-
-        // The access log app-obs stores. Unlike the metrics above it also carries
-        // requests that matched no deployment, under the sink's own deployment id
-        // (`_lb` unless `APP_LB_OBS_DEPLOYMENT` says otherwise) — a wall of 404s
-        // for a hostname somebody expected to work is invisible in a
-        // per-deployment view by construction. `started_at` is set first thing in
-        // `request_filter`, so its absence means the request never got that far
-        // and there is nothing to describe.
-        if let (true, Some(started)) = (observing, ctx.started_at) {
-            let req = session.req_header();
-            let method = req.method.as_str().to_string();
-            // The path alone, never the query: a sign-in callback carries the
-            // OAuth `code` there, and a shared log store is the last place a
-            // credential should come to rest.
-            //
-            // The SIEM is the one exception, and a deliberately narrow one: it
-            // is handed the query as a *separate argument* below, matches attack
-            // signatures against the parameter values, and drops it. On a hit the
-            // alert records the parameter name only, never the value — so the
-            // `code` above still cannot reach a log store, while `?id=1' OR '1'='1`
-            // stops being invisible. `APP_LB_SIEM_SCAN_QUERY=0` turns it off.
-            let path = req.uri.path().to_string();
-            let query = req.uri.query().map(str::to_string);
-            let host = request_host(req);
-            let access = Access {
-                deployment: ctx.deployment.as_ref().map(|d| d.spec.id.as_str()),
-                backend,
-                method: &method,
-                path: &path,
-                host: host.as_deref(),
-                status,
-                duration: started.elapsed(),
+        if let Some(request) = ctx.request.as_mut() {
+            let completion = Completion {
+                status: session.response_written().map(|r| r.status.as_u16()),
+                duration_micros: ctx.started_at.map(|s| s.elapsed().as_micros().min(u64::MAX as u128) as u64).unwrap_or(0),
                 bytes: session.body_bytes_sent(),
-                // The address only. The ephemeral port identifies the
-                // connection, not the caller.
-                client: session.client_addr().map(|addr| match addr.as_inet() {
-                    Some(inet) => inet.ip().to_string(),
-                    None => addr.to_string(),
-                }),
-                error: e.map(|err| err.to_string()),
+                error: e.map(ToString::to_string),
             };
-
-            // SIEM first: it borrows, and `send_access` moves. `Access` is not
-            // `Clone`, so reordering these two stops compiling rather than
-            // silently dropping the analysis.
-            if let Some(siem) = &self.security {
-                siem.observe_access(&access, query.as_deref());
+            if let Err(error) = request.complete(completion).await {
+                crate::worker::control_lost(&error);
             }
-            if let Some(sink) = &self.access_log {
-                sink.send_access(access);
-            }
-        }
-
-        if let Some(err) = e {
-            tracing::warn!(
-                deployment = ctx.deployment.as_ref().map(|d| d.spec.id.as_str()),
-                status,
-                error = %err,
-                "request failed",
-            );
         }
     }
 }
 
-/// Hold the request while the autoscaler boots a VM.
-///
-/// Returns as soon as a backend becomes available, or `None` on timeout or if
-/// the deployment is already at `max_replicas` with nothing healthy (in which
-/// case waiting cannot help).
-pub async fn wait_for_capacity(
-    deployment: &Arc<Deployment>,
-    exclude: &[String],
-    metrics: &Metrics,
-    feed: &crate::feed::Feed,
-) -> Option<Arc<VmBackend>> {
-    if !deployment.can_grow() {
-        // Not a cold-start wait — the pool is at max with nothing healthy, so
-        // there is nothing to hold for. Left out of the cold-start tally.
-        return None;
-    }
-
-    // Count this request as demand *before* nudging. A waiting request holds no
-    // in-flight slot (it has no backend yet), so without this the autoscaler
-    // sees an idle deployment and leaves it at zero while we wait.
-    let _waiter = deployment.track_waiter();
-    metrics.record_cold_start_wait(&deployment.spec.id);
-
-    // Nudge the autoscaler: this deployment may be at zero and nothing else
-    // would wake it.
-    deployment.scale_signal.notify_one();
-
-    let budget = Duration::from_secs(deployment.spec.scaling.cold_start_timeout_secs);
-    let deadline = tokio::time::Instant::now() + budget;
-    tracing::info!(
-        deployment = %deployment.spec.id,
-        timeout_secs = deployment.spec.scaling.cold_start_timeout_secs,
-        "holding request for cold start",
-    );
-
-    loop {
-        // Subscribe *before* re-checking so a VM that becomes ready between the
-        // check and the wait can't be missed.
-        let notified = deployment.ready_signal.notified();
-        if let Some(b) = deployment.select(exclude) {
-            metrics.record_cold_start_hit(&deployment.spec.id);
-            return Some(b);
-        }
-        if tokio::time::timeout_at(deadline, notified).await.is_err() {
-            tracing::warn!(
-                deployment = %deployment.spec.id,
-                "cold start timed out with no VM available",
-            );
-            metrics.record_cold_start_timeout(&deployment.spec.id);
-            feed.issue(
-                &deployment.spec,
-                format!("{}: cold start timed out", deployment.spec.id),
-                format!(
-                    "a request waited {}s and no VM became available",
-                    deployment.spec.scaling.cold_start_timeout_secs
-                ),
-                crate::deployment::now_secs(),
-            );
-            return None;
-        }
-    }
+fn control_error(request: &RemoteRequest, error: String) -> Box<Error> {
+    if !request.connected() { crate::worker::control_lost(&error); }
+    Error::explain(ErrorType::ConnectProxyFailure, error)
 }
 
 #[cfg(test)]
@@ -1148,85 +426,11 @@ mod tests {
     use crate::config::Driver;
 
     #[test]
-    fn acme_challenge_answers_only_outstanding_tokens() {
-        let challenges = ChallengeTable::new();
-        challenges.publish("live-token".into(), "live-token.thumbprint".into());
-
-        assert_eq!(
-            acme_challenge_response(&challenges, "/.well-known/acme-challenge/live-token")
-                .as_deref(),
-            Some("live-token.thumbprint"),
-        );
-
-        // An unknown token must fall through to routing rather than 404 from
-        // here — otherwise the branch would shadow a real route.
-        assert_eq!(
-            acme_challenge_response(&challenges, "/.well-known/acme-challenge/stale-token"),
-            None,
-        );
-        assert_eq!(acme_challenge_response(&challenges, "/.well-known/acme-challenge/"), None);
-        assert_eq!(acme_challenge_response(&challenges, "/live-token"), None);
-        assert_eq!(acme_challenge_response(&challenges, "/"), None);
-    }
-
-    #[test]
-    fn acme_challenge_is_inert_when_acme_is_disabled() {
-        // The table is empty whenever ACME is off, so no request can be
-        // intercepted — the branch costs one map lookup and nothing else.
-        let challenges = ChallengeTable::new();
-        assert_eq!(
-            acme_challenge_response(&challenges, "/.well-known/acme-challenge/anything"),
-            None,
-        );
-    }
-
-    fn header(host: Option<&str>, path: &str) -> RequestHeader {
-        let mut h = RequestHeader::build("GET", path.as_bytes(), None).unwrap();
-        if let Some(v) = host {
-            h.insert_header("host", v).unwrap();
-        }
-        h
-    }
-
-    #[test]
-    fn host_header_is_lowercased_and_port_stripped() {
-        assert_eq!(
-            request_host(&header(Some("Demo.Local:6188"), "/")).as_deref(),
-            Some("demo.local")
-        );
-        assert_eq!(
-            request_host(&header(Some("demo.local"), "/")).as_deref(),
-            Some("demo.local")
-        );
-    }
-
-    #[test]
-    fn missing_host_is_none() {
-        assert_eq!(request_host(&header(None, "/")), None);
-    }
-
-    #[tokio::test]
-    async fn resolve_peer_handles_literals_and_bad_addresses() {
-        // An ip:port literal resolves without DNS.
-        assert_eq!(
-            resolve_peer("127.0.0.1:8080").await,
-            Some("127.0.0.1:8080".parse().unwrap()),
-        );
-        // localhost resolves to a loopback address.
-        let local = resolve_peer("localhost:8080").await;
-        assert!(local.is_some_and(|a| a.ip().is_loopback()), "got {local:?}");
-        // A malformed / unresolvable address is None, not a panic — this is what
-        // keeps a bad static upstream from taking down the proxy runtime.
-        assert_eq!(resolve_peer("no-port").await, None);
-        assert!(
-            resolve_peer("definitely-not-a-real-host.invalid:80").await.is_none()
-        );
-    }
-
-    #[test]
     fn https_backend_builds_a_tls_peer_with_url_hostname_as_sni() {
         let backend = VmBackend::for_upstream("https://ci.eu1.heyo.work:443".into());
-        let peer = http_peer(&backend, "127.0.0.1:443".parse().unwrap());
+        let peer = http_peer(crate::request_control::Peer {
+            address: "127.0.0.1:443".parse().unwrap(), tls: backend.tls, sni: backend.sni.clone(),
+        });
         assert!(peer.is_tls());
         assert_eq!(peer.sni, "ci.eu1.heyo.work");
         assert!(peer.options.verify_cert);
@@ -1234,47 +438,26 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_literal_host_survives_port_stripping() {
-        assert_eq!(
-            request_host(&header(Some("[::1]:8080"), "/")).as_deref(),
-            Some("[::1]")
+    fn upstream_peers_probe_for_a_vanished_backend() {
+        let backend = backend("172.25.128.50:8080");
+        let peer = http_peer(crate::request_control::Peer {
+            address: "172.25.128.50:8080".parse().unwrap(), tls: backend.tls, sni: backend.sni.clone(),
+        });
+        let ka = peer
+            .options
+            .tcp_keepalive
+            .as_ref()
+            .expect("keepalive is set on every upstream");
+        let detect = ka.idle + ka.interval * ka.count as u32;
+        assert!(
+            detect <= Duration::from_secs(90),
+            "a dead VM should be dropped well inside cold-start budgets, got {detect:?}"
         );
-    }
-
-    /// HTTP/2 sends no Host header — the h2 crate parses `:authority` into the
-    /// URI's authority, which is what pingora hands us. Without this branch, all
-    /// h2 traffic would fail to route.
-    #[test]
-    fn authority_is_used_when_present() {
-        let mut h = RequestHeader::build("GET", b"/x", None).unwrap();
-        h.set_uri("http://demo.local:6188/x".parse().unwrap());
-        assert_eq!(request_host(&h).as_deref(), Some("demo.local"));
-    }
-
-    /// An h2 request with both: `:authority` is authoritative per RFC 9113.
-    #[test]
-    fn authority_wins_over_a_conflicting_host_header() {
-        let mut h = header(Some("stale.local"), "/x");
-        h.set_uri("http://demo.local/x".parse().unwrap());
-        assert_eq!(request_host(&h).as_deref(), Some("demo.local"));
-    }
-
-    #[test]
-    fn userinfo_is_stripped_from_authority() {
-        let mut h = RequestHeader::build("GET", b"/x", None).unwrap();
-        h.set_uri("http://user:pass@demo.local:6188/x".parse().unwrap());
-        assert_eq!(request_host(&h).as_deref(), Some("demo.local"));
-    }
-
-    #[test]
-    fn route_prefix_rewrite_preserves_root_and_query() {
-        let prefixed: http::Uri = "/heyosecret/v1/read?path=a%2Fb".parse().unwrap();
-        assert_eq!(
-            strip_uri_prefix(&prefixed, "/heyosecret"),
-            "/v1/read?path=a%2Fb"
+        #[cfg(target_os = "linux")]
+        assert!(
+            !ka.user_timeout.is_zero(),
+            "unacknowledged writes to a dead VM must time out too"
         );
-        let root: http::Uri = "/heyosecret".parse().unwrap();
-        assert_eq!(strip_uri_prefix(&root, "/heyosecret"), "/");
     }
 
     fn deployment(scaling: ScalingPolicy) -> Arc<Deployment> {
@@ -1292,6 +475,7 @@ mod tests {
                 strip_prefix: false,
             }],
             vm: Some(VmSpec {
+                correlated_creates: false,
                 env_from: vec![],
                 workspace_archive: None,
                 image_download_url: None,
@@ -1316,6 +500,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,
@@ -1326,37 +511,6 @@ mod tests {
 
     fn backend(addr: &str) -> Arc<VmBackend> {
         Arc::new(VmBackend::new("sb-1".into(), addr.parse().unwrap()))
-    }
-
-    #[test]
-    fn ctx_release_is_idempotent() {
-        let b = backend("10.0.0.1:80");
-        b.acquire();
-        assert_eq!(b.in_flight(), 1);
-
-        let mut ctx = Ctx {
-            backend: Some(b.clone()),
-            ..Default::default()
-        };
-        ctx.release();
-        assert_eq!(b.in_flight(), 0);
-        // A second release (e.g. fail_to_connect then logging) must not
-        // decrement a slot it no longer owns.
-        ctx.release();
-        assert_eq!(b.in_flight(), 0);
-    }
-
-    #[test]
-    fn maintenance_fence_is_retryable_and_does_not_remove_the_deployment() {
-        let d = deployment(ScalingPolicy::default());
-        assert_eq!(maintenance_response(&d), None);
-        let mut spec = d.spec.clone();
-        spec.maintenance = true;
-        let fenced = Deployment::new(spec);
-        assert_eq!(
-            maintenance_response(&fenced),
-            Some((503, "deployment is under maintenance\n")),
-        );
     }
 
     #[tokio::test]
@@ -1373,7 +527,7 @@ mod tests {
         d.set_backends(vec![b]);
 
         let started = std::time::Instant::now();
-        assert!(wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_none());
+        assert!(crate::request_control::wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -1384,7 +538,7 @@ mod tests {
             cold_start_timeout_secs: 1,
             ..Default::default()
         });
-        assert!(wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_none());
+        assert!(crate::request_control::wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_none());
     }
 
     #[tokio::test]
@@ -1403,7 +557,7 @@ mod tests {
             d2.ready_signal.notify_waiters();
         });
 
-        let got = wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await;
+        let got = crate::request_control::wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await;
         assert_eq!(got.unwrap().peer, "10.0.0.1:80");
     }
 
@@ -1417,6 +571,6 @@ mod tests {
             ..Default::default()
         });
         d.set_backends(vec![backend("10.0.0.1:80")]);
-        assert!(wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_some());
+        assert!(crate::request_control::wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_some());
     }
 }

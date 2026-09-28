@@ -341,6 +341,25 @@ pub struct UpstreamDrain {
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct DeploymentState {
+    /// Irreversible controller freeze; neither reload nor ordinary updates clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement: Option<crate::retirement::Operation>,
+    /// Write-ahead evidence for ordinary allocation attempts. Unknown outcomes
+    /// remain here across restart and prevent a retirement success receipt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub create_attempts: Vec<crate::retirement::CreateAttempt>,
+    /// False for old records, any legacy create dispatch, unjournaled adoption
+    /// or arbitrary host worker. Success on /sandbox-deploy cannot prove an
+    /// exactly-once allocation because its queue delivery may be replayed.
+    /// No API or timeout can promote this bit back to true.
+    #[serde(default)]
+    pub allocation_history_complete: bool,
+    #[serde(default = "crate::rollout::revision")]
+    pub rollout_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rollouts: Vec<crate::rollout::Operation>,
     /// Sandboxes this deployment stopped rather than destroyed, under
     /// `scaling.idle_action: retain`. They hold their `/workspace` data disk and
     /// are candidates for resume in preference to a cold create.
@@ -362,11 +381,20 @@ pub struct DeploymentState {
     /// than the last upstream membership it routed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_version: Option<u64>,
+    /// Source that actually supplied the durable discovery version, not just
+    /// the current environment setting. Prevents falsely attesting a new source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_source_url: Option<String>,
+    /// Durable public-selector transition. A committed record makes restart
+    /// fail closed on the regional spec until fresh discovery is observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_handoff: Option<crate::registry::RouteHandoffRecord>,
 }
 
 #[derive(Debug)]
 pub struct Deployment {
     pub spec: DeploymentSpec,
+    pub regional: Option<Arc<crate::regional::Router>>,
     /// Runtime state, persisted with the spec. Copy-on-write like the pools.
     state: ArcSwap<DeploymentState>,
     /// Ready, routable VMs. Copy-on-write: the autoscaler is the only writer.
@@ -409,8 +437,9 @@ impl Deployment {
             .map(|addr| Arc::new(VmBackend::for_upstream(addr.clone())))
             .collect();
         Self {
+            regional: spec.discovery.as_ref().and_then(|d| d.regional.as_ref()).map(|_| Arc::new(crate::regional::Router::new())),
             spec,
-            state: ArcSwap::from_pointee(DeploymentState::default()),
+            state: ArcSwap::from_pointee(DeploymentState { allocation_history_complete:true, rollout_revision: crate::rollout::revision(), ..Default::default() }),
             backends: ArcSwap::from_pointee(backends),
             pending: ArcSwap::from_pointee(Vec::new()),
             waiters: AtomicUsize::new(0),
@@ -697,6 +726,7 @@ mod tests {
                 strip_prefix: false,
             }],
             vm: Some(VmSpec {
+                correlated_creates: false,
                 env_from: vec![],
                 workspace_archive: None,
                 image_download_url: None,
@@ -721,6 +751,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: vec![],
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,
@@ -750,6 +781,7 @@ mod tests {
             health: HealthCheck::default(),
             upstreams: upstreams.iter().map(|s| s.to_string()).collect(),
             discovery: None,
+            gateway: None,
             build: None,
             artifact: None,
             site: None,
@@ -1012,6 +1044,27 @@ mod tests {
         });
         // No backends => idle_for is MAX => desired 0, and no panic on max().
         assert_eq!(d.desired_replicas(), 0);
+    }
+
+    #[test]
+    fn zero_ceiling_prevents_wake_despite_in_flight_requests_and_waiters() {
+        let d = Arc::new(deployment(ScalingPolicy {
+            min_replicas: 0,
+            max_replicas: 0,
+            warm_pool: 0,
+            ..Default::default()
+        }));
+        let a = backend("10.0.0.1:80");
+        a.acquire();
+        d.set_backends(vec![a]);
+        let _waiter = d.track_waiter();
+        assert_eq!(d.demand(), 2);
+        assert_eq!(d.desired_replicas(), 0);
+        assert!(!d.can_grow());
+        d.set_backends(vec![]);
+        assert_eq!(d.demand(), 1);
+        assert_eq!(d.desired_replicas(), 0);
+        assert!(!d.can_grow(), "a request cannot wake the paused pool");
     }
 
     /// Regression: a request waiting on a scaled-to-zero deployment holds no

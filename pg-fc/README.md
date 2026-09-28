@@ -206,7 +206,7 @@ Config via env (all optional):
 | `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (2GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
 | `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
 | `PG_VM_POOL_DISK_GROW_PCT` | unset (off) | guest-filesystem used% at or above which a schema's data **device** is grown (doubled, offline). Setting it is the on/off switch for device growth — see "Growing the device" |
-| `PG_VM_POOL_DISK_GROW_URGENT_PCT` | `95` | used% at or above which a **warm** VM's device is grown without waiting for it to go idle — stop, resize, and let the next connect boot it, dropping the sessions it had. Must be >= `PG_VM_POOL_DISK_GROW_PCT`; `0` disables the online path. Without it a schema whose write load never pauses can never grow — see "Growing the device" |
+| `PG_VM_POOL_DISK_GROW_URGENT_PCT` | `95` | used% at or above which a **warm** VM's device is grown without waiting for it to go idle — online under the running VM when heyvmd has the online resize route, otherwise stop, resize, and let the next connect boot it, dropping the sessions it had. Once every host's heyvmd has the route, 70–80 grows early at no cost. Must be >= `PG_VM_POOL_DISK_GROW_PCT`; `0` disables the online path. Without it a schema whose write load never pauses can never grow — see "Growing the device" |
 | `PG_VM_POOL_DISK_MAX_GB` | `100` | ceiling device growth never passes (the daemon itself caps at 250) |
 | `PG_VM_POOL_ADMIT_TIMEOUT_SECS` | `30` | how long a client waits for a free connection slot on its schema's VM before the pooler errors it; `0` fails immediately when full |
 | `PG_VM_POOL_MAX_CONCURRENT_BRINGUPS` | `3` | max VM deploys/boots in flight against heyvmd; the excess queues FIFO in the pooler (an unbounded burst can wedge the daemon, whose watchdog restart then kills every running VM); `0` disables |
@@ -230,7 +230,8 @@ Config via env (all optional):
 | `PG_VM_POOL_OFFLOAD_LOAD_MAX` | `0.75` | normalized host load (1-min loadavg / cores; on Linux this includes tasks blocked on disk I/O) at or above which the pacer stops adding jobs beyond the first — aggressive with headroom, single file without |
 | `PG_VM_POOL_OFFLOAD_MAX_HOLDOFF_SECS` | `300` | how long queued client bring-ups **or a running reclaim pass** may hold the pacer off before it dispatches anyway — single-file, no-boot kinds only. Bounds the sawtooth on a host whose bring-up queue is never empty and whose reaper keeps re-triggering reclaim; `0` yields indefinitely — see "Offload pacer" |
 | `PG_VM_POOL_S3_BUCKET` | unset | S3 bucket for dumps (required when eviction is on) |
-| `PG_VM_POOL_S3_PREFIX` | `pg-vm-pool/` | key prefix; the object per schema is `{prefix}{schema}.dump` |
+| `PG_VM_POOL_S3_PREFIX` | `pg-vm-pool/` | key prefix; the objects per schema are `{prefix}{schema}.dump` and `{prefix}{schema}.img.zst`. Joined as plain text, so end it with `/`. Every upload and delete uses it. Give each host its own (e.g. `pg-vm-pool/<host>/`) so hosts sharing a bucket can't overwrite each other's archives |
+| `PG_VM_POOL_S3_LEGACY_PREFIX` | `pg-vm-pool/` when `PG_VM_POOL_S3_PREFIX` differs, else unset | read-only fallback for restores: consulted only when both of a schema's keys under `PG_VM_POOL_S3_PREFIX` are known absent (a failed HEAD or a torn object keeps the restore on the write prefix), so changing the prefix on a host with existing archives doesn't strand them. Nothing is ever written or deleted under it. Set it empty to disable the fallback |
 | `PG_VM_POOL_S3_REGION` | `us-east-1` | region for SigV4 signing |
 | `PG_VM_POOL_S3_ENDPOINT` | unset (AWS) | custom endpoint for an S3-compatible store (MinIO/R2); path-style addressing |
 | `PG_VM_POOL_S3_ACCESS_KEY_ID` / `PG_VM_POOL_S3_SECRET_ACCESS_KEY` | unset | S3 credentials (fall back to `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) |
@@ -241,6 +242,7 @@ Config via env (all optional):
 | `PG_VM_POOL_DUMP_DIR` | `~/.heyo/pg-vm-pool/dumps` | where local dump files live |
 | `PG_VM_POOL_DUMP_LISTEN` | `0.0.0.0:6433` | local dump server bind; guests reach it at their default gateway, access is token-gated |
 | `PG_VM_POOL_WARM_SPARES` | `0` (off) | keep N pre-booted, initdb-complete spare VMs (`spare-pg-*`) for cold bring-ups to claim — an S3 restore skips create+boot+initdb and goes straight to download+load; capped at 16, each parked spare holds its size class's RAM |
+| `PG_VM_POOL_CHILLED_VEHICLES` | `2` (0 when the pool is off) | of those spares, keep N parked **stopped** as image-restore vehicles — a thaw overwrites its vehicle's disk, so it wants a stopped VM and a chilled one saves it the stop plus the disk-release wait (~4.8s of a ~6.9s thaw). Stopped VMs hold no RAM, so these cost a thin disk each, not memory |
 | `PG_VM_POOL_PRESSURE_PATH` | unset (off) | filesystem to watch (the heyvmd run dir); setting it enables emergency disk-pressure eviction — see "S3 eviction tier" |
 | `PG_VM_POOL_PRESSURE_HIGH_PCT` / `PG_VM_POOL_PRESSURE_LOW_PCT` | `85` / `75` | start emergency-archiving oldest-idle schemas at/above high; stop below low |
 | `PG_VM_POOL_PRESSURE_CHECK_SECS` | `60` | how often the pressure watchdog reads disk usage |
@@ -493,6 +495,44 @@ its next tick. Stranded *stopped* spares — the residue of a daemon restart —
 restarted in preference to creating new ones, and are only counted once they are
 genuinely up.
 
+#### Chilled vehicles (`PG_VM_POOL_CHILLED_VEHICLES`)
+
+An **image** restore does not want a running VM. It overwrites its vehicle's
+data disk with the archived filesystem and boots on that, so every bit of the
+boot and `initdb` a warm spare paid for is discarded — and handing it a running
+spare means stopping that VM first and waiting for Firecracker to release the
+disk file before the swap can start. Measured on a production host, that
+stop-and-wait was **~4.8s of a ~6.9s thaw**, against ~2.8s of actual work
+(decompress + one boot).
+
+So `PG_VM_POOL_CHILLED_VEHICLES` of the spares are parked **stopped**, already
+in the state a restore wants. A thaw claims one, writes the disk, and starts
+the VM once. They are chilled by the replenisher, off any client's critical
+path, and only ever from spares whose Postgres answered while running — a
+vehicle that never booted would also have no readable `PG_VERSION` for the
+major-compatibility gate to check the archive against. Stopped VMs hold no RAM,
+so the vehicle shelf does not compete with the warm one for memory; it costs a
+thin data disk each.
+
+Three properties keep the two shelves from fighting:
+
+- **The replenish plan can't see them.** A chilled vehicle is stopped, unbound
+  and unclaimed — exactly the shape the plan restarts as deficit or deletes as
+  surplus. They are exempt from both, or the pool would spend every pass
+  undoing its own vehicles.
+- **Chilling shrinks the warm shelf, and the next pass refills it.** The pool
+  settles at `WARM_SPARES` running plus `CHILLED_VEHICLES` stopped. Nothing is
+  chilled while clients are queued for bring-ups, for the same reason nothing
+  is built then.
+- **The disk-release check still runs.** Skipping the *stop* is safe on the
+  pool's promise; skipping the check that nothing holds the disk open is not,
+  and it costs one fd scan when the disk is already free.
+
+With the shelf empty a restore falls back to the old path — claim a running
+spare, stop it — which is correct, just slower. The dashboard reports vehicle
+depth next to warm-spare depth; zero chilled is the image-restore equivalent of
+zero warm spares.
+
 ### Local freeze tier
 
 Between "idle-stopped VM" (full filesystem image on disk) and "archived to S3"
@@ -591,6 +631,18 @@ have outbound network egress to the S3 endpoint. Each schema maps to one object,
 `s3://{bucket}/{prefix}{schema}.dump`; a single `PUT` caps at 5 GB, which is
 ample for one-workbook databases.
 
+**Empty databases are never uploaded.** A schema's key is stable and shared, so
+an upload replaces whatever is already at it — and a cluster with no user
+relations is worth nothing in a bucket: restoring one leaves a client exactly
+where a fresh create would. Every path that writes to S3 refuses such a cluster
+first. The image paths read the stopped disk's `base/` directory offline (a
+database is copied from `template1` and only grows, so a user database no
+larger than template1 has no relations of its own); the dump paths ask the
+running Postgres. Compaction and local freezing still run — the bytes stay on
+the host, the registry row keeps its tier, and the pooler journals
+`kept local — its database holds no user data`. An unreadable disk or an
+unreachable database is never treated as empty.
+
 **Disk-pressure eviction (emergency tier):** the threshold-driven pacer can't
 help when load outruns it — a filesystem that hits `No space left on device`
 takes everything down at once (VM creates fail, Postgres PANICs, even the
@@ -665,10 +717,21 @@ provisioned max is a cap, not the de-facto footprint. The disk-derived Postgres
 knobs (`max_wal_size`, `temp_file_limit`, swap sizing) key off the live
 filesystem size and are recomputed + reloaded on each growth step.
 
-**Growing the device (second line of defense).** The guest watcher above grows
-the *filesystem* inside the device and then retires — it logs
-`[grow] filesystem spans $DATA_DEV; watcher done` and exits. From that moment
-the **device** is the binding constraint, and only the host can grow it. That
+The watcher never exits. Once the filesystem spans the device it logs
+`[grow] filesystem spans $DATA_DEV; idling until it changes` and re-checks
+once a minute, re-reading the device size each time. When the host grows the
+device under the running VM (heyvmd's online resize runs `resize2fs` in the
+guest itself), the watcher sees a filesystem it didn't grow, logs
+`[grow] filesystem is now …MB (grown outside this watcher); retuning`, and
+recomputes + reloads the same knobs — within a minute of the grow. If the
+device grew but the filesystem didn't, its normal growth path takes over.
+Guests booted from an image older than this keep the old watcher, which exits
+at the first span; they still get the space from an online grow, but keep
+their boot-time knobs until the next restart.
+
+**Growing the device (second line of defense).** Once the guest watcher has
+grown the *filesystem* to span the device, the **device** is the binding
+constraint, and only the host can grow it. That
 is what `PG_VM_POOL_DISK_GROW_PCT` enables, and it has two triggers because one
 is not enough:
 
@@ -676,8 +739,13 @@ is not enough:
   stopping the VM anyway, so the offline resize is free: no client is
   disturbed. This handles every schema that goes quiet.
 - **While warm** (`PG_VM_POOL_DISK_GROW_URGENT_PCT`, default 95). The pooler
-  stops the VM *itself*, resizes, and leaves it for the next connect to boot —
-  dropping whatever sessions it had.
+  asks heyvmd to grow the device *online* (`POST /sandboxes/{id}/resize-online`):
+  heyvmd extends the disk under the running VM, grows the guest filesystem and
+  verifies both, and no session is dropped. When that is unavailable — an
+  older heyvmd without the route (404), a VM that is not running (409), or a
+  failure partway (5xx) — it falls back to stopping the VM *itself*, resizing
+  offline, and leaving it for the next connect to boot, dropping whatever
+  sessions it had.
 
 The second trigger exists because the first one cannot reach the schemas that
 need it most. Growing a device is offline-only (the daemon fscks and cold-boots
@@ -689,14 +757,16 @@ and *stay* that way until its traffic happened to pause for a whole
 `PG_VM_POOL_IDLE_TIMEOUT_SECS`. The busiest schemas were precisely the ones
 that could not grow.
 
-Hence the higher threshold on the online path: the free idle-stop grow keeps
-handling everything that does go idle, and the expensive one only fires on what
-it misses — a filesystem genuinely at the wall. It samples the warm set once a
-minute, resizes at most 4 devices per pass (each costs a schema its live
-sessions, so a busy pass trickles rather than restarting everything at once),
-and backs off per-schema on failure. It claims the schema the same way an
-offload does, so clients arriving mid-resize queue at the pooler instead of
-racing the stop/start, and it logs the stop at `warn` with the session count.
+Hence the higher default threshold on the warm path: the free idle-stop grow
+keeps handling everything that does go idle, and the offline fallback only
+fires on what it misses — a filesystem genuinely at the wall. It samples the
+warm set once a minute, does at most 4 *offline* grows per pass (each costs a
+schema its live sessions, so a busy pass trickles rather than restarting
+everything at once; online grows are not capped), and backs off per-schema on
+failure. The offline fallback claims the schema the same way an offload does,
+so clients arriving mid-resize queue at the pooler instead of racing the
+stop/start, and it logs the stop at `warn` with the session count. Once every
+host's heyvmd serves the online route, the threshold can come down to 70–80.
 
 When a full filesystem already spans a device at `PG_VM_POOL_DISK_MAX_GB`,
 growth has nothing left to give: that is logged at **error** level (and to the
@@ -1637,6 +1707,8 @@ What it gives you (browse to the listen address):
   the controls to start one, refresh it, promote a replica or detach. Same
   operations as JSON at `/api/replication` and `/api/peers` — see
   "Cross-host replication" above.
+- **JSON admin API** (`/api/…`) — everything above, for programs (app-lb's
+  pg-fc plugin reads it). See "JSON admin API" below.
 - **Logs** — tail the pooler log (`/logs/pooler`), the heyvmd log
   (`/logs/heyvmd`), and any VM's in-guest Postgres log (`/logs/vm/<id>`).
 - **Controls** — stop / start / reboot / resize any VM from its detail page.
@@ -1691,6 +1763,42 @@ an older binary and it still reads its charts, simply ignoring the timing
 files. The same numbers are also in the pooler log, one line per create
 (`created VM pg-<schema> in …`).
 
+#### Restore latency (time to a serving Postgres)
+
+Under the two restore charts the monitoring page reports, over the same
+trailing 24 hours, how long a restore took to reach a Postgres serving the
+client — one row per source, because the four have nothing in common to
+average:
+
+| source | what it does |
+| --- | --- |
+| S3 disk image | download `{prefix}{schema}.img.zst`, decompress, swap the disk under a vehicle VM, boot on it |
+| S3 dump | bring a VM up, `CREATE DATABASE`, then the guest's `curl \| pg_restore` |
+| local image (compacted) | the S3 image path minus the download |
+| local dump (frozen) | the S3 dump path minus the download |
+
+Read the two image rows against each other: everything after the download is
+identical work, so the gap between them is what fetching from the bucket costs.
+The note under the table splits an image restore further, into the download and
+everything after it (decompress, `e2fsck`, disk swap, boot) — which is the
+reading that separates "the bucket is slow" from "this host is busy", and points
+at what to tune: the bucket's throughput on one side, or the run-dir filesystem
+(the decompress and the in-place copy are disk-bound) and the spare pool that
+supplies the vehicle on the other. For that last one, check **chilled-vehicle
+depth** before anything else: an adopt figure several seconds above the work it
+describes usually means the shelf was empty and every restore in the window
+paid to stop a running spare and wait out its disk release.
+
+Bounded exactly as the create figures are: the admission wait is excluded (it
+measures how many other clients arrived at once, not what this restore costs),
+only restores that finished are counted, and percentiles are nearest-rank, so
+every figure is a restore someone actually waited through. A source with no
+restores in the window shows dashes rather than zeros, and a window too thin to
+support a percentile marks it rather than printing the maximum three times.
+Samples share the `timings-*.tsv` partitions with the create figures, so they
+survive a restart the same way; the download phase is recorded even when the
+restore that follows it fails, since the bytes still moved.
+
 #### Webhook alerts
 
 The monitoring page can watch the basic host metrics and POST a webhook when one
@@ -1726,6 +1834,55 @@ endpoint is logged and never blocks the pooler. Rules persist to
 sibling of the schema registry) and survive restarts — including the paused
 flag; the firing state is in-memory, so a restart re-evaluates cleanly rather
 than replaying a stale edge.
+
+### JSON admin API
+
+The dashboard listener also serves a JSON API with the same reads and
+actions as the pages, behind the same Basic auth. It is keyed by **schema**
+(the database name clients connect with) rather than sandbox id, because a
+schema outlives its VMs: an offload deletes the VM and a restore creates a
+new one. The wire types live in the `pg-fc-api` crate (`api/`), which
+app-lb's pg-fc plugin depends on too, so the two sides cannot drift.
+
+| Route | What it does |
+|---|---|
+| `GET /api/health` | Version, uptime, listen address, warm/known schema counts, configured tiers. In-memory only. |
+| `GET /api/schemas[?tier=&q=]` | Every schema on every tier (`live`, `compacted`, `frozen`, `archived`, `pending`; `warm` filters to checked-in VMs), with sessions, slots and idle time when warm. |
+| `GET /api/schemas/{schema}` | One schema, plus live `db_size_bytes`/`backends` when warm. |
+| `POST /api/schemas/{schema}/{start,stop,reboot,resize,reap,restore,archive-image}` | The VM page's buttons. `resize` takes `{"size_class":"small"}`. Returns 409 for a pinned schema, or for a power action on an offloaded one. The long actions answer 202 and report in `/api/events`. |
+| `GET /api/host` | Host CPU/memory, disks, spare shelf, and schema counts by tier. |
+| `GET /api/events[?limit=&since=]` | The events journal, newest first. |
+| `GET /api/logs/{pooler,heyvmd}[?lines=]` and `GET /api/logs/schema/{schema}` | Log tails as JSON lines. The schema log is read from inside the VM. |
+| `POST /api/maintenance/{sweep,ttl-sweep,reclaim,stop-idle,purge}` | The monitoring page's buttons. `ttl-sweep` takes `{"ttl_secs":N}`. |
+| `GET /api/config`, `PUT /api/config` | Runtime configuration (below). |
+
+#### Runtime configuration
+
+A few knobs can change without a restart, which would drop every client
+session on the host:
+
+- `idle_timeout_secs`, `idle_timeout_fast_secs` (`0` turns the short timeout off)
+- `warm_spares`
+- `compact_after_secs`, `freeze_after_secs`, `archive_after_secs`
+
+`PUT /api/config` takes any subset of them; absent fields are left unchanged.
+The loops that use these knobs re-read them on every pass. Overrides are saved
+to `runtime-config.json` beside the registry file and applied over the
+environment at boot, so they survive a restart.
+
+`GET` reports each knob's effective value and where it came from (`override`,
+`env` or `default`). It also lists the env-only settings as read-only.
+
+A knob can only change if its subsystem was on at boot. For example, if
+`PG_VM_POOL_ARCHIVE_AFTER_SECS` was unset, the S3 tier has no loop and no
+credentials, so `archive_after_secs` is refused with a 400 until you set the
+variable and restart.
+
+```sh
+curl -u admin:secret http://127.0.0.1:8080/api/config
+curl -u admin:secret -X PUT http://127.0.0.1:8080/api/config \
+  -H 'content-type: application/json' -d '{"idle_timeout_secs": 300}'
+```
 
 ### Testing
 

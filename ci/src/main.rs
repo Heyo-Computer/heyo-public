@@ -11,6 +11,7 @@
 //! with a message naming the variable — not a process that supervisord reports
 //! as `RUNNING` while every job fails.
 
+mod application_lifecycle;
 mod artifacts;
 mod bus;
 mod cd;
@@ -20,11 +21,22 @@ mod cd;
 // axum versions, so the shared module deliberately names no framework type and
 // each one wires its own routes. See `ui/README.md`.
 mod config;
+mod controller_rollout;
+mod debug_report;
 mod dispatch;
+mod executor;
 mod expr;
+mod host_app_lb;
+mod host_bootstrap;
+mod host_bootstrap_delivery;
+mod host_heyvm_bootstrap;
+mod host_heyvm_bootstrap_coordinator;
+mod host_maintenance;
 #[path = "../../ui/ui.rs"]
 mod heyo_ui;
 mod image;
+mod lifecycle;
+mod managed_update;
 mod nats_auth;
 mod native;
 mod objects;
@@ -37,9 +49,12 @@ mod repos;
 mod runners;
 mod secrets;
 mod service_archive;
+mod service_rollout;
 mod store;
+mod submission;
 mod trigger;
 mod vm;
+mod vm_cleanup;
 mod web;
 mod workflow;
 
@@ -57,8 +72,57 @@ use vm::Vms;
 async fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !args.is_empty() {
+        if args[0] == "--reconcile-service-rollout" && args.len() == 3 {
+            let result: anyhow::Result<()> = async {
+                let config = Config::from_env()?;
+                let store = Store::connect(&config.database_url, config.log_dir.clone(), config.db_statement_timeout).await?;
+                service_rollout::recover(&store, &secrets::Secrets::new(&config), &args[1], &args[2]).await
+            }.await;
+            match result {
+                Ok(()) => println!("Service rollout receipt checked; original run and job history preserved."),
+                Err(_) => {
+                    eprintln!("Service rollout recovery unresolved; drain fence retained.");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        if args[0] == "--deliver-host-bootstrap" && matches!(args.len(), 6 | 7) {
+            let targets = std::env::var("CI_HOST_APP_LB_TARGETS").ok();
+            let token = std::env::var("CI_HOST_APP_LB_TOKEN").unwrap_or_default();
+            match host_bootstrap_delivery::run(&args[1], &args[2], args[3].as_ref(), args[4].as_ref(), args[5].as_ref(), args.get(6).map(String::as_str), targets.as_deref(), &token).await {
+                Ok(status) => println!("{status}"),
+                Err(error) => {
+                    eprintln!("bootstrap delivery incomplete: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        if args[0] == "--prepare-host-bootstrap" && args.len() == 5 {
+            match host_bootstrap::run(args[1].as_ref(), args[2].as_ref(), args[3].as_ref(), args[4].as_ref()) {
+                Ok(status) => println!("{status}"),
+                Err(error) => {
+                    eprintln!("bootstrap preparation refused: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        if args[0] == "--check-host-bootstrap" && args.len() == 4 {
+            let targets = std::env::var("CI_HOST_APP_LB_TARGETS").ok();
+            let token = std::env::var("CI_HOST_APP_LB_TOKEN").unwrap_or_default();
+            match host_bootstrap::check(args[2].as_ref(), &args[3], &args[1], targets.as_deref(), &token).await {
+                Ok(status) => println!("{status}"),
+                Err(error) => {
+                    eprintln!("bootstrap remains unverified: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         if args[0] != "--check-workflows" || args.len() < 2 {
-            eprintln!("usage: ci [--check-workflows FILE ...]");
+            eprintln!("usage: ci [--check-workflows FILE ... | --prepare-host-bootstrap PLAN_JSON INSPECTION_JSON BUNDLE OUTPUT_JSON | --deliver-host-bootstrap TARGET inspect|admit INPUT_JSON BUNDLE JOURNAL_JSON | --check-host-bootstrap TARGET MANIFEST_JSON INTENT_SHA256]");
             std::process::exit(2);
         }
         let mut failed = false;
@@ -201,6 +265,20 @@ async fn main() {
         "database ready ({} migrations applied)",
         store::EMBEDDED_MIGRATIONS.len()
     );
+    match store.import_sources(&config.workspace_dir, config.max_source_bytes).await {
+        Ok(count) => tracing::info!(count, "retained source descriptors verified in shared storage"),
+        Err(e) => {
+            eprintln!("ci: refusing to start — {e}");
+            std::process::exit(1);
+        }
+    }
+    match store.import_logs().await {
+        Ok(count) => tracing::info!(count, "retained logs imported into shared storage"),
+        Err(e) => {
+            eprintln!("ci: refusing to start — {e}");
+            std::process::exit(1);
+        }
+    }
 
     let bus = match Bus::connect(&config.nats, &config.nats_prefix).await {
         Ok(b) => Arc::new(b),
@@ -241,7 +319,32 @@ async fn main() {
         );
     }
 
+    // Bind before registering non-expiring ownership. A failed bind must not
+    // leave a boot that can never serve as the durable executor.
+    let listener = match tokio::net::TcpListener::bind(config.listen_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("ci: cannot bind CI_LISTEN_ADDR={} — {e}", config.listen_addr);
+            std::process::exit(1);
+        }
+    };
+    // Deployment IDs are scoped to their regional authority; both regions may
+    // legitimately use the same ID for instances of the one CI application.
+    let executor_identity = config.managed_deployment.clone().unwrap_or_else(|| match (&config.controller_deployment, &config.controller_app_lb_url) {
+        (Some(id), Some(base)) => format!("{}/deployments/{id}", base.trim_end_matches('/')),
+        _ => config.instance_id.clone(),
+    });
+    let executor = if config.managed_deployment.is_some() {
+        executor::ExecutorOwner::register_managed(store.pool().clone(),&executor_identity).await
+    } else {
+        executor::ExecutorOwner::register(store.pool().clone(),&executor_identity).await
+    };
     let dispatcher = Arc::new(Dispatcher {
+        lifecycle: Arc::new(lifecycle::Lifecycle::default()),
+        executor: Arc::new(match executor {
+            Ok(owner) => owner,
+            Err(e) => { eprintln!("ci: refusing to start — {e}"); std::process::exit(1); }
+        }),
         config: config.clone(),
         store: store.clone(),
         pool: Pool::new(store.pool().clone()),
@@ -273,25 +376,35 @@ async fn main() {
     // or the pool leaks its capacity one restart at a time. This instance's own
     // id is fresh, so VMs leased by the process this one replaced no longer look
     // like somebody's live work.
-    if let Err(e) = dispatcher.reclaim_pool().await {
-        tracing::warn!("could not reclaim the VM pool: {e}");
+    if let Ok(_effect) = dispatcher.executor.effect_permit().await {
+        if let Err(e) = dispatcher.reclaim_pool().await {
+            tracing::warn!("could not reclaim the VM pool: {e}");
+        }
     }
     dispatcher.clone().spawn_lease_loop();
     dispatcher.clone().spawn_consumers();
+    application_lifecycle::spawn(dispatcher.clone());
+    controller_rollout::spawn(dispatcher.clone());
+    service_rollout::spawn(dispatcher.clone());
+    managed_update::spawn(dispatcher.clone());
+    host_maintenance::spawn(dispatcher.clone());
+    host_heyvm_bootstrap_coordinator::spawn(dispatcher.clone());
+    vm_cleanup::spawn(dispatcher.clone());
+    debug_report::spawn(dispatcher.clone());
 
-    // Bind before announcing readiness. A listener that cannot bind is a hard
-    // failure here rather than a task that dies quietly and leaves the process
-    // up with no data plane.
-    let listener = match tokio::net::TcpListener::bind(config.listen_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!(
-                "ci: cannot bind CI_LISTEN_ADDR={} — {e}",
-                config.listen_addr
-            );
-            std::process::exit(1);
+    if let Err(e) = dispatcher.executor.mark_ready().await {
+        eprintln!("ci: refusing to announce readiness — {e}");
+        std::process::exit(1);
+    }
+    let executor = dispatcher.executor.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if let Err(error) = executor.mark_ready().await {
+                tracing::warn!(%error, "could not refresh executor handoff readiness");
+            }
         }
-    };
+    });
 
     let app = web::router(
         config.clone(),
@@ -313,18 +426,15 @@ async fn main() {
 
 /// Delete step and VM logs older than `CI_LOG_RETENTION_DAYS`.
 ///
-/// Logs are the bulk of what this process writes and nothing else prunes them —
-/// a build log is megabytes, and an orchestrator that fills its disk stops being
-/// an orchestrator. The rows stay: a step that ran and its exit code are the
+/// Logs are the bulk of what this process writes and nothing else prunes them.
+/// The rows stay: a step that ran and its exit code are the
 /// run's history, and losing those with the bytes would make an old run look as
 /// though it never happened.
 ///
-/// Bounded per pass rather than deleting everything found. A first sweep against
-/// months of history would otherwise be one enormous burst of unlink syscalls on
-/// the same disk a build is writing to.
+/// Bounded per pass to avoid expiring months of shared history in one transaction.
 fn spawn_log_sweeper(config: Arc<Config>, store: Store) {
     let Some(retention) = config.log_retention else {
-        tracing::info!("CI_LOG_RETENTION_DAYS=0, so logs are kept forever; watch the disk");
+        tracing::info!("CI_LOG_RETENTION_DAYS=0, so shared logs are kept forever; watch database storage");
         return;
     };
     /// How often to look. Logs age in days; checking hourly is prompt enough and
@@ -357,19 +467,9 @@ fn spawn_log_sweeper(config: Arc<Config>, store: Store) {
 
             let mut swept = 0u64;
             for run_id in &runs {
-                let dir = store.run_log_dir(run_id);
-                // A missing directory is not an error: the files may have been
-                // removed by hand, or the run may have written none. The rows
-                // are still cleared so it is not offered again.
-                if let Err(e) = tokio::fs::remove_dir_all(&dir).await
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::warn!("could not remove {}: {e}", dir.display());
-                    continue;
-                }
                 match store.forget_logs_of(run_id).await {
                     Ok(n) => swept += n,
-                    Err(e) => tracing::warn!("swept {run_id} on disk but not in the database: {e}"),
+                    Err(e) => tracing::warn!("could not expire shared logs for {run_id}: {e}"),
                 }
             }
             tracing::info!(

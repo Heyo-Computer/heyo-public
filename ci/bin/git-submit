@@ -173,10 +173,15 @@ printf '%s\n' '.ci/workflows/*.yml' '.ci/workflows/*.yaml' > "$work/workflow-glo
 git config --get-all ci.workflowPath >> "$work/workflow-globs" 2>/dev/null || true
 if [ -n "${CI_WORKFLOW_PATHS:-}" ]; then printf '%s\n' "$CI_WORKFLOW_PATHS" | tr ',' '\n' >> "$work/workflow-globs"; fi
 
-# Changes retain the historical before-to-target meaning. Unrepresentable or
-# very large path sets are explicitly unknown rather than silently truncated.
-if [ -n "$before" ] && git cat-file -e "$before^{commit}" 2>/dev/null; then
-  git diff --name-only -z "$before" "$target_commit" -- > "$work/changes"
+# A release validates the complete branch diff, not just its last commit.
+# Keep the previous-commit range for an explicitly resubmitted trunk revision
+# so a failed deployment can still request validation of that revision.
+if [ -n "$release_base" ] && [ "$release_base" != "$target_commit" ]; then
+  before="$release_base"
+fi
+# Unrepresentable or very large path sets are explicitly unknown, not truncated.
+if [ -n "$before" ] && git --git-dir="$pack" cat-file -e "$before^{commit}" 2>/dev/null; then
+  git --git-dir="$pack" diff --no-renames --name-only -z "$before" "$target_commit" -- > "$work/changes"
   changes_reason=""
 else
   : > "$work/changes"; changes_reason="the submitted revision has no parent available"
@@ -264,5 +269,7 @@ import json,sys
 r=json.load(open(sys.argv[1]))
 for w in r.get('warnings',[]): print('warning: '+w,file=sys.stderr)
 for run in r.get('runs',[]): print('  run %s  %sruns/%s'%(run,r.get('url',''),run))
+if r.get('submission'):
+    print('  submission (validation, merge, deployment): %sruns/%s'%(r.get('url',''),r['submission']))
 PY
 else cat "$response"; fi

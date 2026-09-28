@@ -32,37 +32,22 @@ on:
   submit:
     paths:
       # app-lb's subtree covers `app-lb/heyctl/` too — `**` crosses segments.
-      # The workspace has no path dependency outside its own directory, so
-      # unlike the `heyo` monorepo there is no sibling crate to list here.
       - 'app-lb/**'
+      # The one path dependency outside it: the pg-fc plugin's wire types.
+      - 'pg-fc/api/**'
       # This workflow and the image it builds in — named precisely rather than
       # as `.ci/**`, so adding a workflow for another crate here does not
       # rebuild this one. The image is shared with `app-obs.yml`, so editing
       # it rebuilds both, which is the one change that genuinely must.
       - '.ci/workflows/app-lb.yml'
       - '.ci/image/apps/**'
+      - '.ci/workflows/regional-release.yml'
 
 jobs:
   release:
-    # Pinned to the orchestrator's own host — the Linux CI machine. `default`
-    # rather than a spelled-out `<network>/<node>`, so the pin survives the
-    # host being renamed or the network reorganised.
-    #
-    # This used to be unpinned ("any online host"), and the 2026-08-24 run is
-    # why it no longer is: a macbook daemon joined the network and the job
-    # landed on it — a firecracker build on a host that only runs apple_*
-    # drivers. Placement filters on driver capability now, but the warm VM,
-    # its cache disk and the image catalog all live on one machine, so "any
-    # host" was never what these jobs meant; every placement elsewhere is a
-    # cold build.
-    #
-    # `app-obs.yml` is pinned to the same host, and nothing orders the two any
-    # more — a commit touching both, or the shared image, runs them side by
-    # side, asking the host for 12 vCPUs and 24 GB between them. Each then
-    # takes longer than it would alone. That was the reason the old `apps.yml`
-    # ran app-obs after app-lb; it is accepted here as the price of being able
-    # to run either one on its own.
-    uses: default
+    # Let CI choose an eligible Firecracker host by available capacity rather
+    # than pinning builds to the controller's host. Driver filtering excludes
+    # native-only machines; a warm cache must not override disk headroom.
     vm:
       driver: firecracker
       build:
@@ -200,6 +185,7 @@ jobs:
         # the exec channel, not the serial console that carries the marker
         # protocol.
         run: |
+          export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
           cargo fetch --locked
           df -P / "$CARGO_TARGET_DIR"
           cargo test --locked --bin app-lb || exit $?
@@ -281,9 +267,34 @@ jobs:
           branch    ${{ ci.branch }}
           run       ${{ ci.run_id }}
           EOF
-          ( cd dist && sha256sum app-lb heyctl > SHA256SUMS )
+          printf '%s\n' '${{ ci.sha }}' > dist/REVISION
+          ( cd dist && sha256sum app-lb heyctl REVISION > SHA256SUMS )
           ls -la dist
           cat dist/BUILD-INFO
+
+      # Keep the disposable CA feature out of the shipped release binary.
+      # Exercise real proxy traffic, including TLS, rather than only linking.
+      - name: Prepare protocol test tools
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          export TZ=Etc/UTC
+          timeout 120 apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=20 update
+          timeout 120 apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=20 install -y --no-install-recommends python3 openssl
+        timeout-minutes: 5
+
+      - name: Build protocol test binary
+        working-directory: /workspace
+        run: |
+          set -eu
+          export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
+          cargo build --locked --manifest-path app-lb/Cargo.toml --features reqwest/rustls-tls-native-roots
+        timeout-minutes: 15
+
+      - name: Verify proxy protocol compatibility
+        working-directory: /workspace
+        run: APP_LB_TEST_BINARY="$CARGO_TARGET_DIR/debug/app-lb" python3 -u -B app-lb/testdata/gateway_smoke.py
+        timeout-minutes: 3
 
       # Lands in whichever sink the orchestrator is configured for — `disk`
       # (CI_ARTIFACT_DIR) by default, or the central `art serve` when

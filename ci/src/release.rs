@@ -9,6 +9,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -16,6 +17,18 @@ pub struct ReleaseRow {
     pub prepared: PreparedRelease,
     pub status: String,
     pub error: Option<String>,
+}
+
+fn verify_change_coverage(changes: &crate::paths::Changes, diff: &[u8]) -> Result<(), String> {
+    if let crate::paths::Changes::Known { paths } = changes {
+        for path in diff.split(|byte| *byte == 0).filter(|path| !path.is_empty()) {
+            let path = std::str::from_utf8(path).map_err(|_| "changed path is not UTF-8")?;
+            if !paths.iter().any(|known| known == path) {
+                return Err(format!("submitted change set omitted {path:?} from target-trunk diff; resubmit the complete revision"));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -72,7 +85,6 @@ pub async fn merge(
     store: &Store,
     msg: &JobMessage,
     plan: &JobPlan,
-    source: &Path,
     manifests: &[String],
     tags: &BTreeMap<String, String>,
     token: &str,
@@ -87,6 +99,16 @@ pub async fn merge(
         .ok_or_else(|| "release run does not exist".to_string())?;
     if run.status == "cancelled" {
         return Err("cancelled run cannot publish a release".into());
+    }
+    crate::submission::authorize_publication(store, &msg.run_id).await?;
+    let coordinated = match crate::submission::gate(store, &msg.run_id).await? {
+        crate::submission::Gate::Ready => true,
+        crate::submission::Gate::Unmanaged => false,
+        crate::submission::Gate::Waiting => return Err("submission validations are still running".into()),
+        crate::submission::Gate::Rejected(reason) => return Err(reason),
+    };
+    if coordinated && (!manifests.is_empty() || !tags.is_empty()) {
+        return Err("submission publication must preserve the exact validated revision".into());
     }
 
     let rows = sqlx::query(
@@ -115,7 +137,9 @@ pub async fn merge(
             steps,
         });
     }
-    gate(plan, &jobs)?;
+    if !coordinated {
+        gate(plan, &jobs)?;
+    }
     if store
         .is_job_cancelled(&msg.job_id)
         .await
@@ -146,12 +170,25 @@ pub async fn merge(
     let request_hash = hex::encode(Sha256::digest(
         serde_json::to_vec(&identity).map_err(|e| e.to_string())?,
     ));
-    // `source` is Workspace::root. Submissions intentionally persist metadata,
-    // not a controller-side checkout, alongside it as `<run>.source.json`.
-    let descriptor = crate::trigger::read_descriptor_path(&source.with_extension("source.json"))
+    let descriptor = store.source_descriptor(&msg.run_id).await
         .map_err(|e| format!("read release source descriptor: {e}"))?;
     let release_checkout=release_git::materialize(&run.repo_url,&descriptor,token).await?;
+    if coordinated {
+        // Client-supplied changed paths may over-build, but must never omit part
+        // of the revision being published. Unknown paths validate everything.
+        let diff = tokio::process::Command::new("git")
+            .args(["diff", "--no-renames", "--name-only", "-z", release_base, &run.sha, "--"])
+            .current_dir(release_checkout.path()).output().await
+            .map_err(|e| format!("verify submission change coverage: {e}"))?;
+        if !diff.status.success() {
+            return Err("could not verify submission change coverage against target trunk".into());
+        }
+        verify_change_coverage(&run.changes, &diff.stdout)?;
+    }
     let prepared=release_git::prepare(release_checkout.path(),release_base,&run.sha,&target_ref,&policy,tags).await?;
+    if coordinated && prepared.release_sha != run.sha {
+        return Err("publication candidate differs from validated source".into());
+    }
     let prepared_json = serde_json::to_value(&prepared).map_err(|e| e.to_string())?;
 
     let mut tx = store.pool().begin().await.map_err(|e| e.to_string())?;
@@ -279,6 +316,16 @@ pub async fn get(store: &Store, run: &str) -> Result<Option<ReleaseRow>, String>
 mod tests {
     use super::*;
 
+    #[test]
+    fn release_coverage_cannot_omit_an_earlier_commit_or_renamed_source() {
+        let claimed = crate::paths::Changes::known(vec!["cloud/new.rs".into()]);
+        assert!(verify_change_coverage(&claimed, b"cloud/new.rs\0").is_ok());
+        assert!(verify_change_coverage(&claimed, b"auth/index.ts\0cloud/new.rs\0").is_err());
+        assert!(verify_change_coverage(&claimed, b"cloud/old.rs\0cloud/new.rs\0").is_err());
+        assert!(verify_change_coverage(&crate::paths::Changes::unknown("validate all"),
+            b"auth/index.ts\0cloud/new.rs\0").is_ok());
+    }
+
     fn plans(extra: &str) -> (JobPlan, JobPlan) {
         let yaml = format!(
             "jobs:\n  validate:\n    vm: {{ driver: firecracker }}\n    {extra}steps:\n      - run: cargo test\n      - run: cargo check\n  release:\n    needs: [validate]\n    vm: {{ driver: firecracker }}\n    steps:\n      - uses: ci/merge-release\n"
@@ -405,6 +452,7 @@ mod tests {
         git(&source, &["add", "."]);
         git(&source, &["commit", "-m", "feat: change"]);
         let head = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["push", "origin", "HEAD:refs/heads/feature"]);
 
         let workflow = crate::workflow::Workflow::parse("release.yml", "jobs:\n  validate:\n    vm: { driver: firecracker }\n    steps:\n      - run: cargo test\n  release:\n    needs: [validate]\n    vm: { driver: firecracker }\n    steps:\n      - uses: ci/merge-release\n").unwrap();
         let plan = crate::plan::Plan::build(&workflow).unwrap();
@@ -442,6 +490,13 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let descriptor = serde_json::to_vec(&json!({
+                "baseRevision": head, "targetTree": git(remote, &["rev-parse", &format!("{head}^{{tree}}")]),
+                "patchBase64": "", "workflows": {}
+            })).unwrap();
+            let mut tx = store.pool().begin().await.unwrap();
+            Store::record_source_in(&mut tx, &run, &descriptor).await.unwrap();
+            tx.commit().await.unwrap();
             let jobs = store.jobs_of(&run).await.unwrap();
             let validation = jobs.iter().find(|j| j.base_id == "validate").unwrap();
             store
@@ -501,7 +556,6 @@ mod tests {
                 &store,
                 &msg,
                 release_plan,
-                &source,
                 &["package.json".into()],
                 &BTreeMap::new(),
                 "test"
@@ -524,7 +578,6 @@ mod tests {
             &store,
             &msg,
             release_plan,
-            &source,
             &["package.json".into()],
             &BTreeMap::new(),
             "test",
@@ -543,7 +596,6 @@ mod tests {
                 &store,
                 &msg,
                 release_plan,
-                &source,
                 &["package.json".into()],
                 &BTreeMap::new(),
                 "test"
@@ -560,7 +612,6 @@ mod tests {
                 &store,
                 &failed_msg,
                 release_plan,
-                &source,
                 &["package.json".into()],
                 &BTreeMap::new(),
                 "test"

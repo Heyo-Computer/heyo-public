@@ -239,3 +239,126 @@ test("a fleet-operations instance lists no sandbox tools at all", () => {
   const asToken = withForwardedAuth(hosted, { authorization: "Bearer applb_abc123_secret" });
   assert.ok(!names(buildTools(asToken)).includes("sandbox_create"));
 });
+
+/**
+ * app-obs has no namespaces. Its partitions are deployment ids and one token
+ * reaches every one of them, so the only wall a log read can respect is
+ * app-lb's — and `deployment_logs` has to consult it rather than assume the
+ * caller owns what they named.
+ */
+test("deployment_logs asks app-lb whether the deployment is the caller's before reading obs", async () => {
+  const stub = stubFetch((c) => {
+    if (c.url.endsWith("/namespaces")) {
+      return { body: { namespaces: [{ name: "team-a", scope: "admin" }] } };
+    }
+    if (c.url.includes("/lb/deployments/")) return { body: { spec: { id: "web" } } };
+    return { body: { rows: [{ ts: 1, level: "error", message: "giving up on VM" }] } };
+  });
+  try {
+    const tools = buildTools(
+      loadConfig({
+        HEYO_API_KEY: "heyo_api_x",
+        APPLB_TOKEN: "heyo_api_lb",
+        APP_OBS_URL: "https://obs.example.com",
+        APP_OBS_API_TOKEN: "applb_obs",
+      }),
+    );
+    const out = await tool(tools, "deployment_logs").handler({ id: "web", limit: 5 });
+
+    // The reach check happens, through the namespace door, before obs is asked.
+    const paths = stub.calls.map((c) => c.url);
+    assert.ok(
+      paths.some((u) => u === "https://server.heyo.computer/namespaces/team-a/lb/deployments/web"),
+      `no reach check: ${paths.join(", ")}`,
+    );
+    const obsAt = paths.findIndex((u) => u.startsWith("https://obs.example.com"));
+    const reachAt = paths.findIndex((u) => u.endsWith("/lb/deployments/web"));
+    assert.ok(reachAt >= 0 && obsAt > reachAt, "obs must be asked after app-lb, not before");
+    assert.match(out, /giving up on VM/);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("applb_security_events passes the /security query filters through unchanged", async () => {
+  // The five filters `/security` accepts are the tool's whole input, and the
+  // tool's job is to forward them verbatim — it must not invent a default for
+  // `namespace` (managed mode narrows server-side) nor drop an omitted one
+  // into the query string. What the caller sends is what app-lb gets.
+  const stub = stubFetch((c) =>
+    c.url.endsWith("/namespaces")
+      ? { body: { namespaces: [{ name: "team-a", scope: "admin" }] } }
+      : { body: { enabled: true, alerts: [], totals: {}, rules: [], guard: {} } },
+  );
+  try {
+    const out = await tool(twoKeys(), "applb_security_events").handler({
+      severity: "high",
+      rule: "auth.brute-force",
+      deployment: "web",
+      namespace: "team-a",
+      limit: 20,
+    });
+    assert.match(out, /"enabled": true/);
+    assert.equal(stub.calls.length, 2, "namespace discovery then /security");
+    const security = stub.calls[1]!.url;
+    assert.ok(security.includes("/lb/security"), `hit /security: ${security}`);
+    assert.ok(security.includes("severity=high"));
+    assert.ok(security.includes("rule=auth.brute-force"));
+    // 'auth.brute-force' has a '+', not a literal '-' in URLSearchParams.
+    assert.ok(security.includes("deployment=web"));
+    assert.ok(security.includes("namespace=team-a"));
+    assert.ok(security.includes("limit=20"));
+  } finally {
+    stub.restore();
+  }
+});
+
+test("applb_security_events sends nothing when no filter is given", async () => {
+  // An empty call must not synthesize a `namespace=` query param: through the
+  // managed door the response is narrowed server-side, and a self-hosted app-lb
+  // returns everything. Adding a default here would silently widen or narrow
+  // what the caller asked for. A self-hosted config (APPLB_URL) skips namespace
+  // discovery, so the only request is the one to /security.
+  const stub = stubFetch(() => ({ body: { enabled: false, alerts: [], rules: [] } }));
+  try {
+    const tools = buildTools(loadConfig({ APPLB_URL: "http://127.0.0.1:8090" }));
+    await tool(tools, "applb_security_events").handler({});
+    const security = stub.calls.find((c) => c.url.includes("/security"))!.url;
+    assert.ok(!security.includes("namespace="), `no namespace synthesized: ${security}`);
+    assert.ok(!security.includes("severity="), `no severity synthesized: ${security}`);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("deployment_logs refuses a deployment app-lb will not show this credential", async () => {
+  const stub = stubFetch((c) => {
+    if (c.url.endsWith("/namespaces")) {
+      return { body: { namespaces: [{ name: "team-a", scope: "admin" }] } };
+    }
+    // Another namespace's deployment: the door answers 404, exactly as it does
+    // for a name that does not exist at all.
+    if (c.url.includes("/lb/deployments/")) return { status: 404, body: { error: "not found" } };
+    return { body: { rows: [{ ts: 1, message: "someone else's logs" }] } };
+  });
+  try {
+    const tools = buildTools(
+      loadConfig({
+        HEYO_API_KEY: "heyo_api_x",
+        APPLB_TOKEN: "heyo_api_lb",
+        APP_OBS_URL: "https://obs.example.com",
+        APP_OBS_API_TOKEN: "applb_obs",
+      }),
+    );
+    const out = await tool(tools, "deployment_logs").handler({ id: "other-ns-app" });
+
+    assert.match(out, /not visible to this credential/);
+    assert.doesNotMatch(out, /someone else's logs/);
+    assert.ok(
+      !stub.calls.some((c) => c.url.startsWith("https://obs.example.com")),
+      "obs must not be asked at all once app-lb has refused",
+    );
+  } finally {
+    stub.restore();
+  }
+});

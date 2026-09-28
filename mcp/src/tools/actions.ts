@@ -78,6 +78,66 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
       schema: {},
       handler: async () => json(await clients.applb({ path: "/certs" })),
     },
+    {
+      name: "applb_security_events",
+      description:
+        "app-lb's SIEM findings: authentication abuse, attack signatures and traffic " +
+        "anomalies, newest first, plus any block rules in force and the guard's counters. " +
+        "This is the same data the `/siem` console renders, as JSON, behind the same gate " +
+        "(`/security` is `view` tier, like `/metrics`).\n\n" +
+        "Each alert carries its own `response` — a runbook (`investigate`) and the rules " +
+        "ready to post to `/security/rules` (`actions`) — so 'and now what?' is in the answer " +
+        "rather than something to derive. This tool only reads; acting on a finding means " +
+        "POSTing a rule, which is a mutation and has no dedicated tool here — use " +
+        "`applb_request` with `method: POST`, `path: /security/rules` and the `rule` object " +
+        "from an alert's `actions`.\n\n" +
+        "Three things that decide how to read it. The ring is in memory and bounded " +
+        "(`APP_LB_SIEM_ALERT_CAPACITY`, default 512), so an app-lb restart empties it and " +
+        "ids begin again — a momentary gap, not a loss, because the durable record is app-obs " +
+        "and the job history. Repeats of the same finding fold into one alert whose `count` " +
+        "climbs within a suppress window, so a flapping source is one row, not thousands. " +
+        "And `enabled: false` with an empty list means detection is off (`APP_LB_SIEM=0`); " +
+        "the `rules` still come back, because enforcement does not depend on detection.\n\n" +
+        "Through the managed service the response is narrowed to the caller's namespace, so " +
+        "omit `namespace` there. A self-hosted app-lb sees every alert; pass `namespace` to " +
+        "filter, or `deployment` for one deployment's findings. `severity` accepts " +
+        "info/low/medium/high/critical and returns that tier and above.",
+      schema: {
+        severity: z
+          .enum(["info", "low", "medium", "high", "critical"])
+          .optional()
+          .describe("only alerts at or above this severity"),
+        rule: z
+          .string()
+          .optional()
+          .describe("only this rule, e.g. 'auth.brute-force' or 'traffic.scanner'"),
+        deployment: z
+          .string()
+          .optional()
+          .describe("only alerts attributed to this deployment"),
+        namespace: z
+          .string()
+          .optional()
+          .describe(
+            "only alerts for deployments in this namespace; defaults to the configured " +
+              "namespace in managed mode",
+          ),
+        limit: num().optional().describe("most recent N alerts after filtering"),
+      },
+      handler: async (a) =>
+        json(
+          await clients.applb({
+            path: "/security",
+            query: {
+              severity: a.severity as string | undefined,
+              rule: a.rule as string | undefined,
+              deployment: a.deployment as string | undefined,
+              namespace: a.namespace as string | undefined,
+              limit: a.limit as number | undefined,
+            },
+          }),
+        ),
+    },
 
     // ---- app-lb lifecycle ---------------------------------------------
     {

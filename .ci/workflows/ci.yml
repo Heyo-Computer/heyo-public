@@ -1,17 +1,13 @@
-# Build the `ci` release binary and upload it as an artifact.
+# Validate and package CI. regional-release.yml owns merge and deployment.
 #
 # This is the orchestrator building itself. The process that reads this file,
 # plans the run and drives the VM is the program the run compiles — it serves
 # ci.us2.heyo.work, and since the subtree merge its source is `ci/` here rather
 # than a repository of its own.
 #
-# That is less delicate than it sounds, and it is worth saying why. This
-# workflow *builds*; it does not deploy. The artifact is picked up by a person,
-# or by `ci/deploy/ci.json`'s `update` block, never by this run. And a restart
-# in the middle of a run is not lost work: the job sits on a JetStream work
-# queue and the executor is idempotent, so it is redelivered. The one failure
-# this cannot catch is a `ci` binary too broken to dispatch anything, which is
-# the bootstrap every CI system has and not one a workflow file can solve.
+# This workflow cannot publish or deploy on its own. The submission coordinator
+# waits for every selected validation before merging the exact source, and
+# replaces the CI controller only after the regional stages succeed.
 #
 # Submitted from the repository root, with a pinned Git-patch descriptor:
 #
@@ -22,7 +18,7 @@
 # through CI. The guest has `.git`; a patched local submission may have a
 # synthetic HEAD. Changed-path metadata drives the `paths:` filter.
 #
-# ## One job, and no checks yet
+# ## Validation, merge, and deployment status
 #
 # One buildable thing in one file, like every workflow here: whether `ci`
 # passes says nothing about the platform or about codegraph, so it earns its
@@ -30,22 +26,15 @@
 #
 # `cargo fmt --check` and `cargo clippy` would work here — the image installs
 # both components rather than leaving a bare `--profile minimal` toolchain — and
-# are deliberately left for a follow-up. `cargo test` would run too: the 54
-# tests that need Postgres, NATS or a live heyvmd are all `#[ignore]`d, and the
-# other 321 need nothing. It is left out only because this file's job is the
-# artifact; the GitHub `platform-services` job already runs the suite.
+# are deliberately left for a follow-up. The non-ignored test suite runs below;
+# integration tests that require Postgres, NATS or a live heyvmd remain separate.
 name: ci
 
 on:
   submit:
     paths:
-      # The crate's subtree. `ci/Cargo.toml` declares only registry
-      # dependencies — `heyo-sdk` and `async-nats` come from crates.io — so
-      # unlike most of the private monorepo there is no sibling path dep to
-      # list beside it. That is a deliberate property of the crate, not luck:
-      # the manifest documents why it takes the published `heyo-sdk` instead of
-      # the `mvm_ctrl` library, whose path deps and `[patch.crates-io]` only
-      # work from its own workspace root.
+      # The crate's subtree. The SDK and other dependencies resolve through
+      # the committed Cargo.lock; no private sibling checkout is required.
       #
       # Not narrowed to `ci/src/**`. The artifact below also carries
       # `ci/migrations/*.sql` and `ci/deploy/supervisor/ci.conf`, so a change to
@@ -57,11 +46,14 @@ on:
       # anything under `.ci/`, and it does not cover `ci-artifacts/` either —
       # a literal segment matches only itself.
       - 'ci/**'
+      # CI and app-lb deliberately compile the same host-bundle validator.
+      - 'app-lb/src/host_bundle.rs'
       # This workflow and the image it builds in — named precisely rather than
       # as `.ci/**`, so adding a workflow for another crate does not rebuild
       # this one.
       - '.ci/workflows/ci.yml'
       - '.ci/image/ci/**'
+      - '.ci/workflows/regional-release.yml'
 
 jobs:
   release:
@@ -75,12 +67,9 @@ jobs:
     # runs the same glob matcher as `paths:`, so the guard and the filter cannot
     # disagree about what a pattern covers — including the case that matters, an
     # unknown change set, where both are true.
-    if: ${{ changed('ci/**', '.ci/workflows/ci.yml', '.ci/image/ci/**') }}
-    # Use the installation's default runner. Operators can choose its node
-    # through CI_DEFAULT_NODE without editing this workflow.
-    # Warm caches remain host-local; moving the default node starts a cold build.
-    uses: default
-    vm:
+    if: ${{ changed('ci/**', 'app-lb/src/host_bundle.rs', '.ci/workflows/ci.yml', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
+    # Unpinned: the controller chooses an eligible host in the runner network.
+    vm: &ci_vm
       driver: firecracker
       build:
         # Built by the runner's own daemon (`POST /images/build` — docker build
@@ -128,13 +117,12 @@ jobs:
       # wipes on every checkout. This disk is what makes reusing a warm VM worth
       # anything.
       #
-      # 40 GB, carried over from the standalone repository, and the one number
-      # in this file that is inherited rather than measured: nothing records a
-      # release `target/` size for this crate. The margin is not generosity —
-      # cargo never garbage-collects a `target/`, so what it buys is how many
-      # reuses fit before init.sh's 85% guard wipes it. The build step prints
-      # `df`; shrink this once a few real runs have said what the number is.
-      disk_size_gb: 40
+      # The successful Linux CI run 01a0c6d80869-0000000d recorded about
+      # 1.2 GiB used on this cache disk. Keep 20 GiB for compilation and reuse,
+      # rather than the inherited, unmeasured 40 GiB reservation. Host disk
+      # admission still includes both image copies and 5 GiB of headroom;
+      # the 85% cache guard below remains in force.
+      disk_size_gb: 20
       # 4 hours, comfortably past this job's 75-minute timeout.
       #
       # Explicit because the default (`CI_VM_TTL_SECONDS`, 3600) is *shorter*
@@ -259,6 +247,31 @@ jobs:
           fi
         timeout-minutes: 60
 
+      - name: Test CI
+        working-directory: /workspace/ci
+        run: cargo test --release --locked -- --test-threads=1
+        timeout-minutes: 10
+
+      - name: Verify published release retry with disposable PostgreSQL and NATS
+        working-directory: /workspace/ci
+        timeout-minutes: 10
+        run: |
+          set -eu
+          export DEBIAN_FRONTEND=noninteractive
+          timeout 180 apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 update -qq
+          timeout 300 apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 install -y --no-install-recommends postgresql-16 nats-server
+          pg_ctlcluster 16 main status >/dev/null 2>&1 || pg_ctlcluster -o '-c listen_addresses=127.0.0.1' 16 main start
+          runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "ALTER ROLE postgres PASSWORD 'disposable-test-password'"
+          runuser -u postgres -- createdb ci_release_retry
+          nats-server -js -a 127.0.0.1 -p 44222 -sd /tmp/ci-retry-nats >/tmp/ci-retry-nats.log 2>&1 &
+          trap 'kill "$!"' EXIT
+          export CI_TEST_DATABASE_URL=postgres://postgres:disposable-test-password@127.0.0.1/ci_release_retry
+          export CI_TEST_NATS_URL=nats://127.0.0.1:44222
+          cargo test --release --locked --bin ci dispatch::tests::published_release_failed_only_retry_preserves_identity_and_single_flight -- --ignored --exact --test-threads=1
+
+      - name: Test CI boot and deployment templates
+        run: python3 /workspace/ci/deploy/test_start_artifact.py
+
       # `ci` takes no arguments at all — no clap, no `env::args` anywhere in
       # `src/` — and is configured entirely from `CI_*` variables, so there is
       # no `--version` to call the way there is for `codegraph`. That is the
@@ -360,11 +373,12 @@ jobs:
           branch    ${{ ci.branch }}
           run       ${{ ci.run_id }}
           EOF
+          printf '%s\n' '${{ ci.sha }}' > dist/REVISION
           # The migrations are summed alongside the binary, unlike app-lb.yml's
           # binaries-only list: these are SQL statements that will be executed
           # against a production database, and the checksum is the cheap way to
           # prove the file applied is the file built.
-          ( cd dist && sha256sum ci ci.conf migrations/*.sql > SHA256SUMS )
+          ( cd dist && sha256sum ci REVISION ci.conf migrations/*.sql > SHA256SUMS )
           ls -la dist dist/migrations
           cat dist/BUILD-INFO
 

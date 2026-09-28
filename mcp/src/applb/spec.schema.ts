@@ -81,6 +81,17 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
         }
       ]
     },
+    "gateway": {
+      "description": "Opt-in one-hop regional gateway transport over explicit static upstreams.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewaySpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "health": {
       "description": "How app-lb decides a replica is ready to take traffic.",
       "$ref": "#/$defs/HealthCheck",
@@ -103,6 +114,10 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
           "type": "null"
         }
       ]
+    },
+    "maintenance": {
+      "description": "Temporarily fence this deployment's public data plane.",
+      "type": "boolean"
     },
     "namespace": {
       "description": "The namespace this deployment belongs to.",
@@ -333,15 +348,36 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
         }
       ]
     },
+    "ExpectedHeader": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "A response identity assertion, in addition to HTTP success. (Call applb_spec_schema with block \"ExpectedHeader\" for the full shape; everything it accepted is still accepted.)"
+    },
     "FeedSpec": {
       "type": "object",
       "additionalProperties": true,
       "description": "A deployment's opt-in hooks into its namespace's event feed. (Call applb_spec_schema with block \"FeedSpec\" for the full shape; everything it accepted is still accepted.)"
     },
+    "GatewaySpec": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "GatewaySpec (Call applb_spec_schema with block \"GatewaySpec\" for the full shape; everything it accepted is still accepted.)"
+    },
     "HealthCheck": {
       "description": "How a freshly-booted VM is proven ready before it joins the pool.",
       "type": "object",
       "properties": {
+        "expected_header": {
+          "description": "With an identity assertion, require a 2xx response and exactly one matching header.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExpectedHeader"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "path": {
           "description": "`None` means a bare TCP connect is enough.",
           "type": [
@@ -541,7 +577,7 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
       "description": "How a *static* (proxy_pass) deployment's backend is updated: a working directory on the app-lb host, and commands to run in it. (Call applb_spec_schema with block \"UpdateSpec\" for the full shape; everything it accepted is still accepted.)"
     },
     "VmSpec": {
-      "description": "The VM template. (8 more fields — env_from, image_download_url, image_sha256, image_size_bytes, mounts, setup_hooks, workspace, workspace_archive — omitted here for size. Call applb_spec_schema with block \"VmSpec\" for the full shape; everything it accepted is still accepted.)",
+      "description": "The VM template. (9 more fields — correlated_creates, env_from, image_download_url, image_sha256, image_size_bytes, mounts, setup_hooks, workspace, workspace_archive — omitted here for size. Call applb_spec_schema with block \"VmSpec\" for the full shape; everything it accepted is still accepted.)",
       "type": "object",
       "properties": {
         "disk_size_gb": {
@@ -707,6 +743,17 @@ export const DEPLOYMENT_SPEC_FULL = {
         }
       ]
     },
+    "gateway": {
+      "description": "Opt-in one-hop regional gateway transport over explicit static upstreams.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewaySpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "health": {
       "description": "How app-lb decides a replica is ready to take traffic. Defaults to an\nHTTP GET of `/` on the deployment's own port.",
       "$ref": "#/$defs/HealthCheck",
@@ -729,6 +776,10 @@ export const DEPLOYMENT_SPEC_FULL = {
           "type": "null"
         }
       ]
+    },
+    "maintenance": {
+      "description": "Temporarily fence this deployment's public data plane. Routed requests\nreceive HTTP 503 before auth or backend selection, while deployment\nmanagement and VM exec remain available on the separate admin listener.\nPersisted as part of the deployment spec and safe to toggle with PUT.",
+      "type": "boolean"
     },
     "namespace": {
       "description": "The namespace this deployment belongs to. Namespaces segregate use: a\ntoken minted for a namespace reaches only the deployments in it, and the\nevent feed is kept per namespace. Absent means `\"default\"`, so a fleet\nthat never says the word keeps behaving as one namespace.",
@@ -956,6 +1007,13 @@ export const DEPLOYMENT_SPEC_FULL = {
           "$ref": "#/$defs/Providers",
           "default": "google"
         },
+        "provider_ref": {
+          "description": "Inherit the *identity* half of this gate from a named provider declared on\nthe deployment's namespace. See [`AuthProviderSpec`].\n\nWhen set, this gate carries only the route-scoped fields — `public_paths`,\n`session_scope`, `base_path`, `cookie_name`, `redirect_url`,\n`forward_identity`, `session_ttl_secs` — and the provider supplies who may\nenter and how they are verified (`provider`, `client_id`, `client_secret`,\n`allowed_domains`, `allowed_emails`, `jwt`, `cookie_domain`). Setting any\nof those inline *and* a reference is refused\n([`SpecError::ProviderRefWithInlineIdentity`]) rather than silently\noverridden, because whoever wrote them believes they take effect.\n\nResolution is live: app-lb looks the provider up on every gated request,\nso rotating the client secret or tightening the allow-list on the provider\npropagates to every deployment that names it — and, because the resolved\ngate's [`policy_fingerprint`](Self::policy_fingerprint) changes with it,\nre-signs the sessions issued under the old policy. A reference that names\nno provider in the namespace is refused at registration, and if one is\nremoved out from under a live deployment the gate fails *closed*.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "public_paths": {
           "description": "Path prefixes the *sign-in* gate does not sit in front of.\n\nThis list was never \"paths with no authorization\" — it is \"paths an API\nclient reaches without being sent to Google\", which is a different\nthing and was too easily read as the first. Each entry now carries the\nscope app-lb requires in the gate's place, and an entry written as a\nbare string means [`PathScope::Admin`]: the fail-closed reading, because\nthe alternative default is the one that leaked.\n\nA path whose *upstream* does its own authorization — an artifact store\nchecking its API key, a secret service checking a bearer — says so with\n`{\"path\": \"/blobs/\", \"scope\": \"public\"}`. That is the only spelling that\nmeans \"no credential at all\", and it has to be written out.",
           "type": "array",
@@ -1077,11 +1135,54 @@ export const DEPLOYMENT_SPEC_FULL = {
         }
       }
     },
+    "DiscoverySource": {
+      "type": "object",
+      "properties": {
+        "auth": {
+          "$ref": "#/$defs/SecretRef"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "auth"
+      ]
+    },
     "DiscoverySpec": {
       "type": "object",
       "properties": {
+        "region": {
+          "description": "Opt into region-scoped membership; the authority must echo this scope.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "regional": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegionalSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "service_id": {
           "type": "string"
+        },
+        "source": {
+          "description": "Managed per-deployment authority; absent preserves the host env default.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiscoverySource"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1089,7 +1190,7 @@ export const DEPLOYMENT_SPEC_FULL = {
       ]
     },
     "Driver": {
-      "description": "Which runtime boots a deployment's replicas.\n\napp-lb's own enum rather than [`heyo_sdk::SandboxDriver`], because not every\ndriver is a heyvm one: `lxc` is a system container app-lb creates on this\nhost through Incus, and the SDK has no name for it. The spellings are\ndeliberately identical to the SDK's, so a spec written against either\ndeserializes the same and the wire fixtures are unchanged.\n\n`Libvirt` and `FirecrackerContainerd` exist here only so that a spec naming\none still *deserializes* and is then refused by\n[`DeploymentSpec::validate`] with an explanation. Dropping the variants\nwould turn a good error message into an opaque serde failure.",
+      "description": "Which runtime boots a deployment's replicas.\n\napp-lb's own enum rather than [`heyo_sdk::SandboxDriver`], because not every\ndriver is a heyvm one: `lxc` is a system container app-lb creates on this\nhost through Incus, and the SDK has no name for it. The spellings are\ndeliberately identical to the SDK's, so a spec written against either\ndeserializes the same and the wire fixtures are unchanged.\n\n`FirecrackerContainerd` exists here only so that a spec naming it still\n*deserializes* and is then refused by [`DeploymentSpec::validate`] with an\nexplanation. Dropping the variant would turn a good error message into an\nopaque serde failure.",
       "oneOf": [
         {
           "type": "string",
@@ -1105,6 +1206,22 @@ export const DEPLOYMENT_SPEC_FULL = {
           "type": "string",
           "const": "lxc"
         }
+      ]
+    },
+    "ExpectedHeader": {
+      "description": "A response identity assertion, in addition to HTTP success.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
       ]
     },
     "FeedSpec": {
@@ -1130,10 +1247,52 @@ export const DEPLOYMENT_SPEC_FULL = {
         }
       }
     },
+    "GatewayMode": {
+      "type": "string",
+      "enum": [
+        "forward",
+        "local"
+      ]
+    },
+    "GatewaySpec": {
+      "type": "object",
+      "properties": {
+        "auth": {
+          "$ref": "#/$defs/SecretRef"
+        },
+        "mode": {
+          "$ref": "#/$defs/GatewayMode"
+        },
+        "region": {
+          "description": "Destination region for forward mode; this instance's region for local mode.",
+          "type": "string"
+        },
+        "service": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "service",
+        "region",
+        "auth",
+        "mode"
+      ]
+    },
     "HealthCheck": {
       "description": "How a freshly-booted VM is proven ready before it joins the pool.\n\nThis exists because the SDK's readiness signal is not trustworthy on its own\n(see `vm::wait_until_running`), so we always probe the guest ourselves.",
       "type": "object",
       "properties": {
+        "expected_header": {
+          "description": "With an identity assertion, require a 2xx response and exactly one\nmatching header. An old baked-in listener must not verify a new release.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExpectedHeader"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "path": {
           "description": "`None` means a bare TCP connect is enough.",
           "type": [
@@ -1162,7 +1321,7 @@ export const DEPLOYMENT_SPEC_FULL = {
       }
     },
     "IdleAction": {
-      "description": "What becomes of a VM the autoscaler no longer needs.\n\nThe distinction only exists because a *sandbox* is not a replica. Retiring\none of four interchangeable web VMs should reclaim everything it held;\nretiring the single VM that is somebody's working directory should not.\n\nNote what `Retain` can and cannot keep: a stopped sandbox keeps its record\nand its **`/workspace` data disk** (`vm.disk_size_gb`), and loses its memory\nand any writes to the rootfs. For Firecracker the daemon enforces that —\nthe rootfs is recopied from the base image on every cold boot — and for KVM\nthe autoscaler does, by discarding the persisted rootfs copy right after a\nsuspend rather than parking a gigabyte per idle replica. A `Retain`\ndeployment with no data disk therefore saves boot time and nothing else.\nPersistent state has to live under `/workspace`.",
+      "description": "What becomes of a VM the autoscaler no longer needs.\n\nThe distinction only exists because a *sandbox* is not a replica. Retiring\none of four interchangeable web VMs should reclaim everything it held;\nretiring the single VM that is somebody's working directory should not.\n\nNote what `Retain` can and cannot keep: a stopped sandbox keeps its record\nand its **`/workspace` data disk** (`vm.disk_size_gb`), and loses its memory\nand any writes to the rootfs. For Firecracker the daemon enforces that —\nthe rootfs is recopied from the base image on every cold boot — and for KVM\nthe autoscaler does, by discarding the persisted rootfs copy right after a\nsuspend rather than parking a gigabyte per idle replica. A `Retain`\ndeployment with no data disk therefore saves boot time and nothing else.\nPersistent state has to live under `/workspace`.\nLibvirt is different: its qcow2 root disk also survives `Retain` and must\nnot be discarded, because the daemon resumes that disk in place.",
       "oneOf": [
         {
           "description": "Kill it: the sandbox, its data disk and its rootfs all go. The default,\nand right for a pool of interchangeable replicas.",
@@ -1241,6 +1400,27 @@ export const DEPLOYMENT_SPEC_FULL = {
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "login_endpoint": {
+          "description": "Optional Heyo Auth `/api/auth/login` endpoint for browser email/password\nsign-in. The returned access token must pass this JWT policy before a\nhost-only HttpOnly cookie is set. Requires `cookie`; never stores refresh\ntokens or passwords. Existing bearer-only gates remain unchanged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "login_redirect_param": {
+          "description": "The query parameter the hosted sign-in reads the return URL from. Only\nmeaningful with `login_url`; unset means `redirect_uri`. Set it to whatever\nthe issuer expects — `return_to`, `next`, `rd`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "login_url": {
+          "description": "Where to send a browser that reaches a gated path holding no valid token.\n\nThe `jwt` provider is otherwise stateless: it verifies a token that is\nalready being carried and, finding none, answers `401`. That is right for\na program, and a dead end for a person — a browser cannot set an\n`Authorization` header on a navigation, so it has no way to *acquire* one.\n\nSet this to the issuer's hosted sign-in page and a token-less **browser**\n(a request whose `Accept` includes HTML) is redirected there instead, with\nthe URL it was trying to reach passed in `login_redirect_param`. The issuer\nsigns the user in, sets the JWT in the `cookie` named above, and redirects\nback; the gate then reads the cookie and admits the request. app-lb mints\nno session and keeps no flow state — the cookie the issuer set *is* the\nsession. A program (no HTML in `Accept`) still gets the `401`, which it can\nact on and would only fail to parse as a sign-in page.\n\nRequires `cookie`: the return trip is a navigation, and a navigation can\ncarry a credential only in a cookie ([`SpecError::LoginUrlWithoutCookie`]).\nMust be `https://` (or a loopback `http://` for an issuer on this host),\nfor the same reason `jwks_url` must.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "name_claim": {
           "description": "Which claim holds the display name. Absent from most tokens, and absent\nhere means the header is simply not sent.",
@@ -1397,6 +1577,29 @@ export const DEPLOYMENT_SPEC_FULL = {
         }
       ]
     },
+    "RegionalSpec": {
+      "type": "object",
+      "properties": {
+        "auth": {
+          "$ref": "#/$defs/SecretRef"
+        },
+        "backend_server_id": {
+          "type": "string"
+        },
+        "environment": {
+          "type": "string"
+        },
+        "gateway_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gateway_id",
+        "backend_server_id",
+        "environment",
+        "auth"
+      ]
+    },
     "RouteRule": {
       "description": "How a request is matched to a deployment.\n\nA rule matches when *every* populated field matches. An empty rule matches\nnothing (rejected at registration) rather than everything, so a typo can't\nsilently swallow all traffic.",
       "type": "object",
@@ -1470,7 +1673,7 @@ export const DEPLOYMENT_SPEC_FULL = {
           "default": "destroy"
         },
         "max_replicas": {
-          "description": "Ceiling on replicas the autoscaler may run. Defaults to 5. Must be 1\nwhen [`VmSpec::workspace`] is set — a single-writer workspace cannot\nhave two replicas capturing divergent copies of it.",
+          "description": "Ceiling on replicas the autoscaler may run. Defaults to 5. Must be at most 1\nwhen [`VmSpec::workspace`] is set — a single-writer workspace cannot\nhave two replicas capturing divergent copies of it.",
           "type": "integer",
           "format": "uint32",
           "default": 5,
@@ -1674,6 +1877,10 @@ export const DEPLOYMENT_SPEC_FULL = {
       "description": "The VM template. Mirrors `SandboxCreateOptions`, minus the fields the LB owns\n(`name` is generated per-replica; `wait_for_ready` is always zero because the\nautoscaler polls readiness itself rather than blocking its reconcile loop).\n\nNote the SDK cannot express vcpu/memory directly — `size_class` is the only\nresource knob, and the daemon resolves it host-side. It cannot express\n`mounts` either, which is why [`crate::vm::VmManager::create`] builds the\ncreate body itself rather than handing the SDK a `SandboxCreateOptions`.\n`PartialEq` is load-bearing: an in-place edit keeps the running pool only\nwhen the VM *template* is unchanged, so the update path compares old and new\n`VmSpec`s to decide whether the VMs must be rebuilt.",
       "type": "object",
       "properties": {
+        "correlated_creates": {
+          "description": "Require durable heyvmd operation receipts for autoscaler allocations.\nRequires an internal daemon credential and /sandbox-creations support;\nunknown outcomes never fall back to legacy create or name matching.",
+          "type": "boolean"
+        },
         "disk_size_gb": {
           "description": "Size of the replica's persistent data disk, mounted at `/workspace`.\n\nSeparate from the rootfs, which is fixed when the image is built and\ncannot be grown afterwards — so this is not the knob for \"the image ran\nout of space\". The disk belongs to one sandbox: a rollout, a restart or\nany `vm` edit boots a replica with a fresh one, and only\n[`WorkspaceSpec`] carries contents across.",
           "type": [
@@ -1684,7 +1891,7 @@ export const DEPLOYMENT_SPEC_FULL = {
           "minimum": 0
         },
         "driver": {
-          "description": "`firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system\ncontainer from an OCI image). `libvirt` and `firecracker_containerd`\nare rejected at registration.",
+          "description": "`firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system\ncontainer from an OCI image). `libvirt` uses a managed qcow2 VM reached\nthrough heyvmd's host forwards of its `open_ports` or a host-reachable\nguest network. `firecracker_containerd` is rejected.",
           "$ref": "#/$defs/Driver"
         },
         "env_from": {
@@ -1852,7 +2059,7 @@ export const DEPLOYMENT_SPEC_FULL = {
       }
     },
     "WorkspaceSpec": {
-      "description": "A persistent, writable workspace owned by the deployment.\n\nThe fourth thing app-lb moves between a store and a guest, and the only one\nthat moves in **both directions**. A [`MountSpec`] is data the deployment\nwas *given*; a workspace is data the deployment *makes* — the agent's\nsessions, the repositories it cloned, the files it was asked to keep — and\nit has to outlive the VM that wrote it. heyvm's own `/workspace` data disk\ndoes not: it belongs to one sandbox, so every rollout, every `restart`, and\nevery rebuild that recycles the pool boots a replica with an empty one.\n\n## The lifecycle\n\n* **Seed.** When the autoscaler creates a replica it hands heyvmd the\n  workspace's current tree on this host as a writable mount at\n  [`path`](Self::path). The daemon builds the VM its own ext4 image from\n  that tree (`mke2fs -d`), so the guest writes to a block device and the\n  tree itself is only read. With no tree yet — a fresh host, or a swept\n  one — the latest snapshot is pulled from [`store`](Self::store) first;\n  with no snapshot in the store either, the workspace starts empty.\n* **Capture.** When a replica retires for any reason — drained by a\n  rollout, evicted, torn down by an edit or a deregistration, suspended by\n  `idle_action: retain` — app-lb syncs the guest, stops the VM, replays the\n  image's journal, extracts it into a new tree, and points the deployment\n  at that tree. The replacement is not created until that has happened,\n  which is the whole guarantee: the next VM boots from the last VM's final\n  state, not from whatever the store held when the host came up.\n* **Push.** Each capture is bundled (`tar.gz`, named by its sha256) and sent\n  to the store under [`ref`](Self::artifact_ref), so the workspace survives\n  the host too. A push that fails is retried; it never blocks the rollout,\n  because the tree the next VM needs is already here.\n\n## What this costs, and what it refuses\n\nA capture stops the VM, so a rollout of a workspace deployment has a gap:\nthe old replica is drained and stopped, its tree is extracted, and only then\ndoes the new one boot. That is inherent to single-writer state and it is why\n`scaling.max_replicas` **must be 1** — two replicas would each capture their\nown divergent copy and the last one to land would win. `warm_pool` must be\n`0` for the same reason, and the driver must be `firecracker`: the KVM\ndriver has its own idea of what a writable mount means when the VM stops.\n\nOwnership is flattened: the tree is extracted and rebuilt by app-lb's own\nuser, so every file comes back owned by that uid inside the guest. A\nworkload that runs as root reads and writes them regardless; one that\nchecks ownership (git's `safe.directory`, Postgres's data-directory check)\nneeds to be told. Modes, symlinks and timestamps survive.",
+      "description": "A persistent, writable workspace owned by the deployment.\n\nThe fourth thing app-lb moves between a store and a guest, and the only one\nthat moves in **both directions**. A [`MountSpec`] is data the deployment\nwas *given*; a workspace is data the deployment *makes* — the agent's\nsessions, the repositories it cloned, the files it was asked to keep — and\nit has to outlive the VM that wrote it. heyvm's own `/workspace` data disk\ndoes not: it belongs to one sandbox, so every rollout, every `restart`, and\nevery rebuild that recycles the pool boots a replica with an empty one.\n\n## The lifecycle\n\n* **Seed.** When the autoscaler creates a replica it hands heyvmd the\n  workspace's current tree on this host as a writable mount at\n  [`path`](Self::path). The daemon builds the VM its own ext4 image from\n  that tree (`mke2fs -d`), so the guest writes to a block device and the\n  tree itself is only read. With no tree yet — a fresh host, or a swept\n  one — the latest snapshot is pulled from [`store`](Self::store) first;\n  with no snapshot in the store either, the workspace starts empty.\n* **Capture.** When a replica retires for any reason — drained by a\n  rollout, evicted, torn down by an edit or a deregistration, suspended by\n  `idle_action: retain` — app-lb syncs the guest, stops the VM, replays the\n  image's journal, extracts it into a new tree, and points the deployment\n  at that tree. The replacement is not created until that has happened,\n  which is the whole guarantee: the next VM boots from the last VM's final\n  state, not from whatever the store held when the host came up.\n* **Push.** Each capture is bundled (`tar.gz`, named by its sha256) and sent\n  to the store under [`ref`](Self::artifact_ref), so the workspace survives\n  the host too. A push that fails is retried; it never blocks the rollout,\n  because the tree the next VM needs is already here.\n\n## What this costs, and what it refuses\n\nA capture stops the VM, so a rollout of a workspace deployment has a gap:\nthe old replica is drained and stopped, its tree is extracted, and only then\ndoes the new one boot. That is inherent to single-writer state and it is why\n`scaling.max_replicas` **must be at most 1** — two replicas would each capture their\nown divergent copy and the last one to land would win. `warm_pool` must be\n`0` for the same reason, and the driver must be `firecracker`: the KVM\ndriver has its own idea of what a writable mount means when the VM stops.\n\nOwnership is flattened: the tree is extracted and rebuilt by app-lb's own\nuser, so every file comes back owned by that uid inside the guest. A\nworkload that runs as root reads and writes them regardless; one that\nchecks ownership (git's `safe.directory`, Postgres's data-directory check)\nneeds to be told. Modes, symlinks and timestamps survive.",
       "type": "object",
       "properties": {
         "auth": {

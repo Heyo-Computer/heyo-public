@@ -537,7 +537,7 @@ async fn resolve_cell(
     // Warm-spare pool present but empty, as it is on a host whose spares are
     // all claimed — so `bound_ids()` (an O(fleet) clone of the whole store) is
     // still computed per bring-up, exactly as in production.
-    let spares = crate::spares::SparePool::new(12);
+    let spares = crate::spares::SparePool::new(12, 0);
     let bound: HashSet<String> = (0..fleet).map(seed_id).collect();
 
     let cfg = Arc::new(cfg);

@@ -138,6 +138,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(handlers::service_deploy::run_retirement_reconciler(
         state.clone(),
     ));
+    tokio::spawn(handlers::regional_rollout::run_reconciler(state.clone()));
+    tokio::spawn(handlers::application_update::run_reconciler(state.clone()));
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -208,13 +210,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::routing::delete(handlers::orchestration::delete_resource_deployment),
         )
         .route(
+            "/orchestration/services",
+            get(handlers::service_discovery::list_services),
+        )
+        .route(
             "/orchestration/services/deployments",
             post(handlers::service_deploy::deploy_service)
                 .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)),
         )
         .route(
+            "/orchestration/services/adoptions",
+            post(handlers::service_adoption::adopt_retained_deployment),
+        )
+        .route(
+            "/orchestration/services/{service_id}/updates",
+            post(handlers::application_update::create),
+        )
+        .route(
+            "/orchestration/services/{service_id}/managed-updates",
+            post(handlers::managed_update::create),
+        )
+        .route(
+            "/orchestration/services/{service_id}/managed-updates/{operation_id}",
+            get(handlers::managed_update::get),
+        )
+        .route(
+            "/orchestration/services/{service_id}/instances/{deployment_id}/http-request",
+            post(handlers::instance_http::forward).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
             "/orchestration/services/deployments/{deployment_id}",
             get(handlers::service_deploy::get_service_deployment_run),
+        )
+        .route(
+            "/orchestration/services/regional-rollouts",
+            post(handlers::regional_rollout::create),
+        )
+        .route(
+            "/orchestration/services/regional-rollouts/{operation_id}",
+            get(handlers::regional_rollout::get),
+        )
+        .route(
+            "/orchestration/services/regional-rollouts/{operation_id}/resume",
+            post(handlers::regional_rollout::resume),
+        )
+        .route(
+            "/orchestration/services/regional-rollouts/{operation_id}/rollback",
+            post(handlers::regional_rollout::rollback),
         )
         .route(
             "/orchestration/services/archives/presign",
@@ -231,6 +273,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/orchestration/services/{service_id}/discovery",
             get(handlers::service_discovery::get_service_discovery),
+        )
+        .route(
+            "/orchestration/services/{service_id}/regional-policy",
+            axum::routing::put(handlers::regional_policy::put),
         )
         .route(
             "/orchestration/threads/{thread_id}",
@@ -282,11 +328,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn health_check() -> Json<serde_json::Value> {
-    Json(json!({
+async fn health_check() -> impl axum::response::IntoResponse {
+    // Readiness identifies the built binary, not an old image's runtime env.
+    ([("x-heyo-revision", option_env!("HEYO_BUILD_GIT_SHA").unwrap_or("unknown"))], Json(json!({
         "status": "ok",
         "deploymentGitSha": std::env::var("HEYO_ORCHESTRATOR_DEPLOYMENT_GIT_SHA").unwrap_or_default(),
         "deploymentPrNumber": std::env::var("HEYO_ORCHESTRATOR_DEPLOYMENT_PR_NUMBER").unwrap_or_default(),
         "deploymentId": std::env::var("HEYO_ORCHESTRATOR_DEPLOYMENT_ID").unwrap_or_default(),
-    }))
+    })))
+}
+
+#[cfg(test)]
+mod health_tests {
+    #[tokio::test]
+    async fn readiness_header_identifies_build_not_runtime_environment() {
+        use axum::response::IntoResponse;
+        let response = super::health_check().await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(response.headers()["x-heyo-revision"], option_env!("HEYO_BUILD_GIT_SHA").unwrap_or("unknown"));
+    }
 }

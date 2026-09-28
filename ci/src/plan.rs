@@ -135,6 +135,11 @@ impl Plan {
                     fail_fast: strategy.map(|s| s.fail_fast).unwrap_or(true),
                 };
                 substitute_matrix(&mut cell);
+                crate::host_maintenance::validate_plan(&cell).map_err(|e| PlanError::Workflow(e.to_string()))?;
+                crate::host_heyvm_bootstrap_coordinator::validate_plan(&cell).map_err(|e| PlanError::Workflow(e.to_string()))?;
+                if cell.steps.iter().any(|s| s.uses.as_deref() == Some("ci/rollout-host-app-lb") && (s.continue_on_error || cell.continue_on_error)) {
+                    return Err(PlanError::Workflow("host app-lb rollout may not tolerate errors".into()));
+                }
                 jobs.push(cell);
             }
         }

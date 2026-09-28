@@ -52,7 +52,11 @@ API_PORT="${API_PORT:-34099}"
 DASHBOARD_LISTEN="${DASHBOARD_LISTEN:-127.0.0.1:34199}"
 POOL_LISTEN="${POOL_LISTEN:-0.0.0.0:6432}"
 POOL_IMAGE="${POOL_IMAGE:-pg}"
-DOCKERFILE="${DOCKERFILE:-Dockerfile}"            # Dockerfile.pg18 for PG 18
+# PG 18 is the fleet major. The bare ./Dockerfile defaults to PG_MAJOR=16, and
+# a host built from it serves 16 while its peers serve 18 — every archive one
+# writes then fails to restore on the other (they share S3 keys per schema).
+# Override only to build a whole new fleet on a different major.
+DOCKERFILE="${DOCKERFILE:-Dockerfile.pg18}"
 
 STATE_DIR="${POOL_HOME}/.heyo/pg-vm-pool"
 TLS_DIR="${STATE_DIR}/tls"
@@ -71,6 +75,9 @@ PG_VM_POOL_S3_REGION="${PG_VM_POOL_S3_REGION:-}"
 
 # Pooler tunables (defaults match the shipped conf).
 WARM_SPARES="${WARM_SPARES:-12}"
+# Of those spares, how many are parked stopped as image-restore vehicles.
+# Stopped VMs hold no RAM, so this does not come out of the warm pool's memory.
+CHILLED_VEHICLES="${CHILLED_VEHICLES:-2}"
 ARCHIVE_AFTER_SECS="${ARCHIVE_AFTER_SECS:-86400}"
 COMPACT_AFTER_SECS="${COMPACT_AFTER_SECS:-3600}"
 
@@ -494,6 +501,7 @@ HDR
   printf '    PG_VM_POOL_READY_TIMEOUT_SECS="300",\n'
   printf '    PG_VM_POOL_MAX_CONCURRENT_BRINGUPS="3",\n'
   printf '    PG_VM_POOL_WARM_SPARES="%s",\n' "$WARM_SPARES"
+  printf '    PG_VM_POOL_CHILLED_VEHICLES="%s",\n' "$CHILLED_VEHICLES"
   printf '    PG_VM_POOL_DATA_DISK_GB="2",\n'
   printf '    PG_VM_POOL_DISK_GROW_PCT="85",\n'
   printf '    PG_VM_POOL_DISK_MAX_GB="25",\n'

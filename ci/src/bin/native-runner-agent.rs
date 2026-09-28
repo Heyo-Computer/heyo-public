@@ -513,7 +513,9 @@ async fn send_artifact(h:&reqwest::Client,url:&str,token:&str,name:&str,descript
 }
 #[cfg(unix)] fn configure_process_tree(cmd:&mut Command){use std::os::unix::process::CommandExt;cmd.as_std_mut().process_group(0);}
 #[cfg(windows)] fn configure_process_tree(cmd:&mut Command){use std::os::windows::process::CommandExt;cmd.as_std_mut().creation_flags(0x00000200);}
-#[cfg(unix)] async fn terminate_tree(pid:u32){let _=Command::new("kill").args(["-TERM",&format!("-{pid}")]).status().await;tokio::time::sleep(Duration::from_secs(2)).await;let _=Command::new("kill").args(["-KILL",&format!("-{pid}")]).status().await;}
+// End option parsing before the negative process-group ID. procps kill can
+// otherwise signal the caller's group instead of only the job's group.
+#[cfg(unix)] async fn terminate_tree(pid:u32){let _=Command::new("kill").args(["-TERM","--",&format!("-{pid}")]).status().await;tokio::time::sleep(Duration::from_secs(2)).await;let _=Command::new("kill").args(["-KILL","--",&format!("-{pid}")]).status().await;}
 #[cfg(windows)] async fn terminate_tree(pid:u32){let _=Command::new("taskkill").args(["/PID",&pid.to_string(),"/T","/F"]).status().await;}
 fn ensure_inside(root: &Path, path: &Path) -> Result<()> {
     if path
@@ -654,6 +656,31 @@ mod tests {
         let (endpoint,server,_repo)=source_server().await;let dir=tempfile::tempdir().unwrap();let mut first=step(if cfg!(windows){"'answer=42' >> $env:GITHUB_OUTPUT"}else{"echo answer=42 >> \"$GITHUB_OUTPUT\""});first.id=Some("build".into());let mut skipped=step("exit 99");skipped.condition=Some("${{ false }}".into());let handoff=step(if cfg!(windows){"if ('${{ steps.build.outputs.answer }}' -ne '42') { exit 9 }"}else{"test '${{ steps.build.outputs.answer }}' = 42"});let mut failed=step("exit 7");failed.continue_on_error=true;
         let reports=execute(&reqwest::Client::new(),&config(&endpoint,dir.path()),&lease(&endpoint,vec![first,skipped,handoff,failed],Duration::from_secs(5)),tokio::sync::watch::channel(false).1).await.unwrap();server.abort();
         assert_eq!(reports.iter().map(|x|x.status.as_str()).collect::<Vec<_>>(),vec!["success","skipped","success","failure"]);assert_eq!(reports[3].exit_code,Some(7));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn termination_does_not_signal_the_runner_group() {
+        const CHILD: &str = "CI_TEST_TERMINATION_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut command = Command::new("sleep");
+            command.arg("5").kill_on_drop(true);
+            configure_process_tree(&mut command);
+            let mut child = command.spawn().unwrap();
+            terminate_tree(child.id().unwrap()).await;
+            assert!(!child.wait().await.unwrap().success(), "job must be terminated");
+            return;
+        }
+        // Run the assertion in a separate process group: the broken code must
+        // fail this test, not kill cargo and unrelated tests sharing its group.
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "tests::termination_does_not_signal_the_runner_group", "--nocapture"])
+            .env(CHILD, "1").kill_on_drop(true);
+        configure_process_tree(&mut command);
+        let output = tokio::time::timeout(Duration::from_secs(15), command.output())
+            .await.unwrap().unwrap();
+        assert!(output.status.success(), "isolated runner died: {:?}\n{}\n{}",
+            output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     }
 
     #[tokio::test]

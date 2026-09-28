@@ -1,7 +1,48 @@
 # app-lb
 
 An application load balancer for [heyvm](https://heyo.computer) Firecracker/KVM microVMs,
-built on [Pingora](https://github.com/cloudflare/pingora).
+built on [Pingora 0.9](https://github.com/cloudflare/pingora/releases/tag/0.9.0).
+
+The 0.9 upgrade retains app-lb's routing and process lifecycle. It adopts
+Pingora's default upstream hop-by-hop header sanitization (including headers
+nominated by `Connection`), normalized valid WebSocket upgrades, and bounded
+HTTP/2 defaults (100 concurrent streams and a 64 KiB decoded header list).
+The existing TLS listener still does not advertise HTTP/2 via ALPN; this upgrade
+does not enable a new listener protocol.
+Arbitrary non-WebSocket HTTP upgrades are no longer passed through by default.
+The `pg-fc-sql/1` upgrade is explicitly preserved for authenticated cross-region
+PostgreSQL tunnels, including their initial JSON POST and bidirectional stream.
+Other requests retain Pingora's default upstream header sanitization.
+This dependency upgrade does **not** enable graceful binary replacement or
+regional ingress evacuation; host updates still use the existing restart path.
+
+The foreground process is the sole management owner: it holds the state lock,
+admin API, discovery, autoscaling, ACME, authentication, and request reservations.
+It supervises one forwarding subprocess, which owns the HTTP/TLS listeners and
+streams request/response bodies. The private `--forwarding-worker` entry point
+branches before management stores are opened; it is not an operator command.
+Request decisions cross a versioned Unix-socket protocol in a mode-0700 directory.
+Control frames are limited to 1 MiB. Request heads exceeding that limit after
+encoding receive HTTP 431 before admission, rather than terminating a worker;
+oversized manager-generated responses receive HTTP 500. Application response
+bodies stream directly through the worker and are not subject to this limit.
+Workers receive memory-only TLS snapshots, refreshed every five seconds, and
+cannot persist them or issue certificates.
+
+Completion releases the backend attempt and regional assignment; connection
+failure releases only the attempt and never permits regional replay. A lost
+request-control connection is not proof of drain: the manager retains its
+reservations until explicit completion/cancellation or confirmed worker exit.
+Cancelled HTTP tasks finish any pending control exchange before acknowledging
+cancellation. A worker that loses management authority exits; the manager reaps
+it before starting a replacement. On Linux, manager death also kills its worker.
+New requests depend on the manager being available.
+
+This is **not hot takeover**. A crashed worker interrupts its streams, and a
+replacement starts only after it exits. Candidate readiness, listener handoff,
+and zero-interruption regional ingress maintenance remain separate work. The
+host updater still restarts the service; do not use this split as evidence that
+updating a region's ingress is safe without traffic evacuation.
 
 This directory was imported from the standalone
 [`Heyo-Computer/app-lb`](https://github.com/Heyo-Computer/app-lb) repository
@@ -27,18 +68,155 @@ process. A deployment is one of three kinds:
 
 A deployment sets exactly one of `vm`, `upstreams` or `site`.
 
+### Opt-in regional gateway transport
+
+The `gateway` block adds explicit one-hop forwarding to a static deployment.
+This is the transport building block, not automatic regional selection or fleet
+management. Existing deployments remain unchanged. Both sides use one exact-host
+route, preserve paths, and resolve a namespace-scoped secret through `auth`.
+Before provisioning, require `X-App-Lb-Gateway: 1` from `GET /deployments`;
+older binaries can silently ignore unknown spec fields.
+
+Source example (normal application Host is preserved; upstream hostname supplies TLS SNI):
+
+```json
+{"id":"smoke-peer","routes":[{"host":"smoke.example"}],"upstreams":["https://eu1.example:443"],"health":{"path":"/health"},"gateway":{"mode":"forward","service":"smoke","region":"eu1","auth":{"secret":"gateway-forwarding"}}}
+```
+
+Destination example (the existing host ingress must deliver this Host to this route):
+
+```json
+{"id":"smoke-local","routes":[{"host":"smoke.example"}],"upstreams":["127.0.0.1:2227"],"health":{"path":"/health"},"gateway":{"mode":"local","service":"smoke","region":"eu1","auth":{"secret":"gateway-forwarding"}}}
+```
+
+`forward` requires HTTPS upstreams. `local` is peer-only and permits only plaintext
+loopback host-port upstreams; it never chooses another region. Supply the same
+gateway-role token through the existing secrets API on both hosts, backed by the
+canonical HeyoSecret role configuration. Never put the value in a deployment spec.
+Peer headers are validated and consumed before forwarding to the application;
+application Authorization is independent. A second hop is refused with 508,
+invalid/missing peer credentials with 403, and unresolved secrets with 503.
+Forward health probes carry peer authentication and the application Host, require
+2xx, and honor configured revision-header checks. In-flight accounting uses the
+existing backend admission guards on each hop.
+
+Do not point this peer-only destination route at a public local-serving route or
+enable it on existing flattened discovery. Hierarchical discovery uses the separate
+`discovery.regional` opt-in below. Fleet registration, coordinated gateway upgrades
+and live two-region acceptance remain separate work.
+
+Linux CI runs the isolated two-process regression with Python 3 and OpenSSL.
+To run it separately:
+
+```sh
+cargo build --locked --manifest-path app-lb/Cargo.toml --features reqwest/rustls-tls-native-roots
+python3 app-lb/testdata/gateway_smoke.py
+```
+
+The extra build feature lets Rustls health checks read the disposable test CA
+from `SSL_CERT_FILE`, like the OpenSSL proxy. Normal public-CA builds need no
+extra feature. The test never disables TLS verification or touches deployed
+services. It checks request preservation, single POST delivery, peer admission,
+WebSocket echo, and a held response body draining across spec replay while new
+traffic uses another local backend.
+Set `APP_LB_TEST_BINARY` to the absolute binary path when using a custom
+`CARGO_TARGET_DIR`; otherwise the test uses `app-lb/target/debug/app-lb`.
+
+The workload is checked in as `testdata/regional_app.py`, rather than depending
+on a temporary app archive. Its region and immutable runtime revision are explicit
+startup arguments; both are returned in JSON and `X-Heyo-Region` /
+`X-Heyo-Revision` headers. `/health` is excluded from admission history,
+`/admissions` returns the last 4096 requests, and `/held?hold=10&id=drain-1`
+starts a response then holds its body for ten seconds. `--unhealthy` returns
+503 for negative readiness checks. Only use disposable request data: the app
+records paths and bodies; Authorization is hashed, never reflected verbatim.
+
+```sh
+python3 app-lb/testdata/regional_app.py --region eu1 --revision regional-gateway-v2 --port 8080
+python3 -B -m unittest discover -s app-lb/testdata -p test_regional_app.py
+```
+
+The default bind is loopback for host-local tests. A managed VM must explicitly
+bind its guest interface (for example `--bind 0.0.0.0`); only its owning gateway
+uses the host-bound mapping. Cross-region traffic and readiness use authenticated
+HTTPS gateways, not public VM ports. Use the same app artifact/revision in both
+regions and inject the region at startup. This app does not register routes,
+publish discovery, or grant itself serving weight. Rewriting the workload does
+not enable the currently gated managed first-replica enrollment path below.
+
+### Hierarchical discovery (local integration; not live acceptance)
+
+`discovery.regional` contains `gateway_id`, `backend_server_id`, `environment` and
+an `auth` secret reference for the peer role. The backend identity must match the
+policy's gateway placement. It requires `discovery.region`, an explicit managed
+`discovery.source`, and one exact-host route with preserved path; it cannot be
+combined with the legacy `gateway` block. Both secret references are confined to
+the deployment namespace. The authority is queried with `protocol=regional-v1`,
+region, gateway ID and this runtime's boot UUID.
+
+Cold starts return 503 until the authority authorizes that exact boot. One coherent
+snapshot supplies immutable policy history, active generation, local membership and
+a monotonic admission fence. Requests select a weighted region before a local backend
+or a single HTTPS peer hop. Generation/environment/peer credentials are consumed at
+the destination; application Host and Authorization are preserved. Regional requests
+are never replayed against another assignment after a connect failure.
+
+Assignments remain counted across snapshot/spec replay until the whole request or
+stream finishes. The authenticated `discovery-status` response includes a `regional`
+boot/operation envelope and sequenced preparation/adoption/drain report, with
+`Cache-Control: no-store`. Operator maintenance or missing peer credentials prevents
+preparation evidence. A changed runtime identity fences its predecessor rather than
+resetting the predecessor's outstanding counters.
+
+After 30 seconds without an accepted discovery snapshot, reports also set
+`prepared=false`, blocking every Orchestrator policy/drain gate. Polling the admin
+endpoint cannot renew that evidence. Last-valid routing and in-flight counters
+remain intact during the outage; an accepted current snapshot renews evidence,
+but an ignored older version does not.
+
+Even a cold gateway reports authenticated admission metadata: protocol, environment,
+host placement, namespace, routes and discovery authority, plus route conflicts,
+maintenance and credential readiness. This lets the controller pin a configured
+fleet without accepting caller-supplied boot identities. It does not establish the
+absence of unregistered external ingress or authorize a gateway replacement.
+
+The authenticated deployments collection advertises
+`x-app-lb-regional-admission: 1`. Controllers must check this capability before
+create-only cold enrollment; older gateways must not interpret a regional spec as
+a legacy route. Enrollment does not grant traffic admission or replace an existing
+route. Discovery and peer credentials remain separate namespace-local secret refs.
+
+The Orchestrator `two_real_gateways_drain_through_authenticated_durable_barriers`
+test combines real app-lb processes, verified peer TLS, authenticated reports and
+disposable PostgreSQL. Set `APP_LB_TEST_BINARY` to the absolute path of the binary
+built above and `ORCHESTRATOR_TEST_DATABASE_URL` to a disposable test database.
+Public transition-admission APIs remain gated; do not edit shared DB rows to enable
+this feature. These local checks do not establish live multi-region acceptance.
+
 Managed pools support **Firecracker, KVM, and libvirt**. Firecracker/KVM use
-`SandboxInfo.guest_ip`. For libvirt, older daemons omit that field, so app-lb
-uses the authenticated `GET /sandboxes/:id/internal-url?port=...` endpoint.
+`SandboxInfo.guest_ip`. heyvmd reports no `guest_ip` for libvirt, so app-lb resolves each
+guest port it dials in this order:
+
+1. The QEMU `hostfwd` forward heyvmd reports in `SandboxInfo.port_mappings`, dialled at
+   `127.0.0.1:<host port>`. heyvmd forwards every port in `vm.open_ports` (plus `vm.port`)
+   whether or not the VM also has a bridged NIC, so this is the normal path.
+2. For daemons that predate `port_mappings`, the authenticated
+   `GET /sandboxes/:id/internal-url?port=...` endpoint. Its host-forward answer is taken on
+   loopback (`host_local_url`); any other answer must be a guest-network address.
+   Loopback, unspecified, multicast and remapped-port "guest" addresses are refused.
 
 ### Libvirt requirements
 
-- Run app-lb on the backend host, with a heyvmd version exposing the internal-address
-  endpoint and libvirt lifecycle operations.
-- Configure a host-reachable libvirt guest network (heyvmd's `HEYO_VIRT_NETWORK`,
-  or its legacy `HEYO_LIBVIRT_SDN_NETWORK` setting). SLIRP-only localhost/host-port
-  forwarding is not supported by this direct-guest routing mode. DHCP/address lookup
-  failures wait within `scaling.boot_timeout_secs`; they never fall back to the host.
+- Run app-lb on the backend host, beside a heyvmd that allows the backend
+  (`MVM_BACKENDS=libvirt,…`) and reports `port_mappings`, or at least exposes the
+  internal-address endpoint.
+- A separate `health.port` must be listed in `vm.open_ports`, or it is not forwarded and
+  the spec is refused. `vm.port` is always forwarded.
+- QEMU binds each `hostfwd` port on every host interface, so a libvirt replica's forwarded
+  ports are reachable from outside the host unless a firewall blocks them.
+- A host-reachable libvirt guest network (heyvmd's `HEYO_VIRT_NETWORK`, or its legacy
+  `HEYO_LIBVIRT_SDN_NETWORK` setting) is optional. It is used only when no forward
+  answers. DHCP/address lookup failures wait within `scaling.boot_timeout_secs`.
 - Use `vm.driver: "libvirt"` and a daemon-supported `vm.image`, for example
   `ubuntu:24.04`. Existing `build` and rootfs `artifact` pipelines produce raw ext4,
   not libvirt disks, and are rejected for this driver. Persistent `vm.workspace`
@@ -58,6 +236,369 @@ not adopt or replace unrelated libvirt VMs already running on the host.
   unix socket when the daemon publishes a live one (`heyvmd --socket`), and
   otherwise uses `http://127.0.0.1:34099`
 - `cmake` — a hard build dependency of `pingora-core`, via `flate2`'s `zlib-ng` backend
+
+## Conditional candidate-first service rollout
+
+For existing **stateless Firecracker services**, use `POST /deployments/:id/rollouts`
+instead of destructive PUT/pull/mount replacement. First GET `/deployments/:id`:
+its `rollout_revision` is an opaque persisted CAS token, distinct from the spec ETag.
+Send `{ "operation_id": "release-123", "expected_revision": "<GET token>", "spec": <complete desired spec> }`.
+IDs are 1–128 ASCII letters, digits, hyphens or underscores. Exact replay returns the
+same operation, including terminal operations; conflicting payloads/revisions return 409.
+GET `/deployments/:id/rollouts/:operation_id` reports `operation_id`, `deployment`,
+`source_revision`, `target_spec_sha256`, `status`, `phase`, `readiness_verified`,
+`previous_stopped`, `preparation_stage`, and `error`. Status is `running`, `succeeded`, `failed`, or
+`reconciliation_required`. Admission is not rollout success.
+
+Preparation uses the remaining persisted `scaling.boot_timeout_secs` rollout
+budget (30–1800 seconds), not a separate two-minute limit. Restart does not reset
+that deadline. The latest preparation stage is persisted while work runs and on
+failure: for example `rootfs_manifest`, `blob_download`, `blob_http_403`,
+`blob_digest_mismatch`, `daemon_image_import`, or `mount_unpack`. Deadline expiry
+is reported separately from preparation failure. Diagnostics contain bounded
+stage/status codes, not remote response bodies or credentials. Old operation
+records without this field remain readable. A failed preparation never creates
+a candidate or retires the serving generation.
+
+Failed pre-cutover rollouts remain reserved until every attempted Firecracker
+candidate has an authenticated host reclamation receipt. After cleanup progress
+and final settlement are durable, GET adds `failure_settlement` with protocol
+`failed-rollout-reclamation-v1` and the exact `reclaimed_candidate_ids`. A
+missing field means cleanup is unresolved; older hosts without the receipt API
+therefore retain the admission fence.
+
+`target_spec_sha256` hashes compact JSON of the **requested normalized spec**, with
+all object keys recursively sorted and array order preserved. A spec copied from
+GET is already normalized (including secret-reference namespaces). Rootfs import
+uses an operation-specific image alias in a separately recorded prepared spec;
+that materialization does not change the requested-spec hash.
+
+The desired spec must contain `artifact: { "store": "https://…", "ref": "<64 lowercase hex SHA256>" }`.
+The ref identifies a rootfs blob or the canonical artifacts manifest containing
+`rootfs.ext4`. Optional existing fields are `auth: { "secret": "id", "key": "token" }`,
+`grow_gb`, `image_name`, and `strip_components`. Candidate preparation verifies
+manifest and blob content and does not trust the catalog's name/size reuse check.
+The current daemon catalog has no digest, so a preinstalled image alias without
+pinned artifact metadata is **not sufficient**, even if the image name is unchanged.
+Every code mount must be read-only with `ref` and `digest` set to the same blob SHA256.
+Startup, environment and those mounts are applied together to the candidate.
+
+Routes, namespace, owner, request authentication and maintenance mode must remain
+unchanged. Workspace/archive-seeded VMs, writable mounts, non-Firecracker runtimes,
+Cloud ingress and extra exposed ports are rejected. An HTTP health path and a
+stable old serving pool (no pending/draining replicas) are required. Legacy writes
+and jobs are reserved out while the operation runs or requires reconciliation.
+The desired health check must include `expected_header: { "name": "x-heyo-revision", "value": "<exact lowercase Git SHA>" }`.
+Readiness requires 2xx and exactly one matching response header, using a bounded
+16 KiB parser that accepts fragmented headers. The service must emit an immutable
+build-stamped identity, **not echo a deployment environment variable**: an old
+baked-in listener must not pass when the new startup command fails. Missing/wrong
+identity, redirects and even otherwise healthy 404 responses cannot pass a rollout.
+Legacy health checks without `expected_header` retain their existing semantics.
+
+app-lb's own admin `/healthz` also returns `x-heyo-revision`, compiled from
+`HEYO_BUILD_GIT_SHA` (a full lowercase Git SHA; `unknown` for unstamped local
+builds). Runtime environment variables cannot change this header. CI stamps
+the validated source and includes a checksummed `REVISION` in the release bundle,
+so a host-controller rollout can verify the intended build through the public
+admin endpoint instead of accepting an old process's generic `ok` response.
+
+The deployment's existing fsync/rename record stores the operation, unique allocation
+intents, active generation, and exact retiring VM IDs. Candidates stay unrouted until
+healthy. Cutover persists first, then fences admission on old backends and publishes
+the candidate pool. Acquired requests drain until zero or `drain_timeout_secs`; only
+then are recorded previous replicas stopped, **not destroyed**. Their records/disks
+remain claimed, and old retained VMs cannot resume into the new generation.
+Retirement relies on the daemon's stop acknowledgment: install a daemon that
+propagates termination errors and preserves live handles on failure before
+enabling rollouts. Older daemons that swallow stop errors cannot establish
+`previous_stopped` reliably. Normal ephemeral rootfs cleanup performed by the
+daemon on successful stop is unchanged; app-lb never purges the retained sandbox.
+
+Restart reconciles attempted creates by exact recorded name, never by issuing another
+create. Unknown allocations or ambiguous persistence retain both generations for
+operator reconciliation. A failed candidate leaves the source serving; failed candidate
+allocations are retained, not purged. Post-cutover stop/readiness failure is bounded by
+the drain deadline plus five minutes and never reports `previous_stopped`. The record
+requires one owning app-lb process, as the existing registry does; it is not a shared
+multi-process database. Retained history requires explicit operator reconciliation
+before deregistration. This endpoint does not migrate external ingress or coordinate
+regions; the caller must wait for both success flags before rolling the next region.
+
+## Correlated host executable rollout
+
+### One-time native bootstrap over the existing managed command transport
+
+An installed predecessor without the correlated helper uses a **separately
+staged, validated new app-lb binary**, not a shell installer. No bootstrap is
+enabled by a repository workflow alone. A root operator supplies a private
+manifest through the existing management channel. The CI caller durably records
+the intended submission/artifact and manifest hash before requesting its fixed
+managed launcher. Successful legacy job/oneshot exit is **not** deployment success.
+
+The new binary exposes these commands (one redacted JSON object on stdout):
+
+```text
+app-lb --bootstrap-host-update inspect /absolute/desired-config.json
+app-lb --bootstrap-host-update admit /absolute/manifest.json INTENT_SHA256
+app-lb --bootstrap-host-update replan /absolute/manifest.json NEW_INTENT_SHA256 EXPECTED_OLD_INTENT_SHA256
+app-lb --bootstrap-host-update status /absolute/state/bootstrap.json INTENT_SHA256
+app-lb --bootstrap-host-update apply /absolute/state/bootstrap.json INTENT_SHA256
+```
+
+`inspect` and `status` are read-only. `inspect` returns `source` and `files`
+(path, SHA256 or null for absence, and mode). `status` returns `not_found` for
+an absent journal; it never launches or attests a process. `apply` is internal
+to the independently launched systemd oneshot. `admit` returns `protocol:
+host-app-lb-bootstrap-v1`, `operation_id`, `intent_sha256`, `journal_path`,
+`unit_name`, deployment/namespace, status, phase, source/target identities,
+`readiness_verified` and error. Outputs never include config file contents.
+
+The strict manifest schema is:
+
+```text
+{
+  operation_id, helper_sha256,
+  source: {disk_sha256, running_sha256,
+           generation: {boot_id, pid, start_time}},
+  config: <complete AFTER host Config shown below>,
+  mapping_path: <absolute APP_LB_HOST_UPDATE_CONFIG path>,
+  files: [{path, before_sha256: <SHA256 or null>, after_base64, mode}],
+  target: {artifact_sha256, binary_sha256, revision}
+}
+```
+
+`INTENT_SHA256` hashes UTF-8 compact JSON with recursively sorted object keys,
+unchanged array order and no extra whitespace. Include every required field,
+including null `before_sha256`; omit inactive file-action keys. `helper_sha256`
+must equal `target.binary_sha256` and the
+executing new helper's digest; it is **not** the predecessor digest. The exact
+pinned bundle supplies `dist/app-lb`, `dist/REVISION`, and `dist/SHA256SUMS`
+under the same 256 MiB/no-links/no-traversal archive rules as normal rollout.
+The predecessor's disk and running digests must agree. Boot ID/PID/kernel
+start-time bind the observed predecessor generation, not an alias or service
+name alone. A predecessor already configured for normal host updates is refused.
+
+`files` exactly enumerates `config.config_files` in order. Each file has `path`,
+`before_sha256`, `mode`, and **exactly one** of:
+
+- `after_base64`: explicit new bytes. Required for the non-secret mapping file,
+  whose decoded Config must equal `config`. Also suitable for a new systemd
+  environment drop-in. Modes are decimal 384 (0600) or 420 (0644).
+- `preserve:true`: assert and back up existing bytes locally without rewriting
+  the original. Requires its inspected non-null SHA and unchanged mode.
+- `supervisor_environment:true`: derive an edit locally from the preserved
+  original, append only `APP_LB_HOST_UPDATE_CONFIG` in the mapped program's
+  environment, and preserve all other bytes/settings. Requires non-null SHA
+  and unchanged mode. No existing secrets appear in the manifest or output.
+
+The native Supervisor edit requires one effective, ungrouped `[program:name]`
+definition. Its environment may continue on indented lines, including leading
+commas and intervening blank/comment lines. Whitespace-prefixed `;` and `#`
+inline comments follow Supervisor's ConfigParser rules (before quote parsing).
+The edit appends before the final physical value line's comment, preserving
+existing bytes and spacing. Other multiline settings, duplicate
+sections/environment keys, missing separators, ambiguous quotes, pre-existing mapping
+assignment, and colon delimiters are rejected. Mapping path characters are
+restricted to ASCII letters/digits and `/_.-` to avoid interpolation/quoting
+ambiguity. Other environment values and CRLF/LF endings remain untouched.
+Use `preserve:true` for all other effective unit/include/env files. Never export
+those files into CI job logs. Derivation is bound by the BEFORE hash, typed edit,
+mapped process/path and authorized helper digest.
+
+Unknown fields are rejected. Manifest and desired-config reads are bounded at
+4 MiB, decoded/derived AFTER bytes total at 4 MiB, each BEFORE config file at
+4 MiB, and file count at 32. Manifest must be owner-only. All paths and ancestors
+must be root-owned, not group/world writable, with no symlinks or hardlinked
+files. Stage under an operator-owned `/var/lib` or `/opt` tree, **not `/tmp`**.
+Config targets must not overlap the executable or updater state directory.
+
+Admission first durably fences `state_dir/bootstrap.json`, preserves original
+executable/config bytes, modes and explicit absence, then launches exactly once
+as `app-lb-bootstrap-<intent hash>`. Same-ID replay only reads the journal.
+Different intent conflicts; a terminal unit is never recycled. File writes use
+fsync and same-directory atomic rename. Systemd runs bounded `daemon-reload`
+then the exact unit restart. Supervisor runs from `/`, requires one ungrouped
+program, requires `reread` to report only that program changed, then issues
+`update <program>` (not restart-only, `all`, or `supervisor.service`). No VM,
+disk, workspace or unrelated program is touched. Original bytes are retained
+indefinitely; no rollback, automatic relaunch, cancellation/unpin or partial
+install resume is provided.
+
+`replan` is the sole explicit exception to the different-intent conflict. It
+requires the exact old intent in `reconciliation_required` / `preserving`, the
+same operation, Config/state directory, source, mapping path and file actions.
+Only helper/target identities may change. It verifies unchanged predecessor
+generation/executable/config bytes and modes, intact backups and staged helper,
+no unresolved normal operation, and successful `systemctl show` probes returning
+exact `LoadState=not-found` values for both helper units. Errors or existing
+terminal units are not absence. Executor exclusion covers inspection through
+staging; the ledger CAS archives the old journal at
+`state_dir/bootstrap/replans/<old-intent>.json` and atomically replaces the
+active intent before further effects. Original backups and helpers remain pinned;
+the new helper uses `state_dir/bootstrap/helpers/<new-intent>`. Output includes
+`supersedes`. Exact replays only return state, including after interruption or a
+lost launch reply. Running preservation, launch/install and uncertain phases
+cannot be replanned. Never bypass a fence by changing state directories or IDs.
+
+Only authenticated namespace-admin GET
+`/deployments/:id/update/bootstrap/:operation_id` in the installed replacement
+can persist success and release the normal-rollout fence. It verifies this exact
+new mapped process, disk/running/compiled identities, effective mapping env,
+all AFTER files/modes, preserved originals and public 2xx health with **one exact**
+`x-heyo-revision` header. Native status cannot replace this attestation. Lost
+launch replies, interrupted config/binary commits, and failed restarts stay
+fenced; GET can reconcile only a fully verified replacement. Operators must
+retain journals/backups and must not concurrently alter files or supervision.
+This requires root, local durable filesystems, one controller owner and one
+fixed operator-owned mapping/state directory per executable, executable helper
+storage, systemd-run, and the same default Supervisor instance from `/`.
+Multi-file changes are not one filesystem transaction: interruption may leave
+partial configuration installed and require explicit operator reconciliation.
+The mapped legacy `/update` POST remains blocked once configuration is active;
+use authenticated bootstrap GET after replacement, not another legacy job.
+Native status remains available through a separately authorized read-only root
+management transport. A busy helper makes GET retryable, never successful.
+
+### Subsequent unchanged-configuration updates
+
+This is a separate operation from VM/service rollout. It replaces **only the
+running host app-lb executable**, retaining its predecessor indefinitely. It
+does not install bundled units/configuration/heyctl, recreate VMs, purge disks,
+or change workspace state. Bootstrap this API/helper once through the existing
+managed platform update process before enabling CI callers. Unstamped builds
+(`x-heyo-revision: unknown`) cannot complete a correlated rollout.
+
+Disabled by default. `APP_LB_HOST_UPDATE_CONFIG` must name an absolute,
+operator-owned JSON file, inaccessible to workflow writes, for example:
+
+```json
+{
+  "deployment": "app-lb-host-controller",
+  "namespace": "default",
+  "executable": "/usr/local/bin/app-lb-eu1",
+  "process": {"kind": "systemd", "unit": "app-lb-eu1.service"},
+  "state_dir": "/var/lib/heyo-eu1/app-lb/host-updates",
+  "artifact_store": "https://artifacts.eu1.heyo.work",
+  "health_url": "https://admin.eu1.heyo.work/healthz",
+  "config_files": ["/etc/systemd/system/app-lb-eu1.service", "/etc/heyo/app-lb-eu1.env"]
+}
+```
+
+These are example values, not defaults or a provisioning command. A Supervisor
+installation instead uses `"process":{"kind":"supervisor","program":"app-lb"}`.
+It restarts **only that program**, never `supervisor.service`. `config_files`
+must explicitly enumerate all effective startup/unit/include/environment files;
+their contents are hashed, never sent to CI. Do not list mutable deployment or
+workspace state. Mapping/config changes and source binary drift invalidate the
+conditional request. Supervisor requires its already-loaded configuration to
+match these files; operators must not concurrently change/reload supervision.
+The controller and independent helper must resolve the same default
+`supervisorctl` configuration/socket; every supervisor command explicitly runs
+from `/` in both processes. Non-default client layouts are unsupported, and
+the reserved multi-program target `all` and option-like targets are rejected.
+
+Supported hosts are Linux with local durable storage, one controller owning the
+mapped executable, and permission to run `/usr/bin/systemd-run` and the mapped
+`/usr/bin/systemctl` or `/usr/bin/supervisorctl` operation. Mapping, executable
+directory, and state directory must be trusted root-owned locations. Pre-create
+the state directory durably, on a filesystem that allows helper execution.
+Symlink executables and arbitrary shell commands
+are unsupported. No privilege changes or units are provisioned by this feature.
+The supervisor-reported PID must be this app-lb process, not a wrapper/parent.
+
+Authenticated namespace admins use GET `/deployments/:id/update/rollouts` for
+`protocol:host-app-lb-v1`, `binary_sha256`, `config_sha256`, and mapped public
+health/artifact URLs. POST the same path with:
+
+```json
+{
+  "operation_id": "ci-host-stable-id",
+  "expected_binary_sha256": "<GET source SHA256>",
+  "expected_config_sha256": "<GET configuration SHA256>",
+  "artifact_sha256": "<validated public bundle SHA256>",
+  "binary_sha256": "<derived dist/app-lb SHA256>",
+  "revision": "<exact validated 40-character Git SHA>"
+}
+```
+
+GET `/deployments/:id/update/rollouts/:operation_id` returns the exact `request`,
+deployment/namespace, status, phase, error and `readiness_verified`. IDs are
+1–128 ASCII letters/digits/hyphens/underscores. Different replay payloads
+conflict. The mapped deployment cannot use legacy uncorrelated `/update`.
+
+Admission persists before staging or launch. Downloads use the configured
+HTTPS public blob store, never redirects or workflow-selected URLs. Both CI
+and app-lb verify the archive digest, unique regular `dist/app-lb`, exact
+`dist/REVISION`, and `dist/SHA256SUMS`; links, special files, traversal,
+duplicate identity entries, and expansion beyond 256 MiB are rejected.
+Only the verified executable is written; tar paths are never extracted.
+
+The operation retains `.previous` and `.candidate` bytes, syncs files and
+directories, then launches a stable-name independent systemd helper using the
+previous executable. The helper checks source process/configuration again,
+records switch intent, atomically renames a same-directory executable, syncs,
+and restarts only the mapped process. Completion requires a new process start
+identity, exact running/on-disk executable hash, immutable compiled revision,
+unchanged mapped configuration, and public 2xx health with that exact header.
+Command success or generic health is never sufficient.
+
+Interrupted staging/launch with no definitive helper evidence remains fenced;
+replay **does not launch again**. A surviving helper can finish across HTTP
+process restart; GET reconciles the replacement. Ambiguous switch/restart or
+failure never triggers rollback, unit recycling, or VM deletion. CI cancellation
+stops waiting, not accepted remote work. Inspect the recorded operation and
+its stable helper unit before operator reconciliation; do not remove its ledger
+to manufacture a retry. There is intentionally no force/unlock shortcut.
+
+## Recover a retained workspace lineage
+
+`POST /deployments/:id/workspace/recoveries` explicitly selects a stopped retained
+VM as the source of a new workspace snapshot. It is not a VM restart or a data
+merge. The operator must first decide that replacing the current snapshot with
+this source is appropriate; the API verifies filesystem capture, not application
+integrity (for example, JetStream message checks).
+
+```json
+{
+  "operation_id": "recover-retained-source-1",
+  "source_sandbox_id": "sb-exact-retained-id",
+  "expected_snapshot": "<current 64-character lowercase SHA256>",
+  "confirm_replace": true
+}
+```
+
+Admission requires authenticated namespace-admin authority even when ordinary
+CRUD is ungated. The deployment must have exactly one unresolved replacement
+capture, an empty serving/pending/resumable pool, and no queued captures. The
+source must have a unique durable seed record with a mount index, matching
+remembered workspace namespace/path/store, and an exact stopped daemon record.
+Unknown, running, foreign, or missing sources and stale snapshots fail closed.
+The source need not have been seeded from the current snapshot: this explicit
+operation is the only exception, and it does not rewrite its seed history.
+
+GET `/deployments/:id/workspace/recoveries/:operation_id` returns the original
+`request`, deployment/namespace, `status`, resulting `snapshot`, and `error`.
+Status is `running` or `succeeded`; failures remain running with an error and
+the creation fence intact. IDs are 1–128 ASCII letters/digits/hyphens/underscores.
+Exact replay returns the same operation, including after restart/completion;
+reuse with another payload conflicts. There is no unsafe cancel/unpin shortcut.
+
+Recovery first persists intent and a permanent source pin, then captures and
+verifies the stopped source. Snapshot files and the workspace record are synced
+before atomically releasing the replacement fence. Restart retries read-only
+capture if needed; uncertain writes never report success or permit placement.
+The selected VM is never stopped, resumed, deleted, or added to the resumable
+pool by recovery. Its pin survives completion and defeats even forced disk purge.
+PUT/register/scaling and image/mount replacement commits are blocked while
+recovery runs; deletion of a deployment with recovery history is refused.
+One owning app-lb process is required for this local state directory.
+
+Separately, `PATCH /disks/:id {"retain":true}` now also protects workspace
+predecessors from post-capture replacement deletion, not just disk expiry.
+Such predecessors remain stopped after replacement capture; ordinary unpinned
+retirement and same-pool idle suspension retain their existing behavior. These
+app-lb protections cannot prevent an out-of-band daemon/operator deletion.
 
 ## Run
 
@@ -243,6 +784,8 @@ curl -XPOST localhost:9090/deployments -H 'content-type: application/json' -d '{
 curl localhost:9090/deployments          # list, with live VM state
 curl localhost:9090/deployments/demo     # one deployment
 curl -XDELETE localhost:9090/deployments/demo   # drain and reap every VM
+# Remove only a proven-empty stale record (ETag copied from GET):
+curl -XDELETE 'localhost:9090/deployments/demo/record' -H 'If-Match: "<sha256>"'
 curl localhost:9090/healthz
 curl localhost:9090/metrics              # metrics snapshot (JSON)
 curl localhost:9090/certs                # issued TLS certificates and expiry
@@ -329,6 +872,80 @@ Each poll atomically replaces only this spec's upstream list with healthy, non-d
 Orchestrator endpoints and persists the last good set. Failed or stale snapshots leave it intact.
 The same deployment can be registered with
 `heyctl create deployment cloud --host cloud.example.com --discovery-service cloud`.
+
+To request regional membership, set `discovery.region`, for example
+`{"service_id":"cloud","region":"eu1"}`. Require
+`X-App-Lb-Discovery-Region: 1` from `GET /deployments` before provisioning it.
+The watcher adds `?region=eu1` to the authority URL and requires an exact `region`
+echo plus matching region on every endpoint. An old server ignoring the query,
+a foreign endpoint, or an unplaced endpoint rejects the entire snapshot; the
+last valid set remains. Empty regional sets retain the shared authority's version.
+Changing region clears and fences cached membership before polling the new scope;
+in-flight requests stay counted until completion. This is regional membership,
+not regional traffic weights, per-host VM mapping, or the staged peer-drain protocol.
+Legacy specs without `region` continue requesting the full endpoint set.
+
+For managed configuration without host environment changes, include a source in the
+deployment registered through the admin API:
+
+```json
+{"id":"example","routes":[{"host":"example.com"}],"discovery":{"service_id":"example","source":{"url":"https://orchestrator.example.com/orchestration/services/example/discovery","auth":{"secret":"discovery-reader","key":"token"}}}}
+```
+
+Provision `discovery-reader` through the existing secrets API from the service's
+HeyoSecret-backed configuration. Its token is resolved in the deployment's namespace
+on every poll, so rotation needs no restart. Specs and responses contain only the
+reference. The source is persisted with the deployment and takes precedence over
+`APP_LB_DISCOVERY_URL/TOKEN`; omitting it preserves those legacy defaults. The watcher
+runs even without the environment defaults. Missing credentials or an unreachable
+authority retain the last good membership. Changing an already-observed authority
+is rejected; create a distinct deployment for an intentional authority migration.
+`GET /deployments` advertises `X-App-Lb-Discovery-Source: 1` for callers that must
+check support before registration.
+
+`GET /deployments/:id/discovery-status` is on the same admin CRUD/auth tier as deployment
+reads and returns the locally observed drain state:
+
+```json
+{"serviceId":"cloud","version":42,"upstreams":[{"peer":"10.0.0.9:8080","draining":true,"inFlight":1}]}
+```
+
+`version` is the last discovery snapshot whose deployment state was durably written (`null`
+before the first successful write). `upstreams` includes current backends and withdrawn backend
+generations until their already-admitted requests reach zero; entries with the same `peer` are
+combined. A withdrawn generation is fenced from new admission before its snapshot can be
+acknowledged. The endpoint returns `400 Bad Request` for a deployment without `discovery` and
+`404 Not Found` for an unknown id.
+
+`sourceUrl`, when present, is the exact Orchestrator discovery endpoint that supplied
+the durably applied snapshot. It is persisted with `version`, not inferred from the
+current environment. Legacy state acquires it after a successful poll. Once stamped,
+a different discovery authority is rejected rather than mixing its version sequence
+with the old one. Discovery redirects are not followed.
+
+#### Active regional capacity probes
+
+For hierarchical deployments, namespace administrators can POST to
+`/deployments/:id/regional-active-probe`. The request binds `operationId`, `stepId`,
+`epoch`, a fresh `challenge`, active policy `generation`, exact discovery `version`,
+and the destination's `region`, `gatewayId`, `gatewayBootId`, `backendServerId`,
+`deploymentId` and `revision`. The receipt echoes that request, source gateway/boot,
+and the destination's gateway/boot and exact backend URL.
+
+This probes the **active** policy even when a newer proposal is pending. Execution
+identity correlates the result; it does not authorize using an inactive proposal.
+The destination must have positive regional weight, open peer admission, eligible
+discovery membership and an eligible local backend. The authenticated HTTPS peer
+path issues a fresh configured health GET to the exact host-local mapping, checks
+revision and the complete bounded response, and retains both regional and backend
+request guards until completion. Both gateways revalidate the snapshot afterward.
+Public requests cannot inject the internal probe header.
+
+These receipts neither activate policy nor prove withdrawal/drain. Orchestrator
+must verify every pinned source/destination pair within its durable probe epoch,
+then recheck discovery, policy and gateway boots before publishing. A restarted
+gateway or stale/partial receipt set cannot authorize publication. The separate
+withdrawn-member probe contract retains its stricter drain barriers.
 
 #### Cordoning and draining a static upstream
 
@@ -440,7 +1057,72 @@ wins (the body's id can't retarget another deployment). Crucially, the running
 pool is *preserved* whenever the `vm` template is unchanged — a scaling, route,
 or health edit never disturbs live VMs; only a change to the `vm` block reboots
 them, because the existing VMs were built from the old template. (This is unlike
-`POST /deployments`, which always replaces and tears the pool down.)
+`POST /deployments`, which replaces and tears the pool down unless create-only is requested.)
+
+For safe bootstrap, send `If-None-Match: *` on `POST /deployments`. An existing id
+returns **412 Precondition Failed**, checked under the deployment change lock before
+mutation or teardown. A failed initial persistence returns an error rather than
+claiming registration succeeded. `GET /deployments` advertises this support with
+`X-App-Lb-Create-Only: 1`; clients must check it before relying on the header with
+older servers. Requests without the header retain replacement semantics.
+Create-only discovery registration also requires exact-host routes and rejects
+overlap with another deployment's routes with **409 Conflict**. This prevents a
+new deployment id from silently capturing existing production traffic.
+
+`GET /deployments/:id` returns an `ETag` for the response's complete normalized
+`spec`. To make a compare-and-swap update, send that exact value in
+`If-Match` on `PUT /deployments/:id`. The comparison is made under the
+deployment change lock before any fence, registry or persisted-state mutation,
+or VM teardown; a stale tag returns **412 Precondition Failed** with no change.
+Omitting `If-Match` retains the original unconditional replace behavior. Only
+one exact strong tag is supported: wildcard, list, weak, malformed, uppercase,
+or unquoted forms return **400 Bad Request**. A successful PUT also returns the
+new `ETag`.
+
+`DELETE /deployments/:id/record` is the metadata-cleanup endpoint. It
+requires the exact current strong `If-Match` ETag and returns **409 Conflict**
+unless the deployment is route-less, desires zero replicas, and has no live,
+pending/provisioning, suspended, rollout-generation, workspace, discovery,
+handoff, build/artifact/mount/host-update job configuration, job history, or
+host-update mapping. Complete runtime and disk inventories
+must confirm no remaining owned resources; unavailable inventories return **503**.
+The check and removal fence autoscaler reconciliation, registry mutation,
+allocation, and workspace lifecycle. Success removes only the
+persisted and in-memory deployment record; it never tears down a VM or queues
+disk/workspace cleanup. The separate path makes older servers reject the request
+rather than ignore a safety flag. Ordinary `DELETE /deployments/:id` keeps its
+existing drain-and-teardown behavior.
+
+`DELETE /deployments/:id/retired-record` additionally permits **settled terminal
+rollout history** and read-only release mounts for a managed Firecracker service.
+It requires authenticated fleet-admin access and the current `If-Match` ETag.
+First withdraw routes, scale to zero, drain, and explicitly clean up the approved
+VM generations through the runtime/disk APIs. This endpoint never performs that
+resource cleanup. Both ownership names and historical sandbox IDs must be absent
+from complete runtime and disk inventories. Running, uncertain or unsettled
+rollouts, correlated allocations, workspace state and job history remain blockers.
+Before removing the registration it durably archives the exact spec and state to
+`<state-dir>/retired/<sha256>.json`; these reports are not loaded as deployments.
+Archive failure preserves the registration. Export this report to the operator's
+audit store; the endpoint does not upload it to S3. It does not assert backend
+retirement or prevent an external authority from recreating a deployment.
+
+Before operational cleanup, also inventory references held outside this app-lb
+(Orchestrator, Cloud, service routes and host configuration). This local endpoint
+cannot prove that another authority no longer references a registration.
+
+The tag is `"<hex>"`, where `<hex>` is lowercase SHA-256 of the compact JSON
+bytes produced by first serializing the full normalized `DeploymentSpec` to a
+`serde_json::Value`, recursively sorting every object's keys lexically, then
+serializing that value. Array order is preserved. Sorting must be explicit even
+when the default map implementation already sorts: transitive dependencies can
+enable serde_json's `preserve_order` feature. Thus a Rust client must call
+`spec_value.sort_all_objects()` on the GET body's `spec` before computing
+`format!("\"{:x}\"", Sha256::digest(serde_json::to_vec(&spec_value)?))`; hash
+the `spec` value, not the whole status response and not a client struct's field
+order. This is concurrency detection, not a claim that a successful PUT is
+durable or idempotent: existing persistence failures are logged after the
+in-memory replacement, as before.
 
 Set `maintenance: true` in that complete spec to return **503** on the
 deployment's public routes before authentication or backend selection. This
@@ -1367,9 +2049,15 @@ result.
 Rules and caveats, each of which the spec validation enforces or the docs
 above imply:
 
-- `scaling.max_replicas` must be `1` and `warm_pool` must be `0`: one
+- `scaling.max_replicas` must be at most `1` and `warm_pool` must be `0`: one
   directory, one writer. Two replicas would each capture a divergent copy and
   the last to land would win.
+- For a maintenance pause, set both `min_replicas` and `max_replicas` to `0`
+  with `idle_action: retain` through the scaling API. This drains and stops the
+  replica for workspace capture; incoming requests cannot wake it. Keep the
+  deployment registered. Restore a ceiling of `1` to permit resume. A successful
+  scaling response records the policy, not proof of a stopped executor: verify
+  the exact runtime has stopped and workspace capture has settled before recovery.
 - `driver` must be `firecracker`. The KVM driver syncs a writable mount back
   into the shared host tree itself when the VM stops, which is a different
   feature with different semantics.
@@ -1466,6 +2154,30 @@ two seconds ago describes the process that was just replaced.
 in the spec, and `auth` supplies a git credential the same way a build does. A
 managed (`vm`) deployment cannot declare `update`: its backends are microVMs, and
 a directory on this host would update nothing.
+
+### Durable autoscaler allocations
+
+`vm.correlated_creates: true` opts managed VM autoscaling into the authenticated
+heyvmd `/sandbox-creations/:operation_id` protocol. It defaults to false, is not
+supported for LXC, and requires a daemon that supports durable creation receipts
+plus app-lb's internal daemon credential. This is not a Cloud legacy-create
+compatibility fallback.
+
+Before dispatch, app-lb persists the operation identity, endpoint and request
+digests. It persists the matching receipt before publishing pending capacity.
+After a lost response or restart it only GETs that saved operation: it never
+re-POSTs, follows redirects, substitutes a name match or times out into another
+allocation. Unknown outcomes block ordinary deployment mutations and cleanup;
+receipt-backed pending allocations remain reserved until the exact runtime is
+observed running. Resolved request bodies and secrets are not written to the
+allocation journal. Deployment deletion cannot discard correlated receipts.
+
+This option covers **autoscaler creates only**, not rollout candidate creation.
+It does not repair historical allocation completeness or prove that old queued
+work at other ingresses has finished. Retirement still requires complete
+allocation history, matching receipts, runtime observation and its other
+existing reconciliation gates. Do not run older app-lb binaries against this
+state directory: they do not honor these allocation reservations.
 
 ### Seeding `/workspace` from an archive
 
@@ -1815,6 +2527,118 @@ deployments passed the filter before paging, so a client can page without
 guessing. The dashboard's deployment table has a matching filter box and pager,
 which appear only when there is more than one page.
 
+### Shared control-plane view
+
+`/dashboard` defaults to the fleet overview on every gateway: shared applications
+and the same explicitly configured regional observations. It does not poll or show
+the entry gateway's local metrics, secrets, tokens, jobs or host inventory.
+Each regional card links to that gateway's `/dashboard?view=local`, where existing
+local controls remain available and the hostname identifies the selected gateway.
+The overview does not sum regional pool counts as unique application capacity.
+
+Configure an already-running gateway with fleet-admin GET and PUT at
+`/control-plane/config`; these routes require authentication even when the admin
+or dashboard gates are disabled. GET returns `revision`, `config`, and
+`externally_managed`. PUT takes `{"expected_revision":0,"config":{"gateways":[],"control_plane":[]}}`,
+using the revision from GET and the origin/secret-reference arrays described
+below. Empty arrays explicitly disable that view. Secret-reference credentials
+must already resolve in the gateway's secret store. Values are never part of this document.
+Only unconfined fleet admins may read or replace the bindings; view-only,
+deployment-scoped, and namespace-scoped tokens cannot change them.
+
+The complete configuration persists atomically beside `APP_LB_STATE_PATH` with the
+extension replaced by `.views.json`, then becomes visible to new requests without
+restarting app-lb. Stale revisions return 409; after a lost response, GET the
+current revision/config before retrying. Invalid input or unresolved credentials
+leave the previous snapshot active. Restart fails on corrupt persisted data
+rather than silently starting unconfigured. This is a single-owner local state
+file, not replicated application state: install the same bindings on both
+gateways and verify each against the shared authority.
+
+Explicit startup files below override the corresponding persisted bindings and
+make the configuration API read-only (PUT returns 409). Do not use the one-time
+host bootstrap to modify an already-bootstrapped host's service configuration.
+
+**Global applications** reads `GET /services`, which queries Orchestrator's
+shared PostgreSQL inventory rather than any gateway's local registry. Configure
+`APP_LB_CONTROL_PLANE_FILE` on each regional app-lb with a JSON array using the
+same `id`, `region`, `url`, and `auth` fields shown below, but pointing to the
+regional **Orchestrator HTTPS origins**. Use the same HeyoSecret-backed
+`orchestrator/internal-api-key` service credential at both sources. Never expose
+that credential to the browser. These origins must use the same authoritative
+database; this setting does not replicate or reconcile separate databases.
+
+Reads try origins in order and fail over on transport errors or HTTP 5xx.
+Authentication errors, redirects, and invalid responses stop the read rather than
+masking configuration errors. No mutations are replayed. Each page contains at
+most 100 services, with `after` / `nextCursor` pagination; each page is a committed
+database snapshot, not one snapshot across multiple pages. The dashboard shows
+desired regions, recorded revisions/health/drain state, and latest regional
+rollout phase. Missing discovery is unknown, not zero healthy capacity.
+
+Both `/services` and `/fleet` require an authenticated fleet-wide view regardless
+of whether the local dashboard is public. Database failure stays visible; there
+is no fallback to local files or gateway metrics. This provides a common read
+surface, not database HA or a global mutation API. Generic DNS failover still
+requires surviving auth, secrets, storage, and ingress dependencies.
+
+### Regional gateway view
+
+For gateways sharing Heyo Auth, set `use_caller_auth:true` instead of `auth`:
+
+```json
+{"id":"us3-edge","region":"US","url":"https://admin.us3.example.com","use_caller_auth":true}
+```
+
+This explicitly trusts that HTTPS origin to receive the authenticated Heyo user's
+bearer for read-only metrics requests. The token lives only in the request, never
+the saved bindings or observation response. Only already-validated federated
+callers are forwarded; local app-tokens and Basic passwords are not. Without a
+Heyo session the observation reports sign-in required. The destination independently
+checks current permissions. Choose exactly one credential mode per gateway; caller
+credentials are forbidden for Orchestrator bindings, which retain their service key.
+Install identical gateway bindings on both regions. Regional links may require
+sign-in on that origin because session cookies remain host-only.
+
+The dashboard's **Regional gateways** section reads `GET /fleet`. Configure
+`APP_LB_FLEET_FILE` with the path to a JSON array of explicitly trusted gateways:
+
+```json
+[
+  {"id":"us3-edge","region":"US","url":"https://admin.us3.example.com","auth":{"secret":"fleet-observer","key":"token"}},
+  {"id":"eu1-edge","region":"eu1","url":"https://admin.eu1.example.com","auth":{"secret":"fleet-observer","key":"token"}}
+]
+```
+
+Use a fleet-wide **view-only** observer token at each gateway, stored through
+the existing secret API. For Heyo-managed installations, provision that observer
+role through HeyoSecret-backed service configuration. References resolve in the
+`default` namespace unless `auth.namespace` is explicit. A reference with
+`auth.username` uses HTTP Basic authentication instead of bearer authentication.
+Secret values never appear in the fleet file, browser, or observation response.
+The file is read at startup; malformed or duplicate gateway definitions fail
+startup rather than silently dropping a region. Only HTTPS origins are accepted.
+
+This route always requires an authenticated fleet-wide view credential, even
+with `APP_LB_DASHBOARD_AUTH=0`. Deployment/namespace-scoped callers cannot use it.
+The configured gateways are queried concurrently with a five-second timeout,
+no redirects, and bounded responses. Failed observations have `metrics: null`
+and an explicit error, never zero capacity or retained healthy-looking counts.
+
+These are independent gateway-local observations, **not** an atomic Orchestrator
+snapshot, unique fleet capacity, admission membership, or proof of failover.
+The same application can appear at several gateways. Local controls remain on
+each gateway's linked dashboard; this view does not move lifecycle ownership
+from Orchestrator or alter routing/maintenance gates.
+
+After building the debug binary, `node app-lb/testdata/unified_dashboard.cjs`
+checks real dashboard rendering with asymmetric observation/inventory fixtures,
+default-versus-local polling, explicit drill-downs and unavailable-region display.
+It requires Playwright and its Chromium browser; `PLAYWRIGHT_MODULE` may point to
+an existing installation. `SCREENSHOT_DIR` optionally saves desktop, mobile, local
+and unavailable captures. Rust fleet/authorization tests cover credential selection
+and transport; the browser fixtures are not live multi-region acceptance.
+
 ### Sandboxes app-lb does not own
 
 The host is one machine, and not everything on it is a pool. Sandboxes created
@@ -2133,6 +2957,71 @@ owns any more.
 store, it is small (single-digit MB across a whole host), and deleting a daemon's persistence
 records to reclaim 23 KB is not a trade worth making.
 
+## Plugins
+
+Plugins are optional capabilities compiled into app-lb that you switch on at
+runtime from the **Plugins** page (`/plugins`) or with `heyctl plugins`. Each
+one's `{enabled, config}` record lives in `app-lb-plugins.d/<id>.json` beside
+the state file.
+
+A plugin's routes live under `/api/plugins/<id>/…`. Reads are on the view tier
+and actions on the CRUD tier, and every route answers 409 while the plugin is
+disabled. If a plugin fails to start, it stays enabled and the failure shows
+as `last_error` on its card.
+
+Plugin configs never contain credentials. A config names a secret in app-lb's
+secret store (`POST /secrets`) instead, and the plugin reads it at the moment
+it uses it, so rotating the secret needs no re-apply.
+
+```sh
+heyctl plugins ls
+heyctl plugins set pgfc -f pgfc.json --enable
+heyctl plugins disable pgfc
+```
+
+### pg-fc databases (`pgfc`)
+
+This plugin monitors and configures [pg-fc](../pg-fc) pools through their
+JSON admin API. It shows:
+
+- host health and schema counts by tier
+- every schema, with start/stop/reboot/restore/reap actions
+- dedicated databases: create one (the password is shown once, as a
+  connection string) or revoke one
+- the pooler's runtime settings
+- maintenance passes, recent events and log tails
+
+app-lb holds the pg-fc dashboard credential and calls pg-fc on the page's
+behalf, so the browser never sees it. A 401 from pg-fc becomes a 502 naming
+the misconfigured node, rather than looking like your session failed.
+
+Store the password, then configure one entry per pooler:
+
+```sh
+heyctl create secret pg-fc --from-stdin password < pg-fc-password.txt
+```
+
+```json
+{
+  "nodes": [
+    {
+      "name": "local",
+      "url": "http://127.0.0.1:34199",
+      "user": "admin",
+      "password": {"secret": "pg-fc", "key": "password"},
+      "pg_host": "db.example.com"
+    }
+  ],
+  "poll_secs": 15
+}
+```
+
+- `url` is `PG_VM_POOL_DASHBOARD_LISTEN`.
+- `pg_host` and `pg_port` (default 6432) only feed the connection strings
+  the page shows; `pg_host` defaults to the host in `url`.
+- A schema's Postgres log is read by running a command inside its VM, so that
+  route sits on the CRUD tier with the actions.
+
 ## Clients
 
 | | |
@@ -2407,6 +3296,8 @@ JWT against the same issuer, audience, signature and `require` policy before
 setting a host-only Secure/HttpOnly cookie. The form requires HTTPS, same-origin
 POST and signed, short-lived login state. Passwords and refresh tokens are not
 persisted; endpoint redirects are refused. Logout clears the access cookie.
+Opening another sign-in page reuses the browser's unexpired CSRF nonce rather
+than invalidating an open form. Each form retains its own local return path.
 Machine clients still receive 401 and continue using their existing credentials.
 An Auth service requiring CAPTCHA or another interactive challenge cannot use
 this password form; those requirements are not bypassed. This is not Google SSO
@@ -2422,6 +3313,36 @@ A refused token is logged and sent to [security monitoring](#security-monitoring
 as `gate-jwt` with the reason — expired, wrong issuer, bad signature. The caller
 gets a bare `401`: which of those it was is exactly the feedback somebody probing
 a gate is looking for.
+
+### Declaring an identity once: auth providers
+
+Written inline, a gate's identity is copied into every spec that needs it, so
+rotating a client secret or tightening an allow-list means editing each one. An
+**auth provider** is that identity half on its own, named and owned by a
+namespace:
+
+```sh
+heyctl create auth-provider heyo -n team-a --preset heyo-jwks
+heyctl set auth reports --provider-ref heyo --public-path /healthz
+```
+
+The deployment keeps only its route-scoped fields; `provider_ref` supplies the
+rest. Resolution is live — app-lb reads the provider on every gated request — so
+an edit reaches every deployment that names it at once, and re-signs the sessions
+issued under the old policy rather than leaving a removed user signed in. A
+reference that does not resolve **fails closed**: the request is refused, never
+served ungated.
+
+That provider holds nothing secret — it verifies the Heyo auth API's gate tokens
+against the key set that service publishes — so it is safe to declare in a
+namespace somebody else administers, which a shared-secret provider is not
+(`--preset heyo` is the `HS256` form, and that key mints as well as verifies).
+
+Neither preset is a coupling to one issuer: `--issuer` with `--jwks-url`,
+`--public-key-file` or `--secret` describes any issuer at all, and `--login-url`
++ `--cookie` point a token-less browser at that issuer's own sign-in page. Full treatment, including the sign-in page contract
+and what a customer running their own issuer needs:
+**[AUTH_PROVIDERS.md](AUTH_PROVIDERS.md)**.
 
 ### Tokens in a URL
 
@@ -2815,6 +3736,26 @@ it) and the admin API accepts a third credential:
 
 That is also the order of precedence: a local token is never sent upstream,
 and the auth service is only asked about a bearer the store does not know.
+
+With federation and the admin gate enabled, unauthenticated browser navigation
+opens `/login`. Sign in using an existing Heyo email/password; Auth must return
+`fleet:admin`. Heyo's platform administrator role is the authority across all
+regional gateways, not an email allowlist or separate dashboard user database.
+Configure each regional Auth origin against the same authoritative user store.
+
+Browser sessions use a host-only `Secure`, `HttpOnly`, `SameSite=Strict` cookie.
+Tokens are not stored in JavaScript/local storage, and passwords are sent only to
+the configured HTTPS Auth service (HTTP loopback is supported for a colocated
+issuer). Redirects are not followed with credentials. Serve the dashboard through
+HTTPS, preserving its public `Host` header. Cookie-authenticated writes and
+WebSocket upgrades require an exact same-origin HTTPS `Origin`; explicit Basic
+or bearer API credentials retain their existing behavior. The dashboard provides
+sign-out. Session expiry requires sign-in again; permission removal takes effect
+within the existing bounded `APP_LB_AUTH_CACHE_SECS` cache lifetime.
+
+Regional hostnames have independent browser cookies, but the same Heyo account
+and role. A common dashboard hostname avoids separate regional sign-ins. Keep
+Basic credentials as emergency operator access; they are not per-user accounts.
 
 ### What the auth service says
 

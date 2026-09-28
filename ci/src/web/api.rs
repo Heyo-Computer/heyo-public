@@ -83,10 +83,47 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/runs/{run_id}", get(run_status))
         .route("/api/runs/{run_id}/rerun-failed", post(rerun_failed))
+        .route("/api/runs/{run_id}/cache/{sandbox_id}/destroy", post(destroy_run_cache))
+        .route("/api/runs/{run_id}/bootstrap/{operation_id}/recover", post(recover_bootstrap))
+        .route("/api/runs/{run_id}/maintenance/{operation_id}/recover", post(recover_maintenance))
         .route("/api/runs/{run_id}/logs", get(run_logs))
         .route("/api/runs/{run_id}/events", get(run_events))
         .route("/api/runs/{run_id}/deployments", get(run_deployments))
         .route("/api/runs/{run_id}/release", get(run_release))
+}
+
+/// A submit credential can retire its own run's idle build cache, not a host's
+/// entire pool. Read signatures never authorize this mutation. Last-use and
+/// idle status are rechecked atomically when the durable eviction is admitted.
+async fn destroy_run_cache(
+    State(state): State<AppState>,
+    Path((run_id, sandbox_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if bearer(&headers).is_none() {
+        return error(StatusCode::UNAUTHORIZED, "a repository submit bearer token is required");
+    }
+    let reader = match authenticate(&state, &headers, "").await {
+        Ok(reader) => reader,
+        Err(response) => return response,
+    };
+    if let Err(response) = readable_run(&state, &reader, &run_id).await { return response; }
+    let _effect = match state.dispatcher.executor.effect_permit().await {
+        Ok(permit) => permit,
+        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    };
+    match state.dispatcher.destroy_run_cache(&sandbox_id, Some(&run_id)).await {
+        Ok(message) => {
+            tracing::info!(run = %run_id, sandbox = %sandbox_id, "repository caller reclaimed its idle cache");
+            axum::Json(serde_json::json!({"sandbox_id":sandbox_id,"status":"destroyed","message":message})).into_response()
+        }
+        Err(crate::dispatch::DispatchError::VmNotSweepable(_)) =>
+            error(StatusCode::CONFLICT, "no idle cache last used by this run on a served runner"),
+        Err(e) => {
+            tracing::error!(run = %run_id, sandbox = %sandbox_id, "cache cleanup not confirmed: {e}");
+            error(StatusCode::SERVICE_UNAVAILABLE, "cache cleanup not confirmed; durable eviction remains available for reconciliation")
+        }
+    }
 }
 
 /// A submit credential can retry its own repository without a browser session.
@@ -116,10 +153,62 @@ async fn rerun_failed(
         }))).into_response(),
         Err(crate::dispatch::DispatchError::Workflow(message)) =>
             error(StatusCode::CONFLICT, &message),
+        Err(crate::dispatch::DispatchError::ControllerUnavailable(message)) =>
+            error(StatusCode::SERVICE_UNAVAILABLE, &message),
         Err(e) => {
             tracing::error!(run = %run_id, "could not rerun failed jobs: {e}");
             error(StatusCode::INTERNAL_SERVER_ERROR, "could not rerun failed jobs")
         }
+    }
+}
+
+async fn recover_bootstrap(
+    State(state): State<AppState>,
+    Path((run_id, operation_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if bearer(&headers).is_none() {
+        return error(StatusCode::UNAUTHORIZED, "a repository submit bearer token is required");
+    }
+    let reader = match authenticate(&state, &headers, "").await {
+        Ok(reader) => reader,
+        Err(response) => return response,
+    };
+    if let Err(response) = readable_run(&state, &reader, &run_id).await {
+        return response;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(90),
+        crate::host_heyvm_bootstrap_coordinator::recover(&state.dispatcher, &run_id, &operation_id)).await {
+        Ok(Ok(result)) => axum::Json(result).into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(run=%run_id, operation=%operation_id, error=%e, "bootstrap recovery refused; fence retained");
+            error(StatusCode::CONFLICT, "bootstrap recovery verification failed; fence retained; inspect controller logs")
+        }
+        Err(_) => error(StatusCode::GATEWAY_TIMEOUT, "bootstrap recovery timed out; inspect recovery events before retrying"),
+    }
+}
+
+async fn recover_maintenance(
+    State(state): State<AppState>,
+    Path((run_id, operation_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if bearer(&headers).is_none() {
+        return error(StatusCode::UNAUTHORIZED, "a repository submit bearer token is required");
+    }
+    let reader = match authenticate(&state, &headers, "").await {
+        Ok(reader) => reader,
+        Err(response) => return response,
+    };
+    if let Err(response) = readable_run(&state, &reader, &run_id).await { return response; }
+    match tokio::time::timeout(std::time::Duration::from_secs(90),
+        crate::host_maintenance::recover(&state.dispatcher, &run_id, &operation_id)).await {
+        Ok(Ok(result)) => axum::Json(result).into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(run=%run_id, operation=%operation_id, error=%e, "maintenance recovery refused; fence retained");
+            error(StatusCode::CONFLICT, "maintenance recovery refused; inspect the persisted operation and controller logs")
+        }
+        Err(_) => error(StatusCode::GATEWAY_TIMEOUT, "maintenance recovery timed out; inspect recovery events before retrying"),
     }
 }
 
@@ -423,6 +512,14 @@ async fn run_status(
         job_views.push(job_json(job, &steps));
     }
     let artifacts = state.store.artifacts_of(&run_id).await.unwrap_or_default();
+    let reports: Vec<serde_json::Value> = match sqlx::query_scalar("SELECT jsonb_build_object('job_id',job_id,'attempt',attempt,'sandbox_id',sandbox_id,'s3_uri',s3_uri,'uploaded_at',uploaded_at,'error',last_error) FROM ci_debug_report WHERE run_id=$1 ORDER BY job_key,attempt")
+        .bind(&run_id).fetch_all(state.store.pool()).await {
+        Ok(reports) => reports,
+        Err(e) => {
+            tracing::error!("could not load debug reports for {run_id}: {e}");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "could not load debug reports");
+        }
+    };
     let reruns = match state.store.reruns_of(&run_id).await {
         Ok(reruns) => reruns,
         Err(e) => {
@@ -431,10 +528,26 @@ async fn run_status(
         }
     };
 
+    let validation_ids = match crate::submission::validations(&state.store, &run_id).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::error!("could not load submission validations for {run_id}: {e}");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "could not load submission validations");
+        }
+    };
+    let mut validations = Vec::new();
+    for id in validation_ids {
+        match readable_run(&state, &reader, &id).await {
+            Ok(validation) => validations.push(run_json(&state, &validation)),
+            Err(response) => return response,
+        }
+    }
     axum::Json(serde_json::json!({
         "run": run_json(&state, &run),
+        "validations": validations,
         "reruns": reruns.iter().map(|run| run_json(&state, run)).collect::<Vec<_>>(),
         "jobs": job_views,
+        "debug_reports": reports,
         "artifacts": artifacts
             .iter()
             .map(|a| serde_json::json!({
@@ -555,8 +668,8 @@ struct LogQuery {
 ///
 /// Separate from the status route because it is unbounded where that one is
 /// small: status is for polling, this is for the one time a run failed. Logs
-/// are read from the same files the dashboard reads, so a run whose logs have
-/// been swept returns the rows with `log: null` and the byte counts intact,
+/// are read from the same shared storage as the dashboard, so a run whose logs
+/// have been swept returns the rows with `log: null` and zero byte counts,
 /// rather than looking as though the steps never ran.
 async fn run_logs(
     State(state): State<AppState>,
@@ -577,7 +690,13 @@ async fn run_logs(
     let tail = q.tail.unwrap_or(DEFAULT_TAIL_BYTES).min(MAX_TAIL_BYTES);
     let failed_only = q.failed_only.unwrap_or(false);
 
-    let mut jobs = state.store.jobs_of(&run_id).await.unwrap_or_default();
+    let mut jobs = match state.store.jobs_of(&run_id).await {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            tracing::error!("could not load jobs for shared logs: {e}");
+            return error(StatusCode::SERVICE_UNAVAILABLE, "step logs are temporarily unavailable");
+        }
+    };
     if let Some(want) = q.job.as_deref() {
         jobs.retain(|j| j.job_key == want);
         if jobs.is_empty() {
@@ -590,13 +709,25 @@ async fn run_logs(
 
     let mut out = Vec::with_capacity(jobs.len());
     for job in &jobs {
-        let steps = state.store.steps_of(&job.id).await.unwrap_or_default();
+        let steps = match state.store.steps_of(&job.id).await {
+            Ok(steps) => steps,
+            Err(e) => {
+                tracing::error!("could not load steps for shared logs: {e}");
+                return error(StatusCode::SERVICE_UNAVAILABLE, "step logs are temporarily unavailable");
+            }
+        };
         let mut step_logs = Vec::new();
         for step in &steps {
             if failed_only && matches!(step.status.as_str(), "success" | "skipped" | "pending") {
                 continue;
             }
-            let full = state.store.read_log(step).await;
+            let full = match state.store.read_log(step).await {
+                Ok(log) => log,
+                Err(e) => {
+                    tracing::error!("could not read shared step logs: {e}");
+                    return error(StatusCode::SERVICE_UNAVAILABLE, "step logs are temporarily unavailable");
+                }
+            };
             let (text, truncated) = match &full {
                 Some(t) => tail_of(t, tail),
                 None => (None, false),
