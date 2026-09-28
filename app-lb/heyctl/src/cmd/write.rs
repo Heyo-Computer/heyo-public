@@ -71,8 +71,8 @@ pub struct CreateDeploymentArgs {
     /// Guest port traffic is proxied to. Required for a managed deployment.
     #[arg(long, value_name = "PORT", help_heading = "VM pool")]
     pub port: Option<u16>,
-    /// Hypervisor driver: firecracker, kvm, or libvirt. Libvirt requires a
-    /// host-reachable guest network configured on heyvmd.
+    /// Hypervisor driver: firecracker, kvm, or libvirt. Libvirt is reached
+    /// through heyvmd's host forwards of its open ports.
     #[arg(long, value_name = "DRIVER", default_value = "firecracker", help_heading = "VM pool")]
     pub driver: String,
     /// Command the guest runs at boot.

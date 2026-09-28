@@ -7,9 +7,10 @@
 //!    usable — its match has a `_ => return Ok(info)` arm, so `Stopped`,
 //!    `Paused`, and `ColdStored` all come back `Ok`. Against a local daemon a
 //!    broken VM surfaces as `Stopped`, never `Failed`. Always check the status.
-//! 2. Older daemons omit `guest_ip` for libvirt. Resolve it through the daemon's
-//!    internal-address API, never by guessing a subnet or proxying to localhost.
-//!    DHCP/address discovery can lag boot, so retry it within the boot deadline.
+//! 2. The daemon omits `guest_ip` for libvirt. Route to the QEMU host forward it
+//!    reports in `port_mappings`, on loopback, or failing that ask its
+//!    internal-address API — never guess a subnet. DHCP/address discovery can
+//!    lag boot, so retry it within the boot deadline.
 //! 3. `SandboxCreateOptions` cannot express guest mounts, so [`VmManager::create`]
 //!    posts the create body itself rather than calling `Sandbox::create`. The
 //!    body is still the SDK's own serialization of that struct — only the
@@ -591,22 +592,39 @@ impl VmManager {
         Ok(Listing::from_infos(self.daemon.list().await?))
     }
 
-    /// Resolve libvirt through the same authenticated daemon transport used by
-    /// lifecycle operations. Only guest-network addresses are accepted: SLIRP's
-    /// loopback fallback is not a guest, and a forwarded port cannot stand in
-    /// for a guest address when a deployment uses a separate health-check port.
+    /// Resolve a libvirt replica's address for guest `port`, in this order:
+    ///
+    /// 1. A `guest_ip` the listing reports, which must be a guest-network address.
+    /// 2. The QEMU `hostfwd` forward of `port` the listing reports
+    ///    (`SandboxInfo.port_mappings`), dialled on loopback. This is how every
+    ///    SLIRP-networked libvirt VM is reached, and how any libvirt VM's
+    ///    `open_ports` are reached, bridged or not: heyvmd forwards them either
+    ///    way.
+    /// 3. The daemon's `internal-url`, for daemons that predate `port_mappings`.
+    ///    It prefers the host forward too; that answer is taken on loopback via
+    ///    `host_local_url`, and anything else must be a guest-network address.
+    ///
+    /// Each port resolves on its own, so a separate health port gets its own
+    /// forward rather than the serving forward's host port (see
+    /// [`crate::autoscale`]'s replica probe).
     pub async fn routable_addr(
         &self,
         info: &SandboxInfo,
         port: u16,
         driver: Driver,
     ) -> Result<SocketAddr, VmError> {
-        let direct = routable_addr(info, port);
         if driver != Driver::Libvirt || info.status != SandboxStatus::Running {
-            return direct;
+            return routable_addr(info, port);
         }
-        if let Ok(addr) = direct {
-            return libvirt_guest_addr(&info.id, addr, port);
+        if let Some(raw) = info.guest_ip.as_deref().filter(|s| !s.is_empty()) {
+            let ip: IpAddr = raw.parse().map_err(|_| VmError::BadGuestIp {
+                sandbox_id: info.id.clone(),
+                value: raw.to_string(),
+            })?;
+            return libvirt_guest_addr(&info.id, SocketAddr::new(ip, port), port);
+        }
+        if let Some(addr) = host_forward(info, port) {
+            return Ok(addr);
         }
         if !crate::disks::valid_sandbox_id(&info.id) {
             return Err(VmError::AddressPending {
@@ -616,8 +634,12 @@ impl VmManager {
         }
         #[derive(serde::Deserialize)]
         struct InternalAddress {
-            ip: IpAddr,
+            ip: String,
             port: u16,
+            /// Set when the answer is a host forward: the same forward on this
+            /// host's loopback, where app-lb dials it.
+            #[serde(default)]
+            host_local_url: Option<String>,
         }
         let path = format!("/sandboxes/{}/internal-url?port={port}", info.id);
         let request = self.client.request::<InternalAddress>(
@@ -636,7 +658,17 @@ impl VmManager {
                 sandbox_id: info.id.clone(),
                 reason: e.to_string(),
             })?;
-        libvirt_guest_addr(&info.id, SocketAddr::new(address.ip, address.port), port)
+        if let Some(url) = address.host_local_url.as_deref() {
+            return loopback_forward(url).ok_or_else(|| VmError::AddressPending {
+                sandbox_id: info.id.clone(),
+                reason: format!("unusable host forward {url:?}"),
+            });
+        }
+        let ip: IpAddr = address.ip.parse().map_err(|_| VmError::AddressPending {
+            sandbox_id: info.id.clone(),
+            reason: format!("daemon answered with non-IP guest address {:?}", address.ip),
+        })?;
+        libvirt_guest_addr(&info.id, SocketAddr::new(ip, address.port), port)
     }
 
     /// Create a VM and return immediately, without waiting for boot.
@@ -1058,8 +1090,27 @@ impl Listing {
     }
 }
 
-/// Reject the daemon's host fallback and forwarded ports: only a real guest
-/// network supports routing both the service port and an optional health port.
+/// The loopback address of the host forward of guest `port`, if the daemon
+/// reports one. QEMU binds `hostfwd` on every host interface, loopback included,
+/// and app-lb already shares a host with the daemon: a tap `guest_ip` is not
+/// reachable from anywhere else either.
+fn host_forward(info: &SandboxInfo, port: u16) -> Option<SocketAddr> {
+    info.port_mappings
+        .iter()
+        .find(|m| m.container == port && m.host != 0)
+        .map(|m| SocketAddr::new(IpAddr::from([127, 0, 0, 1]), m.host))
+}
+
+/// `http://127.0.0.1:<port>` from `internal-url`'s `host_local_url`, and
+/// nothing else: a forward is only dialled on this host's loopback.
+fn loopback_forward(url: &str) -> Option<SocketAddr> {
+    let addr: SocketAddr = url.strip_prefix("http://")?.trim_end_matches('/').parse().ok()?;
+    (addr.ip().is_loopback() && addr.port() != 0).then_some(addr)
+}
+
+/// Check an address that claims to be on the guest network. Loopback,
+/// unspecified and multicast are not guests, and a remapped port means the
+/// daemon handed back a host forward under the guest's name.
 fn libvirt_guest_addr(id: &str, addr: SocketAddr, guest_port: u16) -> Result<SocketAddr, VmError> {
     let ip = addr.ip().to_canonical();
     if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
@@ -1073,7 +1124,8 @@ fn libvirt_guest_addr(id: &str, addr: SocketAddr, guest_port: u16) -> Result<Soc
     Ok(addr)
 }
 
-/// Extract an address only when the VM is actually Running and has a guest IP.
+/// Extract an address only when the VM is actually Running and has one: its
+/// guest IP, or failing that the daemon's host forward of `port` (libvirt).
 pub fn routable_addr(info: &SandboxInfo, port: u16) -> Result<SocketAddr, VmError> {
     if info.status != SandboxStatus::Running {
         return Err(VmError::NotRunning {
@@ -1083,6 +1135,10 @@ pub fn routable_addr(info: &SandboxInfo, port: u16) -> Result<SocketAddr, VmErro
         });
     }
     let Some(raw) = info.guest_ip.as_deref().filter(|s| !s.is_empty()) else {
+        // A libvirt VM has no guest_ip, but the daemon reports its host forwards.
+        if let Some(addr) = host_forward(info, port) {
+            return Ok(addr);
+        }
         return Err(VmError::NoGuestIp {
             sandbox_id: info.id.clone(),
         });
@@ -1270,6 +1326,7 @@ mod tests {
             status_changed_at: String::new(),
             urls: vec![],
             guest_ip: guest_ip.map(Into::into),
+            port_mappings: Vec::new(),
             metadata: None,
             account_id: None,
             created_at: None,
@@ -1396,6 +1453,84 @@ mod tests {
             routable_addr(&i, 8080),
             Err(VmError::NoGuestIp { .. })
         ));
+    }
+
+    /// A libvirt VM has no `guest_ip`; the daemon's host forward of the
+    /// requested guest port is the address, on loopback.
+    #[test]
+    fn routable_addr_falls_back_to_a_host_forward_of_the_port() {
+        let mut i = info("sb-1", SandboxStatus::Running, None);
+        i.port_mappings = vec![
+            heyo_sdk::PortMapping { host: 41000, container: 8080 },
+            heyo_sdk::PortMapping { host: 41001, container: 9090 },
+        ];
+        assert_eq!(routable_addr(&i, 8080).unwrap(), "127.0.0.1:41000".parse::<SocketAddr>().unwrap());
+        assert_eq!(routable_addr(&i, 9090).unwrap(), "127.0.0.1:41001".parse::<SocketAddr>().unwrap());
+        // A port nothing forwards is exactly as unroutable as before.
+        assert!(matches!(routable_addr(&i, 7000), Err(VmError::NoGuestIp { .. })));
+        // A guest_ip still wins: a tap VM is never routed through a forward.
+        i.guest_ip = Some("172.16.0.2".into());
+        assert_eq!(routable_addr(&i, 8080).unwrap(), "172.16.0.2:8080".parse::<SocketAddr>().unwrap());
+        // And a stopped VM is not routable through a stale forward.
+        i.guest_ip = None;
+        i.status = SandboxStatus::Stopped;
+        assert!(matches!(routable_addr(&i, 8080), Err(VmError::NotRunning { .. })));
+    }
+
+    /// The forward in the listing is used without asking the daemon, and an
+    /// older daemon's `internal-url` host forward is taken on loopback rather
+    /// than rejected as a remapped guest port.
+    #[tokio::test]
+    async fn libvirt_routes_through_host_forwards() {
+        use axum::{Json, Router, routing::get};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = Router::new().route("/sandboxes/sb-1/internal-url", get(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async {
+                Json(json!({
+                    "ip": "backend.us3.internal", "port": 2224,
+                    "host_local_url": "http://127.0.0.1:2224",
+                }))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let manager = VmManager::new(Some(url), None, test_mounts()).unwrap();
+
+        let mut listed = info("sb-1", SandboxStatus::Running, None);
+        listed.port_mappings = vec![heyo_sdk::PortMapping { host: 2223, container: 8080 }];
+        assert_eq!(
+            manager.routable_addr(&listed, 8080, Driver::Libvirt).await.unwrap(),
+            "127.0.0.1:2223".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a listed forward needs no lookup");
+
+        // A port the listing does not forward falls through to the daemon.
+        assert_eq!(
+            manager.routable_addr(&listed, 9090, Driver::Libvirt).await.unwrap(),
+            "127.0.0.1:2224".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A reported guest_ip must still be a guest-network address.
+        listed.guest_ip = Some("127.0.0.1".into());
+        assert!(matches!(
+            manager.routable_addr(&listed, 8080, Driver::Libvirt).await,
+            Err(VmError::AddressPending { .. })
+        ));
+        server.abort();
+    }
+
+    #[test]
+    fn only_loopback_host_forwards_are_dialled() {
+        assert_eq!(loopback_forward("http://127.0.0.1:2224"), Some("127.0.0.1:2224".parse().unwrap()));
+        assert_eq!(loopback_forward("http://127.0.0.1:2224/"), Some("127.0.0.1:2224".parse().unwrap()));
+        for url in ["http://10.0.0.5:2224", "http://127.0.0.1:0", "https://127.0.0.1:2224", "127.0.0.1:2224", "http://localhost:2224"] {
+            assert_eq!(loopback_forward(url), None, "{url}");
+        }
     }
 
     #[test]

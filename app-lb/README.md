@@ -194,17 +194,29 @@ Public transition-admission APIs remain gated; do not edit shared DB rows to ena
 this feature. These local checks do not establish live multi-region acceptance.
 
 Managed pools support **Firecracker, KVM, and libvirt**. Firecracker/KVM use
-`SandboxInfo.guest_ip`. For libvirt, older daemons omit that field, so app-lb
-uses the authenticated `GET /sandboxes/:id/internal-url?port=...` endpoint.
+`SandboxInfo.guest_ip`. heyvmd reports no `guest_ip` for libvirt, so app-lb resolves each
+guest port it dials in this order:
+
+1. The QEMU `hostfwd` forward heyvmd reports in `SandboxInfo.port_mappings`, dialled at
+   `127.0.0.1:<host port>`. heyvmd forwards every port in `vm.open_ports` (plus `vm.port`)
+   whether or not the VM also has a bridged NIC, so this is the normal path.
+2. For daemons that predate `port_mappings`, the authenticated
+   `GET /sandboxes/:id/internal-url?port=...` endpoint. Its host-forward answer is taken on
+   loopback (`host_local_url`); any other answer must be a guest-network address.
+   Loopback, unspecified, multicast and remapped-port "guest" addresses are refused.
 
 ### Libvirt requirements
 
-- Run app-lb on the backend host, with a heyvmd version exposing the internal-address
-  endpoint and libvirt lifecycle operations.
-- Configure a host-reachable libvirt guest network (heyvmd's `HEYO_VIRT_NETWORK`,
-  or its legacy `HEYO_LIBVIRT_SDN_NETWORK` setting). SLIRP-only localhost/host-port
-  forwarding is not supported by this direct-guest routing mode. DHCP/address lookup
-  failures wait within `scaling.boot_timeout_secs`; they never fall back to the host.
+- Run app-lb on the backend host, beside a heyvmd that allows the backend
+  (`MVM_BACKENDS=libvirt,…`) and reports `port_mappings`, or at least exposes the
+  internal-address endpoint.
+- A separate `health.port` must be listed in `vm.open_ports`, or it is not forwarded and
+  the spec is refused. `vm.port` is always forwarded.
+- QEMU binds each `hostfwd` port on every host interface, so a libvirt replica's forwarded
+  ports are reachable from outside the host unless a firewall blocks them.
+- A host-reachable libvirt guest network (heyvmd's `HEYO_VIRT_NETWORK`, or its legacy
+  `HEYO_LIBVIRT_SDN_NETWORK` setting) is optional. It is used only when no forward
+  answers. DHCP/address lookup failures wait within `scaling.boot_timeout_secs`.
 - Use `vm.driver: "libvirt"` and a daemon-supported `vm.image`, for example
   `ubuntu:24.04`. Existing `build` and rootfs `artifact` pipelines produce raw ext4,
   not libvirt disks, and are rejected for this driver. Persistent `vm.workspace`

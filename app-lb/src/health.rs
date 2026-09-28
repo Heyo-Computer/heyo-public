@@ -24,6 +24,13 @@ pub async fn probe(addr: SocketAddr, check: &HealthCheck) -> bool {
         Some(p) => SocketAddr::new(addr.ip(), p),
         None => addr,
     };
+    probe_at(target, check).await
+}
+
+/// [`probe`] exactly `target`, with `check.port` already resolved by the
+/// caller. A libvirt replica needs this: each guest port is its own host
+/// forward, so the health port is not the serving address with a new port.
+pub async fn probe_at(target: SocketAddr, check: &HealthCheck) -> bool {
     let timeout = Duration::from_secs(check.timeout_secs.max(1));
 
     match tokio::time::timeout(timeout, probe_inner(target, check.path.as_deref(), check.expected_header.as_ref())).await {

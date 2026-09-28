@@ -97,10 +97,19 @@ export const SPEC_RULES: readonly SpecRule[] = [
   {
     blocks: ["Driver"],
     rule:
-      "`libvirt` and `firecracker_containerd` parse and are then refused at registration " +
-      "(UnsupportedDriver). They exist as variants so a spec naming one gets an " +
+      "`firecracker_containerd` parses and is then refused at registration " +
+      "(UnsupportedDriver). It exists as a variant so a spec naming it gets an " +
       "explanation instead of a deserialization error. The drivers that work are " +
-      "`firecracker`, `kvm` and `lxc`.",
+      "`firecracker`, `kvm`, `libvirt` and `lxc`.",
+  },
+  {
+    blocks: ["Driver", "VmSpec", "HealthCheck"],
+    rule:
+      "Driver `libvirt` is reached through the host ports heyvmd forwards to the guest, " +
+      "so `health.port`, when it differs from `vm.port`, must be listed in " +
+      "`vm.open_ports`. It rejects `build` and `artifact` (they produce raw ext4, not " +
+      "libvirt disks), and `vm.workspace` stays Firecracker-only. " +
+      "`scaling.idle_action: retain` keeps the qcow2 root disk across stop/start.",
   },
   {
     blocks: ["HealthCheck"],
@@ -238,10 +247,10 @@ export function checkSpec(spec: unknown): string[] {
         problems.push("`vm.workspace` requires the `firecracker` driver.");
       }
     }
-    if (vm.driver === "libvirt" || vm.driver === "firecracker_containerd") {
+    if (vm.driver === "firecracker_containerd") {
       problems.push(
-        `\`${String(vm.driver)}\` parses and is then refused at registration. The drivers ` +
-          "that work are `firecracker`, `kvm` and `lxc`.",
+        "`firecracker_containerd` parses and is then refused at registration. The drivers " +
+          "that work are `firecracker`, `kvm`, `libvirt` and `lxc`.",
       );
     }
   }

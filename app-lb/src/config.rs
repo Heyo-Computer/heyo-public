@@ -762,8 +762,9 @@ enum SandboxSizeSchema {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct VmSpec {
     /// `firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system
-    /// container from an OCI image). `libvirt` uses a managed qcow2 VM with a
-    /// host-reachable guest network. `firecracker_containerd` is rejected.
+    /// container from an OCI image). `libvirt` uses a managed qcow2 VM reached
+    /// through heyvmd's host forwards of its `open_ports` or a host-reachable
+    /// guest network. `firecracker_containerd` is rejected.
     pub driver: Driver,
     /// Require durable heyvmd operation receipts for autoscaler allocations.
     /// Requires an internal daemon credential and /sandbox-creations support;
@@ -3714,6 +3715,10 @@ pub enum SpecError {
     AuthWithoutRoutes,
     UnsupportedDriver(Driver),
     LibvirtImagePipeline,
+    /// A `driver: libvirt` health port that `vm.open_ports` does not forward.
+    /// heyvmd forwards only listed ports, and a SLIRP-only guest is reachable
+    /// through nothing else, so it would be a replica that never turns healthy.
+    LibvirtPortNotOpen(u16),
     /// A `driver: lxc` spec naming a block that only means something on heyvm.
     /// Carries the field, because "this is not supported" without saying which
     /// of eight blocks is the problem is not an error anyone can act on.
@@ -4052,6 +4057,11 @@ impl std::fmt::Display for SpecError {
             Self::UnsupportedDriver(d) => write!(
                 f,
                 "driver {d} is not supported: managed pools require firecracker, kvm, libvirt, or lxc"
+            ),
+            Self::LibvirtPortNotOpen(port) => write!(
+                f,
+                "driver libvirt reaches guest ports through heyvmd's host forwards of \
+                 vm.open_ports; add health.port {port} to vm.open_ports"
             ),
             Self::LibvirtImagePipeline => write!(
                 f,
@@ -4582,8 +4592,9 @@ impl DeploymentSpec {
     ///
     /// A deployment is either *managed* (a `vm` template, autoscaled) or *static*
     /// (a fixed `upstreams` list, proxy_pass); exactly one must be set. For the
-    /// managed kind requires a supported VM driver and a reachable guest
-    /// network. Libvirt addressing is resolved through the local daemon.
+    /// managed kind requires a supported VM driver and a reachable guest.
+    /// Libvirt addressing is resolved through the local daemon: its host
+    /// forwards, or failing that its guest-network address.
     /// Bind every secret reference in the spec to the spec's own namespace.
     ///
     /// Run before [`validate`](Self::validate) on every path a spec enters by
@@ -4929,6 +4940,16 @@ impl DeploymentSpec {
             }
             if vm.driver == Driver::Libvirt && (self.build.is_some() || self.artifact.is_some()) {
                 return Err(SpecError::LibvirtImagePipeline);
+            }
+            // `vm.port` is always forwarded (`prepare_create` adds it). A
+            // separate health port is refused rather than silently opened:
+            // `open_ports` decides which guest ports the host exposes.
+            if let Some(port) = self.health.port
+                && vm.driver == Driver::Libvirt
+                && port != vm.port
+                && !vm.open_ports.contains(&port)
+            {
+                return Err(SpecError::LibvirtPortNotOpen(port));
             }
             if vm.port == 0 {
                 return Err(SpecError::ZeroPort);
@@ -7014,6 +7035,26 @@ mod tests {
         assert!(s.validate().is_ok());
         s.vm.as_mut().unwrap().driver = Driver::Libvirt;
         assert!(s.validate().is_ok());
+    }
+
+    /// A libvirt guest may have no address but its host forwards, so a health
+    /// port outside `open_ports` is a replica that could never turn healthy.
+    #[test]
+    fn libvirt_health_port_must_be_forwarded() {
+        let mut s = spec();
+        s.vm.as_mut().unwrap().driver = Driver::Libvirt;
+        s.health.port = Some(9090);
+        assert_eq!(s.validate(), Err(SpecError::LibvirtPortNotOpen(9090)));
+        s.vm.as_mut().unwrap().open_ports = vec![9090];
+        assert_eq!(s.validate(), Ok(()));
+        // The serving port is always forwarded.
+        s.vm.as_mut().unwrap().open_ports.clear();
+        s.health.port = Some(s.vm.as_ref().unwrap().port);
+        assert_eq!(s.validate(), Ok(()));
+        // Other drivers route to the guest directly and need no forward.
+        s.vm.as_mut().unwrap().driver = Driver::Firecracker;
+        s.health.port = Some(9090);
+        assert_eq!(s.validate(), Ok(()));
     }
 
     #[test]

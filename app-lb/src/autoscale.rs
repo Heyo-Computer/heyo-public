@@ -21,6 +21,7 @@ use heyo_sdk::SandboxInfo;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -266,6 +267,27 @@ impl Autoscaler {
     /// Every kill that still has its deployment in hand goes through here. The
     /// two that do not — the orphan sweeps, where the deployment is already
     /// gone — use [`crate::runtime::Runtime::kill_unknown`] instead.
+    /// Health-probe a managed replica serving at `addr`.
+    ///
+    /// A separate `health.port` is resolved the way the serving port was, not
+    /// by swapping the port on `addr`: a libvirt replica reached through host
+    /// forwards has a different *host* port per guest port. For a tap VM the
+    /// two are the same thing.
+    async fn probe_replica(&self, d: &Deployment, info: &SandboxInfo, addr: SocketAddr) -> bool {
+        let check = &d.spec.health;
+        let target = match check.port {
+            None => addr,
+            Some(port) => match self.vms().routable_addr(info, port, d.spec.vm_spec().driver).await {
+                Ok(target) => target,
+                Err(e) => {
+                    tracing::debug!(sandbox = %info.id, error = %e, "health port unroutable");
+                    return false;
+                }
+            },
+        };
+        health::probe_at(target, check).await
+    }
+
     async fn kill_vm(&self, d: &Arc<Deployment>, sandbox_id: &str) -> Result<(), vm::VmError> {
         if self.registry.allocation_protects(sandbox_id) {return Ok(());}
         if self.registry.retirement_protects(sandbox_id,Some(&d.spec.id)) || self.workspaces.retirement_protects(sandbox_id) {return Ok(());}
@@ -592,10 +614,11 @@ impl Autoscaler {
             let Some(info) = fleet.get(&backend.sandbox_id) else {
                 continue;
             };
-            let Ok(addr) = vm::routable_addr(info, d.spec.vm_spec().port) else {
+            let template = d.spec.vm_spec();
+            let Ok(addr) = self.vms().routable_addr(info, template.port, template.driver).await else {
                 continue;
             };
-            if health::probe(addr, &d.spec.health).await {
+            if self.probe_replica(d, info, addr).await {
                 backend.set_healthy(true);
                 d.ready_signal.notify_waiters();
                 tracing::info!(
@@ -993,7 +1016,7 @@ impl Autoscaler {
 
             let template = d.spec.vm_spec();
             let addr = match self.vms().routable_addr(info, template.port, template.driver).await {
-                Ok(addr) => health::probe(addr, &d.spec.health).await.then_some(addr),
+                Ok(addr) => self.probe_replica(d, info, addr).await.then_some(addr),
                 // Provisioning, or a status the daemon hasn't classified yet.
                 Err(vm::VmError::NotRunning { status, .. }) if !vm::is_terminal(&status) => None,
                 Err(vm::VmError::AddressPending { reason, .. }) => {
@@ -3212,6 +3235,7 @@ mod tests {
             status_changed_at: String::new(),
             urls: vec![],
             guest_ip: guest_ip.map(Into::into),
+            port_mappings: Vec::new(),
             metadata: None,
             account_id: None,
             created_at: None,
@@ -3219,6 +3243,36 @@ mod tests {
             memory: None,
             backend_type: None,
         }
+    }
+
+    /// A libvirt health port sits behind its own host forward, not on the
+    /// serving forward's host port, so it is resolved rather than swapped.
+    #[tokio::test]
+    async fn libvirt_health_port_resolves_through_its_own_forward() {
+        let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let health_port = health.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = health.accept().await;
+        });
+        let mut template = spec();
+        template.vm.as_mut().unwrap().driver = Driver::Libvirt;
+        template.vm.as_mut().unwrap().open_ports = vec![9090];
+        template.health.path = None;
+        template.health.port = Some(9090);
+        // Never contacted: both forwards are in the listing.
+        let (scaler, registry) = autoscaler_against("http://127.0.0.1:1", template);
+        let d = registry.get("demo").unwrap();
+        let mut replica = info(heyo_sdk::SandboxStatus::Running, None);
+        replica.port_mappings = vec![
+            heyo_sdk::PortMapping { host: 1, container: 8080 },
+            heyo_sdk::PortMapping { host: health_port, container: 9090 },
+        ];
+        // The serving forward points nowhere; only the health one listens.
+        let serving: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(scaler.probe_replica(&d, &replica, serving).await);
+        replica.port_mappings.truncate(1);
+        replica.status = heyo_sdk::SandboxStatus::Stopped;
+        assert!(!scaler.probe_replica(&d, &replica, serving).await);
     }
 
     #[tokio::test]

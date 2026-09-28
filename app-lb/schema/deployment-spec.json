@@ -1213,7 +1213,7 @@
           "minimum": 0
         },
         "driver": {
-          "description": "`firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system\ncontainer from an OCI image). `libvirt` uses a managed qcow2 VM with a\nhost-reachable guest network. `firecracker_containerd` is rejected.",
+          "description": "`firecracker` or `kvm` (a heyvm microVM) or `lxc` (an Incus system\ncontainer from an OCI image). `libvirt` uses a managed qcow2 VM reached\nthrough heyvmd's host forwards of its `open_ports` or a host-reachable\nguest network. `firecracker_containerd` is rejected.",
           "$ref": "#/$defs/Driver"
         },
         "env_from": {
