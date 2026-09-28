@@ -10,6 +10,9 @@ HTTP/2 defaults (100 concurrent streams and a 64 KiB decoded header list).
 The existing TLS listener still does not advertise HTTP/2 via ALPN; this upgrade
 does not enable a new listener protocol.
 Arbitrary non-WebSocket HTTP upgrades are no longer passed through by default.
+The `pg-fc-sql/1` upgrade is explicitly preserved for authenticated cross-region
+PostgreSQL tunnels, including their initial JSON POST and bidirectional stream.
+Other requests retain Pingora's default upstream header sanitization.
 This dependency upgrade does **not** enable graceful binary replacement or
 regional ingress evacuation; host updates still use the existing restart path.
 

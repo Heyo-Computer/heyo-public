@@ -348,13 +348,22 @@ impl ProxyHttp for LbProxy {
 
     async fn upstream_peer(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let request = ctx.request.as_mut().expect("request admitted");
         let selected = request.next_peer().await
             .map_err(|error| control_error(request, error))?;
-        Ok(Box::new(http_peer(selected.peer)))
+        let mut peer = http_peer(selected.peer);
+        // Pingora 0.9 otherwise strips this authenticated PostgreSQL tunnel's
+        // handshake as a non-WebSocket upgrade. Keep the default sanitization
+        // for all other requests and unsupported upgrade protocols.
+        if session.req_header().headers.get(http::header::UPGRADE)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"pg-fc-sql/1")) {
+            peer.options.http_upstream_request_policy.h1_upgrade =
+                pingora_core::upstreams::peer::H1UpgradePolicy::Preserve;
+        }
+        Ok(Box::new(peer))
     }
 
     async fn response_filter(
