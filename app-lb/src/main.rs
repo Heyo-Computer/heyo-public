@@ -41,6 +41,7 @@ mod namespaces;
 mod obs;
 mod plugins;
 mod proxy;
+mod request_control;
 mod registry;
 mod allocation;
 mod retirement;

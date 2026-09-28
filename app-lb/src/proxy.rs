@@ -10,7 +10,9 @@
 
 use crate::acme::ChallengeTable;
 use crate::auth::{Authenticator, Decision, Identity, RequestInfo};
-use crate::deployment::{Deployment, VmBackend};
+use crate::deployment::Deployment;
+#[cfg(test)]
+use crate::deployment::VmBackend;
 use crate::guard::{Decision as GuardVerdict, Guard, RequestFacts};
 use crate::metrics::Metrics;
 use crate::obs::{Access, LogSink};
@@ -22,33 +24,12 @@ use pingora_core::protocols::TcpKeepalive;
 use pingora_core::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// How many upstreams one request may try before giving up.
-const MAX_ATTEMPTS: usize = 3;
-
-/// Flat selection can refresh membership, but cannot acquire a different
-/// gateway admission policy or bypass the regional generation reservation.
-fn check_flat_admission_refresh(previous: &Deployment, current: &Deployment) -> Result<()> {
-    if current.spec.gateway != previous.spec.gateway
-        || current.regional.is_some() || previous.regional.is_some() {
-        return Err(Error::explain(ErrorType::ConnectProxyFailure,
-            "gateway policy changed after admission"));
-    }
-    Ok(())
-}
-
 #[derive(Default)]
 pub struct Ctx {
-    /// The backend currently serving, if we've incremented its counter.
-    backend: Option<Arc<VmBackend>>,
-    deployment: Option<Arc<Deployment>>,
-    /// Upstreams already tried (by peer address); `upstream_peer` must not hand
-    /// these back.
-    failed: Vec<String>,
-    attempts: usize,
+    request: crate::request_control::RequestState,
     /// When the request entered the proxy, for latency. Set in `request_filter`
     /// so the measured span covers cold-start waits too, and `None` before then
     /// so a request rejected pre-routing simply isn't timed.
@@ -62,23 +43,6 @@ pub struct Ctx {
     route_prefix: Option<String>,
     /// Resolved once at admission; never recorded in access logs.
     gateway_token: Option<String>,
-    regional_assignment: Option<crate::regional::Assignment>,
-}
-
-impl Ctx {
-    /// Release the in-flight slot exactly once.
-    ///
-    /// Taking the backend out makes this idempotent, which matters because
-    /// `logging` runs on every path and must never double-release.
-    fn release(&mut self) {
-        if let Some(b) = self.backend.take() {
-            b.release();
-        }
-    }
-}
-
-impl Drop for Ctx {
-    fn drop(&mut self) { self.release(); }
 }
 
 /// The URL prefix Let's Encrypt fetches to validate an HTTP-01 challenge.
@@ -276,14 +240,6 @@ fn request_host(req: &RequestHeader) -> Option<String> {
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
-/// Resolve a `host:port` (or `ip:port`) upstream to a concrete address, async so
-/// a DNS lookup never blocks the proxy runtime. An `ip:port` literal resolves
-/// without touching DNS; a hostname is resolved here and re-resolved on every
-/// request, so DNS changes are picked up. `None` on failure or an empty result.
-async fn resolve_peer(peer: &str) -> Option<SocketAddr> {
-    tokio::net::lookup_host(peer).await.ok()?.next()
-}
-
 /// Keepalive on every upstream connection, so a backend that vanishes without
 /// a word is noticed. A destroyed Firecracker VM takes its tap device with it:
 /// no RST ever arrives, and a request waiting on a response has nothing
@@ -300,8 +256,8 @@ const UPSTREAM_KEEPALIVE_COUNT: usize = 3;
 #[cfg(target_os = "linux")]
 const UPSTREAM_USER_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn http_peer(backend: &VmBackend, address: SocketAddr) -> HttpPeer {
-    let mut peer = HttpPeer::new(address, backend.tls, backend.sni.clone());
+fn http_peer(selected: crate::request_control::Peer) -> HttpPeer {
+    let mut peer = HttpPeer::new(selected.address, selected.tls, selected.sni);
     peer.options.tcp_keepalive = Some(TcpKeepalive {
         idle: UPSTREAM_KEEPALIVE_IDLE,
         interval: UPSTREAM_KEEPALIVE_INTERVAL,
@@ -685,7 +641,7 @@ impl ProxyHttp for LbProxy {
         if let Some(refusal) = self.enforce(session, &host, &path, routed.as_ref()) {
             // Attributed to the deployment it was aimed at, so a wall of blocks
             // shows up in that deployment's numbers rather than nowhere.
-            ctx.deployment = routed;
+            if let Some(deployment) = routed { ctx.request.set_deployment(deployment); }
             write_plain(session, 403, &refusal).await?;
             return Ok(true);
         }
@@ -730,7 +686,7 @@ impl ProxyHttp for LbProxy {
                 crate::regional::PROBE,crate::regional::ACTIVE_PROBE]) {
                 session.req_header_mut().remove_header(name);
             }
-            ctx.deployment = Some(deployment);
+            ctx.request.set_deployment(deployment);
             match result {
                 Ok(receipt) => write_plain(session,200,&receipt).await?,
                 Err(status) => write_plain(session,status,"candidate probe refused or unhealthy\n").await?,
@@ -738,16 +694,11 @@ impl ProxyHttp for LbProxy {
             return Ok(true);
         }
 
-        let admission = if let Some(router) = &deployment.regional {
-            let discovery = deployment.spec.discovery.as_ref().expect("regional discovery configured");
-            router.admit(discovery.regional.as_ref().unwrap(), &discovery.service_id,
-                discovery.region.as_deref().unwrap(), &session.req_header().headers, &self.secrets)
-                .map(|assignment| { ctx.regional_assignment = Some(assignment); None })
-        } else if [crate::regional::GENERATION, crate::regional::ENVIRONMENT].iter().any(|h| session.req_header().headers.contains_key(*h)) {
-            Err(403)
-        } else {
-            crate::gateway::admit(deployment.spec.gateway.as_ref(), &session.req_header().headers, &self.secrets)
-        };
+        let admission = ctx.request.admit(
+            &deployment,
+            &session.req_header().headers,
+            &self.secrets,
+        );
         // Pingora tracks header names separately; raw HeaderMap mutation
         // breaks that bookkeeping when serializing the upstream request.
         for name in crate::gateway::HEADERS.into_iter().chain([crate::regional::GENERATION, crate::regional::ENVIRONMENT]) {
@@ -756,7 +707,7 @@ impl ProxyHttp for LbProxy {
         match admission {
             Ok(token) => ctx.gateway_token = token,
             Err(status) => {
-                ctx.deployment = Some(deployment);
+                ctx.request.set_deployment(deployment);
                 write_plain(session, status, "gateway admission refused\n").await?;
                 return Ok(true);
             }
@@ -768,7 +719,7 @@ impl ProxyHttp for LbProxy {
         // exec). Do this before auth and backend selection: maintenance must
         // neither turn into a terminal 401/403 nor wake a scaled-to-zero VM.
         if let Some((status, message)) = maintenance_response(&deployment) {
-            ctx.deployment = Some(deployment);
+            ctx.request.set_deployment(deployment);
             write_plain(session, status, message).await?;
             return Ok(true);
         }
@@ -794,7 +745,7 @@ impl ProxyHttp for LbProxy {
                         "auth gate references an unresolvable provider; refusing the request",
                     );
                     write_plain(session, 500, &msg).await?;
-                    ctx.deployment = Some(deployment);
+                    ctx.request.set_deployment(deployment);
                     return Ok(true);
                 }
             };
@@ -810,7 +761,7 @@ impl ProxyHttp for LbProxy {
                     "this deployment requires sign-in, which needs a Host header\n",
                 )
                 .await?;
-                ctx.deployment = Some(deployment);
+                ctx.request.set_deployment(deployment);
                 return Ok(true);
             };
 
@@ -825,7 +776,7 @@ impl ProxyHttp for LbProxy {
                 while let Some(chunk) = session.read_request_body().await? {
                     if login_body.len() + chunk.len() > 8192 {
                         write_plain(session, 413, "sign-in request is too large\n").await?;
-                        ctx.deployment = Some(deployment);
+                        ctx.request.set_deployment(deployment);
                         return Ok(true);
                     }
                     login_body.extend_from_slice(&chunk);
@@ -860,7 +811,7 @@ impl ProxyHttp for LbProxy {
                     // Recorded against the deployment: a wall of 302s or 403s
                     // here is exactly the symptom of a misconfigured gate, and
                     // it should show up in its metrics.
-                    ctx.deployment = Some(deployment);
+                    ctx.request.set_deployment(deployment);
                     return Ok(true);
                 }
             }
@@ -881,7 +832,7 @@ impl ProxyHttp for LbProxy {
             };
             let events = self.feed.recent(&deployment.spec.namespace, FEED_PAGE);
             let doc = crate::feed::rss(&deployment.spec.namespace, &link, &events);
-            ctx.deployment = Some(deployment);
+            ctx.request.set_deployment(deployment);
             write_rss(session, &doc).await?;
             return Ok(true);
         }
@@ -890,12 +841,12 @@ impl ProxyHttp for LbProxy {
         // sits after the gate on purpose — a private site is private, and files
         // must not be readable by anyone who skips sign-in.
         if let Some(site) = deployment.spec.site.clone() {
-            ctx.deployment = Some(deployment);
+            ctx.request.set_deployment(deployment);
             serve_site(session, &site, &path).await?;
             return Ok(true);
         }
 
-        ctx.deployment = Some(deployment);
+        ctx.request.set_deployment(deployment);
         Ok(false)
     }
 
@@ -907,7 +858,7 @@ impl ProxyHttp for LbProxy {
         upstream: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        if let Some(assignment) = &ctx.regional_assignment {
+        if let Some(assignment) = ctx.request.regional_assignment() {
             if let Some((spec, token, environment)) = &assignment.forward {
                 let mut headers = http::HeaderMap::new();
                 crate::gateway::write_forward_headers(&mut headers, spec, token)
@@ -918,7 +869,7 @@ impl ProxyHttp for LbProxy {
             }
         }
         if let (Some(spec), Some(token)) = (
-            ctx.deployment.as_ref().and_then(|d| d.spec.gateway.as_ref()),
+            ctx.request.deployment().and_then(|d| d.spec.gateway.as_ref()),
             ctx.gateway_token.as_deref(),
         ) {
             let mut headers = http::HeaderMap::new();
@@ -945,7 +896,7 @@ impl ProxyHttp for LbProxy {
             })?);
         }
 
-        let Some(gate) = ctx.deployment.as_ref().and_then(|d| d.spec.auth.as_ref()) else {
+        let Some(gate) = ctx.request.deployment().and_then(|d| d.spec.auth.as_ref()) else {
             return Ok(());
         };
         // Unconditional, before anything is set: on a gated deployment these
@@ -995,113 +946,16 @@ impl ProxyHttp for LbProxy {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let mut deployment = ctx
-            .deployment
-            .clone()
-            .ok_or_else(|| Error::explain(ErrorType::InternalError, "no deployment in ctx"))?;
-
-        ctx.attempts += 1;
-        if ctx.attempts > MAX_ATTEMPTS {
-            return Err(Error::explain(
-                ErrorType::ConnectProxyFailure,
-                "exhausted upstream retries",
-            ));
-        }
-
-        // Give back any slot from a failed attempt before reserving another.
-        ctx.release();
-
-        if let Some(assignment) = &ctx.regional_assignment {
-            if ctx.attempts != 1 || !assignment.backend.try_acquire() {
-                return Err(Error::explain(ErrorType::ConnectProxyFailure, "regional assignment unavailable; replay forbidden"));
-            }
-            let backend = assignment.backend.clone();
-            ctx.backend = Some(backend.clone());
-            let addr = resolve_peer(&backend.address).await.ok_or_else(||
-                Error::explain(ErrorType::ConnectProxyFailure, "regional assignment address did not resolve"))?;
-            return Ok(Box::new(http_peer(&backend, addr)));
-        }
-
-        // Pick a backend, atomically reserve it, and resolve its address to a
-        // concrete `SocketAddr`. Reserving before the await is load-bearing: a
-        // cordon can then either prevent this request or see it in `in_flight`,
-        // but can never report drained and have this request appear afterward.
-        // We
-        // resolve here — with async DNS — rather than handing the `host:port`
-        // string to `HttpPeer::new`, because that constructor resolves with a
-        // *blocking* `to_socket_addrs().unwrap()` that would stall the runtime on
-        // a static hostname and panic if it failed to resolve. A backend whose
-        // address doesn't resolve is treated like a connect failure: marked
-        // unhealthy and skipped, so a bad static upstream fails over to a good one
-        // (and the autoscaler's health re-probe restores it once it resolves).
-        let addr = loop {
-            let observed = deployment.clone();
-            let changed = observed.ready_signal.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if let Some(current) = self.registry.get(&deployment.spec.id) {
-                if !Arc::ptr_eq(&current, &deployment) {
-                    // Admission consumed the peer headers and resolved the
-                    // forwarding credential against the original gateway.
-                    // Never apply that decision to a different gateway policy
-                    // (including changing an ordinary route into a peer route).
-                    check_flat_admission_refresh(&deployment, &current)?;
-                    drop(changed);
-                    deployment = current;
-                    ctx.deployment = Some(deployment.clone());
-                    continue;
-                }
-            }
-            let backend = match deployment.select(&ctx.failed) {
-                Some(b) => b,
-                None => {
-                    // Nothing ready. If the deployment can still grow, hold the
-                    // request while a VM boots rather than failing the caller.
-                    // (A static deployment never grows, so this returns at once.)
-                    match tokio::select! {
-                        result = wait_for_capacity(&deployment, &ctx.failed, &self.metrics, &self.feed) => result,
-                        _ = &mut changed => continue,
-                    } {
-                        Some(b) => b,
-                        None => {
-                            return Err(Error::explain(
-                                ErrorType::ConnectProxyFailure,
-                                "no healthy backend available for deployment",
-                            ));
-                        }
-                    }
-                }
-            };
-
-            // `select` is an intentionally approximate, lock-free shortlist.
-            // A health change or cordon may have won since then; retry instead
-            // of admitting work against that stale decision.
-            if !backend.try_acquire() {
-                ctx.failed.push(backend.peer.clone());
-                continue;
-            }
-            ctx.backend = Some(backend.clone());
-
-            match resolve_peer(&backend.address).await {
-                Some(addr) => break addr,
-                None => {
-                    tracing::warn!(
-                        peer = %backend.peer,
-                        "upstream address did not resolve; marking unhealthy",
-                    );
-                    backend.set_healthy(false);
-                    ctx.failed.push(backend.peer.clone());
-                    ctx.release();
-                    // Loop: pick another backend (or give up when none remain).
-                }
-            }
-        };
-
-        let backend = ctx
-            .backend
-            .as_ref()
-            .expect("selected backend remains in context");
-        Ok(Box::new(http_peer(backend, addr)))
+        let selected = ctx.request.next_peer(&self.registry, &self.metrics, &self.feed)
+            .await
+            .map_err(|error| Error::explain(
+                match error.kind {
+                    crate::request_control::ErrorKind::Internal => ErrorType::InternalError,
+                    crate::request_control::ErrorKind::Connect => ErrorType::ConnectProxyFailure,
+                },
+                error.message,
+            ))?;
+        Ok(Box::new(http_peer(selected)))
     }
 
     async fn response_filter(
@@ -1112,7 +966,7 @@ impl ProxyHttp for LbProxy {
     ) -> Result<()> {
         // Makes it possible to see which VM served a request, which is how the
         // load-spreading and retry behaviour get verified.
-        if let Some(b) = &ctx.backend {
+        if let Some(b) = ctx.request.backend() {
             upstream_response.insert_header("x-vm-id", &b.sandbox_id)?;
         }
         Ok(())
@@ -1127,22 +981,18 @@ impl ProxyHttp for LbProxy {
         ctx: &mut Self::CTX,
         mut e: Box<Error>,
     ) -> Box<Error> {
-        if let Some(b) = &ctx.backend {
+        if let Some(b) = ctx.request.connection_failed() {
             tracing::warn!(
                 sandbox = %b.sandbox_id,
                 addr = %b.peer,
                 "upstream connect failed; marking unhealthy",
             );
-            b.set_healthy(false);
-            ctx.failed.push(b.peer.clone());
         } else {
             tracing::warn!(peer = %peer, "upstream connect failed with no backend in ctx");
         }
         // This attempt never got off the ground, so give the slot back now
         // rather than holding it through the retry.
-        ctx.release();
-
-        if ctx.regional_assignment.is_none() && ctx.attempts < MAX_ATTEMPTS {
+        if ctx.request.retry_allowed() {
             e.set_retry(true);
         }
         e
@@ -1162,11 +1012,10 @@ impl ProxyHttp for LbProxy {
         // backend, which reads as a bug in the SIEM rather than as this line.
         let observing = self.access_log.is_some() || self.security.is_some();
         let backend = match observing {
-            true => ctx.backend.as_ref().map(|b| b.sandbox_id.clone()),
+            true => ctx.request.backend().map(|b| b.sandbox_id.clone()),
             false => None,
         };
-        ctx.release();
-        ctx.regional_assignment.take();
+        ctx.request.complete();
 
         let status = session.response_written().map(|r| r.status.as_u16());
 
@@ -1174,7 +1023,7 @@ impl ProxyHttp for LbProxy {
         // routed. A request rejected before routing (404, no deployment) has no
         // `started_at`/`deployment` and is intentionally left out of a
         // deployment's numbers.
-        if let (Some(started), Some(deployment)) = (ctx.started_at, ctx.deployment.as_ref()) {
+        if let (Some(started), Some(deployment)) = (ctx.started_at, ctx.request.deployment()) {
             self.metrics
                 .record_request(&deployment.spec.id, status, started.elapsed());
         }
@@ -1203,7 +1052,7 @@ impl ProxyHttp for LbProxy {
             let query = req.uri.query().map(str::to_string);
             let host = request_host(req);
             let access = Access {
-                deployment: ctx.deployment.as_ref().map(|d| d.spec.id.as_str()),
+                deployment: ctx.request.deployment().map(|d| d.spec.id.as_str()),
                 backend,
                 method: &method,
                 path: &path,
@@ -1233,74 +1082,11 @@ impl ProxyHttp for LbProxy {
 
         if let Some(err) = e {
             tracing::warn!(
-                deployment = ctx.deployment.as_ref().map(|d| d.spec.id.as_str()),
+                deployment = ctx.request.deployment().map(|d| d.spec.id.as_str()),
                 status,
                 error = %err,
                 "request failed",
             );
-        }
-    }
-}
-
-/// Hold the request while the autoscaler boots a VM.
-///
-/// Returns as soon as a backend becomes available, or `None` on timeout or if
-/// the deployment is already at `max_replicas` with nothing healthy (in which
-/// case waiting cannot help).
-pub async fn wait_for_capacity(
-    deployment: &Arc<Deployment>,
-    exclude: &[String],
-    metrics: &Metrics,
-    feed: &crate::feed::Feed,
-) -> Option<Arc<VmBackend>> {
-    if !deployment.can_grow() {
-        // Not a cold-start wait — the pool is at max with nothing healthy, so
-        // there is nothing to hold for. Left out of the cold-start tally.
-        return None;
-    }
-
-    // Count this request as demand *before* nudging. A waiting request holds no
-    // in-flight slot (it has no backend yet), so without this the autoscaler
-    // sees an idle deployment and leaves it at zero while we wait.
-    let _waiter = deployment.track_waiter();
-    metrics.record_cold_start_wait(&deployment.spec.id);
-
-    // Nudge the autoscaler: this deployment may be at zero and nothing else
-    // would wake it.
-    deployment.scale_signal.notify_one();
-
-    let budget = Duration::from_secs(deployment.spec.scaling.cold_start_timeout_secs);
-    let deadline = tokio::time::Instant::now() + budget;
-    tracing::info!(
-        deployment = %deployment.spec.id,
-        timeout_secs = deployment.spec.scaling.cold_start_timeout_secs,
-        "holding request for cold start",
-    );
-
-    loop {
-        // Subscribe *before* re-checking so a VM that becomes ready between the
-        // check and the wait can't be missed.
-        let notified = deployment.ready_signal.notified();
-        if let Some(b) = deployment.select(exclude) {
-            metrics.record_cold_start_hit(&deployment.spec.id);
-            return Some(b);
-        }
-        if tokio::time::timeout_at(deadline, notified).await.is_err() {
-            tracing::warn!(
-                deployment = %deployment.spec.id,
-                "cold start timed out with no VM available",
-            );
-            metrics.record_cold_start_timeout(&deployment.spec.id);
-            feed.issue(
-                &deployment.spec,
-                format!("{}: cold start timed out", deployment.spec.id),
-                format!(
-                    "a request waited {}s and no VM became available",
-                    deployment.spec.scaling.cold_start_timeout_secs
-                ),
-                crate::deployment::now_secs(),
-            );
-            return None;
         }
     }
 }
@@ -1370,28 +1156,12 @@ mod tests {
         assert_eq!(request_host(&header(None, "/")), None);
     }
 
-    #[tokio::test]
-    async fn resolve_peer_handles_literals_and_bad_addresses() {
-        // An ip:port literal resolves without DNS.
-        assert_eq!(
-            resolve_peer("127.0.0.1:8080").await,
-            Some("127.0.0.1:8080".parse().unwrap()),
-        );
-        // localhost resolves to a loopback address.
-        let local = resolve_peer("localhost:8080").await;
-        assert!(local.is_some_and(|a| a.ip().is_loopback()), "got {local:?}");
-        // A malformed / unresolvable address is None, not a panic — this is what
-        // keeps a bad static upstream from taking down the proxy runtime.
-        assert_eq!(resolve_peer("no-port").await, None);
-        assert!(
-            resolve_peer("definitely-not-a-real-host.invalid:80").await.is_none()
-        );
-    }
-
     #[test]
     fn https_backend_builds_a_tls_peer_with_url_hostname_as_sni() {
         let backend = VmBackend::for_upstream("https://ci.eu1.heyo.work:443".into());
-        let peer = http_peer(&backend, "127.0.0.1:443".parse().unwrap());
+        let peer = http_peer(crate::request_control::Peer {
+            address: "127.0.0.1:443".parse().unwrap(), tls: backend.tls, sni: backend.sni.clone(),
+        });
         assert!(peer.is_tls());
         assert_eq!(peer.sni, "ci.eu1.heyo.work");
         assert!(peer.options.verify_cert);
@@ -1401,7 +1171,9 @@ mod tests {
     #[test]
     fn upstream_peers_probe_for_a_vanished_backend() {
         let backend = backend("172.25.128.50:8080");
-        let peer = http_peer(&backend, "172.25.128.50:8080".parse().unwrap());
+        let peer = http_peer(crate::request_control::Peer {
+            address: "172.25.128.50:8080".parse().unwrap(), tls: backend.tls, sni: backend.sni.clone(),
+        });
         let ka = peer
             .options
             .tcp_keepalive
@@ -1517,47 +1289,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_flat_request_cannot_enter_regional_route_without_admission() {
-        let flat: DeploymentSpec = serde_json::from_value(serde_json::json!({
-            "id":"app", "routes":[{"host":"app.example"}],
-            "discovery":{"service_id":"svc"}, "upstreams":["127.0.0.1:8000"]
-        })).unwrap();
-        let previous = Deployment::new(flat.clone());
-        let mut refreshed = flat.clone();
-        refreshed.upstreams = vec!["127.0.0.1:8001".into()];
-        assert!(check_flat_admission_refresh(&previous, &Deployment::new(refreshed)).is_ok());
-        let mut regional = flat;
-        regional.discovery.as_mut().unwrap().region = Some("us3".into());
-        regional.discovery.as_mut().unwrap().regional = Some(serde_json::from_value(serde_json::json!({
-            "gateway_id":"us", "backend_server_id":"host-us", "environment":"prod", "auth":{"secret":"peer"}
-        })).unwrap());
-        let current = Deployment::new(regional);
-        assert_eq!(previous.spec.gateway, current.spec.gateway, "both are None; the legacy gateway check misses this transition");
-        assert!(check_flat_admission_refresh(&previous, &current).is_err());
-        assert!(check_flat_admission_refresh(&current, &previous).is_err());
-    }
-
-    #[test]
-    fn ctx_release_is_idempotent() {
-        let b = backend("10.0.0.1:80");
-        b.acquire();
-        assert_eq!(b.in_flight(), 1);
-
-        let mut ctx = Ctx::default();
-        ctx.backend = Some(b.clone());
-        ctx.release();
-        assert_eq!(b.in_flight(), 0);
-        // A second release (e.g. fail_to_connect then logging) must not
-        // decrement a slot it no longer owns.
-        ctx.release();
-        assert_eq!(b.in_flight(), 0);
-        b.acquire();
-        ctx.backend = Some(b.clone());
-        drop(ctx);
-        assert_eq!(b.in_flight(), 0, "cancellation must return the backend slot too");
-    }
-
-    #[test]
     fn maintenance_fence_is_retryable_and_does_not_remove_the_deployment() {
         let d = deployment(ScalingPolicy::default());
         assert_eq!(maintenance_response(&d), None);
@@ -1584,7 +1315,7 @@ mod tests {
         d.set_backends(vec![b]);
 
         let started = std::time::Instant::now();
-        assert!(wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_none());
+        assert!(crate::request_control::wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -1595,7 +1326,7 @@ mod tests {
             cold_start_timeout_secs: 1,
             ..Default::default()
         });
-        assert!(wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_none());
+        assert!(crate::request_control::wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_none());
     }
 
     #[tokio::test]
@@ -1614,7 +1345,7 @@ mod tests {
             d2.ready_signal.notify_waiters();
         });
 
-        let got = wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await;
+        let got = crate::request_control::wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await;
         assert_eq!(got.unwrap().peer, "10.0.0.1:80");
     }
 
@@ -1628,6 +1359,6 @@ mod tests {
             ..Default::default()
         });
         d.set_backends(vec![backend("10.0.0.1:80")]);
-        assert!(wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_some());
+        assert!(crate::request_control::wait_for_capacity(&d, &[], &Metrics::new(), &crate::feed::Feed::new()).await.is_some());
     }
 }

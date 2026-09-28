@@ -4635,7 +4635,8 @@ impl VmTarget {
 
 /// Resolve a deployment to a VM that can run something, waking one if asked.
 ///
-/// The waiting half is the proxy's cold-start path (`proxy::wait_for_capacity`)
+/// The waiting half is the request manager's cold-start path
+/// (`request_control::wait_for_capacity`)
 /// reused verbatim, so an `exec` against a sleeping sandbox nudges the
 /// autoscaler and waits exactly as a request would — including the autoscaler's
 /// preference for resuming a suspended VM over booting a fresh one.
@@ -4693,7 +4694,7 @@ async fn hold_a_vm(
         )
         .into_response());
     }
-    match crate::proxy::wait_for_capacity(&d, &[], &state.metrics, &state.feed).await {
+    match crate::request_control::wait_for_capacity(&d, &[], &state.metrics, &state.feed).await {
         Some(b) => match b.try_hold() {
             Some(slot) => Ok(VmTarget::Ready(slot)),
             None => Err(err(

@@ -13,6 +13,13 @@ Arbitrary non-WebSocket HTTP upgrades are no longer passed through by default.
 This dependency upgrade does **not** enable graceful binary replacement or
 regional ingress evacuation; host updates still use the existing restart path.
 
+Process-separation work is in progress. `request_control.rs` owns backend
+admission, reservations, retries, and cold-start waiting independently of
+Pingora's session types. It currently runs in the same process as the proxy;
+there is no separate worker process, IPC protocol, or hot takeover yet. Request
+completion releases both the backend attempt and its regional assignment;
+connection failure releases the attempt without permitting regional replay.
+
 This directory was imported from the standalone
 [`Heyo-Computer/app-lb`](https://github.com/Heyo-Computer/app-lb) repository
 with its 28-commit author, timestamp, message, and ancestry history rewritten
