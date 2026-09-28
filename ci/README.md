@@ -1464,6 +1464,14 @@ The prefix is interpolated verbatim, so it is charset-checked at startup —
 `[A-Za-z0-9_-]`. Two installations sharing a NATS server need different prefixes
 or they share a work queue.
 
+For a broker exposed through an HTTPS ingress, set `CI_NATS_URL` to its
+`wss://host/path` endpoint. The ingress must support WebSocket upgrades and the
+broker must enable its WebSocket listener; an ordinary HTTPS URL is not a NATS
+transport. CI selects the AWS-LC Rustls provider before opening TLS connections,
+so WSS also works when dependencies enable both Rustls crypto providers.
+Regional instances of the same CI app must share the database and NATS prefix;
+using WSS does not provide broker failover or transfer job-execution ownership.
+
 **Four ways to authenticate, and exactly one may be set.** They are not a
 precedence order: naming two is a startup error, because guessing which an
 operator meant is how a process authenticates as the wrong principal.

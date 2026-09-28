@@ -72,6 +72,11 @@ use vm::Vms;
 
 #[tokio::main]
 async fn main() {
+    // WSS client setup cannot infer a provider when the dependency graph
+    // enables both ring and AWS-LC. Select it before any TLS client is built.
+    if rustls::crypto::aws_lc_rs::default_provider().install_default().is_err() {
+        eprintln!("ci: rustls crypto provider was already installed");
+    }
     let args: Vec<_> = std::env::args().skip(1).collect();
     let recovery_path = (args.len() == 2 && args[0] == "--hold-executor-recovery").then(|| args[1].clone());
     if !args.is_empty() && recovery_path.is_none() {
