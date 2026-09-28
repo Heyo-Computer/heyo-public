@@ -54,6 +54,8 @@ mod tls;
 mod tokens;
 mod unpack;
 mod vm;
+mod worker;
+mod worker_rpc;
 mod workspace;
 mod workflows;
 
@@ -64,12 +66,10 @@ use crate::autoscale::Autoscaler;
 use crate::config::LbConfig;
 use crate::jobs::{JobConfig, Jobs};
 use crate::metrics::Metrics;
-use crate::proxy::LbProxy;
 use crate::registry::Registry;
 use crate::secrets::SecretStore;
-use crate::tls::{CertStore, SniResolver};
+use crate::tls::CertStore;
 use crate::vm::VmManager;
-use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
 use pingora_core::services::background::background_service;
 use std::sync::Arc;
@@ -293,6 +293,10 @@ fn init_tracing(events: Option<obs::LogSink>) {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--forwarding-worker") {
+        let path = std::env::args_os().nth(2).expect("worker control directory required");
+        worker::run(path.into());
+    }
     if let Some(code) = host_update::helper_main() { std::process::exit(code); }
     // Before the subscriber, because shipping app-lb's own events means adding a
     // layer to it, and a subscriber can only be built once. Reads the environment
@@ -999,33 +1003,18 @@ fn main() {
         ).unwrap_or_else(|error| panic!("invalid view configuration: {error}")))),
     );
 
-    let mut proxy_svc = pingora_proxy::http_proxy_service(
-        &server.configuration,
-        LbProxy::new(
-            registry.clone(),
-            metrics,
-            challenges,
-            auth,
-            obs.as_ref().and_then(|o| o.access.clone()),
-            siem.as_ref().map(|s| s.sink.clone()),
-            guard.clone(),
-            event_feed,
-            auth_providers.clone(),
-            secrets.clone(),
-        ),
-    );
-    proxy_svc.add_tcp(&cfg.proxy_addr);
-
-    // HTTPS listener, alongside the plaintext one. The acceptor is built with no
-    // certificate attached: `CertStore` supplies one per handshake keyed on SNI,
-    // which is what lets a certificate issued moments ago serve without a
-    // restart. See `src/tls.rs`.
-    if cfg.tls_enabled() {
-        let settings = TlsSettings::with_callbacks(Box::new(SniResolver::new(certs)))
-            .expect("failed to build TLS settings");
-        proxy_svc.add_tls_with_settings(&cfg.tls_addr, None, settings);
-        tracing::info!(tls = %cfg.tls_addr, "HTTPS listener enabled");
-    }
+    let proxy_svc = background_service("forwarding-worker", worker::Supervisor {
+        control: Arc::new(request_control::RequestControl::new(
+            registry.clone(), metrics.clone(), challenges, auth, guard.clone(),
+            event_feed, auth_providers.clone(), secrets.clone(),
+        )),
+        metrics,
+        access_log: obs.as_ref().and_then(|o| o.access.clone()),
+        security: siem.as_ref().map(|s| s.sink.clone()),
+        certs,
+        proxy_addr: cfg.proxy_addr.clone(),
+        tls_addr: cfg.tls_enabled().then(|| cfg.tls_addr.clone()),
+    });
 
     tracing::info!(proxy = %cfg.proxy_addr, admin = %cfg.admin_addr, "starting app-lb");
 

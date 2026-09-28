@@ -13,12 +13,29 @@ Arbitrary non-WebSocket HTTP upgrades are no longer passed through by default.
 This dependency upgrade does **not** enable graceful binary replacement or
 regional ingress evacuation; host updates still use the existing restart path.
 
-Process-separation work is in progress. `request_control.rs` owns backend
-admission, reservations, retries, and cold-start waiting independently of
-Pingora's session types. It currently runs in the same process as the proxy;
-there is no separate worker process, IPC protocol, or hot takeover yet. Request
-completion releases both the backend attempt and its regional assignment;
-connection failure releases the attempt without permitting regional replay.
+The foreground process is the sole management owner: it holds the state lock,
+admin API, discovery, autoscaling, ACME, authentication, and request reservations.
+It supervises one forwarding subprocess, which owns the HTTP/TLS listeners and
+streams request/response bodies. The private `--forwarding-worker` entry point
+branches before management stores are opened; it is not an operator command.
+Request decisions cross a versioned Unix-socket protocol in a mode-0700 directory.
+Workers receive memory-only TLS snapshots, refreshed every five seconds, and
+cannot persist them or issue certificates.
+
+Completion releases the backend attempt and regional assignment; connection
+failure releases only the attempt and never permits regional replay. A lost
+request-control connection is not proof of drain: the manager retains its
+reservations until explicit completion/cancellation or confirmed worker exit.
+Cancelled HTTP tasks finish any pending control exchange before acknowledging
+cancellation. A worker that loses management authority exits; the manager reaps
+it before starting a replacement. On Linux, manager death also kills its worker.
+New requests depend on the manager being available.
+
+This is **not hot takeover**. A crashed worker interrupts its streams, and a
+replacement starts only after it exits. Candidate readiness, listener handoff,
+and zero-interruption regional ingress maintenance remain separate work. The
+host updater still restarts the service; do not use this split as evidence that
+updating a region's ingress is safe without traffic evacuation.
 
 This directory was imported from the standalone
 [`Heyo-Computer/app-lb`](https://github.com/Heyo-Computer/app-lb) repository

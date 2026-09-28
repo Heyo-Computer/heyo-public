@@ -252,7 +252,7 @@ impl RequestState {
         }
     }
     #[cfg(test)]
-    fn set_reserved_backend(&mut self, backend: Arc<VmBackend>) {
+    pub(crate) fn set_reserved_backend(&mut self, backend: Arc<VmBackend>) {
         self.backend = Some(backend);
     }
 

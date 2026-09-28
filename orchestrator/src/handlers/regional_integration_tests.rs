@@ -14,6 +14,22 @@ impl Drop for Proxies {
 
 fn free_port() -> u16 { std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port() }
 
+fn forwarding_children(parent: u32) -> Result<Vec<u32>> {
+    let mut children = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{parent}/task"))? {
+        let path = task?.path().join("children");
+        let Ok(contents) = std::fs::read_to_string(path) else { continue; };
+        for pid in contents.split_whitespace() {
+            let pid: u32 = pid.parse()?;
+            let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            if cmd.split(|b| *b == 0).any(|arg| arg == b"--forwarding-worker") { children.push(pid); }
+        }
+    }
+    children.sort_unstable();
+    children.dedup();
+    Ok(children)
+}
+
 fn openssl(root: &Path, args: &[&str]) {
     let output = std::process::Command::new("openssl").args(args).current_dir(root).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -363,6 +379,35 @@ async fn two_real_gateways_scenario() -> Result<()> {
         .await.unwrap_err().to_string().contains("binding changed"));
     let request = |port, path: &str| client.get(format!("http://127.0.0.1:{port}{path}")).header("host","smoke.example").bearer_auth("application-value");
     assert_eq!(request(proxy_ports[1],"/before").send().await?.error_for_status()?.text().await?,"eu1:fixture-v1");
+    // Replacing forwarding must not replace the manager, its route state, or
+    // its regional boot identity. This intentionally tests crash recovery, not
+    // a zero-interruption hot takeover (a separate protocol).
+    let manager_pid = proxies.0[1].id();
+    let children = forwarding_children(manager_pid)?;
+    assert_eq!(children.len(), 1, "exactly one forwarding child per manager");
+    let old_worker = children[0];
+    let observer = &state.config.discovery_observers[1];
+    let status_url = format!("{}/deployments/smoke/discovery-status", observer.base_url);
+    let before: Value = client.get(&status_url).bearer_auth(&token).send().await?.error_for_status()?.json().await?;
+    assert!(std::process::Command::new("kill").args(["-KILL", &old_worker.to_string()]).status()?.success());
+    let mut recovered = false;
+    for _ in 0..100 {
+        assert!(proxies.0[1].try_wait()?.is_none(), "manager must survive worker failure");
+        let after: Value = client.get(&status_url).bearer_auth(&token).send().await?.error_for_status()?.json().await?;
+        assert_eq!(before["regional"]["bootId"], after["regional"]["bootId"]);
+        let children = forwarding_children(manager_pid)?;
+        if children.len() == 1 && children[0] != old_worker {
+            if let Ok(response) = request(proxy_ports[1],"/worker-replaced").send().await {
+                if response.status().is_success() {
+                    assert_eq!(response.text().await?, "eu1:fixture-v1");
+                    recovered = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(recovered, "replacement worker must serve through the unchanged manager");
     let held_request = request(proxy_ports[1],"/held").timeout(Duration::from_secs(60));
     let held = tokio::spawn(async move { held_request.send().await?.error_for_status()?.text().await });
     tokio::time::timeout(Duration::from_secs(5),entered.notified()).await?;

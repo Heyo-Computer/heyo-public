@@ -22,7 +22,7 @@ use pingora_core::tls::ext;
 use pingora_core::tls::pkey::{PKey, Private};
 use pingora_core::tls::ssl::NameType;
 use pingora_core::tls::x509::X509;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,6 +50,10 @@ impl CertifiedKey {
         }
         let leaf = certs.remove(0);
         let key = PKey::private_key_from_pem(key_pem).map_err(CertError::Parse)?;
+        let public_key = leaf.public_key().map_err(CertError::Parse)?;
+        if !public_key.public_eq(&key) {
+            return Err(CertError::KeyMismatch);
+        }
         Ok(Self {
             leaf,
             chain: certs,
@@ -113,6 +117,8 @@ pub enum CertError {
     NoCerts,
     Io(std::io::Error),
     BadHostname(String),
+    KeyMismatch,
+    ReadOnly,
 }
 
 impl std::fmt::Display for CertError {
@@ -122,6 +128,8 @@ impl std::fmt::Display for CertError {
             Self::NoCerts => write!(f, "PEM contained no certificates"),
             Self::Io(e) => write!(f, "{e}"),
             Self::BadHostname(h) => write!(f, "unusable hostname {h:?}"),
+            Self::KeyMismatch => write!(f, "certificate and private key do not match"),
+            Self::ReadOnly => write!(f, "certificate store is a read-only memory view"),
         }
     }
 }
@@ -137,6 +145,31 @@ pub struct CertStatus {
     pub needs_renewal: bool,
 }
 
+/// Serializable TLS state sent from the manager to forwarding workers.
+///
+/// Deliberately opaque and not `Debug`: it contains private key PEM.
+#[derive(Serialize, Deserialize)]
+pub struct CertSnapshot {
+    certs: HashMap<String, SnapshotCert>,
+    fallback: Option<SnapshotCert>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotCert {
+    chain_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+}
+
+struct CertView {
+    certs: HashMap<String, Arc<CertifiedKey>>,
+    fallback: Option<Arc<CertifiedKey>>,
+}
+
+enum StoreBacking {
+    Disk(PathBuf),
+    MemoryOnly,
+}
+
 /// Hostname -> certificate, swapped wholesale on update.
 ///
 /// Same copy-on-write shape as [`Registry`](crate::registry::Registry): readers
@@ -144,21 +177,50 @@ pub struct CertStatus {
 /// clones the map. Cert issuance is far rarer than handshakes, so the clone
 /// costs nothing that matters.
 pub struct CertStore {
-    certs: ArcSwap<HashMap<String, Arc<CertifiedKey>>>,
-    /// Served when SNI matches nothing — the statically configured
-    /// `APP_LB_TLS_CERT`/`APP_LB_TLS_KEY` pair, if there is one. Without it, an
-    /// unmatched SNI fails the handshake.
-    fallback: Option<Arc<CertifiedKey>>,
-    dir: PathBuf,
+    view: ArcSwap<CertView>,
+    backing: StoreBacking,
 }
 
 impl CertStore {
     pub fn new(dir: impl Into<PathBuf>, fallback: Option<Arc<CertifiedKey>>) -> Self {
         Self {
-            certs: ArcSwap::from_pointee(HashMap::new()),
-            fallback,
-            dir: dir.into(),
+            view: ArcSwap::from_pointee(CertView {
+                certs: HashMap::new(),
+                fallback,
+            }),
+            backing: StoreBacking::Disk(dir.into()),
         }
+    }
+
+    /// Construct a worker-side store which can only be updated by snapshots.
+    pub fn from_snapshot(snapshot: CertSnapshot) -> Result<Self, CertError> {
+        let view = parse_snapshot(snapshot)?;
+        Ok(Self {
+            view: ArcSwap::from_pointee(view),
+            backing: StoreBacking::MemoryOnly,
+        })
+    }
+
+    /// Export the complete live view, including every intermediate and fallback.
+    pub fn snapshot(&self) -> Result<CertSnapshot, CertError> {
+        let view = self.view.load();
+        let certs = view
+            .certs
+            .iter()
+            .map(|(host, cert)| Ok((host.clone(), snapshot_cert(cert)?)))
+            .collect::<Result<_, CertError>>()?;
+        let fallback = view.fallback.as_deref().map(snapshot_cert).transpose()?;
+        Ok(CertSnapshot { certs, fallback })
+    }
+
+    /// Validate the entire replacement before atomically publishing it.
+    pub fn replace_snapshot(&self, snapshot: CertSnapshot) -> Result<(), CertError> {
+        if !matches!(&self.backing, StoreBacking::MemoryOnly) {
+            return Err(CertError::ReadOnly);
+        }
+        let view = parse_snapshot(snapshot)?;
+        self.view.store(Arc::new(view));
+        Ok(())
     }
 
     /// Load a cert/key PEM pair from disk, for the static fallback.
@@ -184,7 +246,8 @@ impl CertStore {
         // SNI arrives in whatever case the client sent; routing lowercases
         // hostnames too (see `proxy::request_host`), so match that.
         let host = host.to_ascii_lowercase();
-        let certs = self.certs.load();
+        let view = self.view.load();
+        let certs = &view.certs;
         if let Some(cert) = certs.get(&host) {
             return Some(cert.clone());
         }
@@ -195,9 +258,32 @@ impl CertStore {
             .cloned()
     }
 
+    /// Resolve SNI and fallback from one immutable view, so snapshot swaps can
+    /// never combine certificates from two generations.
+    fn resolve(&self, host: Option<&str>) -> Option<Arc<CertifiedKey>> {
+        let view = self.view.load();
+        if let Some(host) = host {
+            let host = host.to_ascii_lowercase();
+            if let Some(cert) = view.certs.get(&host) {
+                return Some(cert.clone());
+            }
+            if let Some(parent) = host.split_once('.').map(|(_, parent)| parent) {
+                if let Some(cert) = view
+                    .certs
+                    .get(parent)
+                    .filter(|c| c.wildcard_of().as_deref() == Some(parent))
+                {
+                    return Some(cert.clone());
+                }
+            }
+        }
+        view.fallback.clone()
+    }
+
     /// Hosts whose cert is missing or inside the renewal window.
     pub fn needing_renewal<'a>(&self, wanted: impl Iterator<Item = &'a str>) -> Vec<String> {
-        let certs = self.certs.load();
+        let view = self.view.load();
+        let certs = &view.certs;
         wanted
             .map(|h| h.to_ascii_lowercase())
             .filter(|h| certs.get(h).is_none_or(|c| c.needs_renewal()))
@@ -210,6 +296,9 @@ impl CertStore {
     /// a write failure is logged rather than fatal: serving the cert until the
     /// next restart beats not serving it at all.
     pub fn insert(&self, host: &str, chain_pem: &[u8], key_pem: &[u8]) -> Result<(), CertError> {
+        if !matches!(&self.backing, StoreBacking::Disk(_)) {
+            return Err(CertError::ReadOnly);
+        }
         let host = normalize_host(host)?;
         let cert = Arc::new(CertifiedKey::from_pem(chain_pem, key_pem)?);
 
@@ -217,10 +306,13 @@ impl CertStore {
             tracing::error!(%host, error = %e, "could not persist certificate; it will be lost on restart");
         }
 
-        self.certs.rcu(|current| {
-            let mut next = HashMap::clone(current);
-            next.insert(host.clone(), cert.clone());
-            next
+        self.view.rcu(|current| {
+            let mut certs = current.certs.clone();
+            certs.insert(host.clone(), cert.clone());
+            CertView {
+                certs,
+                fallback: current.fallback.clone(),
+            }
         });
         Ok(())
     }
@@ -229,9 +321,15 @@ impl CertStore {
     /// would fail to parse on the next boot. Same approach as
     /// [`Registry::persist`](crate::registry::Registry::persist).
     fn persist(&self, host: &str, chain_pem: &[u8], key_pem: &[u8]) -> std::io::Result<()> {
-        create_dir_private(&self.dir)?;
+        let StoreBacking::Disk(dir) = &self.backing else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "certificate store is memory-only",
+            ));
+        };
+        create_dir_private(dir)?;
         for (suffix, bytes) in [("crt", chain_pem), ("key", key_pem)] {
-            let final_path = self.dir.join(format!("{host}.{suffix}.pem"));
+            let final_path = dir.join(format!("{host}.{suffix}.pem"));
             let tmp = final_path.with_extension("pem.tmp");
             std::fs::write(&tmp, bytes)?;
             restrict(&tmp)?;
@@ -245,11 +343,14 @@ impl CertStore {
     /// disk. Returns how many loaded; a bad pair is skipped, not fatal, so one
     /// corrupt file can't keep the proxy from starting.
     pub fn load_from_disk(&self) -> usize {
-        let entries = match std::fs::read_dir(&self.dir) {
+        let StoreBacking::Disk(dir) = &self.backing else {
+            return 0;
+        };
+        let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0, // normal first run
             Err(e) => {
-                tracing::error!(dir = %self.dir.display(), error = %e, "could not read cert directory");
+                tracing::error!(dir = %dir.display(), error = %e, "could not read cert directory");
                 return 0;
             }
         };
@@ -265,7 +366,7 @@ impl CertStore {
                 continue;
             };
 
-            let key_path = self.dir.join(format!("{host}.key.pem"));
+            let key_path = dir.join(format!("{host}.key.pem"));
             match Self::load_pair(&entry.path().to_string_lossy(), &key_path.to_string_lossy()) {
                 Ok(cert) => {
                     loaded.insert(host, Arc::new(cert));
@@ -276,15 +377,19 @@ impl CertStore {
 
         let count = loaded.len();
         if count > 0 {
-            self.certs.store(Arc::new(loaded));
+            self.view.rcu(|current| CertView {
+                certs: loaded.clone(),
+                fallback: current.fallback.clone(),
+            });
         }
         count
     }
 
     pub fn status(&self) -> Vec<CertStatus> {
         let mut out: Vec<_> = self
-            .certs
+            .view
             .load()
+            .certs
             .iter()
             .map(|(host, c)| CertStatus {
                 host: host.clone(),
@@ -296,6 +401,32 @@ impl CertStore {
         out.sort_by(|a, b| a.host.cmp(&b.host));
         out
     }
+}
+
+fn snapshot_cert(cert: &CertifiedKey) -> Result<SnapshotCert, CertError> {
+    let mut chain_pem = cert.leaf.to_pem().map_err(CertError::Parse)?;
+    for intermediate in &cert.chain {
+        chain_pem.extend(intermediate.to_pem().map_err(CertError::Parse)?);
+    }
+    let key_pem = cert
+        .key
+        .private_key_to_pem_pkcs8()
+        .map_err(CertError::Parse)?;
+    Ok(SnapshotCert { chain_pem, key_pem })
+}
+
+fn parse_snapshot(snapshot: CertSnapshot) -> Result<CertView, CertError> {
+    let mut certs = HashMap::with_capacity(snapshot.certs.len());
+    for (host, pem) in snapshot.certs {
+        let host = normalize_host(&host)?;
+        let cert = Arc::new(CertifiedKey::from_pem(&pem.chain_pem, &pem.key_pem)?);
+        certs.insert(host, cert);
+    }
+    let fallback = snapshot
+        .fallback
+        .map(|pem| CertifiedKey::from_pem(&pem.chain_pem, &pem.key_pem).map(Arc::new))
+        .transpose()?;
+    Ok(CertView { certs, fallback })
 }
 
 /// Lowercase a hostname and reject anything that could escape the cert
@@ -361,10 +492,7 @@ impl TlsAccept for SniResolver {
         // Owned, because `servername` borrows from `ssl` and everything below
         // needs it mutably.
         let sni = ssl.servername(NameType::HOST_NAME).map(str::to_string);
-        let cert = sni
-            .as_deref()
-            .and_then(|host| self.0.lookup(host))
-            .or_else(|| self.0.fallback.clone());
+        let cert = self.0.resolve(sni.as_deref());
 
         let Some(cert) = cert else {
             // Nothing to offer. Returning without installing a cert fails the
@@ -533,11 +661,82 @@ mod tests {
 
         let with = CertStore::new(&dir, Some(fallback));
         assert!(with.lookup("nothing.example.com").is_none());
-        assert!(with.fallback.is_some(), "fallback serves the unmatched SNI");
+        assert!(with.resolve(Some("nothing.example.com")).is_some());
 
         let without = CertStore::new(&dir, None);
-        assert!(without.fallback.is_none(), "handshake fails with no fallback");
+        assert!(without.resolve(Some("nothing.example.com")).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_preserves_sni_wildcard_full_chain_and_fallback() {
+        let dir = tmpdir("snapshot");
+        let (leaf, key) = self_signed_wildcard("sb.example.com", 60);
+        let (intermediate, _) = self_signed("intermediate.example.com", 90);
+        let mut chain = leaf;
+        chain.extend(intermediate);
+        let (fallback_pem, fallback_key) = self_signed("fallback.example.com", 90);
+        let fallback = Arc::new(CertifiedKey::from_pem(&fallback_pem, &fallback_key).unwrap());
+        let manager = CertStore::new(&dir, Some(fallback));
+        manager.insert("sb.example.com", &chain, &key).unwrap();
+
+        let worker = CertStore::from_snapshot(manager.snapshot().unwrap()).unwrap();
+        let wildcard = worker.lookup("one.sb.example.com").unwrap();
+        assert_eq!(wildcard.chain.len(), 1, "the full chain is transferred");
+        assert!(worker.lookup("two.levels.sb.example.com").is_none());
+        assert!(worker.resolve(Some("unknown.example.com")).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_replacement_removes_stale_hosts_and_fallback() {
+        let dir = tmpdir("snapshot-replace");
+        let (old_crt, old_key) = self_signed("old.example.com", 90);
+        let manager = CertStore::new(&dir, None);
+        manager.insert("old.example.com", &old_crt, &old_key).unwrap();
+        let worker = CertStore::from_snapshot(manager.snapshot().unwrap()).unwrap();
+
+        let other_dir = tmpdir("snapshot-replace-other");
+        let (new_crt, new_key) = self_signed("new.example.com", 90);
+        let replacement = CertStore::new(&other_dir, None);
+        replacement.insert("new.example.com", &new_crt, &new_key).unwrap();
+        worker.replace_snapshot(replacement.snapshot().unwrap()).unwrap();
+
+        assert!(worker.lookup("old.example.com").is_none());
+        assert!(worker.lookup("new.example.com").is_some());
+        assert!(worker.resolve(Some("unknown.example.com")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
+    }
+
+    #[test]
+    fn corrupt_replacement_leaves_the_old_view_intact() {
+        let dir = tmpdir("snapshot-corrupt");
+        let (crt, key) = self_signed("old.example.com", 90);
+        let manager = CertStore::new(&dir, None);
+        manager.insert("old.example.com", &crt, &key).unwrap();
+        let worker = CertStore::from_snapshot(manager.snapshot().unwrap()).unwrap();
+        let mut corrupt = manager.snapshot().unwrap();
+        corrupt.certs.get_mut("old.example.com").unwrap().chain_pem = b"not PEM".to_vec();
+
+        assert!(worker.replace_snapshot(corrupt).is_err());
+        assert!(worker.lookup("old.example.com").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_only_store_refuses_insert_without_touching_disk() {
+        let dir = tmpdir("memory-only");
+        let manager = CertStore::new(&dir, None);
+        let worker = CertStore::from_snapshot(manager.snapshot().unwrap()).unwrap();
+        let (crt, key) = self_signed("new.example.com", 90);
+
+        assert!(matches!(
+            worker.insert("new.example.com", &crt, &key),
+            Err(CertError::ReadOnly)
+        ));
+        assert_eq!(worker.load_from_disk(), 0);
+        assert!(!dir.exists());
     }
 
     #[test]

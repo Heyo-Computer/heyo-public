@@ -8,27 +8,24 @@
 //! Nothing here may block: VM boots happen only in the autoscaler. The one wait
 //! is the cold-start `Notify`, which yields.
 
-use crate::acme::ChallengeTable;
-use crate::auth::Authenticator;
 #[cfg(test)]
 use crate::deployment::{Deployment, VmBackend};
-use crate::guard::Guard;
+#[cfg(test)]
 use crate::metrics::Metrics;
-use crate::obs::{Access, LogSink};
-use crate::siem::SecuritySink;
-use crate::registry::Registry;
+use crate::worker_rpc::{Client, Completion, RemoteDecision, RemoteRequest};
 use async_trait::async_trait;
 use pingora_core::prelude::HttpPeer;
 use pingora_core::protocols::TcpKeepalive;
 use pingora_core::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub struct Ctx {
-    request: crate::request_control::RequestState,
+    request: Option<RemoteRequest>,
     /// When the request entered the proxy, for latency. Set in `request_filter`
     /// so the measured span covers cold-start waits too, and `None` before then
     /// so a request rejected pre-routing simply isn't timed.
@@ -36,56 +33,13 @@ pub struct Ctx {
 }
 
 pub struct LbProxy {
-    control: Arc<crate::request_control::RequestControl>,
-    metrics: Arc<Metrics>,
-    /// Where the access log goes. `None` unless `APP_LB_OBS_URL` is configured,
-    /// in which case `logging` does no extra work at all.
-    access_log: Option<LogSink>,
-    /// Where the same requests go to be analysed for attacks. Independent of
-    /// `access_log` on purpose: the SIEM is on unless `APP_LB_SIEM=0`, and must
-    /// not inherit "off whenever no log collector is configured".
-    security: Option<SecuritySink>,
+    control: Client,
 }
 
 impl LbProxy {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        registry: Arc<Registry>,
-        metrics: Arc<Metrics>,
-        challenges: Arc<ChallengeTable>,
-        auth: Arc<Authenticator>,
-        access_log: Option<LogSink>,
-        security: Option<SecuritySink>,
-        guard: Arc<Guard>,
-        feed: Arc<crate::feed::Feed>,
-        auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
-        secrets: Arc<crate::secrets::SecretStore>,
-    ) -> Self {
-        Self {
-            control: Arc::new(crate::request_control::RequestControl::new(
-                registry, metrics.clone(), challenges, auth, guard, feed, auth_providers, secrets,
-            )),
-            metrics,
-            access_log,
-            security,
-        }
+    pub fn new(control: Client) -> Self {
+        Self { control }
     }
-}
-
-/// The request's target host.
-///
-/// HTTP/2 carries no `Host` header — clients send `:authority`, which pingora
-/// surfaces on the URI — so both have to be checked or h2 traffic never routes.
-/// The port is stripped so `demo.local:6188` matches a `demo.local` rule.
-fn request_host(req: &RequestHeader) -> Option<String> {
-    crate::request_control::RequestHead {
-        method: req.method.clone(),
-        uri: req.uri.clone(),
-        headers: req.headers.clone(),
-        peer: None,
-        tls_terminated: false,
-    }
-    .host()
 }
 
 /// Keepalive on every upstream connection, so a backend that vanishes without
@@ -133,19 +87,23 @@ async fn write_plain(session: &mut Session, code: u16, message: &str) -> Result<
 
 async fn write_control_response(
     session: &mut Session,
-    response: crate::request_control::ResponseData,
+    status: u16,
+    body: String,
+    content_type: String,
+    headers: Vec<(String, String)>,
+    cache_control: Option<String>,
 ) -> Result<()> {
-    let mut header = ResponseHeader::build(response.status, Some(8))?;
-    header.insert_header(http::header::CONTENT_LENGTH, response.body.len().to_string())?;
-    header.insert_header(http::header::CONTENT_TYPE, response.content_type)?;
-    if let Some(cache) = response.cache_control {
+    let mut header = ResponseHeader::build(status, Some(8))?;
+    header.insert_header(http::header::CONTENT_LENGTH, body.len().to_string())?;
+    header.insert_header(http::header::CONTENT_TYPE, content_type)?;
+    if let Some(cache) = cache_control {
         header.insert_header(http::header::CACHE_CONTROL, cache)?;
     }
-    for (name, value) in response.headers {
+    for (name, value) in headers {
         header.append_header(name, value)?;
     }
     session.write_response_header(Box::new(header), false).await?;
-    session.write_response_body(Some(bytes::Bytes::from(response.body)), true).await
+    session.write_response_body(Some(bytes::Bytes::from(body)), true).await
 }
 
 /// The newest events an exposed or admin-served feed returns. Half the ring:
@@ -315,8 +273,10 @@ impl ProxyHttp for LbProxy {
             peer: session.client_addr().and_then(|a| a.as_inet().map(|a| *a)),
             tls_terminated: session.digest().is_some_and(|d| d.ssl_digest.is_some()),
         };
-        let mut decision = self.control.decide(&head, &mut ctx.request).await;
-        if matches!(decision, crate::request_control::RequestDecision::ReadLoginBody) {
+        let (request, mut decision) = self.control.begin(head).await
+            .unwrap_or_else(|error| crate::worker::control_lost(&error));
+        ctx.request = Some(request);
+        if matches!(decision, RemoteDecision::ReadLoginBody) {
             let mut body = Vec::new();
             while let Some(chunk) = session.read_request_body().await? {
                 if body.len() + chunk.len() > crate::request_control::MAX_LOGIN_BODY {
@@ -325,7 +285,9 @@ impl ProxyHttp for LbProxy {
                 }
                 body.extend_from_slice(&chunk);
             }
-            decision = self.control.continue_login(&mut ctx.request, &body).await;
+            let request = ctx.request.as_mut().expect("request admitted");
+            decision = request.continue_login(&body).await
+                .map_err(|error| control_error(request, error))?;
         }
         // Pingora tracks header names separately; preserve its bookkeeping in
         // this transport adapter even though authority evaluated owned headers.
@@ -336,16 +298,16 @@ impl ProxyHttp for LbProxy {
             session.req_header_mut().remove_header(name);
         }
         match decision {
-            crate::request_control::RequestDecision::Respond(response) => {
-                write_control_response(session, response).await?;
+            RemoteDecision::Respond { status, body, content_type, headers, cache_control } => {
+                write_control_response(session, status, body, content_type, headers, cache_control).await?;
                 return Ok(true);
             }
-            crate::request_control::RequestDecision::ServeSite { spec, path } => {
+            RemoteDecision::ServeSite { spec, path } => {
                 serve_site(session, &spec, &path).await?;
                 return Ok(true);
             }
-            crate::request_control::RequestDecision::Proxy => return Ok(false),
-            crate::request_control::RequestDecision::ReadLoginBody => unreachable!("login continuation returns a terminal decision"),
+            RemoteDecision::Proxy => return Ok(false),
+            RemoteDecision::ReadLoginBody => unreachable!("login continuation returns a terminal decision"),
         }
     }
 
@@ -357,9 +319,10 @@ impl ProxyHttp for LbProxy {
         upstream: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        for modification in ctx.request.forwarding_modifications(&upstream.uri).map_err(|error| {
-            Error::explain(ErrorType::InternalError, error)
-        })? {
+        let request = ctx.request.as_mut().expect("request admitted");
+        let modifications = request.forwarding_modifications(&upstream.uri).await
+            .map_err(|error| control_error(request, error))?;
+        for modification in modifications {
             match modification {
                 crate::request_control::HeaderModification::Remove(name) => {
                     upstream.remove_header(&name);
@@ -382,16 +345,10 @@ impl ProxyHttp for LbProxy {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let selected = self.control.next_peer(&mut ctx.request)
-            .await
-            .map_err(|error| Error::explain(
-                match error.kind {
-                    crate::request_control::ErrorKind::Internal => ErrorType::InternalError,
-                    crate::request_control::ErrorKind::Connect => ErrorType::ConnectProxyFailure,
-                },
-                error.message,
-            ))?;
-        Ok(Box::new(http_peer(selected)))
+        let request = ctx.request.as_mut().expect("request admitted");
+        let selected = request.next_peer().await
+            .map_err(|error| control_error(request, error))?;
+        Ok(Box::new(http_peer(selected.peer)))
     }
 
     async fn response_filter(
@@ -402,8 +359,8 @@ impl ProxyHttp for LbProxy {
     ) -> Result<()> {
         // Makes it possible to see which VM served a request, which is how the
         // load-spreading and retry behaviour get verified.
-        if let Some(b) = ctx.request.backend() {
-            upstream_response.insert_header("x-vm-id", &b.sandbox_id)?;
+        if let Some(id) = ctx.request.as_ref().and_then(RemoteRequest::backend_id) {
+            upstream_response.insert_header("x-vm-id", id)?;
         }
         Ok(())
     }
@@ -417,18 +374,8 @@ impl ProxyHttp for LbProxy {
         ctx: &mut Self::CTX,
         mut e: Box<Error>,
     ) -> Box<Error> {
-        if let Some(b) = ctx.request.connection_failed() {
-            tracing::warn!(
-                sandbox = %b.sandbox_id,
-                addr = %b.peer,
-                "upstream connect failed; marking unhealthy",
-            );
-        } else {
-            tracing::warn!(peer = %peer, "upstream connect failed with no backend in ctx");
-        }
-        // This attempt never got off the ground, so give the slot back now
-        // rather than holding it through the retry.
-        if ctx.request.retry_allowed() {
+        tracing::warn!(peer = %peer, "upstream connect failed");
+        if ctx.request.as_mut().is_some_and(RemoteRequest::connection_failed) {
             e.set_retry(true);
         }
         e
@@ -437,94 +384,23 @@ impl ProxyHttp for LbProxy {
     /// Runs on every request, success or failure. If this ever misses a path,
     /// `in_flight` leaks upward and the deployment pins at max replicas.
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX) {
-        // Which backend served, read before `release` — it takes the backend out
-        // of the ctx, so anything that needs its identity must ask first.
-        // `sandbox_id` is the sandbox for a managed VM and the `host:port` for a
-        // static upstream, which is exactly how app-obs keys a backend. Skipped
-        // when nothing is shipping, so an app-lb without app-obs allocates
-        // nothing extra per request.
-        // Either consumer needs it: with `APP_LB_OBS_ACCESS_LOG=0` and the SIEM
-        // on, checking only `access_log` here would leave every alert without a
-        // backend, which reads as a bug in the SIEM rather than as this line.
-        let observing = self.access_log.is_some() || self.security.is_some();
-        let backend = match observing {
-            true => ctx.request.backend().map(|b| b.sandbox_id.clone()),
-            false => None,
-        };
-        ctx.request.complete();
-
-        let status = session.response_written().map(|r| r.status.as_u16());
-
-        // Record latency and outcome for any request that got as far as being
-        // routed. A request rejected before routing (404, no deployment) has no
-        // `started_at`/`deployment` and is intentionally left out of a
-        // deployment's numbers.
-        if let (Some(started), Some(deployment)) = (ctx.started_at, ctx.request.deployment()) {
-            self.metrics
-                .record_request(&deployment.spec.id, status, started.elapsed());
-        }
-
-        // The access log app-obs stores. Unlike the metrics above it also carries
-        // requests that matched no deployment, under the sink's own deployment id
-        // (`_lb` unless `APP_LB_OBS_DEPLOYMENT` says otherwise) — a wall of 404s
-        // for a hostname somebody expected to work is invisible in a
-        // per-deployment view by construction. `started_at` is set first thing in
-        // `request_filter`, so its absence means the request never got that far
-        // and there is nothing to describe.
-        if let (true, Some(started)) = (observing, ctx.started_at) {
-            let req = session.req_header();
-            let method = req.method.as_str().to_string();
-            // The path alone, never the query: a sign-in callback carries the
-            // OAuth `code` there, and a shared log store is the last place a
-            // credential should come to rest.
-            //
-            // The SIEM is the one exception, and a deliberately narrow one: it
-            // is handed the query as a *separate argument* below, matches attack
-            // signatures against the parameter values, and drops it. On a hit the
-            // alert records the parameter name only, never the value — so the
-            // `code` above still cannot reach a log store, while `?id=1' OR '1'='1`
-            // stops being invisible. `APP_LB_SIEM_SCAN_QUERY=0` turns it off.
-            let path = req.uri.path().to_string();
-            let query = req.uri.query().map(str::to_string);
-            let host = request_host(req);
-            let access = Access {
-                deployment: ctx.request.deployment().map(|d| d.spec.id.as_str()),
-                backend,
-                method: &method,
-                path: &path,
-                host: host.as_deref(),
-                status,
-                duration: started.elapsed(),
+        if let Some(request) = ctx.request.as_mut() {
+            let completion = Completion {
+                status: session.response_written().map(|r| r.status.as_u16()),
+                duration_micros: ctx.started_at.map(|s| s.elapsed().as_micros().min(u64::MAX as u128) as u64).unwrap_or(0),
                 bytes: session.body_bytes_sent(),
-                // The address only. The ephemeral port identifies the
-                // connection, not the caller.
-                client: session.client_addr().map(|addr| match addr.as_inet() {
-                    Some(inet) => inet.ip().to_string(),
-                    None => addr.to_string(),
-                }),
-                error: e.map(|err| err.to_string()),
+                error: e.map(ToString::to_string),
             };
-
-            // SIEM first: it borrows, and `send_access` moves. `Access` is not
-            // `Clone`, so reordering these two stops compiling rather than
-            // silently dropping the analysis.
-            if let Some(siem) = &self.security {
-                siem.observe_access(&access, query.as_deref());
+            if let Err(error) = request.complete(completion).await {
+                crate::worker::control_lost(&error);
             }
-            if let Some(sink) = &self.access_log {
-                sink.send_access(access);
-            }
-        }
-
-        if let Some(err) = e {
-            tracing::warn!(
-                deployment = ctx.request.deployment().map(|d| d.spec.id.as_str()),
-                status,
-                error = %err,
-                "request failed",
-            );
         }
     }
+}
+
+fn control_error(request: &RemoteRequest, error: String) -> Box<Error> {
+    if !request.connected() { crate::worker::control_lost(&error); }
+    Error::explain(ErrorType::ConnectProxyFailure, error)
 }
 
 #[cfg(test)]
