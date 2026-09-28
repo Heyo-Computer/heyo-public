@@ -2991,6 +2991,66 @@ heyctl create secret pg-fc --from-stdin password < pg-fc-password.txt
 - A schema's Postgres log is read by running a command inside its VM, so that
   route sits on the CRUD tier with the actions.
 
+### vapi inference (`vapi`)
+
+This plugin watches and drives [vapi](https://github.com/Heyo-Computer/vapi)
+gateways — the LLM inference server — through their OpenAI-compatible API and
+their dashboard JSON. It shows:
+
+- the model each gateway is serving, its uptime, queue depth and response-cache
+  hit rate
+- every registered worker: running and waiting requests against its concurrency
+  limit, KV-cache utilisation, prefix-cache hit rate
+- the gateway's admission settings (max queued requests, first-token and
+  stream-idle timeouts, the response cache), changeable from the page
+- a prompt box that runs a completion through app-lb
+
+app-lb holds the vapi API key and calls the gateway on the page's behalf, so
+the browser never sees it. A 401 from vapi becomes a 502 naming the
+misconfigured gateway, rather than looking like your session failed.
+
+The tier split is the point. Reading a gateway's stats is view-tier; running a
+completion is CRUD-tier, because it occupies a worker, evicts other callers'
+KV blocks and costs time on a GPU that has one of everything. Changing
+admission settings is CRUD-tier too. One vapi key cannot make that distinction;
+app-lb's two tiers can.
+
+Store a key, then configure one entry per gateway:
+
+```sh
+heyctl create secret vapi --from-stdin api_key < vapi-key.txt
+```
+
+```json
+{
+  "gateways": [
+    {
+      "name": "local",
+      "url": "http://127.0.0.1:8080",
+      "api_key": {"secret": "vapi", "key": "api_key"}
+    }
+  ],
+  "poll_secs": 15
+}
+```
+
+- `url` is vapi's `gateway.bind`. `api_key` is one of its `[[auth.keys]]`, and
+  can be omitted entirely when the gateway has none configured.
+- Which key it is matters beyond access: vapi gives each key its own
+  prefix-cache namespace, so calls made through this plugin share a cache with
+  each other and with nobody else.
+- The plugin's poller reads `/health` (open even with keys configured) and
+  `/dashboard/stats` (not). A gateway that answers the first and refuses the
+  second is reported as **up with an error**, so a wrong key sends you here
+  rather than to the gateway.
+
+This is a control plane, not a data plane. The proxy buffers whole responses
+and refuses `"stream": true`; application traffic to a gateway belongs in a
+static (`upstreams`) deployment, which streams, load-balances and health-checks
+it like any other backend. Audio transcription (`/v1/audio/transcriptions`) is
+not proxied either — a multipart upload of tens of megabytes is data-plane
+work.
+
 ## Clients
 
 | | |

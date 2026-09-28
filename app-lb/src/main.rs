@@ -578,7 +578,10 @@ fn main() {
         ),
     }
     let plugin_host = Arc::new(plugins::PluginHost::new(
-        vec![plugins::pgfc::PgFcPlugin::new(secrets.clone())],
+        vec![
+            plugins::pgfc::PgFcPlugin::new(secrets.clone()),
+            plugins::vapi::VapiPlugin::new(secrets.clone()),
+        ],
         plugin_store,
     ));
     let tokens = Arc::new(tokens::TokenStore::new(&cfg.tokens_path));

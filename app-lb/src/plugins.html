@@ -520,6 +520,181 @@ PANELS.pgfc = (() => {
   return { render: refresh, refresh };
 })();
 
+// ---- vapi ---------------------------------------------------------------------
+//
+// Every call goes through app-lb (`/api/plugins/vapi/…`), which holds the
+// gateway's API key; the browser never sees it. The numbers come from the
+// plugin's poller rather than from the gateway per render, so the panel says
+// how old they are. Reads need view credentials; running a prompt and changing
+// admission settings need admin ones — a view-only session gets the 403 flash.
+PANELS.vapi = (() => {
+  const base = "/api/plugins/vapi";
+  let el = null, gw = null, gateways = [], lastKey = "";
+
+  const n = v => (v == null ? "—" : Number(v).toLocaleString());
+  const current = () => gateways.find(x => x.name === gw);
+  const gwUrl = p => `${base}/gateways/${encodeURIComponent(gw)}${p}`;
+
+  function skeleton() {
+    el.innerHTML = `
+      <div class="row" style="align-items:center">
+        <label class="k" for="vapi-gw">Gateway</label>
+        <select id="vapi-gw"></select>
+        <span class="dim" id="vapi-gw-note"></span>
+      </div>
+      <div class="sub-title">Serving</div>
+      <div class="tiles" id="vapi-tiles"></div>
+      <div class="sub-title">Workers</div>
+      <div class="scroll" id="vapi-workers"></div>
+      <div class="sub-title">Admission</div>
+      <div class="row" id="vapi-settings"></div>
+      <div class="sub-title">Try a prompt</div>
+      <div class="row">
+        <input type="text" id="vapi-prompt" placeholder="prompt" size="46">
+        <input type="number" id="vapi-max" value="256" min="1" max="4096" size="5" title="max tokens">
+        <button class="act" type="button" id="vapi-run">Run</button>
+      </div>
+      <pre class="status" id="vapi-out" hidden></pre>`;
+    el.querySelector("#vapi-gw").addEventListener("change", ev => { gw = ev.target.value; renderAll(); });
+    el.querySelector("#vapi-run").addEventListener("click", run);
+  }
+
+  function renderGateways() {
+    const sel = el.querySelector("#vapi-gw");
+    const key = gateways.map(x => x.name).join(",");
+    if (key !== lastKey) {
+      sel.innerHTML = gateways.map(x => `<option value="${esc(x.name)}">${esc(x.name)}</option>`).join("");
+      lastKey = key;
+      if (!gateways.some(x => x.name === gw)) gw = gateways.length ? gateways[0].name : null;
+    }
+    sel.value = gw || "";
+    const cur = current();
+    const age = cur && cur.polled_at ? Math.max(0, Math.round(Date.now() / 1000 - cur.polled_at)) : null;
+    el.querySelector("#vapi-gw-note").innerHTML = !cur ? ""
+      : `${cur.up ? `<span class="tag on">up</span>` : `<span class="tag fail">down</span>`}
+         <span class="mono">${esc(cur.url)}</span>
+         ${cur.authenticated ? "" : `<span class="tag off">no key</span>`}
+         ${age == null ? "" : `<span class="dim">· polled ${age}s ago</span>`}
+         ${cur.error ? `<div class="caveat">${esc(cur.error)}</div>` : ""}`;
+  }
+
+  function renderTiles() {
+    const box = el.querySelector("#vapi-tiles");
+    const s = (current() || {}).stats;
+    if (!s) { box.innerHTML = `<div class="dim">No data from this gateway.</div>`; return; }
+    const tile = (k, v, sub) => `<div class="tile"><span class="k">${k}</span><div class="v">${v}</div>${sub ? `<div class="s">${sub}</div>` : ""}</div>`;
+    box.innerHTML =
+      tile("Model", `<span style="font-size:13px" class="mono">${esc(s.model || "—")}</span>`, `up ${esc(s.uptime || "—")}`) +
+      tile("Queued", n(s.queued), `${n(s.completed)} completed`) +
+      tile("Failed", n(s.failed), `${n(s.refused)} refused`) +
+      tile("Response cache", esc(s.cache_hit_rate || "—"), "hit rate") +
+      tile("Tokens in", n(s.prompt_tokens), `${n(s.completion_tokens)} out`);
+  }
+
+  function renderWorkers() {
+    const box = el.querySelector("#vapi-workers");
+    const workers = ((current() || {}).stats || {}).workers || [];
+    if (!workers.length) {
+      box.innerHTML = `<div class="dim">No workers are registered. A gateway with no worker
+        accepts requests and times them out.</div>`;
+      return;
+    }
+    box.innerHTML = `<table class="grid"><thead><tr><th>Worker</th><th>Model</th><th>Running</th>
+      <th>Waiting</th><th>Load</th><th>KV</th><th>Prefix hits</th><th>Uptime</th></tr></thead><tbody>${
+      workers.map(w => `<tr>
+        <td class="mono">${esc(w.id)}</td>
+        <td class="mono dim">${esc(w.model)}</td>
+        <td class="num">${n(w.running)}<span class="dim"> / ${n(w.max_concurrent)}</span></td>
+        <td class="num">${n(w.waiting)}</td>
+        <td class="num">${esc(w.load)}</td>
+        <td class="num">${esc(w.kv)}</td>
+        <td class="num">${esc(w.prefix_hit)}</td>
+        <td class="num">${esc(w.uptime)}</td></tr>`).join("")}</tbody></table>`;
+  }
+
+  // Only what the gateway process itself owns. Everything a worker acts on —
+  // the model, the KV cache size, the batch limits — is read at the worker's
+  // start, so vapi shows it read-only and this cannot move it either.
+  function renderSettings() {
+    const box = el.querySelector("#vapi-settings");
+    // A poll every five seconds must not overwrite a number being typed.
+    if (box.contains(document.activeElement)) return;
+    const s = ((current() || {}).stats || {}).settings;
+    if (!s) { box.innerHTML = `<div class="dim">—</div>`; return; }
+    const num = (k, label) => `<label class="k">${label}
+      <input type="number" min="1" data-set="${k}" value="${esc(s[k])}" size="6"></label>`;
+    box.innerHTML = num("max_queued_requests", "Max queued") +
+      num("first_token_timeout_secs", "First token (s)") +
+      num("stream_idle_timeout_secs", "Stream idle (s)") +
+      `<label class="k">Response cache
+        <input type="checkbox" data-set="response_cache" ${s.response_cache ? "checked" : ""}
+          ${s.response_cache_available ? "" : "disabled title='no response-cache bucket was opened at start'"}></label>` +
+      `<button class="act" type="button" id="vapi-apply">Apply</button>`;
+    el.querySelector("#vapi-apply").addEventListener("click", applySettings);
+  }
+
+  async function applySettings(ev) {
+    const body = {};
+    el.querySelectorAll("[data-set]").forEach(i => {
+      body[i.dataset.set] = i.type === "checkbox" ? i.checked : Number(i.value);
+    });
+    ev.target.disabled = true;
+    const r = await api("PUT", gwUrl("/settings"), body);
+    ev.target.disabled = false;
+    if (!r.ok) { flash("bad", failure(r, "Changing the gateway's settings")); return; }
+    flash("ok", `${gw}: settings applied.`);
+  }
+
+  async function run(ev) {
+    const prompt = el.querySelector("#vapi-prompt").value.trim();
+    const out = el.querySelector("#vapi-out");
+    if (!prompt) return;
+    const model = (((current() || {}).stats) || {}).model;
+    if (!model) { flash("bad", "This gateway has not reported a model yet."); return; }
+    ev.target.disabled = true;
+    out.hidden = false;
+    out.textContent = "…";
+    const t = Date.now();
+    // Non-streaming on purpose: the plugin proxy buffers whole responses. A
+    // gateway that should stream to real clients belongs behind a static
+    // deployment, where the load balancer streams it.
+    const r = await api("POST", gwUrl("/chat/completions"), {
+      model,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: Number(el.querySelector("#vapi-max").value) || 256,
+      temperature: 0,
+    });
+    ev.target.disabled = false;
+    if (!r.ok) { out.textContent = failure(r, "The completion"); return; }
+    const choice = (r.data.choices || [])[0] || {};
+    const usage = r.data.usage || {};
+    out.textContent = `${(choice.message || {}).content ?? ""}\n\n# ${usage.prompt_tokens ?? "?"} in, ` +
+      `${usage.completion_tokens ?? "?"} out, ${((Date.now() - t) / 1000).toFixed(1)}s, ` +
+      `finish: ${choice.finish_reason ?? "?"}`;
+  }
+
+  function renderAll() { renderGateways(); renderTiles(); renderWorkers(); renderSettings(); }
+
+  async function refresh(view, target) {
+    if (!view.enabled) {
+      el = null; lastKey = "";
+      target.innerHTML = `<p class="desc">Point this at a vapi gateway. If it has API keys configured,
+        store one as an app-lb secret first, then configure, for example:</p>
+        <pre class="status">${esc(JSON.stringify({ gateways: [{ name: "local", url: "http://127.0.0.1:8080",
+          api_key: { secret: "vapi", key: "api_key" } }] }, null, 2))}</pre>`;
+      return;
+    }
+    const first = el !== target;
+    if (first) { el = target; skeleton(); }
+    const r = await api("GET", `${base}/gateways`);
+    if (!r.ok) return;
+    gateways = r.data;
+    renderAll();
+  }
+
+  return { render: refresh, refresh };
+})();
+
 async function load() {
   const r = await api("GET", "/api/plugins");
   const root = $("plugins");
