@@ -9,11 +9,10 @@
 //! is the cold-start `Notify`, which yields.
 
 use crate::acme::ChallengeTable;
-use crate::auth::{Authenticator, Decision, Identity, RequestInfo};
-use crate::deployment::Deployment;
+use crate::auth::Authenticator;
 #[cfg(test)]
-use crate::deployment::VmBackend;
-use crate::guard::{Decision as GuardVerdict, Guard, RequestFacts};
+use crate::deployment::{Deployment, VmBackend};
+use crate::guard::Guard;
 use crate::metrics::Metrics;
 use crate::obs::{Access, LogSink};
 use crate::siem::SecuritySink;
@@ -34,29 +33,11 @@ pub struct Ctx {
     /// so the measured span covers cold-start waits too, and `None` before then
     /// so a request rejected pre-routing simply isn't timed.
     started_at: Option<Instant>,
-    /// Who the caller is, for a deployment behind a sign-in gate. Decided in
-    /// `request_filter` and applied to the upstream request later, so the gate
-    /// runs once per request rather than once per upstream attempt.
-    identity: Option<Identity>,
-    /// The matched route prefix when that route opted into removing it before
-    /// proxying. Routing happens before Pingora builds the upstream request.
-    route_prefix: Option<String>,
-    /// Resolved once at admission; never recorded in access logs.
-    gateway_token: Option<String>,
 }
 
-/// The URL prefix Let's Encrypt fetches to validate an HTTP-01 challenge.
-const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
-
 pub struct LbProxy {
-    registry: Arc<Registry>,
+    control: Arc<crate::request_control::RequestControl>,
     metrics: Arc<Metrics>,
-    /// Outstanding HTTP-01 challenge responses, published by the ACME manager.
-    /// Empty (and the lookup therefore a single miss) whenever ACME is off.
-    challenges: Arc<ChallengeTable>,
-    /// Runs the sign-in gate for deployments that declare one. Inert for the
-    /// rest: a deployment without `auth` never reaches it.
-    auth: Arc<Authenticator>,
     /// Where the access log goes. `None` unless `APP_LB_OBS_URL` is configured,
     /// in which case `logging` does no extra work at all.
     access_log: Option<LogSink>,
@@ -64,20 +45,6 @@ pub struct LbProxy {
     /// `access_log` on purpose: the SIEM is on unless `APP_LB_SIEM=0`, and must
     /// not inherit "off whenever no log collector is configured".
     security: Option<SecuritySink>,
-    /// The other half of that pair: the SIEM decides something is an attack,
-    /// this refuses it. Not an `Option` — an empty rule set is one `is_empty`
-    /// check, and making enforcement conditional on the SIEM being on would
-    /// mean `APP_LB_SIEM=0` silently unblocked every address an operator had
-    /// blocked.
-    guard: Arc<Guard>,
-    /// The per-namespace event feed, for the deployments that `expose` it on
-    /// their own routes, and for the cold-start-timeout issue hook.
-    feed: Arc<crate::feed::Feed>,
-    /// The declared auth providers, resolved live for a gate that inherits one
-    /// with `auth.provider_ref`. Read only on the gated path; a deployment
-    /// without a reference never touches it.
-    auth_providers: Arc<crate::auth_providers::AuthProviderStore>,
-    secrets: Arc<crate::secrets::SecretStore>,
 }
 
 impl LbProxy {
@@ -95,122 +62,15 @@ impl LbProxy {
         secrets: Arc<crate::secrets::SecretStore>,
     ) -> Self {
         Self {
-            registry,
+            control: Arc::new(crate::request_control::RequestControl::new(
+                registry, metrics.clone(), challenges, auth, guard, feed, auth_providers, secrets,
+            )),
             metrics,
-            challenges,
-            auth,
             access_log,
             security,
-            guard,
-            feed,
-            auth_providers,
-            secrets,
-        }
-    }
-
-    /// Resolve a gate that may inherit its identity from a namespace provider.
-    ///
-    /// A gate with no `provider_ref` is returned untouched. One with a reference
-    /// is merged with the named provider in `namespace` — identity from the
-    /// provider, the route-scoped fields from the gate — into a plain,
-    /// self-contained [`AuthGate`] the rest of the pipeline treats exactly like
-    /// an inline one, including [`policy_fingerprint`], so an edit to the
-    /// provider re-signs the sessions issued under the old policy.
-    ///
-    /// A reference that names no provider in the namespace is an `Err`, and the
-    /// caller refuses the request: a gate that cannot be built must fail closed,
-    /// never fall open to serving the deployment with no gate at all.
-    ///
-    /// [`AuthGate`]: crate::config::AuthGate
-    /// [`policy_fingerprint`]: crate::config::AuthGate::policy_fingerprint
-    fn resolve_gate(
-        &self,
-        gate: crate::config::AuthGate,
-        namespace: &str,
-    ) -> std::result::Result<crate::config::AuthGate, String> {
-        let Some(name) = gate.provider_ref.as_deref() else {
-            return Ok(gate);
-        };
-        match self.auth_providers.get(namespace, name) {
-            Some(provider) => Ok(provider.resolve(&gate)),
-            None => Err(format!(
-                "this deployment's sign-in gate inherits the auth provider {name:?}, \
-                 which is not declared in its namespace\n"
-            )),
-        }
-    }
-
-    /// Consult the guard. `Some(body)` means refuse the request with a 403.
-    ///
-    /// The body says nothing about *why*. A refusal that names the rule tells an
-    /// attacker which of their properties was matched and therefore which one to
-    /// change — the operator has the dashboard for that, and they are the only
-    /// party entitled to the answer.
-    fn enforce(
-        &self,
-        session: &Session,
-        host: &Option<String>,
-        path: &str,
-        routed: Option<&Arc<Deployment>>,
-    ) -> Option<String> {
-        let req = session.req_header();
-        // The socket peer, never `X-Forwarded-For`. Keying enforcement on a
-        // client-supplied header would let anyone get anyone else refused, and
-        // let the attacker exempt themselves by setting it.
-        let client = session
-            .client_addr()
-            .and_then(|a| a.as_inet().map(|inet| inet.ip()));
-        let facts = RequestFacts {
-            client,
-            host: host.as_deref(),
-            path,
-            method: req.method.as_str(),
-            deployment: routed.map(|d| d.spec.id.as_str()),
-            // Capped before it is scanned: the header is attacker-controlled and
-            // the substring search is O(header × pattern).
-            //
-            // `get(..n)`, not `&v[..n]`. Slicing would panic on a byte that is
-            // not a char boundary, and a panic here takes down a worker on
-            // attacker-supplied input. `to_str` only succeeds for visible ASCII
-            // today, so the fallback is unreachable — which is exactly the kind
-            // of reasoning that stops being true after somebody else's upgrade.
-            user_agent: req
-                .headers
-                .get(http::header::USER_AGENT)
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.get(..MAX_SCANNED_UA).unwrap_or(v)),
-        };
-
-        match self.guard.decide(&facts, crate::deployment::now_secs()) {
-            GuardVerdict::Pass => None,
-            GuardVerdict::Block(rule) => {
-                tracing::info!(
-                    rule = %rule.id,
-                    matched = %rule.describe(),
-                    client = ?client,
-                    %path,
-                    "refused by a guard rule",
-                );
-                Some("blocked\n".to_string())
-            }
-            // `APP_LB_GUARD_ENFORCE=0`. Warn rather than debug: the whole point
-            // of a dry run is that somebody is watching for exactly this line.
-            GuardVerdict::WouldBlock(rule) => {
-                tracing::warn!(
-                    rule = %rule.id,
-                    matched = %rule.describe(),
-                    client = ?client,
-                    %path,
-                    "would have refused this request (APP_LB_GUARD_ENFORCE=0)",
-                );
-                None
-            }
         }
     }
 }
-
-/// How much of `User-Agent` a rule may match against.
-const MAX_SCANNED_UA: usize = 512;
 
 /// The request's target host.
 ///
@@ -218,26 +78,14 @@ const MAX_SCANNED_UA: usize = 512;
 /// surfaces on the URI — so both have to be checked or h2 traffic never routes.
 /// The port is stripped so `demo.local:6188` matches a `demo.local` rule.
 fn request_host(req: &RequestHeader) -> Option<String> {
-    let raw = req
-        .uri
-        .authority()
-        .map(|a| a.as_str().to_string())
-        .or_else(|| {
-            req.headers
-                .get(http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        })?;
-
-    let host = raw.rsplit_once('@').map_or(raw.as_str(), |(_, h)| h);
-    // Don't split IPv6 literals (`[::1]:80`) on the wrong colon.
-    let host = if let Some(end) = host.find(']') {
-        &host[..=end]
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    crate::request_control::RequestHead {
+        method: req.method.clone(),
+        uri: req.uri.clone(),
+        headers: req.headers.clone(),
+        peer: None,
+        tls_terminated: false,
+    }
+    .host()
 }
 
 /// Keepalive on every upstream connection, so a backend that vanishes without
@@ -268,46 +116,6 @@ fn http_peer(selected: crate::request_control::Peer) -> HttpPeer {
     peer
 }
 
-/// The key authorization to serve for `path`, if it names an outstanding
-/// HTTP-01 challenge.
-///
-/// `None` for anything else — including a challenge-shaped path whose token is
-/// unknown — so this can only ever intercept a request when a challenge for that
-/// exact token is genuinely in flight. Everything else falls through to routing.
-fn acme_challenge_response(challenges: &ChallengeTable, path: &str) -> Option<String> {
-    challenges.get(path.strip_prefix(ACME_CHALLENGE_PREFIX)?)
-}
-
-fn matched_strip_prefix(
-    deployment: &Deployment,
-    host: Option<&str>,
-    path: &str,
-) -> Option<String> {
-    deployment
-        .spec
-        .routes
-        .iter()
-        .filter(|route| route.strip_prefix && route.matches(host, path))
-        .max_by_key(|route| route.specificity())
-        .and_then(|route| route.path_prefix.clone())
-}
-
-fn strip_uri_prefix(uri: &http::Uri, prefix: &str) -> String {
-    let suffix = uri.path().strip_prefix(prefix).unwrap_or(uri.path());
-    let mut rewritten = if suffix.is_empty() {
-        "/".to_string()
-    } else if suffix.starts_with('/') {
-        suffix.to_string()
-    } else {
-        format!("/{suffix}")
-    };
-    if let Some(query) = uri.query() {
-        rewritten.push('?');
-        rewritten.push_str(query);
-    }
-    rewritten
-}
-
 async fn write_plain(session: &mut Session, code: u16, message: &str) -> Result<()> {
     let mut header = ResponseHeader::build(code, Some(2))?;
     header.insert_header(http::header::CONTENT_LENGTH, message.len().to_string())?;
@@ -323,63 +131,26 @@ async fn write_plain(session: &mut Session, code: u16, message: &str) -> Result<
         .await
 }
 
-fn maintenance_response(deployment: &Deployment) -> Option<(u16, &'static str)> {
-    deployment
-        .spec
-        .maintenance
-        .then_some((503, "deployment is under maintenance\n"))
+async fn write_control_response(
+    session: &mut Session,
+    response: crate::request_control::ResponseData,
+) -> Result<()> {
+    let mut header = ResponseHeader::build(response.status, Some(8))?;
+    header.insert_header(http::header::CONTENT_LENGTH, response.body.len().to_string())?;
+    header.insert_header(http::header::CONTENT_TYPE, response.content_type)?;
+    if let Some(cache) = response.cache_control {
+        header.insert_header(http::header::CACHE_CONTROL, cache)?;
+    }
+    for (name, value) in response.headers {
+        header.append_header(name, value)?;
+    }
+    session.write_response_header(Box::new(header), false).await?;
+    session.write_response_body(Some(bytes::Bytes::from(response.body)), true).await
 }
 
 /// The newest events an exposed or admin-served feed returns. Half the ring:
 /// a reader wants "recent", and the full ring is the debugging view.
-pub const FEED_PAGE: usize = 100;
-
-/// Write an RSS document. The one non-plain response the proxy authors itself.
-pub async fn write_rss(session: &mut Session, doc: &str) -> Result<()> {
-    let mut header = ResponseHeader::build(200, Some(3))?;
-    header.insert_header(http::header::CONTENT_LENGTH, doc.len().to_string())?;
-    header.insert_header(http::header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")?;
-    // Feed readers poll on their own schedule; a shared cache re-serving a
-    // stale feed for a few minutes is fine and keeps a popular feed cheap.
-    header.insert_header(http::header::CACHE_CONTROL, "public, max-age=300")?;
-    session
-        .write_response_header(Box::new(header), false)
-        .await?;
-    session
-        .write_response_body(Some(bytes::Bytes::copy_from_slice(doc.as_bytes())), true)
-        .await
-}
-
-/// Write a response the sign-in gate decided on: a redirect to the provider, the
-/// end of a callback, or a refusal.
-async fn write_gate_response(session: &mut Session, r: crate::auth::Response) -> Result<()> {
-    let mut header = ResponseHeader::build(r.status, Some(6))?;
-    header.insert_header(http::header::CONTENT_LENGTH, r.body.len().to_string())?;
-    header.insert_header(http::header::CONTENT_TYPE, r.content_type)?;
-    if let Some(location) = &r.location {
-        header.insert_header(http::header::LOCATION, location)?;
-    }
-    // Nothing in the sign-in flow may be cached: a stored redirect would replay
-    // a spent authorization code, and a stored 403 would outlive the allow-list
-    // change that fixes it.
-    header.insert_header(http::header::CACHE_CONTROL, "no-store")?;
-    header.insert_header("X-Frame-Options", "DENY")?;
-    header.insert_header("Referrer-Policy", "same-origin")?;
-    for cookie in &r.cookies {
-        // Appended, not inserted: a callback sets the session cookie *and*
-        // clears the flow cookie, and one `Set-Cookie` cannot carry both.
-        header.append_header(http::header::SET_COOKIE, cookie)?;
-    }
-    session
-        .write_response_header(Box::new(header), false)
-        .await?;
-    session
-        .write_response_body(
-            Some(bytes::Bytes::copy_from_slice(r.body.as_bytes())),
-            true,
-        )
-        .await
-}
+pub use crate::request_control::FEED_PAGE;
 
 /// Answer a request routed to a `site` deployment, out of its directory.
 ///
@@ -521,81 +292,6 @@ async fn serve_site(session: &mut Session, spec: &crate::config::SiteSpec, path:
     Ok(())
 }
 
-/// Collect what the gate needs out of the live request.
-fn request_info<'a>(
-    session: &'a Session,
-    host: &'a str,
-    path: &'a str,
-    secure: bool,
-    fronts_admin_api: bool,
-) -> RequestInfo<'a> {
-    let req = session.req_header();
-    let cookies = req
-        .headers
-        .get_all(http::header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .map(str::to_string)
-        .collect();
-    // A browser navigating asks for HTML; an API client asks for JSON or says
-    // nothing. The difference decides whether an unauthenticated request is
-    // redirected or refused with a 401 it can act on.
-    let wants_html = req
-        .headers
-        .get(http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|a| a.contains("text/html"));
-
-    // The credential an app-token gate looks for. Read here rather than in
-    // `auth.rs` so the gate stays a pure function of a plain struct.
-    let bearer = req
-        .headers
-        .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-
-    RequestInfo {
-        host,
-        path,
-        query: req.uri.query(),
-        cookies,
-        secure,
-        wants_html,
-        fronts_admin_api,
-        bearer,
-        // The socket peer, for the SIEM's per-source sign-in rules. Never an
-        // `X-Forwarded-For`: keying a detector on a client-supplied header is an
-        // alert-spoofing primitive on an unauthenticated path.
-        client: session
-            .client_addr()
-            .and_then(|addr| addr.as_inet().map(|inet| inet.ip())),
-    }
-}
-
-/// Whether the client reached app-lb over TLS.
-///
-/// The TLS digest is the truth for a connection app-lb terminated itself.
-/// `x-forwarded-proto` is consulted only as a fallback, for a deployment behind
-/// something that already terminated TLS — it is a client-settable header, and
-/// the cost of believing a false one is a `Secure` cookie the browser then
-/// refuses to send back, not a leaked session.
-fn is_secure_request(session: &Session) -> bool {
-    if session
-        .digest()
-        .is_some_and(|d| d.ssl_digest.is_some())
-    {
-        return true;
-    }
-    session
-        .req_header()
-        .headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|p| p.eq_ignore_ascii_case("https"))
-}
-
 #[async_trait]
 impl ProxyHttp for LbProxy {
     type CTX = Ctx;
@@ -611,243 +307,46 @@ impl ProxyHttp for LbProxy {
         // whole time app-lb held the request, cold-start wait included.
         ctx.started_at = Some(Instant::now());
 
-        let (host, path) = {
-            let req = session.req_header();
-            (request_host(req), req.uri.path().to_string())
+        let req = session.req_header();
+        let head = crate::request_control::RequestHead {
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            headers: req.headers.clone(),
+            peer: session.client_addr().and_then(|a| a.as_inet().map(|a| *a)),
+            tls_terminated: session.digest().is_some_and(|d| d.ssl_digest.is_some()),
         };
-
-        // ACME HTTP-01 validation, answered before routing on purpose. The CA
-        // sends an arbitrary `Host` and the hostname being certified often has
-        // no matching deployment yet, so routing this would 404 and fail the
-        // order. An unknown token falls through to normal routing, so this
-        // cannot shadow a real route unless a challenge is genuinely
-        // outstanding for that exact token.
-        if let Some(key_authorization) = acme_challenge_response(&self.challenges, &path) {
-            tracing::debug!(%path, "answering ACME http-01 challenge");
-            write_plain(session, 200, &key_authorization).await?;
-            return Ok(true);
+        let mut decision = self.control.decide(&head, &mut ctx.request).await;
+        if matches!(decision, crate::request_control::RequestDecision::ReadLoginBody) {
+            let mut body = Vec::new();
+            while let Some(chunk) = session.read_request_body().await? {
+                if body.len() + chunk.len() > crate::request_control::MAX_LOGIN_BODY {
+                    body.resize(crate::request_control::MAX_LOGIN_BODY + 1, 0);
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            decision = self.control.continue_login(&mut ctx.request, &body).await;
         }
-
-        // Routed before the guard runs, purely so a rule can name a deployment:
-        // `registry.route` is a lock-free read of an `ArcSwap`, so this costs a
-        // blocked request nothing worth measuring, and without it a
-        // deployment-scoped rule could never match.
-        let routed = self.registry.route(host.as_deref(), &path);
-
-        // Enforcement. Deliberately *after* the ACME block above: a rule must
-        // not be able to break certificate renewal, and answering the challenge
-        // first is a carve-out that needs no special case of its own. An unknown
-        // challenge token falls through to here like anything else.
-        if let Some(refusal) = self.enforce(session, &host, &path, routed.as_ref()) {
-            // Attributed to the deployment it was aimed at, so a wall of blocks
-            // shows up in that deployment's numbers rather than nowhere.
-            if let Some(deployment) = routed { ctx.request.set_deployment(deployment); }
-            write_plain(session, 403, &refusal).await?;
-            return Ok(true);
-        }
-
-        let Some(mut deployment) = routed else {
-            tracing::debug!(?host, %path, "no deployment matches request");
-            write_plain(session, 404, "no deployment matches this request\n").await?;
-            return Ok(true); // response already written; stop proxying
-        };
-
-        // A staged regional runtime is invisible to ordinary public requests.
-        // Peer/probe headers merely nominate it; the regional admission below
-        // still authenticates the complete signed peer header set before any
-        // backend is selected or contacted.
-        let nominates_regional = crate::gateway::HEADERS.iter().chain([
+        // Pingora tracks header names separately; preserve its bookkeeping in
+        // this transport adapter even though authority evaluated owned headers.
+        for name in crate::gateway::HEADERS.into_iter().chain([
             crate::regional::GENERATION, crate::regional::ENVIRONMENT,
             crate::regional::PROBE, crate::regional::ACTIVE_PROBE,
-        ].iter()).any(|name| session.req_header().headers.contains_key(*name));
-        if nominates_regional
-            && let Some(staged) = self.registry.staged(&deployment.spec.id)
-        {
-            deployment = staged;
-        }
-
-        if session.req_header().headers.contains_key(crate::regional::PROBE)
-            || session.req_header().headers.contains_key(crate::regional::ACTIVE_PROBE) {
-            let result = if deployment.spec.maintenance { Err(503) }
-            else if let (Some(router),Some(discovery)) = (&deployment.regional,&deployment.spec.discovery) {
-                if session.req_header().headers.contains_key(crate::regional::ACTIVE_PROBE) {
-                    router.active_probe_local(discovery.regional.as_ref().unwrap(),&discovery.service_id,
-                        discovery.region.as_deref().unwrap(),&session.req_header().headers,&session.req_header().method,
-                        &session.req_header().uri,host.as_deref().unwrap_or(""),&deployment.spec.health,&self.secrets).await
-                        .map(|receipt| serde_json::to_string(&receipt).expect("active probe receipt serializes"))
-                } else {
-                    router.probe_local(discovery.regional.as_ref().unwrap(),&discovery.service_id,
-                        discovery.region.as_deref().unwrap(),&session.req_header().headers,&session.req_header().method,
-                        &session.req_header().uri,host.as_deref().unwrap_or(""),&deployment.spec.health,&self.secrets).await
-                        .map(|receipt| serde_json::to_string(&receipt).expect("probe receipt serializes"))
-                }
-            } else { Err(403) };
-            for name in crate::gateway::HEADERS.into_iter().chain([crate::regional::GENERATION,crate::regional::ENVIRONMENT,
-                crate::regional::PROBE,crate::regional::ACTIVE_PROBE]) {
-                session.req_header_mut().remove_header(name);
-            }
-            ctx.request.set_deployment(deployment);
-            match result {
-                Ok(receipt) => write_plain(session,200,&receipt).await?,
-                Err(status) => write_plain(session,status,"candidate probe refused or unhealthy\n").await?,
-            }
-            return Ok(true);
-        }
-
-        let admission = ctx.request.admit(
-            &deployment,
-            &session.req_header().headers,
-            &self.secrets,
-        );
-        // Pingora tracks header names separately; raw HeaderMap mutation
-        // breaks that bookkeeping when serializing the upstream request.
-        for name in crate::gateway::HEADERS.into_iter().chain([crate::regional::GENERATION, crate::regional::ENVIRONMENT]) {
+        ]) {
             session.req_header_mut().remove_header(name);
         }
-        match admission {
-            Ok(token) => ctx.gateway_token = token,
-            Err(status) => {
-                ctx.request.set_deployment(deployment);
-                write_plain(session, status, "gateway admission refused\n").await?;
+        match decision {
+            crate::request_control::RequestDecision::Respond(response) => {
+                write_control_response(session, response).await?;
                 return Ok(true);
             }
-        }
-
-        // Maintenance is a deployment data-plane fence, not an admin outage.
-        // Keep the route present and answer 503 so retrying clients wait while
-        // operators continue to use the separate admin listener (including
-        // exec). Do this before auth and backend selection: maintenance must
-        // neither turn into a terminal 401/403 nor wake a scaled-to-zero VM.
-        if let Some((status, message)) = maintenance_response(&deployment) {
-            ctx.request.set_deployment(deployment);
-            write_plain(session, status, message).await?;
-            return Ok(true);
-        }
-
-        ctx.route_prefix = matched_strip_prefix(&deployment, host.as_deref(), &path);
-
-        // The sign-in gate, for the deployments that declare one. It runs after
-        // routing (the gate is the deployment's own configuration) and before
-        // anything touches a backend — including the cold-start wait, so an
-        // unauthenticated request never boots a VM.
-        if let Some(gate) = deployment.spec.auth.clone() {
-            // Inherit the identity half from a namespace provider if this gate
-            // names one. Resolution is live — read on every request, so an edit
-            // to the provider reaches here at once — and fails *closed*: a gate
-            // whose provider no longer resolves refuses the request rather than
-            // serving the deployment ungated.
-            let gate = match self.resolve_gate(gate, &deployment.spec.namespace) {
-                Ok(g) => g,
-                Err(msg) => {
-                    tracing::warn!(
-                        deployment = %deployment.spec.id,
-                        namespace = %deployment.spec.namespace,
-                        "auth gate references an unresolvable provider; refusing the request",
-                    );
-                    write_plain(session, 500, &msg).await?;
-                    ctx.request.set_deployment(deployment);
-                    return Ok(true);
-                }
-            };
-
-            // A gate needs a hostname to build its callback URL against; a
-            // request routed purely by path prefix with no Host header cannot
-            // complete a sign-in, and saying so beats redirecting to a URL the
-            // provider will refuse.
-            let Some(host) = host.as_deref() else {
-                write_plain(
-                    session,
-                    400,
-                    "this deployment requires sign-in, which needs a Host header\n",
-                )
-                .await?;
-                ctx.request.set_deployment(deployment);
+            crate::request_control::RequestDecision::ServeSite { spec, path } => {
+                serve_site(session, &spec, &path).await?;
                 return Ok(true);
-            };
-
-            let secure = is_secure_request(session);
-            // Consume credentials only on the gate-owned login endpoint, never
-            // on an application request. Bound the body before buffering it.
-            let login_post = path == gate.login_path()
-                && session.req_header().method == http::Method::POST
-                && gate.jwt_policy().is_some_and(|p| p.login_endpoint.is_some());
-            let mut login_body = Vec::new();
-            if login_post {
-                while let Some(chunk) = session.read_request_body().await? {
-                    if login_body.len() + chunk.len() > 8192 {
-                        write_plain(session, 413, "sign-in request is too large\n").await?;
-                        ctx.request.set_deployment(deployment);
-                        return Ok(true);
-                    }
-                    login_body.extend_from_slice(&chunk);
-                }
             }
-            // Origin checks and logout redirects need the browser's authority,
-            // including a non-default port; routing intentionally strips it.
-            let auth_host = if gate.jwt_policy().is_some_and(|p| p.login_endpoint.is_some()) {
-                session.req_header().uri.authority().map(|a| a.as_str())
-                    .or_else(|| session.req_header().headers.get(http::header::HOST).and_then(|v| v.to_str().ok()))
-                    .unwrap_or(host)
-            } else {
-                host
-            };
-            let info = request_info(
-                session,
-                auth_host,
-                &path,
-                secure,
-                self.auth.fronts_admin_api(&deployment.spec),
-            );
-            let decision = if login_post {
-                let request_origin = session.req_header().headers.get("origin").and_then(|v| v.to_str().ok());
-                Decision::Answered(self.auth.heyo_login_submit(&gate, &deployment.spec.id, &info, request_origin, &login_body).await)
-            } else {
-                self.auth.decide(&gate, &deployment.spec.id, &deployment.spec.namespace, &info).await
-            };
-            match decision {
-                Decision::Allow(identity) => ctx.identity = *identity,
-                Decision::Answered(response) => {
-                    write_gate_response(session, response).await?;
-                    // Recorded against the deployment: a wall of 302s or 403s
-                    // here is exactly the symptom of a misconfigured gate, and
-                    // it should show up in its metrics.
-                    ctx.request.set_deployment(deployment);
-                    return Ok(true);
-                }
-            }
+            crate::request_control::RequestDecision::Proxy => return Ok(false),
+            crate::request_control::RequestDecision::ReadLoginBody => unreachable!("login continuation returns a terminal decision"),
         }
-
-        // A deployment that carries `feed.expose` serves its namespace's feed
-        // at that path — the only door from the data plane to a feed. After the
-        // gate on purpose, like the site branch below: a gated deployment
-        // exposes its feed exactly as far as its gate admits, and an ungated
-        // one has decided the feed is public.
-        if let Some(expose) = deployment.spec.feed.as_ref().and_then(|f| f.expose.as_deref())
-            && path == expose
-        {
-            let link = match &host {
-                Some(h) if is_secure_request(session) => format!("https://{h}{path}"),
-                Some(h) => format!("http://{h}{path}"),
-                None => path.clone(),
-            };
-            let events = self.feed.recent(&deployment.spec.namespace, FEED_PAGE);
-            let doc = crate::feed::rss(&deployment.spec.namespace, &link, &events);
-            ctx.request.set_deployment(deployment);
-            write_rss(session, &doc).await?;
-            return Ok(true);
-        }
-
-        // A site has no backend to pick: app-lb answers it here, off disk. This
-        // sits after the gate on purpose — a private site is private, and files
-        // must not be readable by anyone who skips sign-in.
-        if let Some(site) = deployment.spec.site.clone() {
-            ctx.request.set_deployment(deployment);
-            serve_site(session, &site, &path).await?;
-            return Ok(true);
-        }
-
-        ctx.request.set_deployment(deployment);
-        Ok(false)
     }
 
     /// Attach the caller's identity for a gated deployment — and strip the same
@@ -858,83 +357,20 @@ impl ProxyHttp for LbProxy {
         upstream: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        if let Some(assignment) = ctx.request.regional_assignment() {
-            if let Some((spec, token, environment)) = &assignment.forward {
-                let mut headers = http::HeaderMap::new();
-                crate::gateway::write_forward_headers(&mut headers, spec, token)
-                    .map_err(|_| Error::explain(ErrorType::InternalError, "invalid regional headers"))?;
-                for (name, value) in &headers { upstream.insert_header(name, value)?; }
-                upstream.insert_header(crate::regional::GENERATION, assignment.generation.to_string())?;
-                upstream.insert_header(crate::regional::ENVIRONMENT, environment)?;
-            }
-        }
-        if let (Some(spec), Some(token)) = (
-            ctx.request.deployment().and_then(|d| d.spec.gateway.as_ref()),
-            ctx.gateway_token.as_deref(),
-        ) {
-            let mut headers = http::HeaderMap::new();
-            crate::gateway::write_forward_headers(&mut headers, spec, token)
-                .map_err(|_| Error::explain(ErrorType::InternalError, "invalid gateway headers"))?;
-            for (name, value) in &headers {
-                upstream.insert_header(name, value)?;
-            }
-        }
-        if let Some(prefix) = ctx.route_prefix.as_deref() {
-            let rewritten = strip_uri_prefix(&upstream.uri, prefix);
-            let mut parts = upstream.uri.clone().into_parts();
-            parts.path_and_query = Some(rewritten.parse().map_err(|error| {
-                Error::explain(
-                    ErrorType::InternalError,
-                    format!("failed to rewrite upstream path: {error}"),
-                )
-            })?);
-            upstream.set_uri(http::Uri::from_parts(parts).map_err(|error| {
-                Error::explain(
-                    ErrorType::InternalError,
-                    format!("failed to build rewritten upstream URI: {error}"),
-                )
-            })?);
-        }
-
-        let Some(gate) = ctx.request.deployment().and_then(|d| d.spec.auth.as_ref()) else {
-            return Ok(());
-        };
-        // Unconditional, before anything is set: on a gated deployment these
-        // header names belong to app-lb, and an inbound one is either a mistake
-        // or an attempt to impersonate a signed-in user.
-        for name in crate::auth::IDENTITY_HEADERS {
-            upstream.remove_header(name);
-        }
-
-        // The session's own credential, when the gate minted one. Separate from
-        // `forward_identity`, and deliberately: that switch says whether the
-        // upstream is told *who* this is, while this says whether it is handed
-        // something it can verify. An API that authenticates for itself needs
-        // the second and may not care about the first.
-        //
-        // Replaces whatever the client sent rather than deferring to it. By the
-        // time a session admits a request, `decide` has already tried and
-        // rejected any bearer in the hand — so anything still in the header is
-        // a credential app-lb declined, and forwarding that instead would be
-        // handing the upstream a rejected one.
-        if let Some(token) = ctx.identity.as_ref().and_then(|i| i.session_token.as_deref()) {
-            upstream.insert_header(http::header::AUTHORIZATION, format!("Bearer {token}"))?;
-        }
-
-        if let (true, Some(identity)) = (gate.forward_identity, ctx.identity.as_ref()) {
-            upstream.insert_header("x-auth-request-user", crate::auth::header_safe(&identity.subject))?;
-            // Omitted rather than sent empty. A Google identity always has an
-            // address; a JWT one may not — a token issued to a service has no
-            // person behind it — and `x-auth-request-email: ` upstream reads as
-            // "signed in as nobody" rather than as "not applicable".
-            let email = crate::auth::header_safe(&identity.email);
-            if !email.is_empty() {
-                upstream.insert_header("x-auth-request-email", email)?;
-            }
-            if let Some(name) = &identity.name {
-                let name = crate::auth::header_safe(name);
-                if !name.is_empty() {
-                    upstream.insert_header("x-auth-request-name", name)?;
+        for modification in ctx.request.forwarding_modifications(&upstream.uri).map_err(|error| {
+            Error::explain(ErrorType::InternalError, error)
+        })? {
+            match modification {
+                crate::request_control::HeaderModification::Remove(name) => {
+                    upstream.remove_header(&name);
+                }
+                crate::request_control::HeaderModification::Set(name, value) => {
+                    upstream.insert_header(name, value)?;
+                }
+                crate::request_control::HeaderModification::RewriteUri(rewritten) => {
+                    let mut parts = upstream.uri.clone().into_parts();
+                    parts.path_and_query = Some(rewritten.parse().map_err(|error| Error::explain(ErrorType::InternalError, format!("failed to rewrite upstream path: {error}")))?);
+                    upstream.set_uri(http::Uri::from_parts(parts).map_err(|error| Error::explain(ErrorType::InternalError, format!("failed to build rewritten upstream URI: {error}")))?);
                 }
             }
         }
@@ -946,7 +382,7 @@ impl ProxyHttp for LbProxy {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let selected = ctx.request.next_peer(&self.registry, &self.metrics, &self.feed)
+        let selected = self.control.next_peer(&mut ctx.request)
             .await
             .map_err(|error| Error::explain(
                 match error.kind {
@@ -1099,64 +535,6 @@ mod tests {
     use crate::config::Driver;
 
     #[test]
-    fn acme_challenge_answers_only_outstanding_tokens() {
-        let challenges = ChallengeTable::new();
-        challenges.publish("live-token".into(), "live-token.thumbprint".into());
-
-        assert_eq!(
-            acme_challenge_response(&challenges, "/.well-known/acme-challenge/live-token")
-                .as_deref(),
-            Some("live-token.thumbprint"),
-        );
-
-        // An unknown token must fall through to routing rather than 404 from
-        // here — otherwise the branch would shadow a real route.
-        assert_eq!(
-            acme_challenge_response(&challenges, "/.well-known/acme-challenge/stale-token"),
-            None,
-        );
-        assert_eq!(acme_challenge_response(&challenges, "/.well-known/acme-challenge/"), None);
-        assert_eq!(acme_challenge_response(&challenges, "/live-token"), None);
-        assert_eq!(acme_challenge_response(&challenges, "/"), None);
-    }
-
-    #[test]
-    fn acme_challenge_is_inert_when_acme_is_disabled() {
-        // The table is empty whenever ACME is off, so no request can be
-        // intercepted — the branch costs one map lookup and nothing else.
-        let challenges = ChallengeTable::new();
-        assert_eq!(
-            acme_challenge_response(&challenges, "/.well-known/acme-challenge/anything"),
-            None,
-        );
-    }
-
-    fn header(host: Option<&str>, path: &str) -> RequestHeader {
-        let mut h = RequestHeader::build("GET", path.as_bytes(), None).unwrap();
-        if let Some(v) = host {
-            h.insert_header("host", v).unwrap();
-        }
-        h
-    }
-
-    #[test]
-    fn host_header_is_lowercased_and_port_stripped() {
-        assert_eq!(
-            request_host(&header(Some("Demo.Local:6188"), "/")).as_deref(),
-            Some("demo.local")
-        );
-        assert_eq!(
-            request_host(&header(Some("demo.local"), "/")).as_deref(),
-            Some("demo.local")
-        );
-    }
-
-    #[test]
-    fn missing_host_is_none() {
-        assert_eq!(request_host(&header(None, "/")), None);
-    }
-
-    #[test]
     fn https_backend_builds_a_tls_peer_with_url_hostname_as_sni() {
         let backend = VmBackend::for_upstream("https://ci.eu1.heyo.work:443".into());
         let peer = http_peer(crate::request_control::Peer {
@@ -1189,50 +567,6 @@ mod tests {
             !ka.user_timeout.is_zero(),
             "unacknowledged writes to a dead VM must time out too"
         );
-    }
-
-    #[test]
-    fn ipv6_literal_host_survives_port_stripping() {
-        assert_eq!(
-            request_host(&header(Some("[::1]:8080"), "/")).as_deref(),
-            Some("[::1]")
-        );
-    }
-
-    /// HTTP/2 sends no Host header — the h2 crate parses `:authority` into the
-    /// URI's authority, which is what pingora hands us. Without this branch, all
-    /// h2 traffic would fail to route.
-    #[test]
-    fn authority_is_used_when_present() {
-        let mut h = RequestHeader::build("GET", b"/x", None).unwrap();
-        h.set_uri("http://demo.local:6188/x".parse().unwrap());
-        assert_eq!(request_host(&h).as_deref(), Some("demo.local"));
-    }
-
-    /// An h2 request with both: `:authority` is authoritative per RFC 9113.
-    #[test]
-    fn authority_wins_over_a_conflicting_host_header() {
-        let mut h = header(Some("stale.local"), "/x");
-        h.set_uri("http://demo.local/x".parse().unwrap());
-        assert_eq!(request_host(&h).as_deref(), Some("demo.local"));
-    }
-
-    #[test]
-    fn userinfo_is_stripped_from_authority() {
-        let mut h = RequestHeader::build("GET", b"/x", None).unwrap();
-        h.set_uri("http://user:pass@demo.local:6188/x".parse().unwrap());
-        assert_eq!(request_host(&h).as_deref(), Some("demo.local"));
-    }
-
-    #[test]
-    fn route_prefix_rewrite_preserves_root_and_query() {
-        let prefixed: http::Uri = "/heyosecret/v1/read?path=a%2Fb".parse().unwrap();
-        assert_eq!(
-            strip_uri_prefix(&prefixed, "/heyosecret"),
-            "/v1/read?path=a%2Fb"
-        );
-        let root: http::Uri = "/heyosecret".parse().unwrap();
-        assert_eq!(strip_uri_prefix(&root, "/heyosecret"), "/");
     }
 
     fn deployment(scaling: ScalingPolicy) -> Arc<Deployment> {
@@ -1286,19 +620,6 @@ mod tests {
 
     fn backend(addr: &str) -> Arc<VmBackend> {
         Arc::new(VmBackend::new("sb-1".into(), addr.parse().unwrap()))
-    }
-
-    #[test]
-    fn maintenance_fence_is_retryable_and_does_not_remove_the_deployment() {
-        let d = deployment(ScalingPolicy::default());
-        assert_eq!(maintenance_response(&d), None);
-        let mut spec = d.spec.clone();
-        spec.maintenance = true;
-        let fenced = Deployment::new(spec);
-        assert_eq!(
-            maintenance_response(&fenced),
-            Some((503, "deployment is under maintenance\n")),
-        );
     }
 
     #[tokio::test]
