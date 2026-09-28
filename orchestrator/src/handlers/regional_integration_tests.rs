@@ -145,13 +145,19 @@ async fn two_real_gateways_scenario() -> Result<()> {
     let cloud_creates = create_count.clone();
     let archive_drift = Arc::new(AtomicUsize::new(0));
     let drift_on_download = archive_drift.clone();
-    let control = Router::new().route("/snapshot", get(|State(db): State<sea_orm::DatabaseConnection>, headers: HeaderMap,
-        Query(query): Query<service_discovery::DiscoveryQuery>| async move {
+    let discovery_unavailable = Arc::new(AtomicUsize::new(0));
+    let discovery_failure = discovery_unavailable.clone();
+    let control = Router::new().route("/snapshot", get(move |State(db): State<sea_orm::DatabaseConnection>, headers: HeaderMap,
+        Query(query): Query<service_discovery::DiscoveryQuery>| {
+        let discovery_failure = discovery_failure.clone();
+        async move {
         if headers.get("authorization").is_none_or(|v| v != "Bearer discovery-test") { return (StatusCode::UNAUTHORIZED, Json(json!({}))); }
+        if discovery_failure.load(Ordering::SeqCst) != 0 { return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({}))); }
         match service_discovery::read_regional_snapshot(&db, "smoke", query.region.as_deref().unwrap_or(""),
             query.gateway_id.as_deref().unwrap_or(""), query.boot_id.as_deref().unwrap_or("")).await {
             Ok(snapshot) => (StatusCode::OK, Json(snapshot)),
             Err(_) => (StatusCode::CONFLICT, Json(json!({"error":"unpublished or unpinned"}))),
+        }
         }
     })).route("/v1/secrets/read", post(move |headers: HeaderMap| {
         let token = secret_token.clone();
@@ -379,6 +385,32 @@ async fn two_real_gateways_scenario() -> Result<()> {
     assert_eq!(snapshot["closedThroughGeneration"],2);
     assert_eq!(snapshot["activeGeneration"],2);
     assert!(regional_reports::ready(&db,"smoke","withdraw-eu",2,regional_reports::Gate::AdmissionDrained).await?);
+    // Keep the authenticated admin endpoints reachable while discovery fails.
+    // Fresh polling must not turn an expired routing snapshot into permission
+    // for maintenance, even when every request counter is zero.
+    discovery_unavailable.store(1,Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    super::regional_observers::observe_policy(&state,&db,"smoke","withdraw-eu",2,&participants).await?;
+    for gate in [regional_reports::Gate::Prepared,regional_reports::Gate::Adopted,
+        regional_reports::Gate::AssignmentsDrained,regional_reports::Gate::AdmissionDrained] {
+        assert!(!regional_reports::ready(&db,"smoke","withdraw-eu",2,gate).await?,
+            "fresh admin responses must not attest stale discovery");
+    }
+    for port in &proxy_ports {
+        assert_eq!(request(*port,"/authority-unavailable").send().await?.error_for_status()?.text().await?,"us3:fixture-v1");
+    }
+    assert_eq!(eu_admissions.load(Ordering::SeqCst),admissions);
+    discovery_unavailable.store(0,Ordering::SeqCst);
+    let mut renewed = false;
+    for _ in 0..100 {
+        super::regional_observers::observe_policy(&state,&db,"smoke","withdraw-eu",2,&participants).await?;
+        if regional_reports::ready(&db,"smoke","withdraw-eu",2,regional_reports::Gate::AdmissionDrained).await? {
+            renewed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(renewed,"valid discovery must renew evidence without another withdrawal");
     // The new candidate is deliberately unknown/draining in discovery and
     // distinct from the healthy retained replica. Probe it through real HTTPS
     // gateways, never through a controller-to-VM health request.

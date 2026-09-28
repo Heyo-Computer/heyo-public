@@ -137,6 +137,12 @@ boot/operation envelope and sequenced preparation/adoption/drain report, with
 preparation evidence. A changed runtime identity fences its predecessor rather than
 resetting the predecessor's outstanding counters.
 
+After 30 seconds without an accepted discovery snapshot, reports also set
+`prepared=false`, blocking every Orchestrator policy/drain gate. Polling the admin
+endpoint cannot renew that evidence. Last-valid routing and in-flight counters
+remain intact during the outage; an accepted current snapshot renews evidence,
+but an ignored older version does not.
+
 Even a cold gateway reports authenticated admission metadata: protocol, environment,
 host placement, namespace, routes and discovery authority, plus route conflicts,
 maintenance and credential readiness. This lets the controller pin a configured
