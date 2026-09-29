@@ -28,6 +28,7 @@
 #   index.json        { "store": …, "apps": { "<app>": "<latest>", … } }
 #   install-apps.sh   The installer, copied in so the site serving the
 #                     manifests also serves the script that reads them.
+#   bootstrap-host.sh The fleet host installer, which uses install-apps.sh.
 #
 # `kind` tells the installer what to do with the unpacked tarball:
 #
@@ -344,6 +345,7 @@ done
 } > "$TMP/index.json"
 mv "$TMP/index.json" "$STAGE/index.json"
 cp "$HERE/install-apps.sh" "$STAGE/install-apps.sh"
+cp "$HERE/bootstrap-host.sh" "$STAGE/bootstrap-host.sh"
 
 info "published:$published"
 
@@ -366,7 +368,7 @@ info "wrote $OUT"
 # with `strip_components: 1`.
 bundle="$TMP/releases.tar.gz"
 mkdir -p "$TMP/bundle/releases"
-cp "$OUT"/*.json "$OUT/install-apps.sh" "$TMP/bundle/releases/"
+cp "$OUT"/*.json "$OUT/install-apps.sh" "$OUT/bootstrap-host.sh" "$TMP/bundle/releases/"
 tar -czf "$bundle" -C "$TMP/bundle" releases
 bd="$(sha256sum "$bundle" | cut -d' ' -f1)"
 size="$(wc -c < "$bundle" | tr -d ' ')"
