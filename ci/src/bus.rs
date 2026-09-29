@@ -69,19 +69,9 @@ pub const ACK_WAIT: Duration = Duration::from_secs(60);
 /// far worse than releasing a dead job a minute late.
 pub const ACK_PROGRESS_EVERY: Duration = Duration::from_secs(20);
 
-/// Redelivery ladder, indexed by attempt and saturating at the last entry.
-///
-/// **The first entry must equal [`ACK_WAIT`]**, and that is not a style rule —
-/// nats-server *overrides* a consumer's `ack_wait` with `backoff[0]` whenever a
-/// ladder is set. The two are one setting wearing two names, and the server
-/// believes the ladder.
-///
-/// This ladder used to start at one second while `ack_wait` was configured as
-/// the whole job budget, so the configured value was silently discarded and
-/// every running job became eligible for redelivery a second after it started.
-/// With `max_deliver` at four, a healthy build could burn all four deliveries
-/// while doing nothing wrong — after which a dispatcher that died had no
-/// redelivery left to recover it at all.
+/// Application failure retry delays, sent as explicit delayed NAKs. Do not
+/// install this as broker BackOff: it overrides AckWait and older servers
+/// reject it with unlimited delivery. Drain handoffs use a separate short delay.
 const BACKOFF: [Duration; 3] = [
     ACK_WAIT,
     Duration::from_secs(5 * 60),
@@ -322,7 +312,8 @@ impl Bus {
             filter_subject: filter,
             ack_wait: ACK_WAIT,
             max_deliver: MAX_DELIVER,
-            backoff: BACKOFF.to_vec(),
+            // Explicit delayed NAKs carry application failure backoff. Older
+            // servers reject a broker BackOff list with unlimited delivery.
             ..Default::default()
         };
 
@@ -339,17 +330,17 @@ impl Bus {
             durable: durable.clone(),
             reason: e.to_string(),
         })?.config.clone();
-        if current.ack_wait == ACK_WAIT && current.max_deliver == MAX_DELIVER && current.backoff == BACKOFF {
+        if current.ack_wait == ACK_WAIT && current.max_deliver == MAX_DELIVER && current.backoff.is_empty() {
             return Ok(consumer);
         }
         tracing::info!("{durable}: updating acknowledgement timing and transport delivery limit in place");
         current.ack_wait = ACK_WAIT;
         current.max_deliver = MAX_DELIVER;
-        current.backoff = BACKOFF.to_vec();
+        current.backoff.clear();
         // Keep immutable consumer settings. Updating avoids resetting pending
         // acknowledgements or delivery counts while another region is working.
         stream
-            .update_consumer(current)
+            .create_consumer(current)
             .await
             .map_err(|e| BusError::Consumer {
                 durable: durable.clone(),
@@ -515,10 +506,7 @@ mod tests {
         format!("citest{}", crate::vm::new_id().replace('-', ""))
     }
 
-    /// nats-server overrides `ack_wait` with `backoff[0]` when a ladder is set,
-    /// so the two must agree or the configured window is silently discarded.
-    /// This is a compile-time guard on the pair; the server's behaviour itself
-    /// is pinned by `an_existing_consumer_is_updated_without_losing_pending_delivery`.
+    /// Keep the first application retry delay at the normal ACK timeout.
     #[test]
     fn the_first_backoff_step_is_the_ack_wait() {
         assert_eq!(
@@ -779,7 +767,7 @@ mod tests {
         let info = reconciled.info().await.unwrap();
         assert_eq!(info.config.ack_wait, ACK_WAIT);
         assert_eq!(info.config.max_deliver, -1);
-        assert_eq!(info.config.backoff, BACKOFF);
+        assert!(info.config.backoff.is_empty());
         assert_eq!(info.created, created, "must update rather than recreate");
         assert_eq!(info.num_ack_pending, 1);
         pending.double_ack().await.unwrap();
@@ -787,9 +775,11 @@ mod tests {
         // A correct AckWait alone must not hide an old finite delivery limit.
         let mut limited = reconciled.info().await.unwrap().config.clone();
         limited.max_deliver = 4;
-        stream.update_consumer(limited).await.unwrap();
+        limited.backoff = BACKOFF.to_vec();
+        stream.create_consumer(limited).await.unwrap();
         let mut updated = bus.consumer_for(&route).await.unwrap();
         assert_eq!(updated.info().await.unwrap().config.max_deliver, -1);
+        assert!(updated.info().await.unwrap().config.backoff.is_empty());
 
         // And binding again is a no-op rather than a delete/recreate cycle,
         // which would redeliver in-flight work on every reconnect.
