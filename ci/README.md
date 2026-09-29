@@ -122,6 +122,40 @@ that reaches another boot. Keep `/maintenance` out of app-lb `public_paths`.
 4. `POST /maintenance/{uuid}/resume` reopens this boot for the matching operation,
    unless platform retirement is pending. It cannot resume another operation.
 
+### Runner drain across regions
+
+Instance pause does not drain a server: the other CI instance can still place
+jobs there. To empty a Linux runner without interrupting its running jobs, use
+the authenticated admin API on either CI instance:
+
+- `POST /maintenance/runners/{runner-id}/{uuid}/pause` durably closes that
+  runner's job admission. Use the canonical runner ID, not its display name.
+- `GET /maintenance/runners/{runner-id}` reports running jobs, outstanding host
+  work, cleanup, and `drained`. Only an admission-closed runner with all three
+  counts zero is drained. This is CI job drain, not permission to stop unrelated
+  platform services or retire the CI app itself.
+- `POST /maintenance/runners/{runner-id}/{uuid}/resume` reopens admission for the
+  matching operation after recovery. It does not clear other host-upgrade fences.
+
+Both CI instances must run a version implementing runner drain before using it;
+an older executor does not check this admission state. Keep these routes behind
+the admin identity gate, outside app-lb `public_paths`.
+
+The shared database retains the drain across CI restarts. A runner-scoped lock
+serializes it with job claims; there is no system-wide gate. Jobs already claimed
+finish on their original server, including cleanup. Unclaimed jobs from new or
+existing runs select a healthy, non-draining runner in the same network. Ready
+dependent jobs do not wait for their entire run to finish on the drained server.
+Unpinned jobs prefer their run's most recently used eligible server; this is a
+preference, not a guarantee for simultaneous first jobs.
+
+Use unpinned jobs, or `fallback: any` for a preferred host, for regional movement.
+Movable jobs use the network's durable NATS queue. Strict host pins and named-VM
+jobs remain pinned rather than silently executing on a different machine.
+The queue carries job IDs; dependencies, outputs and ownership stay in the shared
+database. Cross-job files must be published to shared artifact storage and
+downloaded by the next job, not left on the previous job VM's disk.
+
 `ci --inspect-executor` lists registered process boots without starting workers.
 The old `--hold-executor-recovery` and `--transfer-executor-recovery` commands are
 retired and fail explicitly. No singleton transfer is needed after a restart.

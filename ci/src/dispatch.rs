@@ -1315,10 +1315,11 @@ impl Dispatcher {
         let pool = self.runners.snapshot();
         let placement = Self::place(&pool, plan)?;
 
-        // A resolved node is a pinned queue, whatever put it there — `uses:
-        // default`, an explicit node, or a named VM. Only "any host in this
-        // network" goes on the network's shared queue.
-        if let Some(node) = placement.node {
+        // Movable jobs use the shared queue even before a drain, so queued
+        // work does not become stranded when its preferred host goes away.
+        // Explicit VM targets can never move to a different host.
+        if let Some(node) = placement.node
+            && (plan.fallback != Fallback::Any || placement.vm.is_some()) {
             return Ok(Route::Runner(node.id.clone()));
         }
         if placement.network.network_id.is_empty() {
@@ -1353,7 +1354,7 @@ impl Dispatcher {
             .map_err(|e| DispatchError::StepFailed(e.to_string()))?
             || crate::host_heyvm_bootstrap_coordinator::owns_job(&self.store, &msg.job_id).await
             .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Ok(JobStatus::Running); }
-        let (runner, existing_vm) = self.pick_runner(&plan).await?;
+        let (runner, existing_vm) = self.pick_runner(&plan, &msg.run_id).await?;
 
         // The one place a job's failure and its runner are both in hand. A
         // transport-level failure means the cached iroh tunnel is dead — the
@@ -1604,7 +1605,7 @@ impl Dispatcher {
     /// `target`: the node and the VM are one decision, and reading the target
     /// twice is how the queue a job was routed to and the machine it runs on
     /// come to disagree.
-    async fn pick_runner(&self, plan: &JobPlan) -> Result<(String, Option<String>), DispatchError> {
+    async fn pick_runner(&self, plan: &JobPlan, run: &str) -> Result<(String, Option<String>), DispatchError> {
         let pool = self.runners.snapshot();
         let placement = Self::place(&pool, plan)?;
         // `place` only ever yields a VM alongside the node holding it, so this
@@ -1613,9 +1614,17 @@ impl Dispatcher {
 
         let driver = driver_name(plan.vm.driver);
 
-        if let Some(node) = placement.node {
-            if crate::host_maintenance::cordoned(&self.store, &node.id).await
-                .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Err(DispatchError::MaintenancePaused); }
+        let mut pinned = placement.node;
+        if let Some(node) = pinned {
+            let cordoned = crate::host_maintenance::cordoned(&self.store, &node.id).await
+                .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+            if (cordoned || !node.status.is_dispatchable()) && plan.fallback == Fallback::Any && vm.is_none() {
+                pinned = None;
+            } else if cordoned {
+                return Err(DispatchError::MaintenancePaused);
+            }
+        }
+        if let Some(node) = pinned {
             if !node.status.is_dispatchable() {
                 return Err(DispatchError::RunnerOffline {
                     runner: node.name.clone(),
@@ -1675,6 +1684,15 @@ impl Dispatcher {
                     skipped.push(format!("{} could not be reached", candidate.name));
                 }
             }
+        }
+        // Keep successive jobs together when possible, without binding an
+        // entire run to a server. Eligibility was checked above on every claim.
+        let previous: Option<String> = sqlx::query_scalar("SELECT runner_hd_id FROM ci_job WHERE run_id=$1 AND runner_hd_id IS NOT NULL ORDER BY started_at DESC NULLS LAST,id DESC LIMIT 1")
+            .bind(run).fetch_optional(self.store.pool()).await
+            .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+        if let Some(previous) = previous
+            && candidates.iter().any(|(id, _)| id == &previous) {
+            return Ok((previous, vm));
         }
         if let Some(runner) = roomiest_runner(candidates, required) {
             return Ok((runner, vm));
@@ -3890,10 +3908,10 @@ impl Dispatcher {
             // What the queue says, asked once per distinct route: the reaper
             // is batched, and one NATS round trip per job would turn a backlog
             // into a burst of them.
-            let route = placed.as_ref().map(|p| match p.node {
-                Some(node) => Route::Runner(node.id.clone()),
-                None => Route::Network(p.network.network_id.clone()),
-            });
+            let route = match &plan {
+                Some(plan) => self.route_for(plan).await.ok(),
+                None => None,
+            };
             let verdict = match &route {
                 None => QueueVerdict::Unknown,
                 Some(r) => {
@@ -7169,6 +7187,34 @@ jobs:
         let mut networks = d.runners.snapshot().networks.clone();
         networks[0].runners.push(crate::runners::Runner { id: "hd-other".into(), name: "other".into(), status: crate::runners::RunnerStatus::Online, last_seen_at: None });
         d.runners.set_test_pool(crate::runners::Pool { networks, default_network_id: "local".into(), default_node_id: "hd-local".into(), ..Default::default() });
+        // A dependent job is not tied to its predecessor's server. Choose the
+        // lexically later host first so this also distinguishes affinity from
+        // the equal-capacity tie breaker (which would choose hd-local).
+        let workflow = crate::workflow::Workflow::parse("drain.yml", "jobs:\n  build:\n    steps: [{run: echo build}]\n  test:\n    needs: [build]\n    steps: [{run: echo test}]\n").unwrap();
+        let plan = crate::plan::Plan::build(&workflow).unwrap();
+        let run = crate::vm::new_id();
+        d.store.create_run(&run, &crate::store::RunRequest::default(), &plan).await.unwrap();
+        let build = crate::store::job_id(&run, "build");
+        let test = crate::store::job_id(&run, "test");
+        assert!(d.store.claim_job(&build, "hd-other", 1).await.unwrap());
+        let test_plan = plan.jobs.iter().find(|p| p.key == "test").unwrap();
+        assert_eq!(d.pick_runner(test_plan, &run).await.unwrap().0, "hd-other");
+        let drain = uuid::Uuid::new_v4();
+        maintenance::runner_drain(&d.store, "hd-other", drain, true).await.unwrap();
+        d.advance_run(&run).await.unwrap();
+        assert_eq!(d.store.get_job(&test).await.unwrap().unwrap().status, "pending", "wait for build results");
+        d.store.set_job_outputs(&build, &json!({"artifact":"shared-build-digest"})).await.unwrap();
+        d.store.set_job_status(&build, JobStatus::Success, None).await.unwrap();
+        d.store.end_host_work(&build, "hd-other", 1).await.unwrap();
+        d.advance_run(&run).await.unwrap();
+        assert_eq!(d.store.get_job(&test).await.unwrap().unwrap().status, "queued");
+        assert_eq!(d.store.needs_context(&run).await.unwrap()["build"]["outputs"]["artifact"], "shared-build-digest");
+        assert_eq!(d.pick_runner(test_plan, &run).await.unwrap().0, "hd-local");
+        assert!(d.store.claim_job(&test, "hd-local", 1).await.unwrap());
+        assert_eq!(maintenance::runner_drain_status(&d.store, "hd-other").await.unwrap()["drained"], true);
+        d.store.set_job_status(&test, JobStatus::Success, None).await.unwrap();
+        d.store.end_host_work(&test, "hd-local", 1).await.unwrap();
+        maintenance::runner_drain(&d.store, "hd-other", drain, false).await.unwrap();
         for scenario in ["success", "failed", "identity", "cancel-before", "cancel-after", "deadline", "old-cloud"] {
             *remote.lock().unwrap() = Remote { status: "maintenance".into(), lost: true, ..Default::default() };
             let workflow = crate::workflow::Workflow::parse("maintenance.yml", "jobs:\n  upgrade:\n    steps: [{uses: ci/promote-service-archive}, {uses: ci/host-heyvm-maintenance}]\n  existing:\n    steps: [{run: echo existing}]\n  waiting:\n    steps: [{run: echo waiting}]\n  other:\n    steps: [{run: echo other}]\n").unwrap();
@@ -7226,8 +7272,11 @@ jobs:
             assert!(!d.store.claim_job(&other.id, "hd-local", 1).await.unwrap());
             assert!(d.store.claim_job(&other.id, "hd-other", 1).await.unwrap(), "another runner remains usable");
             let mut pinned = job_plan.clone(); pinned.target.node = Some("local".into());
-            assert!(matches!(d.pick_runner(&pinned).await, Err(DispatchError::MaintenancePaused)), "pinned placement must honor the fence");
-            assert_eq!(d.pick_runner(&job_plan).await.unwrap().0, "hd-other", "unpinned placement must choose the unfenced runner");
+            assert!(matches!(d.pick_runner(&pinned, &run).await, Err(DispatchError::MaintenancePaused)), "pinned placement must honor the fence");
+            assert_eq!(d.pick_runner(&job_plan, &run).await.unwrap().0, "hd-other", "unpinned placement must choose the unfenced runner");
+            pinned.fallback = Fallback::Any;
+            assert!(matches!(d.route_for(&pinned).await.unwrap(), Route::Network(_)));
+            assert_eq!(d.pick_runner(&pinned, &run).await.unwrap().0, "hd-other", "fallback jobs must leave a drained host");
             assert_eq!(d.run_job(&msg, 2).await.unwrap(), JobStatus::Running, "duplicate delivery must not reacquire a VM");
             maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
             assert!(remote.lock().unwrap().posts.is_empty());
