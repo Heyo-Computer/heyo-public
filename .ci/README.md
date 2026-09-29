@@ -14,9 +14,10 @@ to "did this commit pass"; every file here holds one job. See
 | `art.yml` | `release` | `art` | `art` — binary, `SHA256SUMS`, `BUILD-INFO` |
 | `queue.yml` | `release` | `queue` | `queue` — binary, `queue.conf`, an app-lb deployment template, `SHA256SUMS`, `BUILD-INFO` |
 | `pg-fc.yml` | `release` | `pg-vm-pool` | `pg-fc` — tested host binary, `SHA256SUMS`, `BUILD-INFO` |
+| `heyosecret.yml` | `release` | `heyosecret` | `heyosecret` — binary, `migrations/`, `heyosecret.conf`, `SHA256SUMS`, `BUILD-INFO` |
 
-The other six crates here (`artifacts`, `computer`, `heyosecret`,
-`heyosecret-client`, `orchestrator`, `printer`) have no workflow yet. Adding one
+The other crates here (`computer`, `heyosecret-client`, `orchestrator`,
+`printer`) have no release workflow yet. Adding one
 is the recipe at the bottom.
 
 Six crates pull `ui/ui.rs` in with `#[path]` and embed the stylesheet, the theme
@@ -71,6 +72,34 @@ warm VM.
 Put jobs in one file only when they genuinely answer one question *and* one
 would never be run without the other — a build and the test of that build,
 say. Independent binaries get independent files.
+
+## Public releases (no key)
+
+[`install-apps.sh`](install-apps.sh) installs any of app-lb, app-obs, ci, queue,
+art, heyosecret — and, from the private monorepo's workflows in the same store,
+cloud, auth, retail and heyvm — with **no credential**:
+
+```sh
+curl -fsSL https://get.us2.heyo.work/install-apps.sh | sh -s -- app-lb heyvm
+curl -fsSL https://get.us2.heyo.work/install-apps.sh | sh -s -- --list
+```
+
+It reads `<app>.json` manifests that [`publish-releases.sh`](publish-releases.sh)
+writes at release time (the key holder resolves each app's newest `ci-…` tag to
+a public blob digest once), then downloads `{store}/blobs/{digest}` anonymously
+and checks the digest and the build's `SHA256SUMS`. Publishing:
+
+```sh
+ART_API_KEY=… sh .ci/publish-releases.sh --all --from-url https://get.us2.heyo.work --push-tag releases-live
+heyctl pull releases
+```
+
+`--push-tag` uploads the manifests and the installer to the store as one public
+bundle; the `releases` site deployment on us2
+([`app-lb/examples/releases-site.json`](../app-lb/examples/releases-site.json))
+follows that tag. Anonymous downloads also need the store's gate to leave
+`/blobs/` public (`app-lb/examples/artifacts-gated.json`); the store itself still
+refuses anything but GET/HEAD of a blob marked public.
 
 ## Installing what these build
 

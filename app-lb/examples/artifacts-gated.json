@@ -37,7 +37,7 @@
     "public_paths": [
       { "path": "/healthz", "scope": "public" },
       { "path": "/__ui/", "scope": "public" },
-      { "path": "/blobs/", "scope": "admin" },
+      { "path": "/blobs/", "scope": "public" },
       { "path": "/manifests", "scope": "admin" },
       { "path": "/tags", "scope": "admin" },
       { "path": "/usage", "scope": "admin" }

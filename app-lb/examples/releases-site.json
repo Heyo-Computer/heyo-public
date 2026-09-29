@@ -1,0 +1,18 @@
+{
+  "id": "releases",
+  "routes": [
+    { "host": "get.us2.heyo.work" }
+  ],
+  "site": {
+    "root": "/var/lib/app-lb/sites/releases",
+    "index": "index.json",
+    "spa": false,
+    "cache_control": "public, max-age=60"
+  },
+  "artifact": {
+    "store": "https://art.us2.heyo.work",
+    "ref": "releases-live",
+    "auth": { "secret": "art", "key": "api_key" },
+    "strip_components": 1
+  }
+}
