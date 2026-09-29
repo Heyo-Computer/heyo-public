@@ -894,6 +894,24 @@ about somebody stopping the run, so it does not convert a cancellation into a
 success — and the executor does not write `failure` over it, which would make a
 deliberate stop read as a broken build.
 
+### Preparation failures do not hold the CI app's drain
+
+New VM jobs record a preparation phase, then atomically cross into execution
+before any VM acquisition, opening, or startup. If preparation returns an error
+before that boundary, CI finishes the job (preserving cancellation) and releases
+its CI-instance ownership. A confirmed source/build failure also releases the
+runner-work record. Expired source records, lost replies and uncertain image
+builds retain a `detached_preparation` runner-work record with the original boot
+identity: they no longer block replacing the CI app, but still block maintenance
+of the runner that may be doing preparation work. They cannot be automatically
+retried as though no remote effects occurred.
+
+Missing VM records are not evidence of this boundary. Existing claims from older
+binaries remain conservative, and failures after the execution transition still
+require verified VM cleanup. An outer task timeout or process death that prevents
+preparation finalization also retains ownership; this change does not infer safe
+cleanup from a timeout or add automatic recovery of legacy claims.
+
 ### VM cleanup survives a failed connection
 
 After execution finishes, CI atomically records the terminal job outcome and a
