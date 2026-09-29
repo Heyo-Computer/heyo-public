@@ -106,8 +106,42 @@ pub fn component_executable_digest(bytes: &[u8], component: &str) -> Result<Stri
 }
 
 pub async fn cordoned(store: &Store, runner: &str) -> Result<bool> {
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase NOT IN ('passed','superseded'))")
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_runner_drain WHERE runner_hd_id=$1) OR EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase NOT IN ('passed','superseded'))")
         .bind(runner).fetch_one(store.pool()).await?)
+}
+
+/// Use the same lock as job claims: after pause commits, no new job may
+/// acquire this runner, including a delivery that selected it before pause.
+pub async fn runner_drain(store: &Store, runner: &str, operation: uuid::Uuid, pause: bool) -> Result<()> {
+    let mut tx = store.pool().begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 222))")
+        .bind(runner).execute(&mut *tx).await?;
+    let owner: Option<uuid::Uuid> = sqlx::query_scalar("SELECT operation_id FROM ci_runner_drain WHERE runner_hd_id=$1")
+        .bind(runner).fetch_optional(&mut *tx).await?;
+    ensure!(owner.is_none() || owner == Some(operation), "another operation owns this runner drain");
+    if pause {
+        sqlx::query("INSERT INTO ci_runner_drain(runner_hd_id,operation_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
+            .bind(runner).bind(operation).execute(&mut *tx).await?;
+    } else {
+        sqlx::query("DELETE FROM ci_runner_drain WHERE runner_hd_id=$1 AND operation_id=$2")
+            .bind(runner).bind(operation).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn runner_drain_status(store: &Store, runner: &str) -> Result<Value> {
+    // One snapshot covers admission and work on this server, regardless of
+    // which regional CI process owns the jobs. Cleanup remains drain work.
+    let row = sqlx::query("SELECT (SELECT operation_id FROM ci_runner_drain WHERE runner_hd_id=$1) AS operation, (SELECT count(*) FROM ci_job WHERE runner_hd_id=$1 AND status='running') AS running, (SELECT count(*) FROM ci_host_work WHERE runner_hd_id=$1) AS work, (SELECT count(*) FROM ci_vm_cleanup WHERE runner_hd_id=$1) AS cleanup")
+        .bind(runner).fetch_one(store.pool()).await?;
+    let operation: Option<uuid::Uuid> = row.get("operation");
+    let running: i64 = row.get("running");
+    let work: i64 = row.get("work");
+    let cleanup: i64 = row.get("cleanup");
+    Ok(json!({"runnerId":runner,"operationId":operation,"admissionClosed":operation.is_some(),
+        "runningJobs":running,"hostWork":work,"cleanup":cleanup,
+        "drained":operation.is_some() && running == 0 && work == 0 && cleanup == 0}))
 }
 
 pub async fn owns_job(store: &Store, job: &str) -> Result<bool> {
