@@ -1633,7 +1633,7 @@ change alone does not authorize a second executor or prove regional failover.
 URL to an operator-owned release policy. Inject it through the service's
 HeyoSecret-backed configuration, outside repository workflow secrets, using
 `ci-controller/release-policies` as the canonical configuration path. CI does not
-read this policy from the submitted checkout. Both regional CI apps must receive
+read this policy from the submitted checkout. All regional CI apps must receive
 the same configuration before using this mode.
 
 Each policy contains `workflow_path` (the stable identity shown on the run),
@@ -1672,17 +1672,21 @@ runs continue independently. The DAG orders one release, not separate concurrent
 releases; existing per-target conflict checks still apply. This policy mechanism is not a sandbox for hostile
 repository code; validation credential scoping remains a separate responsibility.
 
-[`deploy/private-regional-release-policy.yml`](deploy/private-regional-release-policy.yml)
-is a migration example for the private Heyo repository. It completes US Cloud,
-heyvm, and heyvmd before a mandatory US public-health sampling job, then starts
-EU and samples EU health at the end. The sampling requires HTTP 200, not redirects;
+[`deploy/regional-release-policy.example.yml`](deploy/regional-release-policy.example.yml)
+is a region-neutral example for the private Heyo repository. Region names, count,
+endpoints, coordinator placements and sequence are operator configuration, not
+built-in US/EU choices. Adding China or another region requires its target mappings
+and jobs in this operator policy, not Rust changes or candidate workflow edits.
+The example completes Cloud, heyvm and heyvmd in each configured region, followed
+by mandatory public-health sampling before the next region starts.
+The sampling requires HTTP 200, not redirects;
 it supplements the existing exact deployment receipts and is not proof of
 zero-downtime failover. It uses normal maintenance, not the legacy bootstrap flag.
 Confirm installed updater capability before provisioning this example. Runtime
 variables must not be used to switch between bootstrap and maintenance mid-run;
 choose that path in the operator policy itself.
 
-Migration order: install compatible CI code in US, verify it, then EU; provision
+Migration order: install and verify compatible CI code one configured region at a time; provision
 the reviewed policy identically through HeyoSecret; then submit the private
 revision normally. Keep existing repository release YAML until policy activation
 is confirmed, then remove that duplicate. Do not resubmit the old conflicting

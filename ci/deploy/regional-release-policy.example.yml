@@ -1,24 +1,26 @@
 # Operator configuration example, NOT a submit workflow. Review and provision
-# through HeyoSecret only after both CI apps support CI_RELEASE_POLICIES.
+# through HeyoSecret only after all CI apps support CI_RELEASE_POLICIES.
 # Existing host-maintenance and host-heyvm-bootstrap mappings remain authoritative.
 # This is the normal maintenance path; it does not enable legacy bootstrap.
+# Region names, count, endpoints and order are operator choices. These aliases
+# and example domains are placeholders, not defaults or built-in regions.
 https://github.com/Heyo-Computer/heyo.git:
   workflow_path: .ci/workflows/regional-release.yml
   placements:
-    heyvmd-us3: eu1
-    heyvmd-eu1: us3
+    heyvmd-region-a: region-b
+    heyvmd-region-b: region-a
   service_targets:
-    cloud-us3:
-      url: https://admin.us3.heyo.work
-      deployment: cloud-us3
+    cloud-region-a:
+      url: https://admin.region-a.example
+      deployment: cloud-region-a
       namespace: default
       mount_path: /opt/cloud-release
       revision_env: HEYO_CLOUD_DEPLOYMENT_GIT_SHA
       start_command: /opt/cloud-release/start.sh
       working_directory: /opt/cloud-release
-    cloud-eu1:
-      url: https://admin.eu1.heyo.work
-      deployment: cloud-eu1
+    cloud-region-b:
+      url: https://admin.region-b.example
+      deployment: cloud-region-b
       namespace: default
       mount_path: /opt/cloud-release
       revision_env: HEYO_CLOUD_DEPLOYMENT_GIT_SHA
@@ -28,10 +30,10 @@ https://github.com/Heyo-Computer/heyo.git:
     name: regional-release
     on: release
     env:
-      US_CLOUD_HEALTH: https://cloud.us3.heyo.work/health
-      EU_CLOUD_HEALTH: https://cloud.eu1.heyo.work/health
-      US_CI_HEALTH: https://ci.us3.heyo.work/health
-      EU_CI_HEALTH: https://ci.eu1.heyo.work/health
+      FIRST_CLOUD_HEALTH: https://cloud.region-a.example/health
+      SECOND_CLOUD_HEALTH: https://cloud.region-b.example/health
+      FIRST_CI_HEALTH: https://ci.region-a.example/healthz
+      SECOND_CI_HEALTH: https://ci.region-b.example/healthz
     jobs:
       merge:
         vm: &release_vm
@@ -48,7 +50,7 @@ https://github.com/Heyo-Computer/heyo.git:
             with:
               manifests: '[]'
               token: ${{ secrets.CI_GIT_AUTH_TOKEN || secrets.GITHUB_TOKEN }}
-      cloud-us3:
+      cloud-region-a:
         needs: [merge]
         vm: *release_vm
         timeout-minutes: 40
@@ -57,12 +59,12 @@ https://github.com/Heyo-Computer/heyo.git:
             if: &cloud_changed ${{ changed('cloud/**', 'storage/**', 'local-proxy/**', 'rust-toolchain.toml', '.ci/cargo-lock-sync.sh', '.ci/package-service-archive.sh', '.ci/workflows/cloud.yml', '.ci/image/rust/**', '.ci/workflows/regional-release.yml') }}
             timeout-minutes: 30
             with:
-              target: cloud-us3
-              token: ${{ secrets.APP_LB_US3_TOKEN }}
+              target: cloud-region-a
+              token: ${{ secrets.APP_LB_REGION_A_TOKEN }}
               workflow: .ci/workflows/cloud.yml
               artifact: cloud
-      heyvm-us3:
-        needs: [cloud-us3]
+      heyvm-region-a:
+        needs: [cloud-region-a]
         vm: *release_vm
         timeout-minutes: 60
         steps:
@@ -77,21 +79,21 @@ https://github.com/Heyo-Computer/heyo.git:
             id: publish
             if: *heyvm_changed
             with:
-              target: us3
+              target: region-a
               workflow: .ci/workflows/mvm-ctrl.yml
               artifact: heyvm
               path: ${{ steps.archive.outputs.path }}
               token: ${{ secrets.ORCHESTRATOR_TOKEN }}
-              name: host-heyvm-us3
+              name: host-heyvm-region-a
           - uses: ci/host-heyvm-maintenance
             if: *heyvm_changed
             timeout-minutes: 50
             with:
-              target: us3
+              target: region-a
               token: ${{ secrets.CLOUD_TOKEN }}
               archive-id: ${{ steps.publish.outputs.archive-id }}
-      heyvmd-us3:
-        needs: [heyvm-us3]
+      heyvmd-region-a:
+        needs: [heyvm-region-a]
         vm: *release_vm
         timeout-minutes: 60
         steps:
@@ -99,24 +101,24 @@ https://github.com/Heyo-Computer/heyo.git:
             if: *heyvm_changed
             timeout-minutes: 50
             with:
-              target: heyvmd-us3
-              token: ${{ secrets.APP_LB_US3_TOKEN }}
+              target: heyvmd-region-a
+              token: ${{ secrets.APP_LB_REGION_A_TOKEN }}
               workflow: .ci/workflows/mvm-ctrl.yml
               artifact: heyvm
-      verify-us3:
-        needs: [heyvmd-us3]
+      verify-region-a:
+        needs: [heyvmd-region-a]
         vm: *release_vm
         steps:
-          - name: Check US public health after host updates
+          - name: Check first region public health after host updates
             run: |
               set -eu
               for sample in $(seq 1 12); do
-                test "$(curl --silent --show-error --max-time 10 --output /dev/null --write-out '%{http_code}' "$US_CLOUD_HEALTH")" = 200
-                test "$(curl --silent --show-error --max-time 10 --output /dev/null --write-out '%{http_code}' "$US_CI_HEALTH")" = 200
+                test "$(curl --silent --show-error --max-time 10 --output /dev/null --write-out '%{http_code}' "$FIRST_CLOUD_HEALTH")" = 200
+                test "$(curl --silent --show-error --max-time 10 --output /dev/null --write-out '%{http_code}' "$FIRST_CI_HEALTH")" = 200
                 sleep 5
               done
-      cloud-eu1:
-        needs: [verify-us3]
+      cloud-region-b:
+        needs: [verify-region-a]
         vm: *release_vm
         timeout-minutes: 40
         steps:
@@ -124,12 +126,12 @@ https://github.com/Heyo-Computer/heyo.git:
             if: *cloud_changed
             timeout-minutes: 30
             with:
-              target: cloud-eu1
-              token: ${{ secrets.APP_LB_EU1_TOKEN }}
+              target: cloud-region-b
+              token: ${{ secrets.APP_LB_REGION_B_TOKEN }}
               workflow: .ci/workflows/cloud.yml
               artifact: cloud
-      heyvm-eu1:
-        needs: [cloud-eu1]
+      heyvm-region-b:
+        needs: [cloud-region-b]
         vm: *release_vm
         timeout-minutes: 60
         steps:
@@ -144,21 +146,21 @@ https://github.com/Heyo-Computer/heyo.git:
             id: publish
             if: *heyvm_changed
             with:
-              target: eu1
+              target: region-b
               workflow: .ci/workflows/mvm-ctrl.yml
               artifact: heyvm
               path: ${{ steps.archive.outputs.path }}
               token: ${{ secrets.ORCHESTRATOR_TOKEN }}
-              name: host-heyvm-eu1
+              name: host-heyvm-region-b
           - uses: ci/host-heyvm-maintenance
             if: *heyvm_changed
             timeout-minutes: 50
             with:
-              target: eu1
+              target: region-b
               token: ${{ secrets.CLOUD_TOKEN }}
               archive-id: ${{ steps.publish.outputs.archive-id }}
-      heyvmd-eu1:
-        needs: [heyvm-eu1]
+      heyvmd-region-b:
+        needs: [heyvm-region-b]
         vm: *release_vm
         timeout-minutes: 60
         steps:
@@ -166,19 +168,19 @@ https://github.com/Heyo-Computer/heyo.git:
             if: *heyvm_changed
             timeout-minutes: 50
             with:
-              target: heyvmd-eu1
-              token: ${{ secrets.APP_LB_EU1_TOKEN }}
+              target: heyvmd-region-b
+              token: ${{ secrets.APP_LB_REGION_B_TOKEN }}
               workflow: .ci/workflows/mvm-ctrl.yml
               artifact: heyvm
-      verify-eu1:
-        needs: [heyvmd-eu1]
+      verify-region-b:
+        needs: [heyvmd-region-b]
         vm: *release_vm
         steps:
-          - name: Check EU public health after host updates
+          - name: Check second region public health after host updates
             run: |
               set -eu
               for sample in $(seq 1 12); do
-                test "$(curl --silent --show-error --max-time 10 --output /dev/null --write-out '%{http_code}' "$EU_CLOUD_HEALTH")" = 200
-                test "$(curl --silent --show-error --max-time 10 --output /dev/null --write-out '%{http_code}' "$EU_CI_HEALTH")" = 200
+                test "$(curl --silent --show-error --max-time 10 --output /dev/null --write-out '%{http_code}' "$SECOND_CLOUD_HEALTH")" = 200
+                test "$(curl --silent --show-error --max-time 10 --output /dev/null --write-out '%{http_code}' "$SECOND_CI_HEALTH")" = 200
                 sleep 5
               done

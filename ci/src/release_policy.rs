@@ -245,16 +245,24 @@ mod tests {
     }
 
     #[test]
-    fn regional_example_resolves_aliases_and_requires_us_health_before_eu() {
+    fn regional_example_allows_a_third_region_without_engine_changes() {
         let repo = "https://github.com/Heyo-Computer/heyo.git";
-        let policy = select(Some(include_str!("../deploy/private-regional-release-policy.yml")), repo).unwrap().unwrap();
+        let mut policy = select(Some(include_str!("../deploy/regional-release-policy.example.yml")), repo).unwrap().unwrap();
+        let mut china = policy.service_targets["cloud-region-a"].clone();
+        china.url = "https://admin.china.example".into();
+        china.deployment = "cloud-china".into();
+        policy.service_targets.insert("cloud-china".into(), china);
+        policy.workflow.push_str("  cloud-china:\n    needs: [verify-region-b]\n    steps:\n      - uses: ci/rollout-service\n        with:\n          target: cloud-china\n          token: ${{ secrets.APP_LB_CHINA_TOKEN }}\n          workflow: .ci/workflows/cloud.yml\n          artifact: cloud\n");
         let mut snap = snapshot();
-        snap.maintenance.get_mut("us3").unwrap().repository = repo.into();
-        let mut eu = snap.maintenance["us3"].clone();
-        eu.runner_hd_id = "eu-runner".into();
-        eu.backend_server_id = "eu-backend".into();
-        snap.maintenance.insert("eu1".into(), eu);
-        for (alias, runner) in [("heyvmd-us3", "us-runner"), ("heyvmd-eu1", "eu-runner")] {
+        let mut first = snap.maintenance.remove("us3").unwrap();
+        first.repository = repo.into();
+        first.runner_hd_id = "first-runner".into();
+        let mut second = first.clone();
+        second.runner_hd_id = "second-runner".into();
+        second.backend_server_id = "second-backend".into();
+        snap.maintenance.insert("region-a".into(), first);
+        snap.maintenance.insert("region-b".into(), second);
+        for (alias, runner) in [("heyvmd-region-a", "first-runner"), ("heyvmd-region-b", "second-runner")] {
             snap.hosts.insert(alias.into(), serde_json::from_value(serde_json::json!({
                 "repository":repo, "app_lb_admin_url":"https://admin.example", "app_lb_deployment":"daemon",
                 "app_lb_namespace":"default", "runner_hd_id":runner, "backend_server_id":runner,
@@ -268,27 +276,29 @@ mod tests {
         let mut plan = original.clone();
         bind(&mut plan, repo, &policy, &snap).unwrap();
         let job = |id: &str| plan.jobs.iter().find(|j| j.base_id == id).unwrap();
-        assert_eq!(job("cloud-eu1").needs, ["verify-us3"]);
-        assert_eq!(job("verify-us3").needs, ["heyvmd-us3"]);
-        assert!(job("verify-us3").condition.is_none());
-        assert!(job("verify-us3").steps[0].condition.is_none());
-        assert_eq!(job("heyvmd-us3").target.node.as_deref(), Some("eu-runner"));
-        assert_eq!(job("heyvmd-eu1").target.node.as_deref(), Some("us-runner"));
-        assert_eq!(job("cloud-us3").steps[0].with["deployment"], "cloud-us3");
-        assert_eq!(job("cloud-eu1").steps[0].with["url"], "https://admin.eu1.heyo.work");
-        assert_eq!(job("heyvm-us3").steps[2].with["url"], "https://cloud.eu.example");
+        assert_eq!(job("cloud-region-b").needs, ["verify-region-a"]);
+        assert_eq!(job("verify-region-a").needs, ["heyvmd-region-a"]);
+        assert!(job("verify-region-a").condition.is_none());
+        assert!(job("verify-region-a").steps[0].condition.is_none());
+        assert_eq!(job("heyvmd-region-a").target.node.as_deref(), Some("second-runner"));
+        assert_eq!(job("heyvmd-region-b").target.node.as_deref(), Some("first-runner"));
+        assert_eq!(job("cloud-region-a").steps[0].with["deployment"], "cloud-region-a");
+        assert_eq!(job("cloud-region-b").steps[0].with["url"], "https://admin.region-b.example");
+        assert_eq!(job("heyvm-region-a").steps[2].with["url"], "https://cloud.eu.example");
+        assert_eq!(job("cloud-china").needs, ["verify-region-b"]);
+        assert_eq!(job("cloud-china").steps[0].with["url"], "https://admin.china.example");
 
         let mut wrong = policy.clone();
-        wrong.placements.insert("heyvmd-us3".into(), "us3".into());
+        wrong.placements.insert("heyvmd-region-a".into(), "region-a".into());
         assert!(bind(&mut original.clone(), repo, &wrong, &snap).is_err());
         let mut missing = policy.clone();
-        missing.placements.remove("heyvmd-us3");
+        missing.placements.remove("heyvmd-region-a");
         assert!(bind(&mut original.clone(), repo, &missing, &snap).is_err());
         let mut missing_service = policy.clone();
-        missing_service.service_targets.remove("cloud-us3");
+        missing_service.service_targets.remove("cloud-region-a");
         assert!(bind(&mut original.clone(), repo, &missing_service, &snap).is_err());
         let mut unsafe_service = policy.clone();
-        unsafe_service.service_targets.get_mut("cloud-us3").unwrap().url = "https://credential@admin.example".into();
+        unsafe_service.service_targets.get_mut("cloud-region-a").unwrap().url = "https://credential@admin.example".into();
         assert!(bind(&mut original.clone(), repo, &unsafe_service, &snap).is_err());
     }
 }
