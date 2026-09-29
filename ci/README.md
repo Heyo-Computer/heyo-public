@@ -1451,6 +1451,11 @@ attach a VM, complete that attempt, or create its cleanup intent. Cleanup worker
 consume durable intents with `FOR UPDATE SKIP LOCKED`. Shared deployment
 reconcilers coordinate on the specific operation ID, not the whole CI system.
 
+Claim rejection carries its transactional reason: a later resume cannot turn a
+drain-rejected delivery into an acknowledgment of unclaimed work. Pre-claim retry
+diagnostics and final failures update only jobs that are still unclaimed; a losing
+regional delivery cannot overwrite the winning boot's status or error.
+
 Managed retirement closes admission only on the addressed boot. Its existing
 jobs finish and clean up while the peer continues taking new work. The retirement
 receipt requires no local effects or owned job obligations, and a ready approved

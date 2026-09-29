@@ -32,7 +32,7 @@ use crate::expr::Context;
 use crate::plan::JobPlan;
 use crate::pool::Pool;
 use crate::runners::Runners;
-use crate::store::{JobStatus, RunStatus, StepStatus, Store, step_id};
+use crate::store::{JobClaim, JobStatus, RunStatus, StepStatus, Store, step_id};
 use crate::vm::{ExecOutput, SizeCheck, Vm, VmError, Vms, sandbox_name};
 use crate::workflow::{Fallback, Step};
 use async_nats::jetstream::AckKind;
@@ -1391,20 +1391,16 @@ impl Dispatcher {
         //
         // Another delivery may already own this job. Redelivery cannot grant
         // a second execution, even if the first controller stopped heartbeating.
-        if !self.store.claim_job_for_boot(&msg.job_id, &runner, attempt, self.executor.boot_id()).await? {
-            if self.executor.admission_permit().await.is_err() {
-                return Err(DispatchError::InstanceDraining);
-            }
-            if crate::host_maintenance::cordoned(&self.store, &runner).await
-                .map_err(|e| DispatchError::StepFailed(e.to_string()))? {
-                return Err(DispatchError::MaintenancePaused);
-            }
-            if self.store.has_host_work(&msg.job_id).await? {
-                tracing::info!(job = %msg.job_key, "execution already claimed; dropping duplicate delivery");
+        // Use the reason recorded by the claim transaction. Re-reading drain
+        // or cordon state here can race a resume and ACK an unclaimed job.
+        match self.store.claim_job_for_boot(&msg.job_id, &runner, attempt, self.executor.boot_id()).await? {
+            JobClaim::Claimed => {}
+            JobClaim::InstanceDraining => return Err(DispatchError::InstanceDraining),
+            JobClaim::RunnerCordoned => return Err(DispatchError::MaintenancePaused),
+            JobClaim::Unavailable => {
+                tracing::info!(job = %msg.job_key, "job already owned or no longer runnable; dropping duplicate delivery");
                 return Ok(JobStatus::Running);
             }
-            tracing::info!(job = %msg.job_key, "no longer runnable; dropping delivery");
-            return Ok(JobStatus::Success);
         }
         tracing::info!(job = %plan.key, runner = %runner, attempt, "acquiring a VM");
 
@@ -3661,7 +3657,9 @@ async fn process_delivery(
                 Ok(true) => {
                     let detail = format!("Execution outcome requires reconciliation; automatic retry withheld: {e}");
                     tracing::warn!(job = %job.job_key, "{detail}");
-                    if let Err(error) = dispatcher.store.note_job_error(&job.job_id, &detail).await {
+                    if let Err(error) = dispatcher.store.set_job_status_for_boot(
+                        &job.job_id, JobStatus::Running, Some(&detail), attempt, dispatcher.executor.boot_id(),
+                    ).await {
                         tracing::error!(job = %job.job_key, %error, "could not persist unresolved execution");
                         return;
                     }
@@ -3679,14 +3677,17 @@ async fn process_delivery(
             // left `running` forever with nothing coming back to it.
             tracing::warn!(job = %job.job_key, attempt, "failed: {e}");
             if attempt >= crate::bus::MAX_DELIVER as i32 {
-                let _ = dispatcher
+                if let Err(error) = dispatcher
                     .store
-                    .set_job_status(
+                    .record_unclaimed_job_error(
                         &job.job_id,
-                        JobStatus::Failure,
-                        Some(&format!("giving up after {attempt} attempts: {e}")),
+                        &format!("giving up after {attempt} attempts: {e}"),
+                        true,
                     )
-                    .await;
+                    .await {
+                    tracing::error!(job = %job.job_key, %error, "could not persist final delivery failure; refusing ACK");
+                    return;
+                }
                 let _ = msg.ack().await;
             } else {
                 // Negative-ack with the ladder's delay rather than
@@ -3705,7 +3706,10 @@ async fn process_delivery(
                     crate::bus::MAX_DELIVER,
                     delay.as_secs()
                 );
-                let _ = dispatcher.store.note_job_error(&job.job_id, &detail).await;
+                if let Err(error) = dispatcher.store.record_unclaimed_job_error(&job.job_id, &detail, false).await {
+                    tracing::error!(job = %job.job_key, %error, "could not persist retry diagnostic");
+                    return;
+                }
                 let _ = msg
                     .ack_with(async_nats::jetstream::AckKind::Nak(Some(delay)))
                     .await;
@@ -7035,7 +7039,7 @@ jobs:
             let run = crate::vm::new_id(); let sandbox = format!("sb-{run}");
             d.store.create_run(&run, &crate::store::RunRequest { repo_url: "https://example.test/repo.git".into(), ..Default::default() }, &plan).await.unwrap();
             let job = d.store.jobs_of(&run).await.unwrap().remove(0);
-            assert!(d.store.claim_job_for_boot(&job.id, "hd-local", 1, d.executor.boot_id()).await.unwrap());
+            assert_eq!(d.store.claim_job_for_boot(&job.id, "hd-local", 1, d.executor.boot_id()).await.unwrap(), JobClaim::Claimed);
             d.store.start_job(&job.id, "hd-local", &sandbox, "fp", 1).await.unwrap();
             d.pool.register(&sandbox, "hd-local", "fp", "wf", None, &job.id, d.lease()).await.unwrap();
             // A bad handoff must not publish a terminal job or a cleanup intent.
