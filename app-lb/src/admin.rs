@@ -255,6 +255,27 @@ struct AdminState {
     /// already resolved from config (explicit, else the first wildcard). `None`
     /// disables host synthesis. See [`assume_host`].
     deploy_base_domain: Option<Arc<str>>,
+    /// `APP_LB_HOME_URL`: the Heyo front end a namespace user opens this
+    /// dashboard from, linked when their session is refused or runs out. They
+    /// cannot sign in here directly — see [`browser_login::handoff`].
+    home_url: Option<Arc<str>>,
+}
+
+/// `APP_LB_HOME_URL`, when it is an absolute http(s) URL.
+fn home_url_from_env() -> Option<Arc<str>> {
+    let raw = std::env::var("APP_LB_HOME_URL").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() { return None; }
+    match reqwest::Url::parse(raw) {
+        // The parsed form, not the raw one: serialising percent-encodes
+        // anything that could break out of the attribute or script string the
+        // templates put it in.
+        Ok(u) if matches!(u.scheme(), "https" | "http") => Some(Arc::from(u.as_str())),
+        _ => {
+            tracing::warn!(value = %raw, "ignoring APP_LB_HOME_URL: not an absolute http(s) URL");
+            None
+        }
+    }
 }
 
 impl AdminState {
@@ -380,6 +401,7 @@ impl AdminApi {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .map(Arc::from),
+                home_url: home_url_from_env(),
             },
         }
     }
@@ -840,6 +862,11 @@ async fn authorize(
     let browser_navigation = req.method() == axum::http::Method::GET
         && !req.headers().contains_key(header::AUTHORIZATION)
         && req.headers().get(header::ACCEPT).and_then(|h| h.to_str().ok()).is_some_and(|h| h.contains("text/html"));
+    // A page's own `fetch` (Fetch Metadata says `dest: empty`). With browser
+    // sessions on, its 401 must not advertise Basic: Chrome would answer with
+    // a native password prompt over the page, where the page itself should be
+    // saying the session ran out.
+    let script_fetch = req.headers().get("sec-fetch-dest").and_then(|h| h.to_str().ok()) == Some("empty");
     let header = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -928,6 +955,10 @@ async fn authorize(
             observe_auth_failure(&state, peer, &path, AuthAction::AdminRejected, scheme);
             if browser_navigation && state.gate_admin && state.federated.is_some() {
                 return axum::response::Redirect::to("/login").into_response();
+            }
+            if script_fetch && state.gate_admin && state.federated.is_some() {
+                return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")], "unauthorized\n")
+                    .into_response();
             }
             unauthorized()
         }
@@ -2428,6 +2459,51 @@ struct CreateProviderBody {
     /// auth service's address and derives it.
     #[serde(default)]
     jwks_url: Option<String>,
+    /// Request-only tweaks laid over the resulting `jwt` policy — above all
+    /// over a preset's, which is otherwise replaced wholesale. They make
+    /// "Heyo sign-in, for this account only, with a browser redirect" one POST
+    /// instead of a preset followed by an edit.
+    #[serde(default)]
+    require: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default)]
+    cookie: Option<String>,
+    #[serde(default)]
+    login_url: Option<String>,
+    #[serde(default)]
+    login_redirect_param: Option<String>,
+}
+
+impl CreateProviderBody {
+    fn has_jwt_tweaks(&self) -> bool {
+        self.require.is_some()
+            || self.cookie.is_some()
+            || self.login_url.is_some()
+            || self.login_redirect_param.is_some()
+    }
+}
+
+/// Lay the request-only tweaks over a materialised JWT policy. `require` is
+/// merged claim by claim, so a preset's `role` check survives an added
+/// `accountId`.
+fn apply_jwt_tweaks(
+    jwt: &mut crate::config::JwtSpec,
+    require: Option<BTreeMap<String, serde_json::Value>>,
+    cookie: Option<String>,
+    login_url: Option<String>,
+    login_redirect_param: Option<String>,
+) {
+    if let Some(require) = require {
+        jwt.require.extend(require);
+    }
+    if cookie.is_some() {
+        jwt.cookie = cookie;
+    }
+    if login_url.is_some() {
+        jwt.login_url = login_url;
+    }
+    if login_redirect_param.is_some() {
+        jwt.login_redirect_param = login_redirect_param;
+    }
 }
 
 /// `GET /auth-providers[?namespace=]` — the providers this caller may see.
@@ -2464,6 +2540,8 @@ async fn create_auth_provider(
     caller: Option<axum::Extension<Caller>>,
     Json(body): Json<CreateProviderBody>,
 ) -> Response {
+    let has_tweaks = body.has_jwt_tweaks();
+    let tweaks = (body.require, body.cookie, body.login_url, body.login_redirect_param);
     let mut spec = body.spec;
 
     // Apply the preset before validation, so what is stored and what is checked
@@ -2518,6 +2596,19 @@ async fn create_auth_provider(
                 .into_response();
             }
         }
+    }
+
+    if has_tweaks {
+        let Some(jwt) = spec.jwt.as_mut() else {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "`require`, `cookie`, `login_url` and `login_redirect_param` tune a JWT \
+                 policy, and this provider has none — name a `preset` or send a `jwt` block",
+            )
+            .into_response();
+        };
+        let (require, cookie, login_url, login_redirect_param) = tweaks;
+        apply_jwt_tweaks(jwt, require, cookie, login_url, login_redirect_param);
     }
 
     // Bind the secret references to this provider's own namespace before
@@ -3127,6 +3218,7 @@ fn render_page(state: &AdminState, page: &str, headers: &axum::http::HeaderMap) 
         .unwrap_or_default();
     page.replace("{{HTML_ATTRS}}", &state.ui_cookies.attrs(cookies))
         .replace("{{WHO}}", &who)
+        .replace("{{HOME_URL}}", &state.home_url.as_deref().map(html_escape).unwrap_or_default())
 }
 
 /// `GET /__ui/*path` — the platform stylesheet, theme script and fonts.
@@ -5976,6 +6068,8 @@ fn router(state: AdminState) -> Router {
         .route("/__ui/*path", get(ui_asset))
         .route("/login", get(browser_login::page).post(browser_login::login)
             .layer(axum::extract::DefaultBodyLimit::max(8192)))
+        .route("/login/handoff", post(browser_login::handoff)
+            .layer(axum::extract::DefaultBodyLimit::max(8192)))
         .route("/logout", post(browser_login::logout))
         .merge(views)
         .merge(fleet)
@@ -6288,6 +6382,29 @@ async fn revoke_token(State(state): State<AdminState>, Path(id): Path<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preset_tweaks_merge_over_the_heyo_jwks_policy() {
+        let body: CreateProviderBody = serde_json::from_value(serde_json::json!({
+            "name": "heyo", "namespace": "acme", "preset": "heyo-jwks",
+            "require": {"accountId": ["acct-1"]}, "cookie": "heyo_token",
+            "login_url": "https://auth.example/login"
+        }))
+        .unwrap();
+        assert!(body.has_jwt_tweaks());
+        let mut jwt = crate::config::JwtSpec::heyo_jwks("https://auth.example/.well-known/jwks.json".into());
+        apply_jwt_tweaks(&mut jwt, body.require, body.cookie, body.login_url, body.login_redirect_param);
+        // The preset's role check survives; the account check is added.
+        assert_eq!(jwt.require["role"], serde_json::json!(["user", "admin"]));
+        assert_eq!(jwt.require["accountId"], serde_json::json!(["acct-1"]));
+        assert_eq!(jwt.cookie.as_deref(), Some("heyo_token"));
+        assert_eq!(jwt.login_url.as_deref(), Some("https://auth.example/login"));
+        assert_eq!(jwt.audience.as_deref(), Some("heyo-gate"));
+
+        let plain: CreateProviderBody =
+            serde_json::from_value(serde_json::json!({"name": "heyo", "preset": "heyo-jwks"})).unwrap();
+        assert!(!plain.has_jwt_tweaks());
+    }
 
     #[test]
     fn discovery_bootstrap_cannot_shadow_another_route() {
@@ -7442,6 +7559,7 @@ mod tests {
                     .replace("{{HTML_ATTRS}}", r#"data-theme="light""#)
                     .replace("{{WHO}}", "ops@example.com")
                     .replace("{{SESSION_ACTION}}", "")
+                    .replace("{{HOME_URL}}", "")
                     .replace("{{LEDE}}", "")
                     .replace("{{CARDS}}", "");
                 assert!(!rendered.contains("{{"), "{name} left a placeholder unfilled");
