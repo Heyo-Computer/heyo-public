@@ -2627,16 +2627,19 @@ The checked-in example is [`.heyo/fleet/fleet.json`](../.heyo/fleet/fleet.json):
 
 ```json
 [
-  {"id":"us2","region":"US2","url":"https://admin.us2.heyo.work/","auth":{"secret":"fleet-observer","key":"us2"}},
-  {"id":"us4","region":"US4","url":"https://admin.us4.heyo.computer/","auth":{"secret":"fleet-observer","key":"us4"}},
-  {"id":"us5","region":"US5","url":"https://admin.us5.heyo.computer/","auth":{"secret":"fleet-observer","key":"us5"}}
+  {"id":"us2","region":"US2","url":"https://admin.us2.heyo.work/","auth":{"secret":"fleet-observer-us2","key":"token"}},
+  {"id":"us4","region":"US4","url":"https://admin.us4.heyo.computer/","auth":{"secret":"fleet-observer-us4","key":"token"}},
+  {"id":"us5","region":"US5","url":"https://admin.us5.heyo.computer/","auth":{"secret":"fleet-observer-us5","key":"token"}}
 ]
 ```
 
-Point `APP_LB_FLEET_FILE` at it on the control-plane app-lb (or PUT the same
-array as `config.gateways` at `/control-plane/config`). Each key of the
-`fleet-observer` secret (in the `default` namespace unless `auth.namespace` says
-otherwise) holds an app-token minted **on that server**:
+PUT the array as `config.gateways` at `/control-plane/config` on the
+control-plane app-lb — that is what heyo's `scripts/provision-fleet.py` does as
+it adds each server, and it keeps the list editable at runtime. (Pointing
+`APP_LB_FLEET_FILE` at the file works too, but then the view is managed by the
+file and `PUT /control-plane/config` answers 409.) Each gateway's
+`fleet-observer-<id>` secret (key `token`, in the `default` namespace unless
+`auth.namespace` says otherwise) holds an app-token minted **on that server**:
 
 ```sh
 heyctl token mint fleet-observer --admin view --all-deployments -q

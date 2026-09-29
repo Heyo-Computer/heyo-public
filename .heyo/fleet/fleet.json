@@ -1,5 +1,5 @@
 [
-  {"id":"us2","region":"US2","url":"https://admin.us2.heyo.work/","auth":{"secret":"fleet-observer","key":"us2"}},
-  {"id":"us4","region":"US4","url":"https://admin.us4.heyo.computer/","auth":{"secret":"fleet-observer","key":"us4"}},
-  {"id":"us5","region":"US5","url":"https://admin.us5.heyo.computer/","auth":{"secret":"fleet-observer","key":"us5"}}
+  {"id":"us2","region":"US2","url":"https://admin.us2.heyo.work/","auth":{"secret":"fleet-observer-us2","key":"token"}},
+  {"id":"us4","region":"US4","url":"https://admin.us4.heyo.computer/","auth":{"secret":"fleet-observer-us4","key":"token"}},
+  {"id":"us5","region":"US5","url":"https://admin.us5.heyo.computer/","auth":{"secret":"fleet-observer-us5","key":"token"}}
 ]

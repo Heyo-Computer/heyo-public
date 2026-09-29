@@ -1213,7 +1213,7 @@ mod tests {
         let gateways = parse(include_str!("../../.heyo/fleet/fleet.json")).unwrap();
         let ids: Vec<_> = gateways.iter().map(|g| (g.id.as_str(), g.region.as_str())).collect();
         assert_eq!(ids, [("us2", "US2"), ("us4", "US4"), ("us5", "US5")]);
-        assert!(gateways.iter().all(|g| g.auth.as_ref().is_some_and(|a| a.secret == "fleet-observer" && a.key == g.id)));
+        assert!(gateways.iter().all(|g| g.auth.as_ref().is_some_and(|a| a.secret == format!("fleet-observer-{}", g.id) && a.key == "token")));
     }
 
     #[test]
