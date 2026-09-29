@@ -125,7 +125,8 @@
 <div class="wrap">
 <header class="topbar">
     <a class="topbar-brand" href="/"><span>heyo</span><span class="topbar-app">{{APP_NAME}}</span></a>
-    <nav class="topbar-nav">
+    <button class="topbar-toggle" type="button" aria-expanded="false" aria-controls="topbar-nav" aria-label="Toggle navigation"><span class="bars"><span></span></span></button>
+    <nav class="topbar-nav" id="topbar-nav">
       <a href="/" aria-current="page">Directory</a>
       <a href="/dashboard">Dashboard</a>
       <a href="/siem">Security</a>
@@ -146,5 +147,22 @@
      and the theme toggle is the shared one at /__ui/theme.js — a cookie scoped
      to the parent domain, so the choice follows a person to every Heyo app
      rather than stopping at this origin. -->
+<script>
+// Hamburger menu: collapse the nav on narrow screens. The open/closed state
+// lives on the nav (`.open`) and is mirrored to the button's `aria-expanded`
+// so assistive tech reads it correctly. Clicking a link or escaping closes it.
+(function () {
+  var btn = document.querySelector(".topbar-toggle");
+  var nav = document.querySelector(".topbar-nav");
+  if (!btn || !nav) return;
+  var close = function () { nav.classList.remove("open"); btn.setAttribute("aria-expanded", "false"); };
+  btn.addEventListener("click", function () {
+    var open = nav.classList.toggle("open");
+    btn.setAttribute("aria-expanded", String(open));
+  });
+  nav.addEventListener("click", function (e) { if (e.target.closest("a")) close(); });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") close(); });
+})();
+</script>
 </body>
 </html>
