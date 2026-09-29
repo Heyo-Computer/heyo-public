@@ -18,6 +18,7 @@ mod artifact;
 mod auth;
 mod auth_providers;
 mod autoscale;
+mod cli;
 mod config;
 mod deployment;
 mod discovery;
@@ -33,6 +34,7 @@ mod health;
 mod host_bundle;
 mod host_update;
 mod incus;
+mod instance_lock;
 mod jobs;
 mod jwt;
 mod metrics;
@@ -298,6 +300,12 @@ fn main() {
         worker::run(path.into());
     }
     if let Some(code) = host_update::helper_main() { std::process::exit(code); }
+    // After the internal helper entry points above, which take their own
+    // arguments. Anything else that is not empty is a refusal: see `cli`.
+    let command = cli::parse(std::env::args().skip(1));
+    if command != cli::Command::Serve {
+        std::process::exit(cli::run(&command));
+    }
     // Before the subscriber, because shipping app-lb's own events means adding a
     // layer to it, and a subscriber can only be built once. Reads the environment
     // and allocates a channel — no threads, nothing that a later fork would lose.
@@ -466,6 +474,24 @@ fn main() {
         }
     }
 
+    // Before anything can reach the daemon: two app-lbs sharing one heyvm each
+    // see the other's sandboxes as orphans. See `instance_lock`.
+    let lock_setting = instance_lock::setting(std::env::var("APP_LB_INSTANCE_LOCK").ok().as_deref());
+    let holder = format!("pid {} state={}", std::process::id(), cfg.state_path);
+    let _instance_lock = match instance_lock::acquire_setting(&lock_setting, &holder) {
+        Ok(Some((file, path))) => {
+            tracing::info!(path = %path.display(), "holding the host's app-lb instance lock");
+            Some(file)
+        }
+        Ok(None) => {
+            tracing::warn!("APP_LB_INSTANCE_LOCK=off: nothing stops a second app-lb on this host from managing the same sandboxes");
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "refusing to start");
+            std::process::exit(1);
+        }
+    };
     let registry = Arc::new(Registry::new(&cfg.state_path));
     let _controller_lock = registry.controller_lock().unwrap_or_else(|e| {
         tracing::error!(error=%e,"cannot exclusively own deployment state; refusing controller startup");

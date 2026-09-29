@@ -1183,7 +1183,20 @@ pub struct WorkspaceSpec {
     /// the `aws` CLI reads its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<SecretRef>,
+    /// Take a snapshot at least this often, in seconds, by recycling the
+    /// replica: drain, capture, then resume it (`idle_action: retain`) or boot
+    /// its replacement from the result. Unset, a snapshot is taken only when
+    /// the replica retires for some other reason — a VM that runs for days
+    /// holds days of work that exist nowhere else. Each one costs the drain
+    /// plus the capture as downtime, so at least
+    /// [`MIN_SNAPSHOT_INTERVAL_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_interval_secs: Option<u64>,
 }
+
+/// The shortest `vm.workspace.snapshot_interval_secs`: every snapshot is an
+/// outage of drain + capture, so a tighter schedule would mostly be downtime.
+pub const MIN_SNAPSHOT_INTERVAL_SECS: u64 = 300;
 
 /// Which transport a [`WorkspaceSpec::store`] names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1281,6 +1294,11 @@ impl WorkspaceSpec {
         }
         if scaling.warm_pool != 0 {
             return Err(SpecError::WorkspaceWarmPool(scaling.warm_pool));
+        }
+        if let Some(n) = self.snapshot_interval_secs
+            && n < MIN_SNAPSHOT_INTERVAL_SECS
+        {
+            return Err(SpecError::WorkspaceSnapshotInterval(n));
         }
         let ws = self.guest_path();
         for m in mounts {
@@ -3931,6 +3949,8 @@ pub enum SpecError {
     /// A workspace with more than one replica: two writers, one snapshot.
     WorkspaceReplicas(u32),
     WorkspaceWarmPool(u32),
+    /// `vm.workspace.snapshot_interval_secs` under the floor.
+    WorkspaceSnapshotInterval(u64),
     /// The workspace and a mount would land on the same guest path, or one
     /// inside the other.
     WorkspaceCollidesWithMount {
@@ -4503,6 +4523,12 @@ impl std::fmt::Display for SpecError {
                 f,
                 "vm.workspace needs scaling.warm_pool = 0, got {n}: a warm replica is booted \
                  ahead of time from a tree the live replica is still changing"
+            ),
+            Self::WorkspaceSnapshotInterval(n) => write!(
+                f,
+                "vm.workspace.snapshot_interval_secs must be at least \
+                 {MIN_SNAPSHOT_INTERVAL_SECS}, got {n}: each snapshot drains and stops the \
+                 replica, so a shorter interval is mostly downtime"
             ),
             Self::WorkspaceCollidesWithMount { workspace, mount } => write!(
                 f,
@@ -5538,6 +5564,7 @@ mod tests {
             store: "s3://bucket/prefix".into(),
             artifact_ref: None,
             auth: None,
+            snapshot_interval_secs: None,
         });
         assert!(matches!(spec.validate(), Err(SpecError::ArchiveWithWorkspace)), "{:?}", spec.validate());
     }
@@ -7895,6 +7922,7 @@ mod tests {
                 store: store.into(),
                 artifact_ref: None,
                 auth: None,
+                snapshot_interval_secs: None,
             };
             assert_eq!(
                 ws("s3://my-bucket/ws/").backend(),
@@ -7939,6 +7967,22 @@ mod tests {
             assert_eq!(ws.guest_path(), "/data");
             assert_eq!(ws.tag("fastcar"), "fc-ws");
             s.validate().unwrap();
+        }
+
+        #[test]
+        fn a_snapshot_interval_has_a_floor() {
+            let s = with_workspace(serde_json::json!({"store": "s3://b", "snapshot_interval_secs": 21600}));
+            s.validate().expect("six hours is fine");
+            let ws = s.vm.as_ref().unwrap().workspace.as_ref().unwrap();
+            assert_eq!(ws.snapshot_interval_secs, Some(21600));
+
+            let s = with_workspace(serde_json::json!({"store": "s3://b", "snapshot_interval_secs": 60}));
+            assert!(matches!(s.validate(), Err(SpecError::WorkspaceSnapshotInterval(60))));
+
+            let s = with_workspace(serde_json::json!({"store": "s3://b"}));
+            let ws = s.vm.as_ref().unwrap().workspace.as_ref().unwrap();
+            assert_eq!(ws.snapshot_interval_secs, None, "unset stays unset");
+            assert!(!serde_json::to_string(ws).unwrap().contains("snapshot_interval_secs"));
         }
 
         #[test]
