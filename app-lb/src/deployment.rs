@@ -102,6 +102,14 @@ impl VmBackend {
         }
     }
 
+    /// A backend that became ready `secs` ago, for tests of uptime rules.
+    #[cfg(test)]
+    pub fn ready_secs_ago(sandbox_id: &str, secs: u64) -> Self {
+        let mut b = Self::new(sandbox_id.to_string(), "127.0.0.1:9".parse().unwrap());
+        b.ready_at = now_secs().saturating_sub(secs);
+        b
+    }
+
     /// The daemon-side bind of this VM's port, if it has one.
     pub fn bind(&self) -> Option<String> {
         self.bind.lock().unwrap_or_else(|e| e.into_inner()).clone()

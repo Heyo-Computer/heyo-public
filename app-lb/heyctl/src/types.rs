@@ -61,6 +61,9 @@ pub struct WorkspaceSpec {
     #[serde(rename = "ref")]
     pub artifact_ref: Option<String>,
     pub auth: Option<SecretRef>,
+    /// Recycle the replica for a snapshot at least this often. Unset: only
+    /// when it retires for another reason.
+    pub snapshot_interval_secs: Option<u64>,
 }
 
 /// Where a deployment's workspace stands: the snapshot its pool runs from,

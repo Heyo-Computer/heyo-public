@@ -86,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix='heyo-gateway-smoke-') as tmp:
         directory=root/name; directory.mkdir()
         proxy,admin,tlsport=port(),port(),port()
         env={k:v for k,v in os.environ.items() if not k.startswith('APP_LB_')}
-        env.update({'APP_LB_PROXY_ADDR':f'127.0.0.1:{proxy}','APP_LB_ADMIN_ADDR':f'127.0.0.1:{admin}','APP_LB_MOUNTS_DIR':str(directory/'mounts'),'APP_LB_WORKSPACES_DIR':str(directory/'workspaces'),'APP_LB_IMAGES_DIR':str(directory/'images'),'APP_LB_BUILD_DIR':str(directory/'build'),'APP_LB_SIEM':'0','SSL_CERT_FILE':str(ca),'APP_LB_DISK_TTL_SECS':'0','APP_LB_DAEMON_URL':'http://127.0.0.1:9'})
+        env.update({'APP_LB_PROXY_ADDR':f'127.0.0.1:{proxy}','APP_LB_ADMIN_ADDR':f'127.0.0.1:{admin}','APP_LB_MOUNTS_DIR':str(directory/'mounts'),'APP_LB_WORKSPACES_DIR':str(directory/'workspaces'),'APP_LB_IMAGES_DIR':str(directory/'images'),'APP_LB_BUILD_DIR':str(directory/'build'),'APP_LB_SIEM':'0','SSL_CERT_FILE':str(ca),'APP_LB_DISK_TTL_SECS':'0','APP_LB_DAEMON_URL':'http://127.0.0.1:9','APP_LB_INSTANCE_LOCK':str(directory/'instance.lock')})
         if tls: env.update({'APP_LB_PROXY_TLS_ADDR':f'[::1]:{tlsport}','APP_LB_TLS_CERT':str(cert),'APP_LB_TLS_KEY':str(key)})
         log=open(directory/'log','w')
         p=subprocess.Popen([BINARY],cwd=directory,env=env,stdout=log,stderr=log);processes.append((p,log,directory))
