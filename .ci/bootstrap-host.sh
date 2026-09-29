@@ -190,6 +190,13 @@ stderr_logfile_maxbytes=10MB
 stderr_logfile_backups=5
 EOF
 
+n=0
+until supervisorctl pid >/dev/null 2>&1; do
+    n=$((n + 1))
+    [ "$n" -lt 15 ] || die "supervisord is not answering supervisorctl (systemctl status supervisor)"
+    systemctl start supervisor >/dev/null 2>&1 || true
+    sleep 2
+done
 supervisorctl reread >/dev/null
 supervisorctl update >/dev/null
 
