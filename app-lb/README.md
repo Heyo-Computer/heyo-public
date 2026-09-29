@@ -1972,6 +1972,7 @@ that is the state of the deployment, and it has to belong to the deployment.
 | `store` | Where snapshots go: `s3://bucket[/prefix]` (via the `aws` CLI and its own credentials; `APP_LB_DISK_ARCHIVE_ENDPOINT` applies), an `http(s)://` `art serve`, or the absolute path of a local store. |
 | `ref` | The tag the newest snapshot is published under in an artifact store. Defaults to `workspace-<deployment id>`. S3 keys by deployment id instead: `<prefix>/<id>/<digest>.tar.gz` plus a `latest` pointer. |
 | `auth` | A secret reference for the artifact store, like `artifact.auth`. |
+| `snapshot_interval_secs` | Recycle the replica for a snapshot at least this often (minimum `300`). Unset, a snapshot is taken only when the replica retires for another reason. See **Scheduled snapshots** below. |
 
 What happens:
 
@@ -2015,6 +2016,19 @@ capturing`, `workspace restore pending: …`).
 To force a snapshot of a running replica, recycle it: `heyctl restart <id>`
 drains it, the capture runs, and the autoscaler boots its replacement from the
 result.
+
+**Scheduled snapshots.** Without `snapshot_interval_secs`, a replica that runs
+for days holds days of work that exist nowhere else: if its sandbox is lost
+rather than retired — a host failure, or a sandbox destroyed out of band — the
+workspace comes back from the last capture. With it set, the autoscaler does
+what `heyctl restart` does whenever the replica's uptime reaches the interval:
+drain, capture, then resume the same VM (`idle_action: retain`) or boot a new one
+from the result. The clock is the replica's uptime, not the snapshot's age, so a
+replica just booted from an old snapshot is not recycled straight away. Each
+snapshot is an outage of drain + capture + resume — seconds to minutes, growing
+with the workspace — so pick an interval that bounds the loss you can accept
+(`21600`, six hours, is a reasonable start). The daemon can only export a
+stopped VM's image, which is why this is a recycle and not a live copy.
 
 Rules and caveats, each of which the spec validation enforces or the docs
 above imply:

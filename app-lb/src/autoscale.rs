@@ -702,6 +702,8 @@ impl Autoscaler {
             self.scale_down(d, ready - desired as usize).await;
         }
 
+        self.snapshot_if_due(d).await;
+
         // After promotion and drain marking, before reaping: a replica is
         // bound the tick it becomes ready and unbound the tick it starts
         // draining, so the cloud stops sending it new requests before the
@@ -711,6 +713,36 @@ impl Autoscaler {
         self.reap_drained(d).await;
         self.renew_ttls(d, fleet).await;
         self.apply_usage(d, usage);
+    }
+
+    /// Start a scheduled workspace snapshot, if one is due.
+    ///
+    /// A snapshot can only be taken of a stopped VM (the daemon replays the
+    /// image's journal and reads it offline), so "periodic" means recycling:
+    /// the same graceful eviction `heyctl restart` performs. The replica drains,
+    /// `reap_drained` retires it into the capture, and the replacement — the
+    /// same VM resumed under `idle_action: retain`, else a fresh one — boots
+    /// from the result. Nothing is started while the workspace is busy or a
+    /// rollout holds the deployment.
+    async fn snapshot_if_due(&self, d: &Arc<Deployment>) {
+        let interval = snapshot_interval(d);
+        if interval.is_none() || !d.pending().is_empty() || crate::rollout::reserved(d) {
+            return;
+        }
+        if let Some(why) = self.workspaces.blocked(d) {
+            tracing::debug!(deployment = %d.spec.id, %why, "scheduled workspace snapshot waits");
+            return;
+        }
+        let Some(sandbox) = snapshot_candidate(interval, &d.backends()) else {
+            return;
+        };
+        tracing::info!(
+            deployment = %d.spec.id,
+            sandbox = %sandbox,
+            interval_secs = interval.unwrap_or_default(),
+            "scheduled workspace snapshot: recycling the replica so its workspace is captured",
+        );
+        self.evict(d, &sandbox, false).await;
     }
 
     /// Keep the daemon-side binds in step with `ingress.cloud`: every ready,
@@ -2344,6 +2376,36 @@ fn host_sandboxes(
     out
 }
 
+/// `vm.workspace.snapshot_interval_secs`, when `d` has a workspace and sets one.
+fn snapshot_interval(d: &Deployment) -> Option<u64> {
+    d.spec
+        .vm
+        .as_ref()
+        .and_then(|vm| vm.workspace.as_ref())
+        .and_then(|w| w.snapshot_interval_secs)
+}
+
+/// The replica a scheduled workspace snapshot should recycle now, if any.
+///
+/// Measured by the replica's own uptime, not the age of the last snapshot:
+/// what is at risk is what *this* replica has written since it was seeded or
+/// resumed, and a replica just booted from a months-old snapshot has written
+/// nothing yet. Recycling resumes it (or boots a fresh one) as a new backend,
+/// so the clock restarts there. Nothing while any replica is already
+/// draining — that one's capture is the snapshot.
+///
+/// Pure, so the schedule is testable without a daemon.
+fn snapshot_candidate(interval: Option<u64>, backends: &[Arc<VmBackend>]) -> Option<String> {
+    let interval = interval?;
+    if backends.iter().any(|b| b.is_draining()) {
+        return None;
+    }
+    backends
+        .iter()
+        .find(|b| b.uptime_secs() >= interval)
+        .map(|b| b.sandbox_id.clone())
+}
+
 /// Whether `d` needs nothing this tick beyond a usage sample.
 ///
 /// This is the fast path that makes a fleet of thousands viable: at rest, a
@@ -2362,6 +2424,10 @@ fn at_rest(
         return false;
     }
     if backends.len() != d.desired_replicas() as usize {
+        return false;
+    }
+    // A scheduled workspace snapshot is due: only `reconcile_one` starts one.
+    if snapshot_candidate(snapshot_interval(d), &backends).is_some() {
         return false;
     }
     // The daemon runs more replicas for this deployment than it is tracking, so
@@ -3598,6 +3664,64 @@ mod tests {
         create.await;
         assert!(d.pending().is_empty());
         assert!(scaler.workspaces.blocked(&d).is_some());
+    }
+
+    mod scheduled_snapshots {
+        use super::*;
+
+        fn b(id: &str, up: u64) -> Arc<VmBackend> {
+            Arc::new(VmBackend::ready_secs_ago(id, up))
+        }
+
+        #[test]
+        fn nothing_without_an_interval() {
+            assert_eq!(snapshot_candidate(None, &[b("sb-1", 10 * 86_400)]), None);
+        }
+
+        #[test]
+        fn a_replica_up_longer_than_the_interval_is_recycled() {
+            assert_eq!(snapshot_candidate(Some(3600), &[b("sb-1", 3599)]), None);
+            assert_eq!(
+                snapshot_candidate(Some(3600), &[b("sb-1", 3600)]),
+                Some("sb-1".to_string())
+            );
+        }
+
+        #[test]
+        fn nothing_while_a_replica_is_already_draining() {
+            let draining = b("sb-1", 7200);
+            draining.set_draining(true);
+            assert_eq!(snapshot_candidate(Some(3600), &[draining]), None);
+        }
+
+        #[test]
+        fn a_due_deployment_is_not_at_rest() {
+            let mut s = spec();
+            s.scaling.min_replicas = 1;
+            s.scaling.max_replicas = 1;
+            s.vm.as_mut().unwrap().workspace = Some(crate::config::WorkspaceSpec {
+                path: None,
+                store: "/srv/art".into(),
+                artifact_ref: None,
+                auth: None,
+                snapshot_interval_secs: Some(3600),
+            });
+            let (_scaler, registry) = autoscaler_against("http://127.0.0.1:1", s);
+            let d = registry.get("demo").unwrap();
+            let fleet = |up: u64| {
+                let info: SandboxInfo = serde_json::from_value(serde_json::json!({
+                    "id": "sb-1", "name": "applb-demo-000000000001", "status": "running",
+                    "image": "demo", "uptime_secs": up, "is_deployed": true,
+                    "status_changed_at": "", "urls": [], "ttl_seconds": 86_400
+                }))
+                .unwrap();
+                HashMap::from([("sb-1".to_string(), info)])
+            };
+            d.set_backends(vec![b("sb-1", 60)]);
+            assert!(at_rest(&d, &fleet(60), &HashMap::new()), "a fresh replica is at rest");
+            d.set_backends(vec![b("sb-1", 3700)]);
+            assert!(!at_rest(&d, &fleet(3700), &HashMap::new()), "a due one needs reconcile_one");
+        }
     }
 
     /// Sandboxes named for a deployment this LB does not have. The 2026-09-29

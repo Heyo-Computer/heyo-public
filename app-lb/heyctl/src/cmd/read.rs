@@ -1252,6 +1252,19 @@ fn describe_one(d: &DeploymentStatus, metrics: Option<&MetricsResponse>) {
                     }
                 },
             );
+            let interval = d
+                .spec
+                .vm
+                .as_ref()
+                .and_then(|vm| vm.workspace.as_ref())
+                .and_then(|w| w.snapshot_interval_secs);
+            output::field(
+                "  Snapshot every",
+                match interval {
+                    Some(n) => output::duration(n),
+                    None => "only when the replica retires (snapshot_interval_secs unset)".to_string(),
+                },
+            );
             for p in &ws.pending {
                 output::field(
                     "  Capture queued",

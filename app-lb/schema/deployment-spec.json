@@ -1409,6 +1409,15 @@
             "null"
           ]
         },
+        "snapshot_interval_secs": {
+          "description": "Take a snapshot at least this often, in seconds, by recycling the\nreplica: drain, capture, then resume it (`idle_action: retain`) or boot\nits replacement from the result. Unset, a snapshot is taken only when\nthe replica retires for some other reason — a VM that runs for days\nholds days of work that exist nowhere else. Each one costs the drain\nplus the capture as downtime, so at least\n[`MIN_SNAPSHOT_INTERVAL_SECS`].",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "store": {
           "description": "Where snapshots go, in one of three forms:\n\n* `s3://bucket[/prefix]` — an S3 bucket, reached with the `aws` CLI and\n  whatever credentials it finds (`APP_LB_DISK_ARCHIVE_ENDPOINT` applies\n  for an S3-compatible store). Snapshots land at\n  `<prefix>/<deployment>/<digest>.tar.gz` with a `latest` pointer.\n* `http(s)://host:port` — a remote `art serve`. Each snapshot is a blob,\n  and [`ref`](Self::artifact_ref) is the tag that names the newest.\n* an absolute path — a local `ART_ROOT`, reached through the `art` CLI.",
           "type": "string"

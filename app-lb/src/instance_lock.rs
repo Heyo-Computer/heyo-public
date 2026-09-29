@@ -144,7 +144,17 @@ mod tests {
         );
         drop(first);
         // Released with the file: the next start succeeds and records itself.
-        let _second = acquire(&path, "pid 44").unwrap();
+        // Retried briefly because other tests in this process fork children,
+        // and one forked before `drop` holds the lock's file description until
+        // it execs — flock semantics, not a bug here.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let _second = loop {
+            match acquire(&path, "pid 44") {
+                Ok(f) => break f,
+                Err(e) if std::time::Instant::now() >= deadline => panic!("{e}"),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        };
         assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "pid 44");
     }
 }
