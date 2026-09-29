@@ -1627,6 +1627,76 @@ files. Do not mix old disk-writing controllers with shared-storage controllers
 or roll back the binary without a compatible log-storage plan. This storage
 change alone does not authorize a second executor or prove regional failover.
 
+### Operator-owned release policy
+
+`CI_RELEASE_POLICIES` optionally supplies a YAML (or JSON) mapping from repository
+URL to an operator-owned release policy. Inject it through the service's
+HeyoSecret-backed configuration, outside repository workflow secrets, using
+`ci-controller/release-policies` as the canonical configuration path. CI does not
+read this policy from the submitted checkout. All regional CI apps must receive
+the same configuration before using this mode.
+
+Each policy contains `workflow_path` (the stable identity shown on the run),
+`workflow` (the `on: release` YAML), `service_targets`, and optional `placements`.
+Candidate `on: release` files are ignored for enrolled repositories; deleting or
+renaming one does not remove the operator policy. Candidate validation workflows
+remain candidate-owned. Partial submissions remain validation-only.
+
+The operator workflow uses existing actions with logical aliases:
+
+- `ci/rollout-service`: `with.target` resolves through `service_targets`, whose
+  entries contain the existing service rollout target fields (`url`,
+  `deployment`, `namespace`, `mount_path`, `revision_env`, `start_command`, and
+  `working_directory`). Do not repeat those values in the action.
+- `ci/promote-service-archive` and `ci/host-heyvm-maintenance`: `with.target`
+  resolves through the existing trusted host-maintenance mapping. That **one
+  mapping** owns Cloud URL, Orchestrator URL, archive owner, runner, and backend.
+  In particular, a US host may be managed by an EU Cloud authority. Do not infer
+  the API endpoint from the region name or repeat `url`, `runner`, or `user-id`.
+- `ci/rollout-host-heyvmd` and `ci/bootstrap-host-heyvm` retain their existing
+  target aliases. `placements` maps their **job IDs** to maintenance aliases for
+  the coordinator host. Admission rejects a missing coordinator or one on the
+  host being replaced, rather than waiting until deployment to discover it.
+
+Admission validates the complete policy and resolves its targets before creating
+any run. Each release job stores the expanded instructions, a policy/target
+digest, and non-secret host mapping snapshots in its existing JSON plan. Restart
+and published-release retry reuse those plans, not newly loaded policy YAML.
+Before merge, CI rechecks host mappings and resolves the policy's credential
+expressions. Host operations also refuse changed mappings at execution. No
+credential values are stored in the policy snapshot.
+
+This does **not** add a global execution lock, an active/standby role, or a new
+coordinator. Region sequencing is the release's existing `needs` DAG. Other CI
+runs continue independently. The DAG orders one release, not separate concurrent
+releases; existing per-target conflict checks still apply. This policy mechanism is not a sandbox for hostile
+repository code; validation credential scoping remains a separate responsibility.
+
+[`deploy/regional-release-policy.example.yml`](deploy/regional-release-policy.example.yml)
+is a region-neutral example for the private Heyo repository. Region names, count,
+endpoints, coordinator placements and sequence are operator configuration, not
+built-in US/EU choices. Adding China or another region requires its target mappings
+and jobs in this operator policy, not Rust changes or candidate workflow edits.
+The example completes Cloud, heyvm and heyvmd in each configured region, followed
+by mandatory public-health sampling before the next region starts.
+The sampling requires HTTP 200, not redirects;
+it supplements the existing exact deployment receipts and is not proof of
+zero-downtime failover. It uses normal maintenance, not the legacy bootstrap flag.
+Confirm installed updater capability before provisioning this example. Runtime
+variables must not be used to switch between bootstrap and maintenance mid-run;
+choose that path in the operator policy itself.
+
+Migration order: install and verify compatible CI code one configured region at a time; provision
+the reviewed policy identically through HeyoSecret; then submit the private
+revision normally. Keep existing repository release YAML until policy activation
+is confirmed, then remove that duplicate. Do not resubmit the old conflicting
+release in the transition. Existing admitted runs retain their original plans;
+cancel an unmerged obsolete release and submit anew rather than rewriting it.
+Without a policy entry, repositories retain the existing workflow behavior.
+Invalid configured policy is an admission error, never a fallback to candidate
+release YAML. Live API reachability, permissions, and health can still change
+after admission; these checks do not promise that deployment cannot fail.
+
 ### One submission across validation workflows and deployment
 
 A repository can define exactly one trusted workflow with `on: release`, alongside

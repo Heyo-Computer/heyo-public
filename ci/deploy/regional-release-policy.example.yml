@@ -1,0 +1,186 @@
+# Operator configuration example, NOT a submit workflow. Review and provision
+# through HeyoSecret only after all CI apps support CI_RELEASE_POLICIES.
+# Existing host-maintenance and host-heyvm-bootstrap mappings remain authoritative.
+# This is the normal maintenance path; it does not enable legacy bootstrap.
+# Region names, count, endpoints and order are operator choices. These aliases
+# and example domains are placeholders, not defaults or built-in regions.
+https://github.com/Heyo-Computer/heyo.git:
+  workflow_path: .ci/workflows/regional-release.yml
+  placements:
+    heyvmd-region-a: region-b
+    heyvmd-region-b: region-a
+  service_targets:
+    cloud-region-a:
+      url: https://admin.region-a.example
+      deployment: cloud-region-a
+      namespace: default
+      mount_path: /opt/cloud-release
+      revision_env: HEYO_CLOUD_DEPLOYMENT_GIT_SHA
+      start_command: /opt/cloud-release/start.sh
+      working_directory: /opt/cloud-release
+    cloud-region-b:
+      url: https://admin.region-b.example
+      deployment: cloud-region-b
+      namespace: default
+      mount_path: /opt/cloud-release
+      revision_env: HEYO_CLOUD_DEPLOYMENT_GIT_SHA
+      start_command: /opt/cloud-release/start.sh
+      working_directory: /opt/cloud-release
+  workflow: |
+    name: regional-release
+    on: release
+    env:
+      FIRST_CLOUD_HEALTH: https://cloud.region-a.example/health
+      SECOND_CLOUD_HEALTH: https://cloud.region-b.example/health
+      FIRST_CI_HEALTH: https://ci.region-a.example/healthz
+      SECOND_CI_HEALTH: https://ci.region-b.example/healthz
+    jobs:
+      merge:
+        vm: &release_vm
+          driver: firecracker
+          build:
+            dockerfile: .ci/image/bun/Dockerfile
+            context: .ci/image/bun
+            size_mb: 4096
+          size_class: small
+          disk_size_gb: 10
+          ttl_seconds: 3600
+        steps:
+          - uses: ci/merge-release
+            with:
+              manifests: '[]'
+              token: ${{ secrets.CI_GIT_AUTH_TOKEN || secrets.GITHUB_TOKEN }}
+      cloud-region-a:
+        needs: [merge]
+        vm: *release_vm
+        timeout-minutes: 40
+        steps:
+          - uses: ci/rollout-service
+            if: &cloud_changed ${{ changed('cloud/**', 'storage/**', 'local-proxy/**', 'rust-toolchain.toml', '.ci/cargo-lock-sync.sh', '.ci/package-service-archive.sh', '.ci/workflows/cloud.yml', '.ci/image/rust/**', '.ci/workflows/regional-release.yml') }}
+            timeout-minutes: 30
+            with:
+              target: cloud-region-a
+              token: ${{ secrets.APP_LB_REGION_A_TOKEN }}
+              workflow: .ci/workflows/cloud.yml
+              artifact: cloud
+      heyvm-region-a:
+        needs: [cloud-region-a]
+        vm: *release_vm
+        timeout-minutes: 60
+        steps:
+          - id: archive
+            if: &heyvm_changed ${{ changed('mvm-ctrl/**', 'local-proxy/**', 'kvmbind/**', 'avfbind/**', 'rust-toolchain.toml', '.ci/cargo-lock-sync.sh', '.ci/workflows/mvm-ctrl.yml', '.ci/image/rust/**', '.ci/workflows/regional-release.yml') }}
+            run: |
+              set -eu
+              version="$(awk -F'"' '/^version = /{print $2; exit}' mvm-ctrl/Cargo.toml)"
+              test -n "$version"
+              printf 'path=dist/heyvm-%s-unknown-linux-gnu-x86_64.tar.gz\n' "$version" >> "$CI_OUTPUT"
+          - uses: ci/promote-service-archive
+            id: publish
+            if: *heyvm_changed
+            with:
+              target: region-a
+              workflow: .ci/workflows/mvm-ctrl.yml
+              artifact: heyvm
+              path: ${{ steps.archive.outputs.path }}
+              token: ${{ secrets.ORCHESTRATOR_TOKEN }}
+              name: host-heyvm-region-a
+          - uses: ci/host-heyvm-maintenance
+            if: *heyvm_changed
+            timeout-minutes: 50
+            with:
+              target: region-a
+              token: ${{ secrets.CLOUD_TOKEN }}
+              archive-id: ${{ steps.publish.outputs.archive-id }}
+      heyvmd-region-a:
+        needs: [heyvm-region-a]
+        vm: *release_vm
+        timeout-minutes: 60
+        steps:
+          - uses: ci/rollout-host-heyvmd
+            if: *heyvm_changed
+            timeout-minutes: 50
+            with:
+              target: heyvmd-region-a
+              token: ${{ secrets.APP_LB_REGION_A_TOKEN }}
+              workflow: .ci/workflows/mvm-ctrl.yml
+              artifact: heyvm
+      verify-region-a:
+        needs: [heyvmd-region-a]
+        vm: *release_vm
+        steps:
+          - name: Check first region public health after host updates
+            run: |
+              set -eu
+              for sample in $(seq 1 12); do
+                test "$(curl --silent --show-error --max-time 10 --output /dev/null --write-out '%{http_code}' "$FIRST_CLOUD_HEALTH")" = 200
+                test "$(curl --silent --show-error --max-time 10 --output /dev/null --write-out '%{http_code}' "$FIRST_CI_HEALTH")" = 200
+                sleep 5
+              done
+      cloud-region-b:
+        needs: [verify-region-a]
+        vm: *release_vm
+        timeout-minutes: 40
+        steps:
+          - uses: ci/rollout-service
+            if: *cloud_changed
+            timeout-minutes: 30
+            with:
+              target: cloud-region-b
+              token: ${{ secrets.APP_LB_REGION_B_TOKEN }}
+              workflow: .ci/workflows/cloud.yml
+              artifact: cloud
+      heyvm-region-b:
+        needs: [cloud-region-b]
+        vm: *release_vm
+        timeout-minutes: 60
+        steps:
+          - id: archive
+            if: *heyvm_changed
+            run: |
+              set -eu
+              version="$(awk -F'"' '/^version = /{print $2; exit}' mvm-ctrl/Cargo.toml)"
+              test -n "$version"
+              printf 'path=dist/heyvm-%s-unknown-linux-gnu-x86_64.tar.gz\n' "$version" >> "$CI_OUTPUT"
+          - uses: ci/promote-service-archive
+            id: publish
+            if: *heyvm_changed
+            with:
+              target: region-b
+              workflow: .ci/workflows/mvm-ctrl.yml
+              artifact: heyvm
+              path: ${{ steps.archive.outputs.path }}
+              token: ${{ secrets.ORCHESTRATOR_TOKEN }}
+              name: host-heyvm-region-b
+          - uses: ci/host-heyvm-maintenance
+            if: *heyvm_changed
+            timeout-minutes: 50
+            with:
+              target: region-b
+              token: ${{ secrets.CLOUD_TOKEN }}
+              archive-id: ${{ steps.publish.outputs.archive-id }}
+      heyvmd-region-b:
+        needs: [heyvm-region-b]
+        vm: *release_vm
+        timeout-minutes: 60
+        steps:
+          - uses: ci/rollout-host-heyvmd
+            if: *heyvm_changed
+            timeout-minutes: 50
+            with:
+              target: heyvmd-region-b
+              token: ${{ secrets.APP_LB_REGION_B_TOKEN }}
+              workflow: .ci/workflows/mvm-ctrl.yml
+              artifact: heyvm
+      verify-region-b:
+        needs: [heyvmd-region-b]
+        vm: *release_vm
+        steps:
+          - name: Check second region public health after host updates
+            run: |
+              set -eu
+              for sample in $(seq 1 12); do
+                test "$(curl --silent --show-error --max-time 10 --output /dev/null --write-out '%{http_code}' "$SECOND_CLOUD_HEALTH")" = 200
+                test "$(curl --silent --show-error --max-time 10 --output /dev/null --write-out '%{http_code}' "$SECOND_CI_HEALTH")" = 200
+                sleep 5
+              done

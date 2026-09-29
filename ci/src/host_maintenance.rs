@@ -149,7 +149,7 @@ pub async fn owns_job(store: &Store, job: &str) -> Result<bool> {
         .bind(job).fetch_one(store.pool()).await?)
 }
 
-async fn trusted_target(d: &Dispatcher, alias: &str) -> Result<Target> {
+pub(crate) async fn trusted_target(d: &Dispatcher, alias: &str) -> Result<Target> {
     let managed;
     let raw = match d.config.host_maintenance_targets.as_deref() {
         Some(raw) => raw,
@@ -166,6 +166,9 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, plan: &JobPlan, step: &st
     validate_plan(plan)?;
     crate::submission::authorize_publication(&d.store, &msg.run_id).await.map_err(anyhow::Error::msg)?;
     let target = trusted_target(d, alias).await?;
+    if let Some(policy) = &plan.release_policy {
+        ensure!(policy.maintenance.get(alias) == Some(&target), "maintenance target changed since release admission");
+    }
     ensure!(endpoint(cloud_url)? == endpoint(&target.cloud_url)?, "workflow Cloud URL differs from trusted mapping");
     ensure!(d.runners.snapshot().locate(&target.runner_hd_id).is_some(), "mapped runner is not served by this controller");
     let run = d.store.get_run(&msg.run_id).await?.ok_or_else(|| anyhow::anyhow!("missing run"))?;
