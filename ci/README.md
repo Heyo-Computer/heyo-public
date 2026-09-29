@@ -122,6 +122,40 @@ that reaches another boot. Keep `/maintenance` out of app-lb `public_paths`.
 4. `POST /maintenance/{uuid}/resume` reopens this boot for the matching operation,
    unless platform retirement is pending. It cannot resume another operation.
 
+### Runner drain across regions
+
+Instance pause does not drain a server: the other CI instance can still place
+jobs there. To empty a Linux runner without interrupting its running jobs, use
+the authenticated admin API on either CI instance:
+
+- `POST /maintenance/runners/{runner-id}/{uuid}/pause` durably closes that
+  runner's job admission. Use the canonical runner ID, not its display name.
+- `GET /maintenance/runners/{runner-id}` reports running jobs, outstanding host
+  work, cleanup, and `drained`. Only an admission-closed runner with all three
+  counts zero is drained. This is CI job drain, not permission to stop unrelated
+  platform services or retire the CI app itself.
+- `POST /maintenance/runners/{runner-id}/{uuid}/resume` reopens admission for the
+  matching operation after recovery. It does not clear other host-upgrade fences.
+
+Both CI instances must run a version implementing runner drain before using it;
+an older executor does not check this admission state. Keep these routes behind
+the admin identity gate, outside app-lb `public_paths`.
+
+The shared database retains the drain across CI restarts. A runner-scoped lock
+serializes it with job claims; there is no system-wide gate. Jobs already claimed
+finish on their original server, including cleanup. Unclaimed jobs from new or
+existing runs select a healthy, non-draining runner in the same network. Ready
+dependent jobs do not wait for their entire run to finish on the drained server.
+Unpinned jobs prefer their run's most recently used eligible server; this is a
+preference, not a guarantee for simultaneous first jobs.
+
+Use unpinned jobs, or `fallback: any` for a preferred host, for regional movement.
+Movable jobs use the network's durable NATS queue. Strict host pins and named-VM
+jobs remain pinned rather than silently executing on a different machine.
+The queue carries job IDs; dependencies, outputs and ownership stay in the shared
+database. Cross-job files must be published to shared artifact storage and
+downloaded by the next job, not left on the previous job VM's disk.
+
 `ci --inspect-executor` lists registered process boots without starting workers.
 The old `--hold-executor-recovery` and `--transfer-executor-recovery` commands are
 retired and fail explicitly. No singleton transfer is needed after a restart.
@@ -164,9 +198,13 @@ the registered HeyoSecret `GIT_AUTH_TOKEN`, with no version bump or tags. The
 captured trunk must still match at publication; a moved trunk requires revalidation.
 
 CI runtime changes also require `ci/deploy-controller`. It prepares a durable
-release intent and obtains acceptance from Orchestrator's shared application
-update API. Only Orchestrator's authenticated activation can advance a prepared
-intent into a rollout. CI then closes new submissions (HTTP 503) and lets existing jobs finish before
+release intent. A never-adopted app-lb deployment with all three application
+lifecycle settings absent starts its scoped rollout directly, after the existing
+repository, merged-release, artifact and deployment checks. An adopted deployment
+obtains acceptance from Orchestrator's shared application update API; only its
+authenticated activation advances that prepared intent. Partial configuration is
+an error, and removing configuration cannot bypass a recorded adoption. CI then
+closes new submissions (HTTP 503) and lets existing jobs finish before
 replacing the controller. The requesting job finishes first; the **run remains
 running** until the replacement resumes reconciliation and its public health
 endpoint identifies the expected revision and executable SHA256. Documentation
@@ -181,8 +219,8 @@ configuration before enabling the workflow:
 
 - `CI_CONTROLLER_DEPLOYMENT`: the app-lb deployment ID of this controller.
 - `CI_CONTROLLER_REPOSITORY`: the only repository allowed to replace it.
-- `CI_APPLICATION_ID`: the adopted shared application identity, normally `ci`.
-- `CI_APPLICATION_ORCHESTRATOR_URL`: the shared application authority origin.
+- `CI_APPLICATION_ID`: when adopted, the shared application identity, normally `ci`.
+- `CI_APPLICATION_ORCHESTRATOR_URL`: when adopted, the shared application authority origin.
 - `CI_APPLICATION_LIFECYCLE_TOKEN`: a HeyoSecret-backed credential scoped to
   this application's update exchange. Orchestrator's binding references the same
   credential. It is not the app-lb admin, repository submit or native runner token.
@@ -1472,19 +1510,22 @@ receipt requires no local effects or owned job obligations, and a ready approved
 survivor outside the retiring region. No authority transfers to that survivor:
 it was already active. Retired boots cannot begin effects.
 
-App-lb-managed CI keeps the existing `ci/deploy-controller` action and application
-acceptance/activation contract; removing the execution owner does not remove the
-deployment path or migrate its VM. Replacement pins the source boot, drains only
+App-lb-managed CI keeps the existing `ci/deploy-controller` action. Application
+acceptance/activation is required for adopted deployments, not never-adopted
+installations with no application lifecycle settings. This does not migrate VM
+ownership. Replacement pins the source boot, drains only
 that boot, and conditionally updates the same app-lb deployment. Other regions
 keep admitting work. Concurrent replacements are serialized per app-lb authority
 and deployment, not globally. The old boot retires before the update request;
 its replacement reconciles the saved intent and verifies the exact binary before
 opening admissions. A lost response is reconciled, never treated as success.
 
-Existing configuration requirements, including `CI_APPLICATION_ID` and the
-application authority's authenticated acceptance, still apply. This correction
-does not configure missing live bindings or implement a two-region release
-coordinator. Historical rollouts without a pinned source boot remain inspectable
+Configured application authority and persisted adopted operations retain their
+authenticated acceptance requirement. All three lifecycle settings must either
+be absent on a never-adopted deployment or form a complete valid configuration.
+This correction does not install itself into an older binary that unconditionally
+requires those settings, or implement a two-region release coordinator.
+Historical rollouts without a pinned source boot remain inspectable
 and require explicit reconciliation; they are not silently adopted or completed.
 An original process lost before submitting its update likewise requires explicit
 reconciliation rather than letting a new boot replace an unidentified predecessor.

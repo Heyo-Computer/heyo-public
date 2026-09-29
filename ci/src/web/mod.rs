@@ -87,6 +87,8 @@ pub fn router(
         // Behind the identity gate, never a repository-token/public machine API.
         .route("/maintenance", get(maintenance_status))
         .route("/maintenance/{id}/{action}", post(maintenance_action))
+        .route("/maintenance/runners/{runner}", get(runner_maintenance_status))
+        .route("/maintenance/runners/{runner}/{id}/{action}", post(runner_maintenance_action))
         .route("/runs/{run_id}", get(run_page))
         // Admin-only like the other state-changing routes: cancelling stops
         // somebody's build.
@@ -155,6 +157,37 @@ pub fn router(
 async fn maintenance_admin(state: &AppState, headers: &HeaderMap) -> Result<Identity, axum::response::Response> {
     may_manage(state, headers).await?.ok_or_else(||
         error(StatusCode::UNAUTHORIZED, "maintenance requires an authenticated CI admin"))
+}
+
+async fn runner_maintenance_status(State(state): State<AppState>, Path(runner): Path<String>, headers: HeaderMap) -> axum::response::Response {
+    if let Err(response) = maintenance_admin(&state, &headers).await { return response; }
+    match crate::host_maintenance::runner_drain_status(&state.store, &runner).await {
+        Ok(status) => Json(status).into_response(),
+        Err(detail) => {
+            tracing::error!(%runner, %detail, "could not read runner drain");
+            error(StatusCode::SERVICE_UNAVAILABLE, "runner drain status unavailable")
+        }
+    }
+}
+
+async fn runner_maintenance_action(State(state): State<AppState>, Path((runner, id, action)): Path<(String, uuid::Uuid, String)>, headers: HeaderMap) -> axum::response::Response {
+    if let Err(response) = maintenance_admin(&state, &headers).await { return response; }
+    let pause = match action.as_str() {
+        "pause" => true,
+        "resume" => false,
+        _ => return error(StatusCode::BAD_REQUEST, "expected pause or resume"),
+    };
+    if pause && state.runners.snapshot().locate(&runner).is_none() {
+        return error(StatusCode::NOT_FOUND, "unknown runner ID");
+    }
+    match tokio::time::timeout(Duration::from_secs(5), crate::host_maintenance::runner_drain(&state.store, &runner, id, pause)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(detail)) => {
+            tracing::warn!(%runner, %id, %detail, "runner drain transition refused");
+            error(StatusCode::CONFLICT, "runner drain transition refused")
+        }
+        Err(_) => error(StatusCode::GATEWAY_TIMEOUT, "read runner drain status before retrying the same operation ID"),
+    }
 }
 
 async fn maintenance_status(State(state): State<AppState>, headers: HeaderMap) -> axum::response::Response {

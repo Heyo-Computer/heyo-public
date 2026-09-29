@@ -1446,7 +1446,7 @@ impl Store {
         // this running job and must drain it before submitting.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 222))")
             .bind(runner_hd_id).execute(&mut *tx).await.map_err(StoreError::sql)?;
-        let cordoned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase NOT IN ('passed','superseded'))")
+        let cordoned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_runner_drain WHERE runner_hd_id=$1) OR EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase NOT IN ('passed','superseded'))")
             .bind(runner_hd_id).fetch_one(&mut *tx).await.map_err(StoreError::sql)?;
         if cordoned { return Ok(JobClaim::RunnerCordoned); }
         let row = sqlx::query(
@@ -3782,6 +3782,48 @@ jobs:
             "drain does not prevent already-owned work from finishing");
         assert_eq!(store.get_job(&job).await.unwrap().unwrap().status, "success");
         assert_eq!(store.get_job(&waiting).await.unwrap().unwrap().executor_boot, Some(other));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn runner_drain_moves_waiting_work_without_interrupting_running_jobs() {
+        use crate::host_maintenance::{runner_drain, runner_drain_status};
+        let store = test_store().await;
+        let run = crate::vm::new_id();
+        store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+        let us = format!("us-{run}");
+        let eu = format!("eu-{run}");
+        let first = job_id(&run, "build-x86_64");
+        let waiting = job_id(&run, "build-aarch64");
+        assert!(store.claim_job(&first, &us, 1).await.unwrap());
+        let operation = Uuid::new_v4();
+        // Force a late claim to wait for the same lock as drain admission.
+        let mut drain = store.pool().begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,222))")
+            .bind(&us).execute(&mut *drain).await.unwrap();
+        sqlx::query("INSERT INTO ci_runner_drain(runner_hd_id,operation_id) VALUES($1,$2)")
+            .bind(&us).bind(operation).execute(&mut *drain).await.unwrap();
+        let late = store.claim_job(&waiting, &us, 1);
+        tokio::pin!(late);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut late).await.is_err());
+        drain.commit().await.unwrap();
+        assert!(!late.await.unwrap(), "drain must exclude a racing claim");
+        runner_drain(&store, &us, operation, true).await.unwrap();
+        assert!(runner_drain(&store, &us, Uuid::new_v4(), false).await.is_err());
+        assert_eq!(runner_drain_status(&store, &us).await.unwrap()["drained"], false);
+        assert!(store.claim_job(&waiting, &eu, 1).await.unwrap(), "same run continues on EU");
+        store.set_job_status(&first, JobStatus::Success, None).await.unwrap();
+        assert_eq!(runner_drain_status(&store, &us).await.unwrap()["drained"], false,
+            "terminal status alone must not erase cleanup obligations");
+        store.end_host_work(&first, &us, 1).await.unwrap();
+        assert_eq!(runner_drain_status(&store, &us).await.unwrap()["drained"], true);
+        assert_eq!(store.get_job(&waiting).await.unwrap().unwrap().runner_hd_id.as_deref(), Some(eu.as_str()));
+        let next_run = crate::vm::new_id();
+        store.create_run(&next_run, &RunRequest::default(), &test_plan()).await.unwrap();
+        let next_job = job_id(&next_run, "build-x86_64");
+        assert!(!store.claim_job(&next_job, &us, 1).await.unwrap(), "new runs also avoid US");
+        runner_drain(&store, &us, operation, false).await.unwrap();
+        assert!(store.claim_job(&next_job, &us, 1).await.unwrap(), "recovered US accepts new jobs");
     }
 
     #[tokio::test]
