@@ -3672,44 +3672,23 @@ async fn process_delivery(
                 }
                 Ok(false) => {}
             }
-            // Retryable up to `MAX_DELIVER`. Past that JetStream stops
-            // redelivering, so the job is marked failed here rather than
-            // left `running` forever with nothing coming back to it.
-            tracing::warn!(job = %job.job_key, attempt, "failed: {e}");
-            if attempt >= crate::bus::MAX_DELIVER as i32 {
-                if let Err(error) = dispatcher
-                    .store
-                    .record_unclaimed_job_error(
-                        &job.job_id,
-                        &format!("giving up after {attempt} attempts: {e}"),
-                        true,
-                    )
-                    .await {
-                    tracing::error!(job = %job.job_key, %error, "could not persist final delivery failure; refusing ACK");
+            // Drain handoffs and lost ACKs are deliveries, not failures.
+            // Persist the actual failure count atomically with the ownership
+            // check; a peer may have claimed this job since the error occurred.
+            let failures = match dispatcher.store.record_unclaimed_job_error(&job.job_id, &e.to_string()).await {
+                Ok(count) => count,
+                Err(error) => {
+                    tracing::error!(job = %job.job_key, %error, "could not persist delivery failure; refusing ACK");
                     return;
                 }
+            };
+            if failures.is_none_or(|count| count >= crate::bus::MAX_PRECLAIM_FAILURES) {
+                tracing::warn!(job = %job.job_key, ?failures, "no retry: job claimed, terminal, or failure budget exhausted: {e}");
                 let _ = msg.ack().await;
             } else {
-                // Negative-ack with the ladder's delay rather than
-                // waiting out `ack_wait`, which is job-length.
-                let delay = crate::bus::backoff_for(attempt as u32);
-                // Written on *every* attempt, not only the last. The
-                // ladder is 60s, 5 minutes, then 15, so a job that can
-                // never work — an image the host does not have is the
-                // usual one — used to show an empty error for twenty
-                // minutes before the fourth delivery finally recorded
-                // the reason. Saying it now, with what happens next, is
-                // the difference between a page that explains the wait
-                // and one that looks like nothing is happening.
-                let detail = format!(
-                    "attempt {attempt} of {} failed: {e}. Retrying in {}s.",
-                    crate::bus::MAX_DELIVER,
-                    delay.as_secs()
-                );
-                if let Err(error) = dispatcher.store.record_unclaimed_job_error(&job.job_id, &detail, false).await {
-                    tracing::error!(job = %job.job_key, %error, "could not persist retry diagnostic");
-                    return;
-                }
+                let failures = failures.unwrap();
+                let delay = crate::bus::backoff_for(failures as u32);
+                tracing::warn!(job = %job.job_key, failures, retry_seconds = delay.as_secs(), "pre-claim failure: {e}");
                 let _ = msg
                     .ack_with(async_nats::jetstream::AckKind::Nak(Some(delay)))
                     .await;
@@ -6647,9 +6626,17 @@ mod tests {
         let consumer = d.bus.consumer_for(&route).await.unwrap();
         let job = JobMessage { run_id: "run".into(), job_id: "job".into(), job_key: "deploy".into() };
         d.bus.publish_job(&route, &job).await.unwrap();
+        // Cross the old four-delivery boundary using real drain handoffs.
+        // No execution failure or claim may result from any of them.
+        d.executor.pause(uuid::Uuid::new_v4()).await.unwrap();
+        for expected_delivery in 1..=5 {
+            let (message, _slot) = tokio::time::timeout(Duration::from_secs(5),
+                pull_with_capacity(&consumer, Arc::new(tokio::sync::Semaphore::new(1)))).await.unwrap().unwrap().unwrap();
+            assert_eq!(message.info().unwrap().delivered, expected_delivery);
+            process_delivery(d.clone(), message, job.clone(), expected_delivery as i32).await;
+        }
         let (message, _slot) = pull_with_capacity(&consumer, Arc::new(tokio::sync::Semaphore::new(1))).await.unwrap().unwrap();
         let effect = d.executor.effect_permit().await.unwrap();
-        d.executor.pause(uuid::Uuid::new_v4()).await.unwrap();
         let running = d.clone();
         let task = tokio::spawn(async move {
             let _effect = effect;
@@ -6659,6 +6646,9 @@ mod tests {
         let fence = tokio::time::timeout(Duration::from_secs(2), d.executor.idle_guard()).await.unwrap().unwrap();
         assert_eq!(d.store.get_job("job").await.unwrap().unwrap().status, "queued");
         assert!(!d.store.has_host_work("job").await.unwrap());
+        let failures: i32 = sqlx::query_scalar("SELECT preclaim_failures FROM ci_job WHERE id='job'")
+            .fetch_one(d.store.pool()).await.unwrap();
+        assert_eq!(failures, 0, "drain handoffs must not spend the failure budget");
         drop(fence);
         let (redelivery, _) = tokio::time::timeout(Duration::from_secs(5),
             pull_with_capacity(&consumer, Arc::new(tokio::sync::Semaphore::new(1)))).await.unwrap().unwrap().unwrap();

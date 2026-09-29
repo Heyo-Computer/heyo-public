@@ -1498,7 +1498,7 @@ impl Store {
             .bind(run_id).fetch_one(&self.pool).await.map_err(StoreError::sql)
     }
 
-    /// Record a pre-claim delivery error, optionally exhausting its retry budget.
+    /// Count an actual pre-claim failure, independent of transport deliveries.
     ///
     /// A failed delivery is negative-acked and retried on the backoff ladder —
     /// 60s, then 5 minutes, then 15 — and until this existed the reason was
@@ -1510,19 +1510,20 @@ impl Store {
     ///
     /// The UPDATE races atomically with a regional claim. Never annotate or
     /// fail another boot's work based on an earlier ownership observation.
-    pub async fn record_unclaimed_job_error(&self, job_id: &str, error: &str, terminal: bool) -> Result<bool, StoreError> {
+    pub async fn record_unclaimed_job_error(&self, job_id: &str, error: &str) -> Result<Option<i32>, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
         let row = sqlx::query(
             "UPDATE ci_job SET error = $2,
-                    status = CASE WHEN $3 THEN 'failure' ELSE status END,
-                    finished_at = CASE WHEN $3 THEN now() ELSE finished_at END
+                    preclaim_failures = preclaim_failures + 1,
+                    status = CASE WHEN preclaim_failures + 1 >= $3 THEN 'failure' ELSE status END,
+                    finished_at = CASE WHEN preclaim_failures + 1 >= $3 THEN now() ELSE finished_at END
               WHERE id = $1 AND status IN ('pending','queued') AND executor_boot IS NULL
                 AND NOT EXISTS (SELECT 1 FROM ci_host_work w WHERE w.job_id=ci_job.id)
-              RETURNING run_id, job_key, status",
+              RETURNING run_id, job_key, status, preclaim_failures",
         )
         .bind(job_id)
         .bind(error)
-        .bind(terminal)
+        .bind(crate::bus::MAX_PRECLAIM_FAILURES)
         .fetch_optional(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
@@ -1532,7 +1533,7 @@ impl Store {
                 &row.get::<String,_>("status"), Some(error)).await?;
         }
         tx.commit().await.map_err(StoreError::sql)?;
-        Ok(row.is_some())
+        Ok(row.map(|row| row.get("preclaim_failures")))
     }
 
     /// Record which machine a running job landed on.
@@ -2710,7 +2711,7 @@ mod tests {
         store.create_run(&run_id, &RunRequest::default(), &test_plan()).await.unwrap();
         let job = store.jobs_of(&run_id).await.unwrap().remove(0);
 
-        assert!(store.record_unclaimed_job_error(&job.id, "attempt 1 failed; retrying", false).await.unwrap());
+        assert_eq!(store.record_unclaimed_job_error(&job.id, "attempt 1 failed; retrying").await.unwrap(), Some(1));
         assert_eq!(store.get_job(&job.id).await.unwrap().unwrap().error.as_deref(), Some("attempt 1 failed; retrying"));
         store.set_job_status(&job.id, JobStatus::Success, None).await.unwrap();
         let finished = store.get_job(&job.id).await.unwrap().unwrap();
@@ -3796,12 +3797,12 @@ jobs:
         let mut winner = store.pool().begin().await.unwrap();
         sqlx::query("UPDATE ci_job SET status='running',executor_boot=$2,attempt=7,error='winner diagnostic' WHERE id=$1")
             .bind(&job).bind(boot).execute(&mut *winner).await.unwrap();
-        let losing_error = store.record_unclaimed_job_error(&job, "loser exhausted retries", true);
+        let losing_error = store.record_unclaimed_job_error(&job, "loser exhausted retries");
         tokio::pin!(losing_error);
         assert!(tokio::time::timeout(Duration::from_millis(50), &mut losing_error).await.is_err());
         winner.commit().await.unwrap();
-        assert!(!losing_error.await.unwrap());
-        assert!(!store.record_unclaimed_job_error(&job, "loser retry diagnostic", false).await.unwrap());
+        assert_eq!(losing_error.await.unwrap(), None);
+        assert_eq!(store.record_unclaimed_job_error(&job, "loser retry diagnostic").await.unwrap(), None);
         assert!(!store.set_job_status_for_boot(&job, JobStatus::Running, Some("loser owned error"), 7, Uuid::new_v4()).await.unwrap());
         let claimed = store.get_job(&job).await.unwrap().unwrap();
         assert_eq!(claimed.status, "running");
@@ -3812,15 +3813,25 @@ jobs:
         // Genuine pre-claim failures still record retry diagnostics and reach
         // a terminal failure, rather than silently leaving pending jobs behind.
         let unclaimed = job_id(&run, "build-aarch64");
-        assert!(store.record_unclaimed_job_error(&unclaimed, "retry", false).await.unwrap());
+        assert_eq!(store.record_unclaimed_job_error(&unclaimed, "retry").await.unwrap(), Some(1));
         let pending = store.get_job(&unclaimed).await.unwrap().unwrap();
         assert_eq!(pending.status, "pending");
         assert_eq!(pending.error.as_deref(), Some("retry"));
-        assert!(store.record_unclaimed_job_error(&unclaimed, "exhausted", true).await.unwrap());
+        // Independent dispatchers share one persisted failure budget. Neither
+        // can lose the other's increment, and three failures remain retryable.
+        let (a, b) = tokio::join!(
+            store.record_unclaimed_job_error(&unclaimed, "retry a"),
+            store.record_unclaimed_job_error(&unclaimed, "retry b"),
+        );
+        let mut counts = [a.unwrap().unwrap(), b.unwrap().unwrap()];
+        counts.sort();
+        assert_eq!(counts, [2, 3]);
+        assert_eq!(store.get_job(&unclaimed).await.unwrap().unwrap().status, "pending");
+        assert_eq!(store.record_unclaimed_job_error(&unclaimed, "exhausted").await.unwrap(), Some(4));
         let failed = store.get_job(&unclaimed).await.unwrap().unwrap();
         assert_eq!(failed.status, "failure");
         assert_eq!(failed.error.as_deref(), Some("exhausted"));
-        assert!(!store.record_unclaimed_job_error(&unclaimed, "late retry", false).await.unwrap());
+        assert_eq!(store.record_unclaimed_job_error(&unclaimed, "late retry").await.unwrap(), None);
         assert_eq!(store.get_job(&unclaimed).await.unwrap().unwrap().error.as_deref(), Some("exhausted"));
     }
 

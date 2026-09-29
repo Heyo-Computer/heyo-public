@@ -1440,7 +1440,16 @@ integration test pins the server's behaviour.
 
 Binding also **reconciles an existing consumer**: JetStream returns the durable
 that is already there and ignores the config passed with it, so an upgrade would
-otherwise keep the old window and none of this would take effect.
+otherwise keep the old window and none of this would take effect. CI updates
+acknowledgement timing and the delivery limit in place (NATS server 2.10+), without
+deleting the consumer or discarding pending acknowledgements.
+
+Transport delivery is unlimited: returning an unstarted job during drain does
+not count as a failed execution. Migration 044 adds a per-job `preclaim_failures`
+counter; only actual pre-claim errors increment it, atomically with the ownership
+check. The fourth such failure marks the job failed. Retry delays follow that
+counter, not the NATS delivery number. The existing queued-job waiting timeout
+still applies; unlimited delivery does not promise an unlimited queue lifetime.
 
 ### Active CI instances, scoped job ownership
 

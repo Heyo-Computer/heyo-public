@@ -275,6 +275,7 @@ jobs:
           cargo test --release --locked --bin ci store::tests::delivery_failure_cannot_overwrite_a_regional_claim -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci store::tests::regional_claims_and_expiry_cannot_reassign_unresolved_execution -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci dispatch::tests::delivery_racing_instance_drain_returns_to_shared_queue -- --ignored --exact --test-threads=1
+          cargo test --release --locked --bin ci bus::tests::an_existing_consumer_is_updated_without_losing_pending_delivery -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci dispatch::tests::durable_vm_cleanup_recovers_without_guessing_ownership -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci web::tests::managed_frontends_preserve_auth_and_reject_wrong_boot_without_retry -- --ignored --exact --test-threads=1
 
