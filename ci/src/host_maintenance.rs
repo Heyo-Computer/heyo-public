@@ -358,7 +358,7 @@ pub fn spawn(d: Arc<Dispatcher>) {
 /// Reconcile an exact completed operation, never POST another upgrade. Only
 /// untouched skipped jobs resume; the failed outcome remains in the event log.
 pub async fn recover(d: &Dispatcher, run_id: &str, id: &str) -> Result<Value> {
-    let _effect = d.executor.effect_permit_for(Some(id)).await.map_err(anyhow::Error::msg)?;
+    let effect = d.executor.effect_permit_for(Some(id)).await.map_err(anyhow::Error::msg)?;
     let mut tx = d.store.pool().begin().await?;
     let runner: String = sqlx::query_scalar("SELECT h.runner_hd_id FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.id=$1 AND s.run_id=$2")
         .bind(id).bind(run_id).fetch_one(&mut *tx).await?;

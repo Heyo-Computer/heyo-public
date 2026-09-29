@@ -1435,13 +1435,14 @@ while `ack_wait` was configured as four hours, so the configured value was
 discarded and every running job became eligible for redelivery a second after it
 started; with `max_deliver` at four, a healthy build could burn all four
 deliveries while doing nothing wrong, leaving a dispatcher that died with no
-redelivery left to recover it. A unit test now pins the two together and an
-integration test pins the server's behaviour.
+redelivery left to recover it. CI now leaves broker `BackOff` empty and uses
+explicit delayed NAKs for application failure retries. This also avoids older
+NATS servers rejecting a backoff list with unlimited delivery.
 
 Binding also **reconciles an existing consumer**: JetStream returns the durable
 that is already there and ignores the config passed with it, so an upgrade would
 otherwise keep the old window and none of this would take effect. CI updates
-acknowledgement timing and the delivery limit in place (NATS server 2.10+), without
+acknowledgement timing and the delivery limit in place through create-or-update, without
 deleting the consumer or discarding pending acknowledgements.
 
 Transport delivery is unlimited: returning an unstarted job during drain does
