@@ -1457,10 +1457,22 @@ receipt requires no local effects or owned job obligations, and a ready approved
 survivor outside the retiring region. No authority transfers to that survivor:
 it was already active. Retired boots cannot begin effects.
 
-Legacy direct CI self-replacement is retired: new requests fail before recording
-intent. Historical rollout records remain readable, but do not globally block
-admissions and are not silently marked successful. Updates belong to the platform
-per-instance lifecycle, preserving the existing application deployment identity.
+App-lb-managed CI keeps the existing `ci/deploy-controller` action and application
+acceptance/activation contract; removing the execution owner does not remove the
+deployment path or migrate its VM. Replacement pins the source boot, drains only
+that boot, and conditionally updates the same app-lb deployment. Other regions
+keep admitting work. Concurrent replacements are serialized per app-lb authority
+and deployment, not globally. The old boot retires before the update request;
+its replacement reconciles the saved intent and verifies the exact binary before
+opening admissions. A lost response is reconciled, never treated as success.
+
+Existing configuration requirements, including `CI_APPLICATION_ID` and the
+application authority's authenticated acceptance, still apply. This correction
+does not configure missing live bindings or implement a two-region release
+coordinator. Historical rollouts without a pinned source boot remain inspectable
+and require explicit reconciliation; they are not silently adopted or completed.
+An original process lost before submitting its update likewise requires explicit
+reconciliation rather than letting a new boot replace an unidentified predecessor.
 
 Configure `source.applicationLifecycle` in managed service metadata with `port`
 and `tokenSecretPath`; resolve `CI_APPLICATION_LIFECYCLE_TOKEN` from that same
@@ -1495,7 +1507,8 @@ or boot-scoped claims. Do not assume arbitrary mixed-version reconciliation is
 safe. Finish or explicitly settle their outstanding operations and stop old
 execution before enabling concurrent new execution. Preserve shared state and
 existing VM identities; do not delete owner/job records to force a cutover.
-Migrations 041/042 are additive. Historical singleton tables remain for diagnosis,
+Migrations 041/042 are additive; 043 scopes active rollout uniqueness to one
+app-lb authority/deployment. Historical singleton tables remain for diagnosis,
 but new processes neither read nor write their ownership state. This change alone
 does not deploy two regional CI apps or prove database/NATS regional failover.
 

@@ -31,8 +31,17 @@ impl ExecutorInstance {
     pub async fn register(pool: PgPool, deployment_id: &str) -> Result<Self, String> {
         if deployment_id.is_empty() { return Err("executor deployment identity must not be empty".into()); }
         let boot_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO ci_executor_boot(boot_id,deployment_id,execution_protocol) VALUES($1,$2,'job-claims-v1')")
-            .bind(boot_id).bind(deployment_id).execute(&pool).await.map_err(db)?;
+        // A replacement verifies its own unfinished rollout before taking jobs.
+        // Other deployment identities are unaffected, including other regions.
+        // Lock the matching rollout so finish cannot reopen admissions between
+        // observing the drain and committing this new boot.
+        let mut tx = pool.begin().await.map_err(db)?;
+        let drain: Option<Option<Uuid>> = sqlx::query_scalar("SELECT (request->>'source_boot')::uuid FROM ci_controller_rollout WHERE phase NOT IN ('prepared','complete') AND (request->>'base_url')||'/deployments/'||(request->>'deployment')=$1 FOR SHARE")
+            .bind(deployment_id).fetch_optional(&mut *tx).await.map_err(db)?;
+        sqlx::query("INSERT INTO ci_executor_boot(boot_id,deployment_id,execution_protocol,draining,maintenance_operation) VALUES($1,$2,'job-claims-v1',$3,$4)")
+            .bind(boot_id).bind(deployment_id).bind(drain.is_some()).bind(drain.flatten())
+            .execute(&mut *tx).await.map_err(db)?;
+        tx.commit().await.map_err(db)?;
         Ok(Self { pool, boot_id, deployment_id: deployment_id.into(), local: Arc::new(RwLock::new(())) })
     }
 
@@ -90,9 +99,9 @@ impl ExecutorInstance {
     }
 
     pub async fn resume(&self, id: Uuid) -> Result<(), String> {
-        let changed = sqlx::query("UPDATE ci_executor_boot SET draining=FALSE,maintenance_operation=NULL WHERE boot_id=$1 AND maintenance_operation=$2 AND NOT retired AND NOT EXISTS(SELECT 1 FROM ci_application_retirement WHERE target_boot=$1)")
-            .bind(self.boot_id).bind(id).execute(&self.pool).await.map_err(db)?.rows_affected();
-        if changed != 1 { return Err("maintenance operation does not match or retirement is pending".into()); }
+        let changed = sqlx::query("UPDATE ci_executor_boot SET draining=FALSE,maintenance_operation=NULL WHERE boot_id=$1 AND maintenance_operation=$2 AND NOT retired AND NOT EXISTS(SELECT 1 FROM ci_application_retirement WHERE target_boot=$1) AND NOT EXISTS(SELECT 1 FROM ci_controller_rollout WHERE phase<>'complete' AND request->>'source_boot'=($2::uuid)::text AND (request->>'base_url')||'/deployments/'||(request->>'deployment')=$3)")
+            .bind(self.boot_id).bind(id).bind(&self.deployment_id).execute(&self.pool).await.map_err(db)?.rows_affected();
+        if changed != 1 { return Err("maintenance operation does not match or retirement/replacement is pending".into()); }
         Ok(())
     }
 
@@ -108,6 +117,17 @@ impl ExecutorInstance {
         if !draining { return Err("maintenance operation does not match this instance".into()); }
         if self.has_work().await? { return Err("this CI instance still owns job or cleanup work".into()); }
         Ok(())
+    }
+
+    /// The app-lb replacement operation outlives this boot. Do not transfer
+    /// global authority; stop only this boot's effects, under its local guard.
+    pub async fn retire_for_replacement(&self, id: Uuid) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, String> {
+        let local = self.local.clone().try_write_owned().map_err(|_| "this CI instance has work in flight".to_owned())?;
+        if self.has_work().await? { return Err("this CI instance still owns job or cleanup work".into()); }
+        let changed = sqlx::query("UPDATE ci_executor_boot SET retired=TRUE WHERE boot_id=$1 AND draining AND maintenance_operation=$2")
+            .bind(self.boot_id).bind(id).execute(&self.pool).await.map_err(db)?.rows_affected();
+        if changed != 1 { return Err("replacement does not own this instance drain".into()); }
+        Ok(local)
     }
 
     pub async fn status(&self) -> Result<serde_json::Value, String> {

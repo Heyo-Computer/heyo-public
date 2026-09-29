@@ -412,6 +412,7 @@ async fn start_execution(dispatcher: Arc<Dispatcher>) {
     dispatcher.clone().spawn_lease_loop();
     dispatcher.clone().spawn_consumers();
     application_lifecycle::spawn(dispatcher.clone());
+    controller_rollout::spawn(dispatcher.clone());
     service_rollout::spawn(dispatcher.clone());
     managed_update::spawn(dispatcher.clone());
     host_maintenance::spawn(dispatcher.clone());

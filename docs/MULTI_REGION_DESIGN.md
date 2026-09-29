@@ -20,6 +20,13 @@ new work. Cleanup retains its row locks and ownership checks. Shared deployment
 reconcilers coordinate per operation. Existing app-lb-managed CI VM ownership is
 unchanged; this correction does not migrate them into Cloud management.
 
+The app-lb `ci/deploy-controller` action remains available with its existing
+application acceptance contract. Its drain, restart admission state and update
+uniqueness are scoped to the target deployment; no global authority is transferred.
+Artifact verification, conditional spec updates and exact replacement-binary
+verification remain required. Missing live application bindings are not repaired
+by this source change, and old unpinned rollout records need explicit reconciliation.
+
 Delivery/acceptance remains pending: the new tests are wired into the Linux CI
 workflow, but the change has not yet been deployed or proven with concurrent live
 regional jobs. Old binaries lack these scoped locks: their outstanding operations
