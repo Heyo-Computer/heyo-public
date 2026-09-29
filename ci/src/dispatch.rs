@@ -7045,7 +7045,7 @@ jobs:
             terminal.store(failed, Ordering::SeqCst);
             let workspace = tempfile::tempdir().unwrap();
             let d = test_dispatcher(workspace.path()).await;
-            let yaml = "jobs:\n  build:\n    vm:\n      build: {dockerfile: Dockerfile}\n    steps: [{run: echo test}]\n";
+            let yaml = "jobs:\n  build:\n    vm:\n      driver: firecracker\n      build: {dockerfile: Dockerfile}\n    steps: [{run: echo test}]\n";
             let workflow = crate::workflow::Workflow::parse("prep.yml", yaml).unwrap();
             let plan = crate::plan::Plan::build(&workflow).unwrap();
             let run = crate::vm::new_id();
