@@ -244,6 +244,16 @@ impl Dispatcher {
             None => req.repository.url.clone(),
         };
 
+        // Policy comes from the CI service's operator configuration, never the
+        // submitted tree. Resolve every target before admitting any run.
+        let release_policy = crate::release_policy::select(self.config.release_policies.as_deref(), &repo_url)
+            .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+        let operator_plan = match &release_policy {
+            Some(policy) => Some(crate::release_policy::prepare(self, &repo_url, policy).await
+                .map_err(|e| DispatchError::Workflow(e.to_string()))?),
+            None => None,
+        };
+
         // A registered workflow object decides the path glob and the id; without
         // one, the installation-wide default applies. Matching is on the
         // *repository*, because `git submit` knows what it is a clone of but not
@@ -340,8 +350,12 @@ impl Dispatcher {
         // not only on a page nobody has open.
         let mut warnings: Vec<String> = Vec::new();
 
-        for source in &sources {
-            let files = crate::trigger::find_workflows(&workspace.root, &source.pattern)?;
+        for (source_index, source) in sources.iter().enumerate() {
+            let mut files = crate::trigger::find_workflows(&workspace.root, &source.pattern)?;
+            if let Some(policy) = &release_policy {
+                files = crate::release_policy::workflows(files, policy, source_index == 0)
+                    .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+            }
             patterns_tried.push(source.pattern.clone());
             if files.is_empty() {
                 continue;
@@ -420,8 +434,11 @@ impl Dispatcher {
                         continue;
                     }
                 }
-                let mut plan = crate::plan::Plan::build(&wf)
-                    .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+                let mut plan = match operator_plan.as_ref().filter(|_| is_release) {
+                    Some(plan) => plan.clone(),
+                    None => crate::plan::Plan::build(&wf)
+                        .map_err(|e| DispatchError::Workflow(e.to_string()))?,
+                };
                 if is_release {
                     crate::submission::validate_release_plan(&plan)
                         .map_err(DispatchError::Workflow)?;
@@ -2870,6 +2887,13 @@ impl Dispatcher {
 
         match action {
             "ci/merge-release" => {
+                if let Some(policy) = &plan.release_policy {
+                    crate::release_policy::check_targets(self, policy).await
+                        .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                    if policy.token_expressions.iter().any(|expression| ctx.substitute(expression).trim().is_empty()) {
+                        return Err(DispatchError::StepFailed("operator release policy has an unresolved credential; merge refused".into()));
+                    }
+                }
                 let manifests: Vec<String> = serde_json::from_str(&required("manifests")?)
                     .map_err(|_| DispatchError::StepFailed("with.manifests must be a JSON array of manifest paths".into()))?;
                 let tags = with("tags").map(|raw| serde_json::from_str(&raw)

@@ -36,8 +36,18 @@ fn digest(value: &Value) -> String {
     hex::encode(Sha256::digest(serde_json::to_vec(&canonical).expect("JSON serializes")))
 }
 
-fn desired_spec(mut spec: Value, target: &Target, store: &str, artifact: &str, sha: &str) -> Result<Value> {
+pub(crate) fn validate_target(target: &Target) -> Result<()> {
     use std::path::{Component, Path};
+    ensure!(target.mount_path.starts_with("/opt/") && Path::new(&target.mount_path).components()
+        .all(|c| matches!(c, Component::RootDir | Component::Normal(_))), "release mount must be an absolute /opt path without traversal");
+    ensure!(target.working_directory == target.mount_path && target.start_command == format!("{}/start.sh", target.mount_path),
+        "service startup must execute the validated release mount start.sh");
+    ensure!(!target.revision_env.is_empty() && target.revision_env.bytes().enumerate()
+        .all(|(i,b)| b == b'_' || b.is_ascii_uppercase() || (i > 0 && b.is_ascii_digit())), "invalid revision environment name");
+    Ok(())
+}
+
+fn desired_spec(mut spec: Value, target: &Target, store: &str, artifact: &str, sha: &str) -> Result<Value> {
     ensure!(spec["id"] == target.deployment && spec["namespace"].as_str().unwrap_or("default") == target.namespace,
         "registered deployment identity differs from target");
     ensure!(spec["vm"]["driver"] == "firecracker" && spec["vm"]["workspace"].is_null(),
@@ -46,12 +56,7 @@ fn desired_spec(mut spec: Value, target: &Target, store: &str, artifact: &str, s
     ensure!(health.get("path").and_then(Value::as_str).is_some_and(|p| p.starts_with('/')),
         "candidate rollout requires an HTTP readiness path");
     health.insert("expected_header".into(), json!({"name":"x-heyo-revision","value":sha}));
-    ensure!(target.mount_path.starts_with("/opt/") && Path::new(&target.mount_path).components()
-        .all(|c| matches!(c, Component::RootDir | Component::Normal(_))), "release mount must be an absolute /opt path without traversal");
-    ensure!(target.working_directory == target.mount_path && target.start_command == format!("{}/start.sh", target.mount_path),
-        "service startup must execute the validated release mount start.sh");
-    ensure!(!target.revision_env.is_empty() && target.revision_env.bytes().enumerate()
-        .all(|(i,b)| b == b'_' || b.is_ascii_uppercase() || (i > 0 && b.is_ascii_digit())), "invalid revision environment name");
+    validate_target(target)?;
     let rootfs_auth = (spec["artifact"]["store"].as_str().map(|s| s.trim_end_matches('/'))
         == Some(store.trim_end_matches('/')))
         .then(|| spec["artifact"]["auth"].clone()).filter(|auth| !auth.is_null());

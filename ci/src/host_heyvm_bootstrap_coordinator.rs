@@ -40,6 +40,21 @@ async fn reconnect_daemon(d:&Dispatcher,req:&Request)->Result<()> {
     Ok(())
 }
 
+impl Target {
+    pub(crate) fn validate_admission(&self, repository: &str, coordinator: Option<&str>, heyvmd: bool) -> Result<()> {
+        ensure!(crate::repos::same_repo(repository, &self.repository), "host target is not authorized for this repository");
+        ensure!(coordinator.is_some_and(|runner| runner != self.runner_hd_id),
+            "host replacement requires a mapped coordinator on a different runner");
+        if heyvmd {
+            ensure!(matches!(self.process_manager.as_deref(), Some("systemd" | "supervisor")),
+                "heyvmd target requires an explicit process manager");
+            ensure!(std::path::Path::new(&self.executable).file_name().is_some_and(|name| name == "heyvmd"),
+                "daemon rollout target must name heyvmd");
+        }
+        Ok(())
+    }
+}
+
 pub fn validate_plan(plan: &JobPlan) -> Result<()> {
     for (i, step) in plan.steps.iter().enumerate().filter(|(_,s)| matches!(s.uses.as_deref(),Some(ACTION|HEYVMD_ACTION))) {
         ensure!(i+1==plan.steps.len() && !step.continue_on_error && !plan.continue_on_error,
@@ -62,7 +77,7 @@ fn mapping(raw: &str, alias: &str) -> Result<Target> {
     Ok(t)
 }
 
-async fn trusted(d:&Dispatcher, alias:&str)->Result<Target>{
+pub(crate) async fn trusted(d:&Dispatcher, alias:&str)->Result<Target>{
     let managed;
     let raw=match d.config.host_heyvm_bootstrap_targets.as_deref(){Some(v)=>v,None=>{managed=d.secrets.host_heyvm_bootstrap_targets().await?;managed.as_str()}};
     mapping(raw,alias)
@@ -99,6 +114,9 @@ fn launcher_spec(id:&str, namespace:&str, command:String)->Value { json!({"id":i
 pub async fn request(d:&Dispatcher,msg:&JobMessage,plan:&JobPlan,step:&str,alias:&str,token_expression:&str,workflow:&str,name:&str,timeout:Duration,component:&str)->Result<String>{
     validate_plan(plan)?; crate::submission::authorize_publication(&d.store,&msg.run_id).await.map_err(anyhow::Error::msg)?;
     let target=trusted(d,alias).await?; let secret=crate::host_maintenance::token_secret(token_expression)?;
+    if let Some(policy) = &plan.release_policy {
+        ensure!(policy.hosts.get(alias) == Some(&target), "host target changed since release admission");
+    }
     let run=d.store.get_run(&msg.run_id).await?.ok_or_else(||anyhow::anyhow!("missing run"))?;
     ensure!(crate::repos::same_repo(REPOSITORY,&run.repo_url),"only the private Heyo repository may bootstrap hosts");
     let release=crate::release::get(&d.store,&msg.run_id).await.map_err(anyhow::Error::msg)?.filter(|r|r.status=="published")
