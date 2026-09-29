@@ -2372,6 +2372,7 @@ mod page_tests {
             sandbox_id: Some("sb-1a341ac0".into()),
             status: status.into(),
             attempt: 1,
+            executor_boot: None,
             matrix: serde_json::json!({}),
             outputs: serde_json::json!({}),
             plan: serde_json::json!({ "needs": ["build"] }),

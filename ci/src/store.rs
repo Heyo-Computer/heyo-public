@@ -29,6 +29,7 @@ use sqlx::{PgPool, Row};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use uuid::Uuid;
 
 include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 
@@ -297,6 +298,9 @@ pub struct JobRow {
     pub sandbox_id: Option<String>,
     pub status: String,
     pub attempt: i32,
+    /// Process boot that atomically claimed this execution attempt. Historical
+    /// rows and non-executor status transitions intentionally remain NULL.
+    pub executor_boot: Option<Uuid>,
     pub matrix: serde_json::Value,
     pub outputs: serde_json::Value,
     /// The expanded `JobPlan` this job runs. The queue message carries only
@@ -329,6 +333,7 @@ impl JobRow {
             sandbox_id: r.get("sandbox_id"),
             status: r.get("status"),
             attempt: r.get("attempt"),
+            executor_boot: r.get("executor_boot"),
             matrix: r.get("matrix"),
             outputs: r.get("outputs"),
             plan: r.get("plan"),
@@ -1392,7 +1397,42 @@ impl Store {
         runner_hd_id: &str,
         attempt: i32,
     ) -> Result<bool, StoreError> {
+        self.claim_job_inner(job_id, runner_hd_id, attempt, None).await
+    }
+
+    /// Claim executor work for one registered process boot. In addition to the
+    /// job row race, this locks the boot row and rechecks admission in the same
+    /// transaction, closing the outstanding-pull versus drain race.
+    pub async fn claim_job_for_boot(
+        &self,
+        job_id: &str,
+        runner_hd_id: &str,
+        attempt: i32,
+        boot_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        self.claim_job_inner(job_id, runner_hd_id, attempt, Some(boot_id)).await
+    }
+
+    // `None` is deliberately limited to the compatibility wrapper above. It
+    // preserves unit-test and administrative callers without granting a NULL
+    // historical claim authority over a boot-owned attempt.
+    async fn claim_job_inner(
+        &self,
+        job_id: &str,
+        runner_hd_id: &str,
+        attempt: i32,
+        boot_id: Option<Uuid>,
+    ) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        if let Some(boot_id) = boot_id {
+            let admitted: Option<bool> = sqlx::query_scalar(
+                "SELECT NOT draining AND NOT retired FROM ci_executor_boot WHERE boot_id=$1 FOR UPDATE",
+            ).bind(boot_id).fetch_optional(&mut *tx).await.map_err(StoreError::sql)?;
+            if admitted != Some(true) {
+                tx.commit().await.map_err(StoreError::sql)?;
+                return Ok(false);
+            }
+        }
         // Same transaction-scoped runner lock as maintenance intent. The
         // subsequent snapshot sees a committed fence, or maintenance sees
         // this running job and must drain it before submitting.
@@ -1404,6 +1444,7 @@ impl Store {
         let row = sqlx::query(
             "UPDATE ci_job
                 SET status = 'running', runner_hd_id = $2, attempt = $3,
+                    executor_boot = $4,
                     started_at = COALESCE(started_at, now())
               WHERE id = $1
                 AND status IN ('pending','queued')
@@ -1415,6 +1456,7 @@ impl Store {
         .bind(job_id)
         .bind(runner_hd_id)
         .bind(attempt)
+        .bind(boot_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
@@ -1511,6 +1553,36 @@ impl Store {
         .await
         .map_err(StoreError::sql)?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Fill in VM identity only for the boot and attempt that won the claim.
+    pub async fn start_job_for_boot(&self, job_id: &str, runner_hd_id: &str,
+        sandbox_id: &str, fingerprint: &str, attempt: i32, boot_id: Uuid) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE ci_job SET sandbox_id=$3,fingerprint=$4
+             WHERE id=$1 AND runner_hd_id=$2 AND attempt=$5 AND executor_boot=$6
+               AND status='running'",
+        ).bind(job_id).bind(runner_hd_id).bind(sandbox_id).bind(fingerprint)
+            .bind(attempt).bind(boot_id).execute(&self.pool).await.map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn set_job_outputs_for_boot(&self, job_id: &str, outputs: &serde_json::Value,
+        attempt: i32, boot_id: Uuid) -> Result<bool, StoreError> {
+        let result = sqlx::query("UPDATE ci_job SET outputs=$2 WHERE id=$1 AND status='running' AND attempt=$3 AND executor_boot=$4")
+            .bind(job_id).bind(outputs).bind(attempt).bind(boot_id).execute(&self.pool).await.map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn set_job_status_for_boot(&self, job_id: &str, status: JobStatus,
+        error: Option<&str>, attempt: i32, boot_id: Uuid) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let row = sqlx::query("UPDATE ci_job SET status=$2,error=CASE WHEN $2 IN ('success','skipped') THEN $3 ELSE COALESCE($3,error) END,finished_at=CASE WHEN $2 IN ('success','failure','skipped','cancelled') THEN now() ELSE finished_at END WHERE id=$1 AND status='running' AND attempt=$4 AND executor_boot=$5 RETURNING run_id,job_key")
+            .bind(job_id).bind(status.as_str()).bind(error).bind(attempt).bind(boot_id)
+            .fetch_optional(&mut *tx).await.map_err(StoreError::sql)?;
+        if let Some(row) = &row { Self::add_event(&mut tx, &row.get::<String,_>("run_id"), Some(job_id), Some(&row.get::<String,_>("job_key")), None, "ci.job.status.v1", status.as_str(), error).await?; }
+        tx.commit().await.map_err(StoreError::sql)?;
+        Ok(row.is_some())
     }
 
     /// Move a job from `pending` to `queued`.
@@ -3653,6 +3725,45 @@ jobs:
         assert_eq!(pool.release_orphans(&runners, "new-controller").await.unwrap(), 1);
         assert_eq!(pool.sweep_stale_builds(&runners, "new-controller").await.unwrap(), 1);
         assert_eq!(pool.get(&sandbox).await.unwrap().unwrap().status, "idle");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn boot_claim_is_atomic_with_drain_and_cannot_be_completed_by_another_boot() {
+        let store = test_store().await;
+        let run = crate::vm::new_id();
+        store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+        let job = job_id(&run, "build-x86_64");
+        let admitted = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        for boot in [admitted, other] {
+            sqlx::query("INSERT INTO ci_executor_boot(boot_id,deployment_id,draining) VALUES($1,$2,FALSE)")
+                .bind(boot).bind(format!("test-{boot}")).execute(store.pool()).await.unwrap();
+        }
+
+        assert!(store.claim_job_for_boot(&job, "hd-1", 1, admitted).await.unwrap());
+        assert!(!store.claim_job_for_boot(&job, "hd-2", 2, other).await.unwrap(),
+            "a regional redelivery cannot steal a running attempt");
+        assert!(!store.set_job_status_for_boot(&job, JobStatus::Success, None, 1, other).await.unwrap(),
+            "another boot cannot complete the winner's attempt");
+
+        let waiting = job_id(&run, "build-aarch64");
+        let mut draining = store.pool().begin().await.unwrap();
+        sqlx::query("UPDATE ci_executor_boot SET draining=TRUE WHERE boot_id=$1")
+            .bind(admitted).execute(&mut *draining).await.unwrap();
+        let late_claim = store.claim_job_for_boot(&waiting, "hd-1", 1, admitted);
+        tokio::pin!(late_claim);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut late_claim).await.is_err(),
+            "claim must serialize with the in-flight drain transaction");
+        draining.commit().await.unwrap();
+        assert!(!late_claim.await.unwrap(),
+            "a draining boot cannot turn an outstanding delivery into new work");
+        assert!(store.claim_job_for_boot(&waiting, "hd-2", 1, other).await.unwrap(),
+            "the peer remains able to claim the exact rejected job");
+        assert!(store.set_job_status_for_boot(&job, JobStatus::Success, None, 1, admitted).await.unwrap(),
+            "drain does not prevent already-owned work from finishing");
+        assert_eq!(store.get_job(&job).await.unwrap().unwrap().status, "success");
+        assert_eq!(store.get_job(&waiting).await.unwrap().unwrap().executor_boot, Some(other));
     }
 
     // ---- log retention ---------------------------------------------------

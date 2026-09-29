@@ -161,7 +161,6 @@ pub async fn poll(
     validate_protocol(p.protocol_version).map_err(PollError::Rejected)?;
     let internal = |e: Box<dyn std::fmt::Display>| PollError::Internal(e.to_string());
     let mut tx = store.pool().begin().await.map_err(|e| internal(Box::new(e)))?;
-    crate::lifecycle::Lifecycle::grant_in(&mut tx).await.map_err(PollError::Internal)?;
     let quarantined: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_native_quarantine WHERE runner_id=$1)")
         .bind(&p.runner_id).fetch_one(&mut *tx).await.map_err(|e| internal(Box::new(e)))?;
     if quarantined { return Err(PollError::Rejected("native runner is quarantined pending operator cleanup".into())); }

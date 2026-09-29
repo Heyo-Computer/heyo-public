@@ -62,17 +62,22 @@ fn targets(observation:&Value,command:&Value,service:&str)->Result<Value> {
 }
 
 pub(crate) async fn reconcile(d:&Dispatcher)->Result<()> {
-    if d.config.managed_deployment.is_none() || !d.executor.is_owner().await.map_err(anyhow::Error::msg)? {return Ok(())}
+    if d.config.managed_deployment.is_none() {return Ok(())}
     let row=sqlx::query("SELECT u.*,j.status AS job_status,r.status AS run_status FROM ci_managed_update u
         JOIN ci_job j ON j.id=u.job_id JOIN ci_run r ON r.id=u.run_id WHERE u.result IS NULL ORDER BY u.created_at LIMIT 1")
         .fetch_optional(d.store.pool()).await?;
     let Some(row)=row else {return Ok(())};
+    let id:String=row.get("operation_id");
+    let _permit=d.executor.effect_permit_for(Some(&id)).await.map_err(anyhow::Error::msg)?;
+    // Selection predates the operation lock; a peer may have finished meanwhile.
+    let row=sqlx::query("SELECT u.*,j.status AS job_status FROM ci_managed_update u JOIN ci_job j ON j.id=u.job_id WHERE u.operation_id=$1 AND u.result IS NULL")
+        .bind(&id).fetch_optional(d.store.pool()).await?;
+    let Some(row)=row else {return Ok(())};
     let job:String=row.get("job_status");
     if !matches!(job.as_str(),"success"|"failure"|"cancelled"|"skipped") {return Ok(())}
-    let _permit=d.executor.effect_permit().await.map_err(anyhow::Error::msg)?;
     let (service,url,token)=target(d)?;
     anyhow::ensure!(row.get::<String,_>("service_id")==service,"managed service changed");
-    let id:String=row.get("operation_id"); let command:Value=row.get("request");
+    let command:Value=row.get("request");
     let saved:Option<Value>=row.get("targets");
     if !row.get::<bool,_>("attempted") {
         let mut tx=d.store.pool().begin().await?;

@@ -162,8 +162,7 @@ impl QueueVerdict {
 }
 
 pub struct Dispatcher {
-    pub lifecycle: Arc<crate::lifecycle::Lifecycle>,
-    pub executor: Arc<crate::executor::ExecutorOwner>,
+    pub executor: Arc<crate::executor::ExecutorInstance>,
     pub config: Arc<Config>,
     pub store: Store,
     pub pool: Pool,
@@ -206,7 +205,7 @@ impl Dispatcher {
         actor: Option<&crate::web::identity::Identity>,
         repo: Option<&crate::store::Repo>,
     ) -> Result<Submitted, DispatchError> {
-        let _admission = self.lifecycle.admission(&self.store).await
+        let _admission = self.executor.admission_permit().await
             .map_err(DispatchError::ControllerUnavailable)?;
         self.submit_admitted(req, actor, repo).await
     }
@@ -563,7 +562,6 @@ impl Dispatcher {
         warnings.extend(skipped.into_iter().map(|s| format!("no run started — {s}")));
         let mut tx = self.store.pool().begin().await
             .map_err(|e| DispatchError::Workflow(format!("begin submission: {e}")))?;
-        crate::lifecycle::Lifecycle::admit_in(&mut tx).await.map_err(DispatchError::Workflow)?;
         for (id, request, plan) in &planned {
             Store::create_run_in(&mut tx, id, request, plan).await?;
             Store::record_source_in(&mut tx, id, &source_bytes).await?;
@@ -616,7 +614,7 @@ impl Dispatcher {
         failed_only: bool,
         actor: Option<&crate::web::identity::Identity>,
     ) -> Result<Submitted, DispatchError> {
-        let _admission = self.lifecycle.admission(&self.store).await
+        let _admission = self.executor.admission_permit().await
             .map_err(DispatchError::ControllerUnavailable)?;
         let run = self
             .store
@@ -747,7 +745,6 @@ impl Dispatcher {
         let retry = crate::vm::new_id();
         let mut tx = self.store.pool().begin().await
             .map_err(|e| DispatchError::Workflow(format!("begin release retry: {e}")))?;
-        crate::lifecycle::Lifecycle::admit_in(&mut tx).await.map_err(DispatchError::Workflow)?;
         let source = sqlx::query(
             "SELECT r.status,rel.status AS release_status
                FROM ci_run r JOIN ci_submission sub ON sub.release_run_id=r.id
@@ -1394,7 +1391,10 @@ impl Dispatcher {
         //
         // Another delivery may already own this job. Redelivery cannot grant
         // a second execution, even if the first controller stopped heartbeating.
-        if !self.store.claim_job(&msg.job_id, &runner, attempt).await? {
+        if !self.store.claim_job_for_boot(&msg.job_id, &runner, attempt, self.executor.boot_id()).await? {
+            if self.executor.admission_permit().await.is_err() {
+                return Err(DispatchError::InstanceDraining);
+            }
             if crate::host_maintenance::cordoned(&self.store, &runner).await
                 .map_err(|e| DispatchError::StepFailed(e.to_string()))? {
                 return Err(DispatchError::MaintenancePaused);
@@ -1474,7 +1474,8 @@ impl Dispatcher {
 
         if !self
             .store
-            .start_job(&msg.job_id, &runner, vm.id(), &fingerprint, attempt)
+            .start_job_for_boot(&msg.job_id, &runner, vm.id(), &fingerprint, attempt,
+                self.executor.boot_id())
             .await?
         {
             // Something else finished this job while we were booting a VM.
@@ -1526,7 +1527,10 @@ impl Dispatcher {
 
         let status = match &outcome {
             Ok(outputs) => {
-                self.store.set_job_outputs(&msg.job_id, outputs).await?;
+                // Cancellation can win after the final step. It must suppress
+                // outputs without skipping the VM's cleanup handoff below.
+                self.store.set_job_outputs_for_boot(&msg.job_id, outputs, attempt,
+                    self.executor.boot_id()).await?;
                 JobStatus::Success
             }
             // Cancelled stays cancelled. `continue_on_error` is about a step
@@ -1551,7 +1555,8 @@ impl Dispatcher {
             if self.release_vm(&plan, &vm, guest_corrupted).await && outcome.is_ok() {
                 self.store.end_host_work(&msg.job_id, &runner, attempt).await?;
             }
-            self.store.set_job_status(&msg.job_id, status, error.as_deref()).await?;
+            self.store.set_job_status_for_boot(&msg.job_id, status, error.as_deref(), attempt,
+                self.executor.boot_id()).await?;
         }
         Ok(status)
     }
@@ -3484,16 +3489,10 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
         };
 
         loop {
-            // Do not pull during a global drain's quiesced phase. In particular,
-            // a stale delivery must not hold an effect permit while waiting for
-            // the rollout that needs that same permit to finish.
-            if dispatcher.lifecycle.work(&dispatcher.store).await.is_err() {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-            // Acquire before pulling: a standby must never remove a delivery
-            // from the shared consumer merely to hold or redeliver it.
-            let effect = match dispatcher.executor.effect_permit().await {
+            // Acquire before pulling: a draining boot must never remove a new
+            // delivery from the shared consumer. The claim transaction repeats
+            // this check under the durable boot-row lock.
+            let admission = match dispatcher.executor.admission_permit().await {
                 Ok(permit) => permit,
                 Err(_) => {
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -3523,7 +3522,7 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                 // host at a time, each getting its full budget from pickup.
                 Route::Runner(_) => {
                     let _permit = permit;
-                    let _effect = effect;
+                    let _admission = admission;
                     process_delivery(Arc::clone(&dispatcher), msg, job, attempt).await;
                 }
                 // The network's shared queue is where "any host" jobs wait, and
@@ -3539,7 +3538,7 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                     let dispatcher = Arc::clone(&dispatcher);
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let _effect = effect;
+                        let _admission = admission;
                         process_delivery(dispatcher, msg, job, attempt).await;
                     });
                 }
@@ -3602,22 +3601,6 @@ async fn process_delivery(
         })
     };
 
-    // Quiescence can race an already outstanding pull. Return that delivery
-    // without beginning execution, releasing the caller's effect permit so
-    // handoff can finish. The pull-loop gate prevents repeatedly taking it
-    // while closed and consuming the entire redelivery budget.
-    let _work = match dispatcher.lifecycle.work(&dispatcher.store).await {
-        Ok(permit) => permit,
-        Err(e) => {
-            heartbeat.abort();
-            tracing::debug!(job = %job.job_key, "returning delivery across executor handoff: {e}");
-            if let Err(error) = msg.ack_with(AckKind::Nak(Some(Duration::from_secs(30)))).await {
-                tracing::warn!(job = %job.job_key, %error, "could not return delivery; broker acknowledgement timeout retains recovery");
-            }
-            return;
-        }
-    };
-
     // `CI_MAX_JOB_SECONDS` is enforced here, and only here. It used to
     // reach JetStream as `ack_wait` and nothing else, so once the ack
     // window stopped being derived from it the setting would have become
@@ -3634,6 +3617,9 @@ async fn process_delivery(
     // moment the job is taken, not from when it was submitted.
     let ceiling = dispatcher.config.max_job_duration;
     let outcome = loop {
+        if dispatcher.executor.admission_permit().await.is_err() {
+            break Err(DispatchError::InstanceDraining);
+        }
         let result = bounded_from_pickup(ceiling, &job.job_key, dispatcher.run_job(&job, attempt)).await;
         if matches!(result, Err(DispatchError::MaintenancePaused)) {
             // Preserve this delivery and its retry budget. Re-select on every
@@ -3648,6 +3634,11 @@ async fn process_delivery(
     heartbeat.abort();
 
     match outcome {
+        Err(DispatchError::InstanceDraining) => {
+            // The job was never claimed. Return an outstanding pull to the
+            // shared consumer so the other region can execute it.
+            let _ = msg.ack_with(AckKind::Nak(Some(Duration::from_secs(1)))).await;
+        }
         Ok(status) => {
             tracing::info!(job = %job.job_key, "finished: {}", status.as_str());
             let _ = msg.ack().await;
@@ -4395,7 +4386,6 @@ impl Dispatcher {
             loop {
                 ticker.tick().await;
                 let Ok(_effect) = images.executor.effect_permit().await else { continue };
-                let Ok(_work) = images.lifecycle.work(&images.store).await else { continue };
                 for runner in images.served_runner_ids() {
                     let result = async {
                         let options = images.runners.options_for(&runner).await?;
@@ -4421,7 +4411,6 @@ impl Dispatcher {
             loop {
                 ticker.tick().await;
                 let Ok(_effect) = self.executor.effect_permit().await else { continue };
-                let Ok(_work) = self.lifecycle.work(&self.store).await else { continue };
                 if let Err(e) = self.pool.renew_leases(self.lease()).await {
                     // Not fatal, and not worth giving up a VM over: the lease
                     // has time left, and the next tick may well succeed.
@@ -4807,6 +4796,7 @@ fn or_none(items: &[String]) -> String {
 
 #[derive(Debug)]
 pub enum DispatchError {
+    InstanceDraining,
     MaintenancePaused,
     ControllerUnavailable(String),
     DiskPressure(String),
@@ -5006,6 +4996,7 @@ impl std::fmt::Display for DispatchError {
             Self::BadPlan(e) => write!(f, "the stored plan could not be read: {e}"),
             Self::Condition(e) => write!(f, "an `if:` condition could not be evaluated: {e}"),
             Self::UnknownJob(id) => write!(f, "no job {id} exists"),
+            Self::InstanceDraining => write!(f, "CI instance is draining; job returned to the shared queue"),
             Self::MaintenancePaused => write!(f, "runner is cordoned for host maintenance; job remains queued"),
             Self::UnknownRunner { wanted, network } => write!(
                 f,
@@ -5605,6 +5596,7 @@ mod tests {
             sandbox_id: None,
             status: "success".into(),
             attempt: 1,
+            executor_boot: None,
             matrix: serde_json::json!({}),
             outputs: serde_json::json!({}),
             plan: serde_json::json!({}),
@@ -6610,8 +6602,7 @@ mod tests {
         );
 
         Arc::new(Dispatcher {
-            lifecycle: Arc::new(crate::lifecycle::Lifecycle::default()),
-            executor: Arc::new(crate::executor::ExecutorOwner::register(store.pool().clone(), &format!("dispatch-test-{}", uuid::Uuid::new_v4())).await.expect("executor")),
+            executor: Arc::new(crate::executor::ExecutorInstance::register(store.pool().clone(), &format!("dispatch-test-{}", uuid::Uuid::new_v4())).await.expect("executor")),
             config: config.clone(),
             store: store.clone(),
             pool: Pool::new(store.pool().clone()),
@@ -6630,7 +6621,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
-    async fn delivery_racing_quiescence_releases_the_handoff_permit() {
+    async fn delivery_racing_instance_drain_returns_to_shared_queue() {
         let base = std::env::var("CI_TEST_DATABASE_URL").unwrap();
         let admin = sqlx::PgPool::connect(&base).await.unwrap();
         let schema = format!("delivery_{}", uuid::Uuid::new_v4().simple());
@@ -6643,7 +6634,7 @@ mod tests {
         let d = test_dispatcher(root.path()).await;
         unsafe { std::env::set_var("CI_TEST_DATABASE_URL", base); }
         sqlx::raw_sql("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES('run','test','ci.yml','running');
-            INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES('job','run','deploy','deploy','Deploy','success');
+            INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES('job','run','deploy','deploy','Deploy','queued');
             INSERT INTO ci_step(id,job_id,idx,name,uses,status) VALUES('step','job',0,'Request','ci/deploy-controller','success');
             INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES('op','step','run','job','ci','hash','running','source','main');
             INSERT INTO ci_controller_rollout(id,request,phase) VALUES('op','{}','quiesced');")
@@ -6654,16 +6645,21 @@ mod tests {
         d.bus.publish_job(&route, &job).await.unwrap();
         let (message, _slot) = pull_with_capacity(&consumer, Arc::new(tokio::sync::Semaphore::new(1))).await.unwrap().unwrap();
         let effect = d.executor.effect_permit().await.unwrap();
+        d.executor.pause(uuid::Uuid::new_v4()).await.unwrap();
         let running = d.clone();
         let task = tokio::spawn(async move {
             let _effect = effect;
             process_delivery(running, message, job, 1).await;
         });
-        tokio::time::timeout(Duration::from_secs(2), task).await.expect("closed work cannot wait for rollout while retaining the handoff permit").unwrap();
-        let fence = tokio::time::timeout(Duration::from_secs(2), d.executor.handoff_fence()).await.unwrap().unwrap();
-        d.lifecycle.verify_handoff_quiesced(&d.store, "op").await.unwrap();
-        assert_eq!(d.store.get_job("job").await.unwrap().unwrap().status, "success");
+        tokio::time::timeout(Duration::from_secs(2), task).await.expect("draining delivery must release its local work guard").unwrap();
+        let fence = tokio::time::timeout(Duration::from_secs(2), d.executor.idle_guard()).await.unwrap().unwrap();
+        assert_eq!(d.store.get_job("job").await.unwrap().unwrap().status, "queued");
+        assert!(!d.store.has_host_work("job").await.unwrap());
         drop(fence);
+        let (redelivery, _) = tokio::time::timeout(Duration::from_secs(5),
+            pull_with_capacity(&consumer, Arc::new(tokio::sync::Semaphore::new(1)))).await.unwrap().unwrap().unwrap();
+        assert_eq!(serde_json::from_slice::<JobMessage>(&redelivery.payload).unwrap().job_id, "job");
+        redelivery.ack().await.unwrap();
     }
 
     #[tokio::test]
@@ -6731,7 +6727,7 @@ mod tests {
         assert!(crate::managed_update::reconcile(&d).await.is_err());
         assert_eq!(posts.load(Ordering::SeqCst),1);
         // The failed HTTP observation must not retain the local effect permit.
-        drop(tokio::time::timeout(Duration::from_secs(1),d.executor.handoff_fence()).await.unwrap().unwrap());
+        drop(tokio::time::timeout(Duration::from_secs(1),d.executor.idle_guard()).await.unwrap().unwrap());
         crate::managed_update::reconcile(&d).await.unwrap(); assert_eq!(posts.load(Ordering::SeqCst),2);
         assert_eq!(d.store.get_run("run").await.unwrap().unwrap().status,"running");
         assert!(crate::managed_update::reconcile(&d).await.is_err(),"changed regional identity cannot complete the release");
@@ -7039,7 +7035,7 @@ jobs:
             let run = crate::vm::new_id(); let sandbox = format!("sb-{run}");
             d.store.create_run(&run, &crate::store::RunRequest { repo_url: "https://example.test/repo.git".into(), ..Default::default() }, &plan).await.unwrap();
             let job = d.store.jobs_of(&run).await.unwrap().remove(0);
-            assert!(d.store.claim_job(&job.id, "hd-local", 1).await.unwrap());
+            assert!(d.store.claim_job_for_boot(&job.id, "hd-local", 1, d.executor.boot_id()).await.unwrap());
             d.store.start_job(&job.id, "hd-local", &sandbox, "fp", 1).await.unwrap();
             d.pool.register(&sandbox, "hd-local", "fp", "wf", None, &job.id, d.lease()).await.unwrap();
             // A bad handoff must not publish a terminal job or a cleanup intent.
@@ -7062,16 +7058,10 @@ jobs:
             assert_eq!(status, if scenario == "cancel" { "cancelled" } else { "failure" });
             assert!(handoff(&d, &job.id, "hd-local", 1, &sandbox, JobStatus::Success, None).await.is_err());
             assert_eq!(sqlx::query_scalar::<_,String>("SELECT status FROM ci_job WHERE id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap(), status);
-            let rollout = format!("rollout-{run}");
-            d.store.create_step(&rollout, &job.id, 0, "controller", None).await.unwrap();
-            sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES($1,$1,$2,$3,'ci','test','running','test','main')")
-                .bind(&rollout).bind(&run).bind(&job.id).execute(d.store.pool()).await.unwrap();
-            sqlx::query("INSERT INTO ci_controller_rollout(id,request,phase) VALUES($1,'{}','draining')")
-                .bind(&rollout).execute(d.store.pool()).await.unwrap();
-            assert!(d.lifecycle.work(&d.store).await.is_ok(), "cleanup is allowed during drain");
-            assert!(!d.lifecycle.quiesce(&d.store, &rollout).await.unwrap());
-            let message: String = sqlx::query_scalar("SELECT message FROM ci_service_deployment WHERE id=$1").bind(&rollout).fetch_one(d.store.pool()).await.unwrap();
-            assert!(message.contains(&sandbox));
+            let drain = uuid::Uuid::new_v4();
+            d.executor.pause(drain).await.unwrap();
+            assert!(d.executor.effect_permit().await.is_ok(), "cleanup is allowed during drain");
+            assert!(d.executor.quiesce(drain).await.is_err());
             // Restart + expired lease must not hand a cleanup-owned VM to a job.
             sqlx::query("UPDATE ci_vm_pool SET leased_until=now()-interval '1 hour' WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
             assert_eq!(d.pool.release_orphans(&["hd-local".into()], "restarted-instance").await.unwrap(), 0);
@@ -7113,9 +7103,8 @@ jobs:
             assert_eq!(report["job"]["sandbox"], sandbox);
             assert!(sqlx::query_scalar::<_,bool>("SELECT uploaded_at IS NULL FROM ci_debug_report WHERE job_id=$1 AND sandbox_id=$2")
                 .bind(&job.id).bind(&sandbox).fetch_one(d.store.pool()).await.unwrap(), "S3 unavailability must not retain the VM");
-            assert!(d.lifecycle.quiesce(&d.store, &rollout).await.unwrap(), "verified cleanup unblocks drain");
-            sqlx::query("DELETE FROM ci_controller_rollout WHERE id=$1").bind(&rollout).execute(d.store.pool()).await.unwrap();
-            sqlx::query("DELETE FROM ci_service_deployment WHERE id=$1").bind(&rollout).execute(d.store.pool()).await.unwrap();
+            d.executor.quiesce(drain).await.expect("verified cleanup unblocks instance drain");
+            d.executor.resume(drain).await.unwrap();
             sqlx::query("DELETE FROM ci_vm_pool WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
             sqlx::query("DELETE FROM ci_debug_report WHERE job_id=$1").bind(&job.id).execute(d.store.pool()).await.unwrap();
             sqlx::query("DELETE FROM ci_run WHERE id=$1").bind(&run).execute(d.store.pool()).await.unwrap();

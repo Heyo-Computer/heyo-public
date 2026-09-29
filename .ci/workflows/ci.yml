@@ -252,7 +252,7 @@ jobs:
         run: cargo test --release --locked -- --test-threads=1
         timeout-minutes: 10
 
-      - name: Verify published release retry with disposable PostgreSQL and NATS
+      - name: Verify CI claims and instance drain with disposable PostgreSQL and NATS
         working-directory: /workspace/ci
         timeout-minutes: 10
         run: |
@@ -267,9 +267,14 @@ jobs:
           trap 'kill "$!"' EXIT
           export CI_TEST_DATABASE_URL=postgres://postgres:disposable-test-password@127.0.0.1/ci_release_retry
           export CI_TEST_NATS_URL=nats://127.0.0.1:44222
+          export CI_NATS_URL="$CI_TEST_NATS_URL"
           cargo test --release --locked --bin ci dispatch::tests::published_release_failed_only_retry_preserves_identity_and_single_flight -- --ignored --exact --test-threads=1
-          cargo test --release --locked --bin ci maintenance::tests::operator_pause_fences_admission_effects_and_stale_resume -- --ignored --exact --test-threads=1
-          cargo test --release --locked --bin ci executor_recovery::tests::recovery_cas_is_one_shot_restricted_and_preserves_failed_run -- --ignored --exact --test-threads=1
+          cargo test --release --locked --bin ci executor::tests::both_regions_active_and_only_target_drains -- --ignored --exact --test-threads=1
+          cargo test --release --locked --bin ci store::tests::boot_claim_is_atomic_with_drain_and_cannot_be_completed_by_another_boot -- --ignored --exact --test-threads=1
+          cargo test --release --locked --bin ci store::tests::regional_claims_and_expiry_cannot_reassign_unresolved_execution -- --ignored --exact --test-threads=1
+          cargo test --release --locked --bin ci dispatch::tests::delivery_racing_instance_drain_returns_to_shared_queue -- --ignored --exact --test-threads=1
+          cargo test --release --locked --bin ci dispatch::tests::durable_vm_cleanup_recovers_without_guessing_ownership -- --ignored --exact --test-threads=1
+          cargo test --release --locked --bin ci web::tests::managed_frontends_preserve_auth_and_reject_wrong_boot_without_retry -- --ignored --exact --test-threads=1
 
       - name: Test CI boot and deployment templates
         run: python3 /workspace/ci/deploy/test_start_artifact.py

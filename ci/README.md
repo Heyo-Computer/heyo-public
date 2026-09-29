@@ -106,99 +106,27 @@ before using this migration for live CI. Database access must survive a change o
 VM address/interface; a firewall allowance tied to the retired VM is insufficient.
 Branch promotion authorizes deployment of the tested artifact, not GitHub merge/tag writes.
 
-### Operator maintenance pause
+### Instance maintenance
 
-The CI admin routes below provide a durable, reversible pause across processes
-sharing the CI database. They require an authenticated admin through the app-lb
-identity gate, including in development; repository submit tokens are insufficient.
-Keep `/maintenance` and its descendants out of app-lb `public_paths`. Scripted
-requests through the browser gate must use its authenticated session and
-`Accept: text/html`; these handlers return JSON status or an empty success response.
+Both CI instances execute work. Authenticated admin maintenance requests apply
+only to the addressed process boot; use `x-ci-target-boot` to reject a request
+that reaches another boot. Keep `/maintenance` out of app-lb `public_paths`.
 
-1. `POST /maintenance/{uuid}/pause` closes new submissions, including submissions
-   still preparing source that have not committed. Already-admitted jobs and
-   cleanup may finish. Repeating the same active operation is idempotent.
-2. `GET /maintenance` reports the phase and durable blockers without advancing it.
-3. `POST /maintenance/{uuid}/quiesce` runs on the execution owner. It waits for local
-   effects, checks local work and durable obligations, and only then persists
-   `paused`, blocking new grants and external-effect permits. Running jobs, expired
-   but uncompleted native leases, pending cleanup, and unresolved failed maintenance
-   or deployment operations prevent this transition. A five-second HTTP timeout
-   is not evidence of success or failure: read status and retry the same ID.
-4. `POST /maintenance/{uuid}/resume` removes only that operation's pause. It does
-   not change ownership or clear other rollout/retirement/maintenance restrictions.
-   A stale resume cannot reopen a newer pause. Completed IDs cannot be reused.
+1. `POST /maintenance/{uuid}/pause` closes new admissions on this boot. Job claims
+   recheck its durable drain state transactionally. Outstanding unclaimed queue
+   deliveries return to NATS; the other region can claim them.
+2. Existing jobs finish normally, including their durable VM cleanup.
+3. `GET /maintenance` reports this boot's work. `POST /maintenance/{uuid}/quiesce`
+   checks that its local work and job/cleanup obligations have finished. Neither
+   request pauses the other region or grants VM replacement authority.
+4. `POST /maintenance/{uuid}/resume` reopens this boot for the matching operation,
+   unless platform retirement is pending. It cannot resume another operation.
 
-**This is not a VM replacement authorization.** `quiesced` means work drained
-under this protocol; `safeToReplace` remains false because pause does not transfer
-the non-expiring executor ownership. Replacing the owning singleton still needs
-a separately verified ownership handoff. This feature does not bootstrap itself
-into an older installed binary, and an older binary does not enforce this gate.
-Do not use it as a mixed-version or binary-rollback safety guarantee. Migration
-039 is additive and is not a request to alter live data manually.
-
-### Explicit recovery of a retained singleton
-
-This is an operator-approved maintenance-window procedure, not automatic failover
-or managed two-region bootstrap. Keep the logical deployment ID, workspace,
-external PostgreSQL and NATS services unchanged. Build and verify the recovery
-artifact before interrupting the installed CI app.
-
-`ci --inspect-executor` reads the existing owner/generation and outstanding
-obligation categories without migrating or starting workers. Record those values
-and the exact source VM before replacement. A recovery plan JSON contains
-`operation_id` (fresh UUID), `source_boot`, `source_generation`, `deployment`,
-`source_sandbox`, `revision` (exact artifact Git SHA), `maintenance_run`,
-`maintenance_operation`, and `operator`. It contains no credentials.
-
-Close submission traffic, finish admitted work, and account for direct callers
-and native callbacks before using app-lb maintenance mode. Use a conditional
-same-deployment template replacement with the tested artifact and the plan as
-the fourth argument to `start-artifact.sh`. This invokes
-`ci --hold-executor-recovery PLAN_JSON`. It runs embedded migrations and registers
-a fresh held boot, but starts no imports, NATS, consumers, cleanup or reconcilers.
-Its `/healthz` identifies the operation/boot/revision; HTTP 200 means alive, **not
-authorized to execute jobs**. Keep public maintenance enabled.
-
-After capture/replacement, an authenticated operator runs
-`ci --transfer-executor-recovery PLAN_JSON CANDIDATE_BOOT CANDIDATE_SANDBOX SPEC_ETAG`
-through exact-sandbox platform exec. Supply ordinary CI configuration and
-HeyoSecret-backed `CI_RECOVERY_APP_LB_URL`, `CI_RECOVERY_APP_LB_USER`,
-`CI_RECOVERY_APP_LB_PASSWORD`, `CI_RECOVERY_BACKEND_URL`, and
-`CI_RECOVERY_BACKEND_TOKEN` in the exec environment; never in the plan or Git.
-The command requires a durable matching spec read, a sole healthy candidate,
-the exact held boot observed through non-waking exec, a pushed workspace captured
-from the predecessor, and a positive authenticated Firecracker reclamation receipt.
-Do not allow concurrent deployment writers during this operator procedure.
-Reclamation is point-in-time evidence, not a permanent tombstone: inventory and
-exclude other authorities or outstanding requests capable of recreating the old VM.
-
-The ownership transaction compares the recorded predecessor boot/generation,
-preserves every job and operation ledger, retires the predecessor, and authorizes
-only the named maintenance reconciliation. It does not grant general execution.
-The candidate continues in the **same process boot**, serving the recovery API
-without starting workers. Reconcile the named operation through the existing
-run-scoped maintenance recovery endpoint. In this mode, positive Cloud receipt
-reconciliation releases the maintenance obligation **without resuming the old
-failed release or its skipped regional deployments**.
-
-An authenticated admin then posts `/maintenance/{operation_id}/activate-recovery`.
-Activation requires the pinned owner, the settled named operation and no remaining
-jobs/leases/cleanup/remote-effect obligations. It atomically removes the restriction;
-only then do queue workers start. Verify public identity, state continuity, and
-execution before reopening ingress. Never clear a blocker by deleting its row.
-For an explicitly retired native job, retain `ci_host_work`, cancel the job and
-native lease, revoke its lease token, and record the runner in
-`ci_native_quarantine` with the S3 report and operator identity. That runner cannot
-receive new jobs, even if it re-registers. Explicit executor recovery can exclude
-only this isolated native work from its Linux activation check; it does not claim
-the remote process stopped. Ordinary handoff checks remain unchanged. A partially
-settled maintenance record still requires both its host and deployment records to
-be passed after exact receipt verification.
-An ambiguous transfer is retried with identical arguments; it cannot increment
-the owner generation twice. A crashed candidate cannot reuse its receipt in a
-new boot. Keep maintenance enabled and explicitly fence/recover again rather than
-restoring an old specification as if it were a verified ownership rollback.
+`ci --inspect-executor` lists registered process boots without starting workers.
+The old `--hold-executor-recovery` and `--transfer-executor-recovery` commands are
+retired and fail explicitly. No singleton transfer is needed after a restart.
+Existing unresolved jobs still require their own reconciliation; a new boot does
+not steal them or delete their evidence.
 
 Release and deployment default to disabled. A merge requires both
 `RELEASE_ENABLED=true` and `RELEASE_SOURCE_SHA` equal to the exact submitted commit,
@@ -1231,13 +1159,11 @@ claiming work still use the retry ladder.
 
 The same rule applies to native runners: expiry rejects stale reports but does
 not reassign the execution or free its runner capacity. These guards are
-prerequisites for regional CI, not a complete multi-controller implementation.
-Source and logs use shared storage. Final submission transactions and native
-execution grants serialize with shared drain transitions, so a request that
-passed an earlier process-local check cannot commit through a closed gate.
-Already-admitted native jobs can obtain grants during draining; quiescence waits
-for those transactions and blocks later grants. Executor handoff and recovery
-remain required before running a second CI controller against production state.
+prerequisites for regional CI, not proof of regional failure survival.
+Source and logs use shared storage. Linux job claims record the owning process
+boot and serialize with that boot's drain transition. Other boots remain active.
+Native callbacks retain their per-job lease-token checks and can be handled by
+another active frontend; there is no singleton execution handoff.
 
 `uses: default` resolves through **`~/.heyo/daemon.json`** — heyvmd mints
 `backend_id` there on first start and registers and heartbeats under it, so it is
@@ -1516,42 +1442,25 @@ Binding also **reconciles an existing consumer**: JetStream returns the durable
 that is already there and ignores the config passed with it, so an upgrade would
 otherwise keep the old window and none of this would take effect.
 
-### Shared executor ownership is not automatic failover
+### Active CI instances, scoped job ownership
 
-CI replicas sharing PostgreSQL register distinct process boots. One boot owns
-external effects; the others can serve shared run/source/log reads, submission,
-rerun and transactional completion writes. Queue execution, native grants,
-artifact uploads, VM changes and infrastructure reconcilers require the owner's
-permit. Managed replicas forward mutations once to the exact owner's boot through
-the per-application authenticated Orchestrator instance transport. The original
-caller authentication is preserved; wrong boots, forwarding loops and unavailable
-transport fail closed. Existing handler effect permits remain required. Unmanaged
-replicas still return 503 for owner-only operations on a standby.
+Every registered CI boot may execute work; no global owner is selected or
+consulted. HTTP mutations are handled locally with their existing authentication.
+Linux jobs atomically claim a row with their boot and attempt; another boot cannot
+attach a VM, complete that attempt, or create its cleanup intent. Cleanup workers
+consume durable intents with `FOR UPDATE SKIP LOCKED`. Shared deployment
+reconcilers coordinate on the specific operation ID, not the whole CI system.
 
-The owner is **non-expiring**. A timeout, cancelled run or lost heartbeat never
-proves that a worker or VM command stopped. An unplanned owner restart therefore
-does not recover execution automatically. The explicit singleton recovery above
-requires verified runtime reclamation and an operator-controlled replacement;
-there is no timeout-based force-takeover API or automatic crash failover.
+Managed retirement closes admission only on the addressed boot. Its existing
+jobs finish and clean up while the peer continues taking new work. The retirement
+receipt requires no local effects or owned job obligations, and a ready approved
+survivor outside the retiring region. No authority transfers to that survivor:
+it was already active. Retired boots cannot begin effects.
 
-Legacy direct controller replacement closes shared admission and grants, waits for
-local effect permits, then verifies durable jobs, leases, VM cleanup and remote
-operation fences. It transfers to a named, recently ready boot at a different
-deployment authority before replacing itself. The successor may perform only
-that exact recorded rollout until public revision verification and the atomic
-completion commit release normal execution. Both regions use the same canonical
-HeyoSecret service-role credential for that recorded authority. Readiness refresh
-only filters handoff candidates; it never revokes or grants ownership.
-
-Managed retirement uses a separate job-independent command and receipt ledger.
-The running target boot validates the immutable request and obtains its own local
-effect fence. Owner retirement closes shared admission, drains admitted work and
-durable remote obligations, and transfers only to a ready boot in the platform's
-pinned surviving set outside the retiring region. Standby retirement serializes
-with the same owner-row lock as successor selection. Receipt, retirement and owner
-generation commit together; replay cannot transfer twice. Normal admission resumes
-on the successor before the platform continues HTTP withdrawal and replacement.
-Retained old boots cannot issue effects. No timeout grants ownership.
+Legacy direct CI self-replacement is retired: new requests fail before recording
+intent. Historical rollout records remain readable, but do not globally block
+admissions and are not silently marked successful. Updates belong to the platform
+per-instance lifecycle, preserving the existing application deployment identity.
 
 Configure `source.applicationLifecycle` in managed service metadata with `port`
 and `tokenSecretPath`; resolve `CI_APPLICATION_LIFECYCLE_TOKEN` from that same
@@ -1581,14 +1490,14 @@ direct app-lb self-replacement dispatcher. Composed full-stack acceptance remain
 outstanding; the external-service binding is still single-deployment and must not
 be used to label the singleton as a two-region service.
 
-**Initial managed CI startup fails closed on an empty executor-owner table.** An
-older singleton can still schedule without participating in this protocol. Empty
-ownership, empty Orchestrator discovery, or a successful stop with unknown runtime
-status do not prove it fenced. There is no bootstrap bypass flag. A supported
-legacy cutover must first establish authoritative non-restarting runtime fencing,
-preserve and reconcile shared database/job/source/log/artifact state, and provide
-a durable verified initial-owner handoff. That cutover/initialization capability is
-not implemented; do not initialize the owner table manually to bypass this gate.
+**Upgrade boundary:** old binaries do not participate in the new operation locks
+or boot-scoped claims. Do not assume arbitrary mixed-version reconciliation is
+safe. Finish or explicitly settle their outstanding operations and stop old
+execution before enabling concurrent new execution. Preserve shared state and
+existing VM identities; do not delete owner/job records to force a cutover.
+Migrations 041/042 are additive. Historical singleton tables remain for diagnosis,
+but new processes neither read nor write their ownership state. This change alone
+does not deploy two regional CI apps or prove database/NATS regional failover.
 
 The exact-runtime Cloud transport must never wake stopped instances, retry, follow
 redirects or silently substitute another backend. The public client checks echoed

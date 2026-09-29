@@ -25,7 +25,6 @@ mod controller_rollout;
 mod debug_report;
 mod dispatch;
 mod executor;
-mod executor_recovery;
 mod expr;
 mod host_app_lb;
 mod host_bootstrap;
@@ -36,8 +35,6 @@ mod host_maintenance;
 #[path = "../../ui/ui.rs"]
 mod heyo_ui;
 mod image;
-mod lifecycle;
-mod maintenance;
 mod managed_update;
 mod nats_auth;
 mod native;
@@ -78,34 +75,22 @@ async fn main() {
         eprintln!("ci: rustls crypto provider was already installed");
     }
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let recovery_path = (args.len() == 2 && args[0] == "--hold-executor-recovery").then(|| args[1].clone());
-    if !args.is_empty() && recovery_path.is_none() {
+    if !args.is_empty() {
+        if matches!(args[0].as_str(), "--hold-executor-recovery" | "--transfer-executor-recovery") {
+            eprintln!("{} is no longer supported; executor ownership is scoped to each process boot", args[0]);
+            std::process::exit(2);
+        }
         if args[0] == "--inspect-executor" && args.len() == 1 {
             let result: anyhow::Result<serde_json::Value> = async {
                 let config = Config::from_env()?;
                 let store = Store::connect(&config.database_url, config.log_dir.clone(), config.db_statement_timeout).await?;
-                let owner: serde_json::Value = sqlx::query_scalar("SELECT jsonb_build_object('bootId',o.boot_id,'generation',o.generation,'deployment',b.deployment_id,'continuation',o.continuation_operation_id) FROM ci_executor_owner o JOIN ci_executor_boot b ON b.boot_id=o.boot_id WHERE o.singleton=TRUE")
-                    .fetch_one(store.pool()).await?;
-                let mut tx = store.pool().begin().await?;
-                let blockers = maintenance::blockers(&mut tx).await.map_err(anyhow::Error::msg)?;
-                Ok(serde_json::json!({"owner":owner,"blockers":blockers}))
+                let boots: Vec<serde_json::Value> = sqlx::query_scalar("SELECT jsonb_build_object('bootId',boot_id,'deployment',deployment_id,'registeredAt',registered_at,'readyAt',ready_at,'retired',retired) FROM ci_executor_boot ORDER BY registered_at DESC,boot_id")
+                    .fetch_all(store.pool()).await?;
+                Ok(serde_json::json!({"boots":boots}))
             }.await;
             match result {
                 Ok(value) => println!("{value}"),
                 Err(error) => { eprintln!("executor inspection failed: {error}"); std::process::exit(1); }
-            }
-            return;
-        }
-        if args[0] == "--transfer-executor-recovery" && args.len() == 5 {
-            let result: anyhow::Result<()> = async {
-                let config = Config::from_env()?;
-                let plan = executor_recovery::load(args[1].as_ref())?;
-                let store = Store::connect(&config.database_url, config.log_dir.clone(), config.db_statement_timeout).await?;
-                executor_recovery::transfer(&store, &plan, args[2].parse()?, &args[3], &args[4]).await
-            }.await;
-            match result {
-                Ok(()) => println!("Ownership transferred to the pinned recovery-only boot; normal execution remains disabled."),
-                Err(error) => { eprintln!("executor recovery refused: {error}"); std::process::exit(1); }
             }
             return;
         }
@@ -159,7 +144,7 @@ async fn main() {
             return;
         }
         if args[0] != "--check-workflows" || args.len() < 2 {
-            eprintln!("usage: ci [--inspect-executor | --hold-executor-recovery PLAN_JSON | --transfer-executor-recovery PLAN_JSON CANDIDATE_BOOT CANDIDATE_SANDBOX SPEC_ETAG | --check-workflows FILE ... | --prepare-host-bootstrap PLAN_JSON INSPECTION_JSON BUNDLE OUTPUT_JSON | --deliver-host-bootstrap TARGET inspect|admit INPUT_JSON BUNDLE JOURNAL_JSON | --check-host-bootstrap TARGET MANIFEST_JSON INTENT_SHA256]");
+            eprintln!("usage: ci [--inspect-executor | --check-workflows FILE ... | --prepare-host-bootstrap PLAN_JSON INSPECTION_JSON BUNDLE OUTPUT_JSON | --deliver-host-bootstrap TARGET inspect|admit INPUT_JSON BUNDLE JOURNAL_JSON | --check-host-bootstrap TARGET MANIFEST_JSON INTENT_SHA256]");
             std::process::exit(2);
         }
         let mut failed = false;
@@ -197,17 +182,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-
-    let recovered_executor = if let Some(path) = recovery_path {
-        let result = async {
-            let plan = executor_recovery::load(path.as_ref())?;
-            executor_recovery::hold(&config, &plan).await
-        }.await;
-        match result {
-            Ok(owner) => Some(owner),
-            Err(error) => { eprintln!("executor recovery remains held: {error}"); std::process::exit(1); }
-        }
-    } else { None };
 
     if config.nats.credential_from_url {
         tracing::warn!(
@@ -365,8 +339,7 @@ async fn main() {
         );
     }
 
-    // Bind before registering non-expiring ownership. A failed bind must not
-    // leave a boot that can never serve as the durable executor.
+    // Register only after binding so failed listeners do not advertise a boot.
     let listener = match tokio::net::TcpListener::bind(config.listen_addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -376,17 +349,9 @@ async fn main() {
     };
     // Deployment IDs are scoped to their regional authority; both regions may
     // legitimately use the same ID for instances of the one CI application.
-    let recovering = recovered_executor.is_some();
-    let executor_identity = executor_recovery::identity(&config);
-    let executor = if let Some(owner) = recovered_executor {
-        Ok(owner)
-    } else if config.managed_deployment.is_some() {
-        executor::ExecutorOwner::register_managed(store.pool().clone(),&executor_identity).await
-    } else {
-        executor::ExecutorOwner::register(store.pool().clone(),&executor_identity).await
-    };
+    let executor_identity = executor::identity(&config);
+    let executor = executor::ExecutorInstance::register(store.pool().clone(), &executor_identity).await;
     let dispatcher = Arc::new(Dispatcher {
-        lifecycle: Arc::new(lifecycle::Lifecycle::default()),
         executor: Arc::new(match executor {
             Ok(owner) => owner,
             Err(e) => { eprintln!("ci: refusing to start — {e}"); std::process::exit(1); }
@@ -416,24 +381,7 @@ async fn main() {
     }
     objects.clone().spawn_refresh_loop();
 
-    if recovering {
-        let d = dispatcher.clone();
-        tokio::spawn(async move {
-            loop {
-                let active = sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM ci_executor_recovery WHERE candidate_boot=$1 AND phase='complete')")
-                    .bind(d.executor.boot_id()).fetch_one(d.store.pool()).await;
-                match active {
-                    Ok(true) => break,
-                    Ok(false) => {},
-                    Err(error) => tracing::warn!(%error, "recovery activation remains unverified"),
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            start_execution(d).await;
-        });
-    } else {
-        start_execution(dispatcher.clone()).await;
-    }
+    start_execution(dispatcher.clone()).await;
 
     let app = web::router(
         config.clone(),
@@ -453,8 +401,6 @@ async fn main() {
     tracing::info!("shut down cleanly");
 }
 
-/// Recovery serves operator requests without starting queue/cleanup workers.
-/// Those workers start only after the explicit activation transaction commits.
 async fn start_execution(dispatcher: Arc<Dispatcher>) {
     dispatcher.bus.clone().spawn_outbox_publisher(dispatcher.store.clone());
     spawn_log_sweeper(dispatcher.config.clone(), dispatcher.store.clone());
@@ -466,7 +412,6 @@ async fn start_execution(dispatcher: Arc<Dispatcher>) {
     dispatcher.clone().spawn_lease_loop();
     dispatcher.clone().spawn_consumers();
     application_lifecycle::spawn(dispatcher.clone());
-    controller_rollout::spawn(dispatcher.clone());
     service_rollout::spawn(dispatcher.clone());
     managed_update::spawn(dispatcher.clone());
     host_maintenance::spawn(dispatcher.clone());
@@ -483,7 +428,7 @@ async fn start_execution(dispatcher: Arc<Dispatcher>) {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             if let Err(error) = executor.mark_ready().await {
-                tracing::warn!(%error, "could not refresh executor handoff readiness");
+                tracing::warn!(%error, "could not refresh CI instance readiness");
             }
         }
     });

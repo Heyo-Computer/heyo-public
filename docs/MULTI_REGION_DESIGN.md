@@ -5,6 +5,27 @@ decisions and checklist below supersede conflicting next-step statements in the
 historical checkpoints. Existing capabilities are identified separately from new
 work. This document does not itself change running infrastructure.
 
+## CI execution correction — 2026-09-29
+
+CI uses active instances in both regions, not a globally elected executor.
+The singleton gate introduced on September 24 is removed from the implementation:
+startup, HTTP mutations, queue consumption and app retirement no longer consult
+or transfer `ci_executor_owner`. Historical records are retained, not deleted or
+marked complete. This section supersedes the owner/standby and global handoff
+requirements in the historical checkpoints below.
+
+Each Linux job claim records a process boot and attempt. Draining closes claims
+only for that boot; its existing jobs finish and clean up, while the peer accepts
+new work. Cleanup retains its row locks and ownership checks. Shared deployment
+reconcilers coordinate per operation. Existing app-lb-managed CI VM ownership is
+unchanged; this correction does not migrate them into Cloud management.
+
+Delivery/acceptance remains pending: the new tests are wired into the Linux CI
+workflow, but the change has not yet been deployed or proven with concurrent live
+regional jobs. Old binaries lack these scoped locks: their outstanding operations
+must settle before concurrent new execution is enabled. Independent PostgreSQL
+and NATS regional failure survival is still a separate unresolved requirement.
+
 ## IP capacity and failed-rollout recovery — 2026-09-25
 
 The existing /24 remains unchanged. Initial inventory found 63 reserved /30s
