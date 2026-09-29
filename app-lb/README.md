@@ -586,6 +586,7 @@ Configuration is environment-only:
 | `APP_LB_PROXY_ADDR` | `0.0.0.0:6188` | Proxy listener |
 | `APP_LB_ADMIN_ADDR` | `127.0.0.1:9090` | Admin API listener |
 | `APP_LB_STATE_PATH` | `app-lb-state.json` | Names the state *directory* — see below |
+| `APP_LB_INSTANCE_LOCK` | `/run/app-lb/instance.lock` | Host-wide single-instance lock, so two app-lbs never manage the same daemon's sandboxes. A different path only for instances on separate daemons; `off` disables it |
 | `APP_LB_SECRETS_PATH` | `app-lb-secrets.json` | Where stored secrets persist (written `0600`) |
 | `APP_LB_SECRET_KEY` | *(unset)* | 32-byte hex key (or any passphrase) that seals the secrets file with AES-256-GCM |
 | `APP_LB_TOKENS_PATH` | `app-lb-tokens.json` | Where minted [app-tokens](#app-tokens) persist (written `0600`; only hashes) |
@@ -3729,6 +3730,20 @@ is visible without reading logs at all.
 is renewed while app-lb is alive, and VMs from a previous run are re-adopted on startup
 (matched by their `applb-<deployment>-<nonce>` name). VMs app-lb did not create are never
 touched.
+
+A VM whose name points at a deployment this LB's state does **not** hold is stopped, never
+destroyed: its disk stays, `/disks` lists it, and the disk sweep reclaims it after
+`APP_LB_DISK_TTL_SECS` like any other unclaimed disk. An LB with *no* deployments at all
+touches nothing, because empty state is indistinguishable from the wrong state file. Both
+rules exist because "ours but unknown" can also mean "another app-lb's": on 2026-09-29 a
+second instance started by `app-lb --version` (arguments were ignored then) destroyed every
+sandbox the live one served, workspaces uncaptured.
+
+Only one app-lb runs per host. Startup takes `/run/app-lb/instance.lock` (the temp directory
+when `/run` is not writable) and a second instance refuses to start, naming the holder.
+`APP_LB_INSTANCE_LOCK` points it elsewhere — only for instances that talk to *different*
+heyvm daemons — or `off`. `app-lb --version` and `--help` print and exit; any other argument
+is refused without starting anything.
 
 Booting a VM takes long enough that an admin request can delete or rebuild the deployment
 while a create is still in flight. The autoscaler therefore re-checks, after every create and

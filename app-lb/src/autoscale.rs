@@ -1807,6 +1807,12 @@ impl Autoscaler {
                 continue;
             }
             let d = deployments.get(owner);
+            // Named for a deployment this LB does not have (or one that no
+            // longer owns VMs): not this sweep's to destroy. `leave_unowned`
+            // documents why; the disk sweep's TTL reclaims it.
+            if !d.is_some_and(|d| d.spec.is_managed()) {
+                continue;
+            }
             if d.is_some_and(|d| crate::rollout::protected_ids(&d.state()).any(|id| id == &info.id)
                 || d.state().rollouts.iter().any(|o| info.name.starts_with(&o.prefix))) { continue; }
             if d.is_some_and(|d| d.state().suspended.contains(&info.id)) {
@@ -1917,7 +1923,12 @@ impl Autoscaler {
 
         let deployments = self.registry.deployments();
         let mut adopted: HashMap<String, Vec<Arc<VmBackend>>> = HashMap::new();
+        // Replicas of a deployment this LB still has: unroutable or unhealthy,
+        // so destroyed and replaced exactly as before.
         let mut orphans = Vec::new();
+        // Sandboxes named for a deployment this LB does *not* have. Stopped,
+        // never destroyed — see `leave_unowned`.
+        let mut unowned = Vec::new();
 
         let indexed = vm::index_by_id(fleet.clone());
         for d in deployments.values().filter(|d| d.spec.is_managed()) {
@@ -1931,15 +1942,18 @@ impl Autoscaler {
                 continue; // not ours; leave it alone
             };
             let Some(d) = deployments.get(owner) else {
-                // Ours, but its deployment is gone from the state file.
-                orphans.push(info.id.clone());
+                // Named for a deployment this LB's state does not hold: deleted
+                // from the state file, or — the case that destroyed a fleet —
+                // owned by a *different* app-lb whose state this is not.
+                unowned.push((info.id.clone(), owner.to_string()));
                 continue;
             };
             if !crate::rollout::adoptable(d, &info.name, &info.id) { continue; }
             if !d.spec.is_managed() {
                 // The id was reused for a static deployment or a site since this
-                // VM was created; neither owns VMs, so this sandbox is an orphan.
-                orphans.push(info.id.clone());
+                // VM was created; neither owns VMs, so nothing here will ever
+                // adopt it. Its disk is still the old deployment's data.
+                unowned.push((info.id.clone(), owner.to_string()));
                 continue;
             }
             if !d.state().create_attempts.iter().any(|a|a.sandbox_id.as_ref()==Some(&info.id)) {
@@ -1994,6 +2008,56 @@ impl Autoscaler {
             tracing::info!(sandbox = %id, "killing orphaned VM from a previous run");
             if let Err(e) = self.runtime.kill_unknown(&id).await {
                 tracing::warn!(sandbox = %id, error = %e, "failed to kill orphan");
+            }
+        }
+
+        self.leave_unowned(deployments.is_empty(), unowned).await;
+    }
+
+    /// Deal with sandboxes named for deployments this LB does not have.
+    ///
+    /// They used to be destroyed — `kill_unknown`, which purges the disk — on
+    /// the theory that "ours, but not in the state file" can only mean a
+    /// deployment deleted while this LB was down. It can also mean this is not
+    /// the LB that owns them. On 2026-09-29 `app-lb --version`, run on a host
+    /// whose app-lb was live, started a second instance with an empty state
+    /// file (arguments were ignored then; see `cli`), and this sweep purged
+    /// every sandbox the first one was serving — workspaces uncaptured.
+    ///
+    /// So, two rules:
+    ///
+    /// - **An LB with no deployments touches nothing.** Empty state is
+    ///   indistinguishable from "the wrong state file", and a fresh install on
+    ///   a host with leftovers loses nothing by leaving them: each still has
+    ///   the daemon's TTL, which nobody is renewing.
+    /// - **Otherwise stop, never destroy.** A stopped sandbox keeps its disk;
+    ///   `/disks` lists it and the disk sweep reclaims it after
+    ///   `APP_LB_DISK_TTL_SECS`, the same as any other unclaimed disk. A
+    ///   mistake becomes an outage a person can undo, not data loss.
+    async fn leave_unowned(&self, registry_empty: bool, unowned: Vec<(String, String)>) {
+        if unowned.is_empty() {
+            return;
+        }
+        if registry_empty {
+            tracing::warn!(
+                count = unowned.len(),
+                "this LB has no deployments but the daemon runs sandboxes named for some; \
+                 leaving every one of them alone (another app-lb may own them, or this is \
+                 the wrong APP_LB_STATE_PATH)",
+            );
+            return;
+        }
+        for (id, owner) in unowned {
+            if self.registry.allocation_protects(&id) { continue; }
+            if self.workspaces.source_retained(&id) { continue; }
+            tracing::warn!(
+                deployment = %owner,
+                sandbox = %id,
+                "stopping a VM whose deployment this LB does not have; its disk is kept \
+                 until the disk sweep's TTL",
+            );
+            if let Err(e) = self.runtime.stop_unknown(&id).await {
+                tracing::warn!(sandbox = %id, error = %e, "failed to stop unowned VM");
             }
         }
     }
@@ -3534,6 +3598,90 @@ mod tests {
         create.await;
         assert!(d.pending().is_empty());
         assert!(scaler.workspaces.blocked(&d).is_some());
+    }
+
+    /// Sandboxes named for a deployment this LB does not have. The 2026-09-29
+    /// incident: a second app-lb with an empty state file destroyed every
+    /// sandbox the live one served, disks and uncaptured workspaces included.
+    mod unowned_sandboxes {
+        use super::*;
+        use axum::{Json, Router, extract::{Path, State}, routing::{delete, get, post}};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Daemon {
+            stopped: Mutex<Vec<String>>,
+            deleted: Mutex<Vec<String>>,
+        }
+
+        fn row(id: &str, name: &str, status: &str) -> serde_json::Value {
+            serde_json::json!({
+                "id": id, "name": name, "status": status,
+                "image": "fastcar", "uptime_secs": 0, "is_deployed": true,
+                "status_changed_at": "", "urls": [], "guest_ip": "127.0.0.1"
+            })
+        }
+
+        /// A daemon running one sandbox owned by `ghost` — a deployment no
+        /// test registers — and holding one stopped `ghost` sandbox.
+        async fn daemon() -> (String, Arc<Daemon>, tokio::task::JoinHandle<()>) {
+            let d = Arc::new(Daemon::default());
+            let app = Router::new()
+                .route("/deployed-sandboxes", get(|| async {
+                    Json(vec![row("sb-running", "applb-ghost-000000000001", "running")])
+                }))
+                .route("/sandboxes/inactive", get(|| async {
+                    Json(serde_json::json!({
+                        "sandboxes": [row("sb-stopped", "applb-ghost-000000000002", "stopped")],
+                        "next_cursor": null
+                    }))
+                }))
+                .route("/deployed-sandboxes/:id", delete(|State(d): State<Arc<Daemon>>, Path(id): Path<String>| async move {
+                    d.deleted.lock().unwrap().push(id);
+                    Json(serde_json::json!({}))
+                }))
+                .route("/sandbox/:id/stop", post(|State(d): State<Arc<Daemon>>, Path(id): Path<String>| async move {
+                    d.stopped.lock().unwrap().push(id);
+                    Json(serde_json::json!({}))
+                }))
+                .with_state(d.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (url, d, server)
+        }
+
+        #[tokio::test]
+        async fn an_lb_with_no_deployments_touches_nothing() {
+            let (url, daemon, server) = daemon().await;
+            let (scaler, registry) = autoscaler_against(&url, spec());
+            registry.remove("demo");
+            assert!(registry.deployments().is_empty());
+            scaler.adopt_existing().await;
+            scaler.sweep_suspended().await;
+            assert!(daemon.deleted.lock().unwrap().is_empty(), "nothing destroyed");
+            assert!(daemon.stopped.lock().unwrap().is_empty(), "nothing stopped either");
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn a_sandbox_of_an_unknown_deployment_is_stopped_never_destroyed() {
+            let (url, daemon, server) = daemon().await;
+            let (scaler, _registry) = autoscaler_against(&url, spec());
+            scaler.adopt_existing().await;
+            assert_eq!(*daemon.stopped.lock().unwrap(), vec!["sb-running".to_string()]);
+            assert!(daemon.deleted.lock().unwrap().is_empty(), "its disk is kept");
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn the_suspended_sweep_leaves_unknown_stopped_sandboxes_to_the_disk_ttl() {
+            let (url, daemon, server) = daemon().await;
+            let (scaler, _registry) = autoscaler_against(&url, spec());
+            scaler.sweep_suspended().await;
+            assert!(daemon.deleted.lock().unwrap().is_empty());
+            server.abort();
+        }
     }
 
     #[tokio::test]
