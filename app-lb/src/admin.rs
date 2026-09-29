@@ -626,6 +626,14 @@ fn is_auth_provider_route(matched: &str) -> bool {
     matches!(matched, "/auth-providers" | "/auth-providers/:namespace/:name")
 }
 
+/// Fleet reads a namespace-confined caller may reach with `?namespace=`. The
+/// handler checks the namespace against the caller's reach and restricts the
+/// fan-out to gateways that take the caller's own identity. `/fleet`,
+/// `/fleet/network` and `/services` stay fleet-wide only.
+fn is_fleet_namespace_route(matched: &str) -> bool {
+    matches!(matched, "/fleet/deployments" | "/fleet/gateways/:id/metrics")
+}
+
 /// The deployment a matched route acts on, if it acts on one.
 ///
 /// Read off the *matched* path rather than the raw URI so this cannot be fooled
@@ -824,6 +832,10 @@ fn decide_access(
             // parameter the gate does not read (and the body names it on
             // `POST`), so the handler measures the caller's reach against it.
             None if is_auth_provider_route(matched) && caller.confined() => {}
+            // The workload rollup and gateway drill-down narrow to a namespace
+            // the handler measures against the caller's reach, and then only
+            // through gateways that take the caller's own identity.
+            None if is_fleet_namespace_route(matched) && caller.confined() => {}
             None if !narrows_itself(matched) && !caller.covers_fleet() => {
                 return Verdict::Forbidden(
                     "this token is scoped to specific deployments, so it cannot use a \
@@ -5796,6 +5808,89 @@ async fn fleet_snapshot(State(state): State<AdminState>, axum::Extension(caller)
     }))).into_response()
 }
 
+#[derive(Default, Deserialize)]
+struct FleetQuery {
+    namespace: Option<String>,
+    #[serde(default)]
+    offset: usize,
+}
+
+/// Who may read a fleet rollup, and with which credentials. A fleet-wide
+/// caller reads everything. A caller without fleet coverage must name a
+/// namespace it may view, and is then served only by gateways that take its own
+/// Heyo identity: service credentials are never spent on its behalf.
+fn fleet_reach(caller: &Caller, namespace: Option<&str>) -> Result<crate::fleet::Reach, Response> {
+    if matches!(caller, Caller::Ungated) { return Err(forbidden("authenticated fleet view required")); }
+    if namespace.is_some_and(|ns| !crate::config::is_valid_namespace(ns)) {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid namespace").into_response());
+    }
+    if caller.covers_fleet() { return Ok(crate::fleet::Reach::Fleet); }
+    match namespace {
+        Some(ns) if caller.reaches_namespace(ns) && caller.satisfies_in(crate::tokens::AdminScope::View, Some(ns)) =>
+            Ok(crate::fleet::Reach::CallerOnly),
+        Some(_) => Err(forbidden("this credential cannot view that namespace")),
+        None => Err(forbidden("authenticated fleet view required; name a namespace with ?namespace=")),
+    }
+}
+
+fn fleet_namespace(query: &FleetQuery) -> Option<&str> {
+    query.namespace.as_deref().map(str::trim).filter(|ns| !ns.is_empty())
+}
+
+/// `GET /fleet/deployments` — namespace × deployment rows with a cell per
+/// gateway. Observations only; nothing here places or scales anything.
+async fn fleet_deployments(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    headers: axum::http::HeaderMap, Query(query): Query<FleetQuery>) -> Response {
+    let namespace = fleet_namespace(&query);
+    let reach = match fleet_reach(&caller, namespace) { Ok(r) => r, Err(refused) => return refused };
+    let credential = fleet_credential(&caller, &headers);
+    let snapshot = state.views.as_ref().map(|views| views.snapshot());
+    let Some(fleet) = snapshot.as_ref().and_then(|s| s.fleet.as_ref()) else {
+        return ([(header::CACHE_CONTROL, "no-store")], Json(serde_json::json!({"configured":false}))).into_response();
+    };
+    let workloads = fleet.workloads(namespace, reach, credential.as_deref()).await;
+    let mut body = serde_json::to_value(&workloads).unwrap_or_default();
+    if let Some(map) = body.as_object_mut() {
+        map.insert("configured".into(), true.into());
+        map.insert("fleet_view".into(), (reach == crate::fleet::Reach::Fleet).into());
+    }
+    ([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response()
+}
+
+/// `GET /fleet/gateways/:id/metrics` — one allowlisted page of one gateway,
+/// through this origin. Guest addresses only for fleet-wide callers.
+async fn fleet_gateway_metrics(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    headers: axum::http::HeaderMap, Path(id): Path<String>, Query(query): Query<FleetQuery>) -> Response {
+    let namespace = fleet_namespace(&query);
+    let reach = match fleet_reach(&caller, namespace) { Ok(r) => r, Err(refused) => return refused };
+    let credential = fleet_credential(&caller, &headers);
+    let snapshot = state.views.as_ref().map(|views| views.snapshot());
+    let Some(fleet) = snapshot.as_ref().and_then(|s| s.fleet.as_ref()) else {
+        return err(StatusCode::NOT_FOUND, "no fleet is configured").into_response();
+    };
+    match fleet.gateway_detail(&id, namespace, query.offset, reach, credential.as_deref()).await {
+        None => err(StatusCode::NOT_FOUND, "no such gateway").into_response(),
+        Some(Err(e @ crate::fleet::SERVICE_CREDENTIAL_REFUSED)) => forbidden(e),
+        Some(Err(e)) => err(StatusCode::BAD_GATEWAY, e).into_response(),
+        Some(Ok(detail)) => ([(header::CACHE_CONTROL, "no-store")], Json(detail)).into_response(),
+    }
+}
+
+/// `GET /fleet/network` — region → gateway → deployments → VMs, with ingress
+/// addresses and guest addresses. Fleet-wide callers only.
+async fn fleet_network(State(state): State<AdminState>, axum::Extension(caller): axum::Extension<Caller>,
+    headers: axum::http::HeaderMap) -> Response {
+    if matches!(caller, Caller::Ungated) || !caller.covers_fleet() {
+        return forbidden("authenticated fleet view required");
+    }
+    let credential = fleet_credential(&caller, &headers);
+    let snapshot = state.views.as_ref().map(|views| views.snapshot());
+    let Some(fleet) = snapshot.as_ref().and_then(|s| s.fleet.as_ref()) else {
+        return err(StatusCode::NOT_FOUND, "no fleet is configured").into_response();
+    };
+    ([(header::CACHE_CONTROL, "no-store")], Json(fleet.network(credential.as_deref()).await)).into_response()
+}
+
 async fn require_fleet_view(State(state): State<AdminState>, req: Request, next: Next) -> Response {
     authorize(state, req, next, crate::tokens::AdminScope::View).await
 }
@@ -6039,6 +6134,9 @@ fn router(state: AdminState) -> Router {
 
     let fleet = Router::new()
         .route("/fleet", get(fleet_snapshot))
+        .route("/fleet/deployments", get(fleet_deployments))
+        .route("/fleet/gateways/:id/metrics", get(fleet_gateway_metrics))
+        .route("/fleet/network", get(fleet_network))
         .route("/services", get(services_snapshot))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_fleet_view));
 
@@ -7780,6 +7878,18 @@ mod tests {
             // draws; a bare `metrics` would return an empty VM list.
             assert!(NETWORK_HTML.contains("metrics?summary=false"), "page never polls /metrics");
             assert!(NETWORK_HTML.contains("ingress"), "page never polls /ingress");
+            // Global scope first, local on `?view=local` or when refused.
+            assert!(NETWORK_HTML.contains("fetch(\"fleet/network\""), "page never polls /fleet/network");
+            assert!(NETWORK_HTML.contains("/network?view=local"), "no way back to the local view");
+        }
+
+        /// The dashboard's workload rollup and server drill-down fetch the
+        /// fleet routes the router registers, relative to `/dashboard`.
+        #[test]
+        fn the_dashboard_calls_the_fleet_rollup_routes() {
+            assert!(DASHBOARD_HTML.contains("\"fleet/deployments\""));
+            assert!(DASHBOARD_HTML.contains("\"fleet/gateways/\" + encodeURIComponent("));
+            assert!(DASHBOARD_HTML.contains("\"/metrics?\""));
         }
 
         /// All five legend states must appear in the page, because the canvas
@@ -8237,6 +8347,11 @@ mod tests {
             assert!(matches!(at("/jobs", "/jobs"), Verdict::Forbidden(_)));
             assert!(matches!(at("/services", "/services"), Verdict::Forbidden(_)));
             assert!(matches!(at("/fleet", "/fleet"), Verdict::Forbidden(_)));
+            assert!(matches!(at("/fleet/network", "/fleet/network"), Verdict::Forbidden(_)));
+            // The rollup and drill-down narrow to a namespace in the handler,
+            // which also restricts them to caller-auth gateways.
+            assert!(matches!(at("/fleet/deployments", "/fleet/deployments"), Verdict::Allow(_)));
+            assert!(matches!(at("/fleet/gateways/:id/metrics", "/fleet/gateways/us2/metrics"), Verdict::Allow(_)));
             // Secrets are walled in the handler, per namespace, so the gate
             // lets a confined caller through to be measured there.
             assert!(matches!(at("/secrets", "/secrets"), Verdict::Allow(_)));
@@ -8279,6 +8394,34 @@ mod tests {
             assert!(may_use_secrets(Some(&fleet), "anything", true).is_ok());
             assert!(may_use_secrets(Some(&Caller::Operator), "anything", true).is_ok());
             assert!(may_use_secrets(None, "anything", true).is_ok());
+        }
+
+        /// Namespace narrowing on the fleet rollup: a confined caller must name
+        /// a namespace it may view, and is then served caller-auth gateways
+        /// only. Fleet callers keep full reach; nobody ungated gets any.
+        #[test]
+        fn fleet_rollup_reach_is_measured_per_namespace() {
+            use crate::fleet::Reach;
+            let t = store();
+            let raw = mint_in_namespace(&t, AdminScope::View, "team-a");
+            let token = Caller::Token(t.verify(&raw, NOW).unwrap());
+            assert!(fleet_reach(&token, Some("team-a")).ok() == Some(Reach::CallerOnly));
+            assert!(fleet_reach(&token, Some("team-b")).is_err());
+            assert!(fleet_reach(&token, None).is_err());
+            assert!(fleet_reach(&token, Some("../x")).is_err());
+
+            let federated = Caller::Federated(grant(&[("team-a", AdminScope::View)], false));
+            assert!(fleet_reach(&federated, Some("team-a")).ok() == Some(Reach::CallerOnly));
+            assert!(fleet_reach(&federated, Some("team-c")).is_err());
+
+            let fleet = Caller::Federated(grant(&[], true));
+            assert!(fleet_reach(&fleet, None).ok() == Some(Reach::Fleet));
+            assert!(fleet_reach(&fleet, Some("team-c")).ok() == Some(Reach::Fleet));
+            assert!(fleet_reach(&Caller::Operator, None).ok() == Some(Reach::Fleet));
+            assert!(fleet_reach(&Caller::Ungated, None).is_err());
+            // A deployment-scoped token names no namespace wall to narrow to.
+            let scoped = Caller::Token(t.verify(&mint(&t, AdminScope::View, &["sb-1"]), NOW).unwrap());
+            assert!(fleet_reach(&scoped, Some("default")).is_err());
         }
 
         fn grant(ns: &[(&str, AdminScope)], fleet: bool) -> Arc<crate::federated::Grant> {
@@ -8905,6 +9048,9 @@ mod tests {
             // are not about the one deployment this token was given.
             for route in [
                 "/fleet",
+                "/fleet/deployments",
+                "/fleet/gateways/:id/metrics",
+                "/fleet/network",
                 "/services",
                 "/control-plane/config",
                 "/deployments",

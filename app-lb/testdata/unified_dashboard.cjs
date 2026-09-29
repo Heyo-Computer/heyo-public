@@ -34,7 +34,7 @@ const inventory = {services:[{serviceId:'shared-app', desiredReplicas:2, replica
     const dir=root+'/'+i;fs.mkdirSync(dir);
     const log=fs.openSync(dir+'/log','w');
     const child=spawn(binary,[],{cwd:dir,env:{...process.env,SSL_CERT_FILE:root+'/cert',
-      APP_LB_ADMIN_ADDR:'127.0.0.1:'+port,APP_LB_PROXY_ADDR:'127.0.0.1:0',APP_LB_DAEMON_URL:'http://127.0.0.1:9',
+      APP_LB_INSTANCE_LOCK:dir+'/instance.lock',APP_LB_ADMIN_ADDR:'127.0.0.1:'+port,APP_LB_PROXY_ADDR:'127.0.0.1:0',APP_LB_DAEMON_URL:'http://127.0.0.1:9',
       APP_LB_ADMIN_AUTH:'1',APP_LB_DASHBOARD_AUTH:'1',APP_LB_DASHBOARD_USER:'admin',APP_LB_DASHBOARD_PASSWORD:'fixture-password',
       APP_LB_AUTH_URL:'http://127.0.0.1:'+authPort,APP_LB_SIEM:'0',APP_LB_DISK_TTL_SECS:'0',
       APP_LB_MOUNTS_DIR:dir+'/mounts',APP_LB_WORKSPACES_DIR:dir+'/workspaces',APP_LB_IMAGES_DIR:dir+'/images',APP_LB_BUILD_DIR:dir+'/build'},stdio:['ignore',log,log]});
