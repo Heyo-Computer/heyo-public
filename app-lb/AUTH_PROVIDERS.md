@@ -64,6 +64,19 @@ heyctl create auth-provider heyo -n team-a \
   --preset heyo-jwks --require accountId=acct_7f3c
 ```
 
+Over the API the same thing is one `POST /auth-providers`: next to `preset`,
+the request-only fields `require` (merged claim by claim over the preset's, so
+its `role` check stays), `cookie`, `login_url` and `login_redirect_param` are laid
+over the expanded policy:
+
+```json
+{"name": "heyo", "namespace": "team-a", "preset": "heyo-jwks",
+ "require": {"accountId": ["acct_7f3c"]},
+ "cookie": "heyo_token", "login_url": "https://auth.example.com/login"}
+```
+
+This is what Heyo sends when a namespace is created from its UI.
+
 `--require namespace=team-a` is the other useful one: that claim is only present
 on a token exchanged from a namespace-scoped API key, so it admits exactly the
 credentials minted for this namespace.

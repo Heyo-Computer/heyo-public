@@ -311,6 +311,11 @@
   }
   #toast.show { opacity: 1; }
   #toast.err { background: var(--critical); color: #fff; }
+/* A namespace opened at the view tier: the controls that need admin are
+   hidden rather than left to fail. Paging and the filter are reads. */
+body[data-tier="view"] #local-view button:not(#dep-prev):not(#dep-next),
+body[data-tier="view"] [data-admin-only] { display: none; }
+#ns-banner a { margin-left: .5em; }
 </style>
 <!-- The theme used to be read from localStorage by a blocking script here.
      It is now stamped on <html> by the server from a cookie, which is both
@@ -343,13 +348,15 @@
     </div>
   </header>
 
-  <section aria-labelledby="services-title">
+  <div class="card" id="ns-banner" hidden role="status"></div>
+
+  <section aria-labelledby="services-title" data-fleet-only>
     <div class="section-title" id="services-title">Global applications</div>
     <div class="card" id="global-services" aria-live="polite">Loading shared application state…</div>
     <div><button class="btn btn-sm" id="services-first" hidden>First page</button> <button class="btn btn-sm" id="services-next" hidden>Next page</button></div>
   </section>
 
-  <section aria-labelledby="regions-title">
+  <section aria-labelledby="regions-title" data-fleet-only>
     <div class="section-title" id="regions-title">Regional gateways</div>
     <div class="card" id="regional-fleet" aria-live="polite">Loading regional observations…</div>
   </section>
@@ -430,38 +437,38 @@
   </div>
   <div class="card" id="host-sandboxes"></div>
 
-  <div class="section-title">
+  <div class="section-title" data-fleet-only>
     Certificates <span class="count" id="certs-count"></span>
   </div>
-  <div class="card" id="certs"></div>
+  <div class="card" id="certs" data-fleet-only></div>
 
-  <div class="section-title">
+  <div class="section-title" data-admin-only>
     Secrets <span class="count" id="secrets-count"></span>
     <span class="spacer"></span>
     <button class="btn mini" id="secret-new">New secret</button>
   </div>
-  <div class="card" id="secrets"></div>
+  <div class="card" id="secrets" data-admin-only></div>
 
   <!-- Above App-tokens on purpose: a namespace is the wall a token is scoped
        against, so the list of walls should be read before the list of keys. -->
-  <div class="section-title">
+  <div class="section-title" data-fleet-only>
     Namespaces <span class="count" id="ns-count"></span>
     <span class="spacer"></span>
     <button class="btn mini" id="ns-new">New namespace</button>
   </div>
-  <div class="card" id="namespaces"></div>
+  <div class="card" id="namespaces" data-fleet-only></div>
 
-  <div class="section-title">
+  <div class="section-title" data-fleet-only>
     App-tokens <span class="count" id="tokens-count"></span>
     <span class="spacer"></span>
     <button class="btn mini" id="token-new">New token</button>
   </div>
-  <div class="card" id="tokens"></div>
+  <div class="card" id="tokens" data-fleet-only></div>
 
-  <div class="section-title">
+  <div class="section-title" data-fleet-only>
     Deploy jobs <span class="count" id="jobs-count"></span>
   </div>
-  <div class="card" id="jobs"></div>
+  <div class="card" id="jobs" data-fleet-only></div>
   </section>
 </div>
 
@@ -483,11 +490,23 @@
 "use strict";
 // The entry region must not silently select the fleet dashboard's data.
 // Gateway cards link to an explicit local view on that gateway's own origin.
-const localView = new URLSearchParams(location.search).get("view") === "local";
+const pageParams = new URLSearchParams(location.search);
+// `?namespace=` is how a Heyo front end opens this page for one namespace (see
+// POST /login/handoff): everything narrows to it, and the fleet-wide sections
+// — which a namespace user cannot read — are not shown at all.
+// The same alphabet `is_valid_namespace` admits server-side.
+const NS_RE = /^(?!\.\.?$)[A-Za-z0-9._-]+$/;
+const pinnedNamespace = NS_RE.test(pageParams.get("namespace") || "") ? pageParams.get("namespace") : "";
+const HOME_URL = "{{HOME_URL}}";
+const localView = pageParams.get("view") === "local" || !!pinnedNamespace;
+if (pinnedNamespace) {
+  document.querySelectorAll("[data-fleet-only]").forEach(el => el.hidden = true);
+}
 document.getElementById("local-view").hidden = !localView;
 document.querySelectorAll("[data-local-nav]").forEach(el => el.hidden = !localView);
 document.querySelector(".topbar-brand").href = "/dashboard";
-document.querySelector(".topbar-app").textContent = localView ? location.host : "Control plane";
+document.querySelector(".topbar-app").textContent = pinnedNamespace
+  ? "Namespace " + pinnedNamespace : localView ? location.host : "Control plane";
 document.title = localView ? location.host + " · Heyo" : "Heyo control plane";
 document.getElementById("local-title").textContent = "Selected gateway: " + location.host + " · host & pools";
 document.getElementById("uptime").hidden = !localView;
@@ -510,7 +529,7 @@ let depsById = {};   // id -> latest deployment view, for form prefills
 const DEP_PAGE = 50;
 let depOffset = 0;   // first deployment on the current page
 let depPrefix = "";  // id-prefix filter, sent to the server, not applied here
-let depNamespace = ""; // namespace filter, likewise server-side; "" is all of them
+let depNamespace = pinnedNamespace; // namespace filter, likewise server-side; "" is all of them
 let knownNamespaces = []; // last seen from GET /namespaces, for the mint form
 
 const $ = (id) => document.getElementById(id);
@@ -2351,7 +2370,8 @@ function renderNamespaces(list) {
   // One namespace and it is `default` means nobody is using them: a picker with
   // a single choice is furniture, so it stays hidden until there is a decision
   // to make.
-  const meaningful = names.length > 1 || (names.length === 1 && names[0] !== "default");
+  const meaningful = !pinnedNamespace
+    && (names.length > 1 || (names.length === 1 && names[0] !== "default"));
   sel.hidden = !meaningful;
   if (!meaningful) return;
 
@@ -2390,6 +2410,7 @@ async function poll() {
   if (!localView) return;
   try {
     const r = await fetch(metricsUrl(), { headers: { accept: "application/json" }, cache: "no-store" });
+    if (r.status === 401 && pinnedNamespace) { sessionExpired(); return; }
     if (!r.ok) throw new Error("HTTP " + r.status);
     render(await r.json());
   } catch (e) {
@@ -2496,7 +2517,7 @@ async function pollSlow() {
   try {
     // Independent of the local CRUD reads, which can fail for a view token.
     // Clear old values on failure instead of leaving a disconnected region green.
-    await Promise.all([
+    if (!pinnedNamespace) await Promise.all([
       api("GET", "fleet").then(renderFleet).catch(() => renderFleet({ ok: false })),
       pollServices(),
     ]);
@@ -2505,11 +2526,14 @@ async function pollSlow() {
       $("livedot").hidden = true;
       return;
     }
+    // Fleet-only lists a namespace session would only be refused; skipped
+    // rather than asked for and hidden.
+    const skipped = Promise.resolve({ ok: false, status: 0 });
     const [certs, secrets, tokens, jobs, security, namespaces] = await Promise.all([
-      api("GET", "certs"),
-      api("GET", "secrets"),
-      api("GET", "tokens"),
-      api("GET", "jobs"),
+      pinnedNamespace ? skipped : api("GET", "certs"),
+      api("GET", pinnedNamespace ? "secrets?namespace=" + encodeURIComponent(pinnedNamespace) : "secrets"),
+      pinnedNamespace ? skipped : api("GET", "tokens"),
+      pinnedNamespace ? skipped : api("GET", "jobs"),
       // Ten seconds, not two: repeats fold into an open alert over a suppression
       // window measured in minutes, so a faster poll would spend a request per
       // tick on a list that has not moved. The stat tile is on the fast poll for
@@ -2554,6 +2578,39 @@ $("pausebtn").addEventListener("click", () => {
 // cookie scoped to the parent domain, so the choice follows a person to every
 // Heyo app instead of stopping at this origin.
 
+// A namespace session is a one-hour token handed over by Heyo; this page
+// cannot renew it, so when it runs out the way back is through Heyo.
+function sessionExpired() {
+  paused = true;
+  clearTimeout(timer); clearTimeout(slowTimer);
+  $("updated").textContent = "session expired";
+  $("livedot").classList.add("stale");
+  const banner = $("ns-banner");
+  banner.textContent = "Your session for namespace " + pinnedNamespace + " has expired. Open the dashboard again from Heyo.";
+  if (HOME_URL) {
+    const a = document.createElement("a");
+    a.href = HOME_URL; a.textContent = "Back to Heyo";
+    banner.append(a);
+  }
+  banner.hidden = false;
+}
+
+// Which tier this caller holds in the pinned namespace, from /whoami. A view
+// grant gets the page without the controls it would only be refused at.
+async function applyNamespaceTier() {
+  if (!pinnedNamespace) return;
+  const who = await api("GET", "whoami").catch(() => ({ ok: false }));
+  if (!who.ok) { if (who.status === 401) sessionExpired(); return; }
+  const tier = who.data.fleet ? "admin" : (who.data.namespaces || {})[pinnedNamespace];
+  document.body.dataset.tier = tier || "none";
+  const banner = $("ns-banner");
+  banner.textContent = tier
+    ? "Namespace " + pinnedNamespace + " · " + (tier === "admin" ? "admin" : "read-only") + " access"
+    : "This session cannot reach namespace " + pinnedNamespace + ".";
+  banner.hidden = false;
+}
+
+applyNamespaceTier();
 poll();
 // Second, independent loop. Started after `poll` so `depsById` is usually already
 // populated by the time `renderCerts` cross-references it for routed hostnames.

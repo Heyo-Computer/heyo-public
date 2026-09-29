@@ -605,6 +605,7 @@ Configuration is environment-only:
 | `APP_LB_AUTH_URL` | *(unset)* | Base URL of the Heyo auth service. **Setting it enables [federated auth](#managed-mode-federated-auth-and-namespaces)**: a bearer that is not an app-token is resolved to namespace grants by `GET /api/auth/scopes`. Needs `APP_LB_ADMIN_AUTH=1` |
 | `APP_LB_AUTH_CACHE_SECS` | `60` | How long a resolved grant is trusted before re-fetching (never past the token's own expiry). Also the ceiling on revocation latency |
 | `APP_LB_AUTH_TIMEOUT_SECS` | `5` | Timeout for one scopes lookup. An unreachable auth service fails closed |
+| `APP_LB_HOME_URL` | *(unset)* | The Heyo front end namespace users open the dashboard from (e.g. `https://heyo.computer/namespaces`). Linked from `/login` and when a [namespace session](#opening-the-dashboard-for-one-namespace) is refused or expires |
 | `APP_LB_TLS_CERT` | *(unset)* | PEM cert path; set with `APP_LB_TLS_KEY`. The fallback cert when ACME is on |
 | `APP_LB_TLS_KEY` | *(unset)* | PEM private-key path |
 | `APP_LB_PROXY_TLS_ADDR` | `0.0.0.0:6189` | HTTPS listener (bound when ACME is on or cert+key are set) |
@@ -3871,6 +3872,27 @@ nothing; its specs and create bodies are byte-for-byte what they were. An auth
 service that predates `namespaces[]` still works: the caller's own account is
 used, with a warning, which is right for a user in one account and wrong for a
 user in several.
+
+### Opening the dashboard for one namespace
+
+`/login`'s password form admits platform administrators only. A namespace
+owner reaches the dashboard from Heyo instead: the front end asks the auth
+service for a token confined to that namespace at the user's own tier
+(`POST /api/auth/namespace-token`, one hour, no refresh), and posts it from a
+form in a new tab to **`POST /login/handoff`** (`token`, `namespace`,
+form-encoded). app-lb resolves the token like any bearer and, if the grant
+reaches the namespace, sets it as the session cookie and navigates to
+`/dashboard?namespace=<ns>`.
+
+That page pins itself to the namespace: the picker and the fleet-wide sections
+(global applications, regional gateways, certificates, namespaces, app-tokens,
+deploy jobs) are hidden, and a view-tier grant gets no write controls. When the
+token runs out the page says so and links back to `APP_LB_HOME_URL`; there is
+no refresh here, by design.
+
+The handoff is the one cookie write that is cross-site on purpose, so it skips
+the origin check every other one has. The most a forged post can do is sign the
+victim into the forger's own namespace, which the page names.
 
 ### Caching, and what it costs
 
