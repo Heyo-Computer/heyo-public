@@ -185,8 +185,12 @@ requires a new service identity with no Cloud-managed state or operation history
 It creates no VM and does not change the current app-lb routes, workspace,
 database, NATS consumers, artifacts, warm pool, or runner records.
 
-CI prepares an immutable release intent, then obtains durable acceptance from
-Orchestrator before it may close admissions or replace itself. CI remains the
+Once adopted, CI prepares an immutable release intent, then obtains durable
+acceptance from Orchestrator before it may close admissions or replace itself.
+Never-adopted app-lb CI with all application lifecycle settings absent retains
+its direct, release-authorized self-update path; partial configuration is rejected,
+and removing configuration cannot bypass a previously recorded adopted update.
+CI remains the
 executor of job/lease draining and exact-binary verification; app-lb remains the
 executor of retained-workspace replacement. Orchestrator never creates a second
 CI VM through the Cloud archive path. Existing Cloud creation, regional rollout

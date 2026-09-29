@@ -198,9 +198,13 @@ the registered HeyoSecret `GIT_AUTH_TOKEN`, with no version bump or tags. The
 captured trunk must still match at publication; a moved trunk requires revalidation.
 
 CI runtime changes also require `ci/deploy-controller`. It prepares a durable
-release intent and obtains acceptance from Orchestrator's shared application
-update API. Only Orchestrator's authenticated activation can advance a prepared
-intent into a rollout. CI then closes new submissions (HTTP 503) and lets existing jobs finish before
+release intent. A never-adopted app-lb deployment with all three application
+lifecycle settings absent starts its scoped rollout directly, after the existing
+repository, merged-release, artifact and deployment checks. An adopted deployment
+obtains acceptance from Orchestrator's shared application update API; only its
+authenticated activation advances that prepared intent. Partial configuration is
+an error, and removing configuration cannot bypass a recorded adoption. CI then
+closes new submissions (HTTP 503) and lets existing jobs finish before
 replacing the controller. The requesting job finishes first; the **run remains
 running** until the replacement resumes reconciliation and its public health
 endpoint identifies the expected revision and executable SHA256. Documentation
@@ -215,8 +219,8 @@ configuration before enabling the workflow:
 
 - `CI_CONTROLLER_DEPLOYMENT`: the app-lb deployment ID of this controller.
 - `CI_CONTROLLER_REPOSITORY`: the only repository allowed to replace it.
-- `CI_APPLICATION_ID`: the adopted shared application identity, normally `ci`.
-- `CI_APPLICATION_ORCHESTRATOR_URL`: the shared application authority origin.
+- `CI_APPLICATION_ID`: when adopted, the shared application identity, normally `ci`.
+- `CI_APPLICATION_ORCHESTRATOR_URL`: when adopted, the shared application authority origin.
 - `CI_APPLICATION_LIFECYCLE_TOKEN`: a HeyoSecret-backed credential scoped to
   this application's update exchange. Orchestrator's binding references the same
   credential. It is not the app-lb admin, repository submit or native runner token.
@@ -1506,19 +1510,22 @@ receipt requires no local effects or owned job obligations, and a ready approved
 survivor outside the retiring region. No authority transfers to that survivor:
 it was already active. Retired boots cannot begin effects.
 
-App-lb-managed CI keeps the existing `ci/deploy-controller` action and application
-acceptance/activation contract; removing the execution owner does not remove the
-deployment path or migrate its VM. Replacement pins the source boot, drains only
+App-lb-managed CI keeps the existing `ci/deploy-controller` action. Application
+acceptance/activation is required for adopted deployments, not never-adopted
+installations with no application lifecycle settings. This does not migrate VM
+ownership. Replacement pins the source boot, drains only
 that boot, and conditionally updates the same app-lb deployment. Other regions
 keep admitting work. Concurrent replacements are serialized per app-lb authority
 and deployment, not globally. The old boot retires before the update request;
 its replacement reconciles the saved intent and verifies the exact binary before
 opening admissions. A lost response is reconciled, never treated as success.
 
-Existing configuration requirements, including `CI_APPLICATION_ID` and the
-application authority's authenticated acceptance, still apply. This correction
-does not configure missing live bindings or implement a two-region release
-coordinator. Historical rollouts without a pinned source boot remain inspectable
+Configured application authority and persisted adopted operations retain their
+authenticated acceptance requirement. All three lifecycle settings must either
+be absent on a never-adopted deployment or form a complete valid configuration.
+This correction does not install itself into an older binary that unconditionally
+requires those settings, or implement a two-region release coordinator.
+Historical rollouts without a pinned source boot remain inspectable
 and require explicit reconciliation; they are not silently adopted or completed.
 An original process lost before submitting its update likewise requires explicit
 reconciliation rather than letting a new boot replace an unidentified predecessor.
