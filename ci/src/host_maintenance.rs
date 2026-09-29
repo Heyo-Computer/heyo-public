@@ -328,12 +328,12 @@ pub fn spawn(d: Arc<Dispatcher>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let Ok(_effect) = d.executor.effect_permit().await else { continue };
             let rows = sqlx::query("SELECT h.id,h.request,s.job_id,s.run_id FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.phase NOT IN ('passed','failed') ORDER BY h.created_at LIMIT 32").fetch_all(d.store.pool()).await;
             let Ok(rows) = rows else { continue };
             for row in rows {
                 let id: String = row.get("id"); let run: String = row.get("run_id");
                 let result: Result<()> = async {
+                    let _effect = d.executor.effect_permit_for(Some(&id)).await.map_err(anyhow::Error::msg)?;
                     let request: Request = serde_json::from_value(row.get("request"))?;
                     let target = trusted_target(&d, &request.alias).await.ok();
                     // Local cancellation/deadline/configuration checks do not
@@ -358,7 +358,7 @@ pub fn spawn(d: Arc<Dispatcher>) {
 /// Reconcile an exact completed operation, never POST another upgrade. Only
 /// untouched skipped jobs resume; the failed outcome remains in the event log.
 pub async fn recover(d: &Dispatcher, run_id: &str, id: &str) -> Result<Value> {
-    let effect = d.executor.effect_permit_for(Some(id)).await.map_err(anyhow::Error::msg)?;
+    let _effect = d.executor.effect_permit_for(Some(id)).await.map_err(anyhow::Error::msg)?;
     let mut tx = d.store.pool().begin().await?;
     let runner: String = sqlx::query_scalar("SELECT h.runner_hd_id FROM ci_host_maintenance h JOIN ci_service_deployment s ON s.id=h.id WHERE h.id=$1 AND s.run_id=$2")
         .bind(id).bind(run_id).fetch_one(&mut *tx).await?;
@@ -374,9 +374,8 @@ pub async fn recover(d: &Dispatcher, run_id: &str, id: &str) -> Result<Value> {
     if row.get::<String,_>("phase") == "passed" && row.get::<String,_>("deployment_status") == "passed" {
         return Ok(json!({"operation_id":id,"status":"already_passed"}));
     }
-    ensure!(status == "failure" && (row.get::<String,_>("phase") == "failed"
-        || (effect.continuation_operation_id().is_some() && row.get::<String,_>("phase") == "passed"
-            && row.get::<String,_>("deployment_status") == "failed")), "only failed maintenance can be recovered");
+    ensure!(status == "failure" && row.get::<String,_>("phase") == "failed",
+        "only failed maintenance can be recovered");
     let job_id: String = row.get("job_id");
     ensure!(jobs.iter().all(|j| if j.get::<String,_>("id") == job_id {
         j.get::<String,_>("status") == "failure"
@@ -409,17 +408,6 @@ pub async fn recover(d: &Dispatcher, run_id: &str, id: &str) -> Result<Value> {
     let note = json!({"operation_id":id,"original_error":job.error,"receipt":receipt}).to_string();
     Store::add_event(&mut tx, run_id, Some(&job_id), None, None,
         "ci.host.maintenance.recovered.v1", "recovered", Some(&note)).await?;
-    if effect.continuation_operation_id().is_some() {
-        // Emergency executor recovery settles the remote obligation only. Do
-        // not restart an old release or deploy its skipped EU stages.
-        sqlx::query("UPDATE ci_host_maintenance SET phase='passed',updated_at=now() WHERE id=$1")
-            .bind(id).execute(&mut *tx).await?;
-        sqlx::query("UPDATE ci_service_deployment SET status='passed',phase='passed',message='Exact completed Cloud receipt reconciled during executor recovery; original failed run was not resumed',updated_at=now() WHERE id=$1")
-            .bind(id).execute(&mut *tx).await?;
-        Store::add_service_deployment_event(&mut tx, id).await?;
-        tx.commit().await?;
-        return Ok(json!({"operation_id":id,"status":"recovered","run_id":run_id,"runResumed":false}));
-    }
     // The only failed job is proven complete, and no skipped job has executed.
     // Keep attempt IDs, logs, publication and prior status events intact.
     sqlx::query("UPDATE ci_job SET status='pending',finished_at=NULL,error=NULL WHERE run_id=$1 AND status='skipped'")

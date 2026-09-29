@@ -11,9 +11,11 @@ pub async fn handoff(d: &Dispatcher, job: &str, runner: &str, attempt: i32,
     sandbox: &str, status: JobStatus, error: Option<&str>) -> Result<()> {
     ensure!(status.is_terminal(), "cleanup requires a terminal executor outcome");
     let mut tx = d.store.pool().begin().await?;
-    let j = sqlx::query("SELECT run_id,job_key,attempt,status FROM ci_job WHERE id=$1 FOR UPDATE")
+    let j = sqlx::query("SELECT run_id,job_key,attempt,status,executor_boot FROM ci_job WHERE id=$1 FOR UPDATE")
         .bind(job).fetch_one(&mut *tx).await?;
     ensure!(j.get::<i32,_>("attempt") == attempt, "cleanup attempt changed");
+    ensure!(j.get::<Option<uuid::Uuid>,_>("executor_boot") == Some(d.executor.boot_id()),
+        "cleanup executor ownership changed");
     let p = sqlx::query("SELECT status,claimed_by_job,runner_hd_id,leased_by FROM ci_vm_pool WHERE sandbox_id=$1 FOR UPDATE")
         .bind(sandbox).fetch_one(&mut *tx).await?;
     ensure!(p.get::<String,_>("status") == "claimed"
@@ -34,8 +36,10 @@ pub async fn handoff(d: &Dispatcher, job: &str, runner: &str, attempt: i32,
     // Cleanup must preserve that outcome, not overwrite it.
     let existing = j.get::<String,_>("status");
     let final_status = if JobStatus::parse(&existing).is_some_and(|s| s.is_terminal()) { existing.as_str() } else { status.as_str() };
-    sqlx::query("UPDATE ci_job SET status=$2,error=COALESCE($3,error),finished_at=now() WHERE id=$1")
-        .bind(job).bind(final_status).bind(error).execute(&mut *tx).await?;
+    let updated = sqlx::query("UPDATE ci_job SET status=$2,error=COALESCE($3,error),finished_at=now() WHERE id=$1 AND attempt=$4 AND executor_boot=$5")
+        .bind(job).bind(final_status).bind(error).bind(attempt).bind(d.executor.boot_id())
+        .execute(&mut *tx).await?;
+    ensure!(updated.rows_affected() == 1, "cleanup executor ownership changed");
     Store::add_event(&mut tx, &j.get::<String,_>("run_id"), Some(job), Some(&j.get::<String,_>("job_key")),
         None, "ci.job.status.v1", final_status, error).await?;
     crate::debug_report::enqueue(&mut tx, job, sandbox).await?;
@@ -50,7 +54,6 @@ pub fn spawn(d: std::sync::Arc<Dispatcher>) {
         loop {
             ticker.tick().await;
             let Ok(_effect) = d.executor.effect_permit().await else { continue };
-            let Ok(_work) = d.lifecycle.work(&d.store).await else { continue };
             if let Err(e) = reconcile(&d).await {
                 tracing::warn!("could not reconcile VM cleanup: {e}");
             }

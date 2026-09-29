@@ -21,7 +21,7 @@
 
 pub mod api;
 pub mod identity;
-mod owner_http;
+mod instance_http;
 pub mod pages;
 pub mod stream;
 
@@ -148,7 +148,7 @@ pub fn router(
         // above, for the reason this module's header gives — a machine route
         // behind the gate answers 401 whatever it carries. See [`api`].
         .merge(api::router())
-        .layer(axum::middleware::from_fn_with_state(state.clone(), owner_http::route))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), instance_http::route))
         .with_state(state)
 }
 
@@ -159,7 +159,7 @@ async fn maintenance_admin(state: &AppState, headers: &HeaderMap) -> Result<Iden
 
 async fn maintenance_status(State(state): State<AppState>, headers: HeaderMap) -> axum::response::Response {
     if let Err(response) = maintenance_admin(&state, &headers).await { return response; }
-    match crate::maintenance::status(&state.store).await {
+    match state.dispatcher.executor.status().await {
         Ok(status) => Json(status).into_response(),
         Err(detail) => {
             tracing::error!(%detail, "could not read operator maintenance");
@@ -169,16 +169,15 @@ async fn maintenance_status(State(state): State<AppState>, headers: HeaderMap) -
 }
 
 async fn maintenance_action(State(state): State<AppState>, Path((id, action)): Path<(uuid::Uuid, String)>, headers: HeaderMap) -> axum::response::Response {
-    let who = match maintenance_admin(&state, &headers).await {
+    let _who = match maintenance_admin(&state, &headers).await {
         Ok(who) => who,
         Err(response) => return response,
     };
     let operation = async {
         match action.as_str() {
-            "pause" => crate::maintenance::pause(&state.store, id, &who.subject).await,
-            "quiesce" => crate::maintenance::quiesce(&state.store, &state.dispatcher.executor, &state.dispatcher.lifecycle, id).await,
-            "resume" => crate::maintenance::resume(&state.store, id).await,
-            "activate-recovery" => crate::executor_recovery::activate(&state.dispatcher, id).await.map_err(|e| e.to_string()),
+            "pause" => state.dispatcher.executor.pause(id).await,
+            "quiesce" => state.dispatcher.executor.quiesce(id).await,
+            "resume" => state.dispatcher.executor.resume(id).await,
             _ => Err("unknown maintenance action".into()),
         }
     };
@@ -283,9 +282,9 @@ fn native_poll_error(e: crate::native::PollError) -> axum::response::Response {
         }
     }
 }
-async fn native_poll(State(s):State<AppState>,h:HeaderMap,Json(p):Json<crate::native::Poll>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let _effect=match s.dispatcher.executor.effect_permit().await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)};let _work=match s.dispatcher.lifecycle.work(&s.store).await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)};if let Ok(runs)=crate::native::pending_advancements(&s.store).await{for run in runs{if s.dispatcher.advance_run(&run).await.is_ok(){let _=crate::native::advancement_done(&s.store,&run).await;}}} match crate::native::poll(&s.store,p,&s.config.public_url,&s.dispatcher.secrets).await {Ok(job)=>Json(serde_json::json!({"job":job})).into_response(),Err(e)=>native_poll_error(e)} }
-async fn native_heartbeat(State(s):State<AppState>,h:HeaderMap,Json(u):Json<crate::native::LeaseUpdate>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let _work=match s.dispatcher.lifecycle.work(&s.store).await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)}; match crate::native::heartbeat(&s.store,&u).await {Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)} }
-async fn native_complete(State(s):State<AppState>,h:HeaderMap,Json(c):Json<crate::native::Completion>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let _work=match s.dispatcher.lifecycle.work(&s.store).await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)}; match crate::native::complete(&s.store,&s.dispatcher.secrets,c).await {Ok(Some(run))=>{match s.dispatcher.advance_run(&run).await{Ok(_)=>{let _=crate::native::advancement_done(&s.store,&run).await;},Err(e)=>tracing::error!("native completion scheduling failed: {e}")} StatusCode::NO_CONTENT.into_response()},Ok(None)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::CONFLICT,&e)} }
+async fn native_poll(State(s):State<AppState>,h:HeaderMap,Json(p):Json<crate::native::Poll>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let _admission=match s.dispatcher.executor.admission_permit().await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)};if let Ok(runs)=crate::native::pending_advancements(&s.store).await{for run in runs{if s.dispatcher.advance_run(&run).await.is_ok(){let _=crate::native::advancement_done(&s.store,&run).await;}}} match crate::native::poll(&s.store,p,&s.config.public_url,&s.dispatcher.secrets).await {Ok(job)=>Json(serde_json::json!({"job":job})).into_response(),Err(e)=>native_poll_error(e)} }
+async fn native_heartbeat(State(s):State<AppState>,h:HeaderMap,Json(u):Json<crate::native::LeaseUpdate>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let _effect=match s.dispatcher.executor.effect_permit().await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)};match crate::native::heartbeat(&s.store,&u).await {Ok(true)=>StatusCode::NO_CONTENT.into_response(),Ok(false)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::INTERNAL_SERVER_ERROR,&e)} }
+async fn native_complete(State(s):State<AppState>,h:HeaderMap,Json(c):Json<crate::native::Completion>)->impl IntoResponse { if let Err(e)=native_auth(&s,&h){return e};let _effect=match s.dispatcher.executor.effect_permit().await{Ok(g)=>g,Err(e)=>return error(StatusCode::SERVICE_UNAVAILABLE,&e)};match crate::native::complete(&s.store,&s.dispatcher.secrets,c).await {Ok(Some(run))=>{match s.dispatcher.advance_run(&run).await{Ok(_)=>{let _=crate::native::advancement_done(&s.store,&run).await;},Err(e)=>tracing::error!("native completion scheduling failed: {e}")} StatusCode::NO_CONTENT.into_response()},Ok(None)=>error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>error(StatusCode::CONFLICT,&e)} }
 async fn native_source(State(s):State<AppState>,h:HeaderMap,Path(lease):Path<uuid::Uuid>)->impl IntoResponse {
     if let Err(e)=native_auth(&s,&h){return e}
     let run_id=match crate::native::source_run(&s.store,lease).await {Ok(Some(r))=>r,Ok(None)=>return error(StatusCode::CONFLICT,"lease expired or fenced"),Err(e)=>return error(StatusCode::INTERNAL_SERVER_ERROR,&e)};
@@ -303,10 +302,6 @@ async fn native_release_source(State(s):State<AppState>,h:HeaderMap,Path((lease,
 async fn native_artifact(State(s):State<AppState>,h:HeaderMap,Path((lease,index)):Path<(uuid::Uuid,usize)>,Query(q):Query<NativeArtifactQuery>,body:Bytes)->impl IntoResponse {
     if let Err(e)=native_auth(&s,&h){return e};
     let _effect = match s.dispatcher.executor.effect_permit().await {
-        Ok(permit) => permit,
-        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, &e),
-    };
-    let _work = match s.dispatcher.lifecycle.work(&s.store).await {
         Ok(permit) => permit,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, &e),
     };
@@ -1851,10 +1846,10 @@ mod tests {
             .expect("store");
         store.migrate().await.expect("migrations");
         let runners = test_runners(config.clone());
+        let identity = crate::executor::identity(&config);
+        let executor = crate::executor::ExecutorInstance::register(store.pool().clone(), &identity).await.expect("executor");
         let dispatcher = Arc::new(Dispatcher {
-            lifecycle: Arc::new(crate::lifecycle::Lifecycle::default()),
-            executor: Arc::new(crate::executor::ExecutorOwner::register(store.pool().clone(),
-                config.managed_deployment.as_deref().unwrap_or(&format!("web-test-{}", uuid::Uuid::new_v4()))).await.expect("executor")),
+            executor: Arc::new(executor),
             config: config.clone(),
             store: store.clone(),
             pool: crate::pool::Pool::new(store.pool().clone()),
@@ -1879,8 +1874,6 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_NATS_URL; run alone"]
     async fn managed_frontends_preserve_auth_and_reject_wrong_boot_without_retry() {
-        use base64::Engine;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         let base = std::env::var("CI_TEST_DATABASE_URL").unwrap();
         let admin = sqlx::PgPool::connect(&base).await.unwrap();
         let schema = format!("routing_{}",uuid::Uuid::new_v4().simple());
@@ -1893,33 +1886,15 @@ mod tests {
         config.native_runner_secret=Some("original-native-token".into());
         let owner = test_router_with_config(Arc::new(config)).await;
         let pool = sqlx::PgPool::connect(url.as_str()).await.unwrap();
-        let boot: uuid::Uuid = sqlx::query_scalar("SELECT boot_id FROM ci_executor_owner").fetch_one(&pool).await.unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let proxy_owner=owner.clone(); let proxy_calls=calls.clone();
-        let proxy=Router::new().route("/orchestration/services/ci/instances/{deployment}/http-request",post(
-            move |headers:HeaderMap,body:Body| {let owner=proxy_owner.clone(); let calls=proxy_calls.clone(); async move {
-                calls.fetch_add(1,Ordering::SeqCst);
-                assert_eq!(headers["authorization"],"Bearer app-role-token");
-                let meta:serde_json::Value=serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(headers["x-heyo-instance-request"].as_bytes()).unwrap()).unwrap();
-                assert_eq!(meta["bootId"],boot.to_string());
-                let mut request=Request::builder().method(meta["method"].as_str().unwrap()).uri(meta["path"].as_str().unwrap())
-                    .header("x-ci-target-boot",boot.to_string()).header("x-ci-forwarded","1");
-                for pair in meta["headers"].as_array().unwrap() {
-                    request=request.header(pair[0].as_str().unwrap(),pair[1].as_str().unwrap());
-                }
-                owner.oneshot(request.body(body).unwrap()).await.unwrap()
-            }}));
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address=format!("http://{}",listener.local_addr().unwrap());
-        let server=tokio::spawn(async move {axum::serve(listener,proxy).await.unwrap()});
         let mut config=Arc::try_unwrap(test_config()).unwrap();
         config.managed_deployment=Some("managed-standby".into());
-        config.application_id=Some("ci".into()); config.application_orchestrator_url=Some(address);
-        config.application_lifecycle_token=Some("app-role-token".into());
+        config.native_runner_secret=Some("original-native-token".into());
         let standby=test_router_with_config(Arc::new(config)).await;
+        let boots:Vec<uuid::Uuid>=sqlx::query_scalar("SELECT boot_id FROM ci_executor_boot ORDER BY registered_at")
+            .fetch_all(&pool).await.unwrap();
+        assert_eq!(boots.len(),2);
         for (app,name,credential,status) in [(&owner,"direct","original-native-token",StatusCode::OK),
-            (&standby,"forwarded","original-native-token",StatusCode::OK),
+            (&standby,"local","original-native-token",StatusCode::OK),
             (&standby,"unauthorized","wrong-token",StatusCode::UNAUTHORIZED)] {
             let body=serde_json::json!({"runnerId":name,"name":name,"labels":["macos","x86_64"],"platform":"macos","arch":"x86_64","protocolVersion":1});
             let response=app.clone().oneshot(Request::builder().method("POST").uri("/api/native/register")
@@ -1928,10 +1903,10 @@ mod tests {
             assert_eq!(response.status(),status);
         }
         let names:Vec<String>=sqlx::query_scalar("SELECT id FROM ci_native_runner ORDER BY id").fetch_all(&pool).await.unwrap();
-        assert_eq!(names,vec!["direct","forwarded"]);
-        // Registration is a shared write; polling additionally requires the
-        // owner's effect permit, so this checks an actually owner-only route.
-        for (app,runner) in [(&owner,"direct"),(&standby,"forwarded")] {
+        assert_eq!(names,vec!["direct","local"]);
+        // Each managed frontend is an active executor and handles admissions
+        // locally; neither forwards credentials or work to a singleton.
+        for (app,runner) in [(&owner,"direct"),(&standby,"local")] {
             let response=app.clone().oneshot(Request::builder().method("POST").uri("/api/native/poll")
                 .header("content-type","application/json").header("authorization","Bearer original-native-token")
                 .body(Body::from(serde_json::json!({"runnerId":runner,"protocolVersion":1}).to_string())).unwrap()).await.unwrap();
@@ -1939,14 +1914,12 @@ mod tests {
             let body=to_bytes(response.into_body(),1024).await.unwrap();
             assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(),serde_json::json!({"job":null}));
         }
-        for (app,target,marker) in [(&owner,uuid::Uuid::new_v4(),"1"),(&standby,boot,"1"),(&owner,boot,"2")] {
+        for (app,target) in [(&owner,boots[1]),(&standby,boots[0])] {
             let response=app.clone().oneshot(Request::builder().method("POST").uri("/api/native/register")
-                .header("x-ci-target-boot",target.to_string()).header("x-ci-forwarded",marker)
+                .header("x-ci-target-boot",target.to_string())
                 .body(Body::empty()).unwrap()).await.unwrap();
             assert_eq!(response.status(),StatusCode::CONFLICT);
         }
-        assert_eq!(calls.load(Ordering::SeqCst),3,"wrong boots and loops must not dispatch another request");
-        server.abort();
         unsafe {std::env::set_var("CI_TEST_DATABASE_URL",base);}
     }
 

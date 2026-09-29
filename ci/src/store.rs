@@ -29,6 +29,7 @@ use sqlx::{PgPool, Row};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use uuid::Uuid;
 
 include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 
@@ -178,6 +179,14 @@ impl JobStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobClaim {
+    Claimed,
+    InstanceDraining,
+    RunnerCordoned,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepStatus {
     Pending,
     Running,
@@ -297,6 +306,9 @@ pub struct JobRow {
     pub sandbox_id: Option<String>,
     pub status: String,
     pub attempt: i32,
+    /// Process boot that atomically claimed this execution attempt. Historical
+    /// rows and non-executor status transitions intentionally remain NULL.
+    pub executor_boot: Option<Uuid>,
     pub matrix: serde_json::Value,
     pub outputs: serde_json::Value,
     /// The expanded `JobPlan` this job runs. The queue message carries only
@@ -329,6 +341,7 @@ impl JobRow {
             sandbox_id: r.get("sandbox_id"),
             status: r.get("status"),
             attempt: r.get("attempt"),
+            executor_boot: r.get("executor_boot"),
             matrix: r.get("matrix"),
             outputs: r.get("outputs"),
             plan: r.get("plan"),
@@ -1392,7 +1405,42 @@ impl Store {
         runner_hd_id: &str,
         attempt: i32,
     ) -> Result<bool, StoreError> {
+        Ok(self.claim_job_inner(job_id, runner_hd_id, attempt, None).await? == JobClaim::Claimed)
+    }
+
+    /// Claim executor work for one registered process boot. In addition to the
+    /// job row race, this locks the boot row and rechecks admission in the same
+    /// transaction, closing the outstanding-pull versus drain race.
+    pub async fn claim_job_for_boot(
+        &self,
+        job_id: &str,
+        runner_hd_id: &str,
+        attempt: i32,
+        boot_id: Uuid,
+    ) -> Result<JobClaim, StoreError> {
+        self.claim_job_inner(job_id, runner_hd_id, attempt, Some(boot_id)).await
+    }
+
+    // `None` is deliberately limited to the compatibility wrapper above. It
+    // preserves unit-test and administrative callers without granting a NULL
+    // historical claim authority over a boot-owned attempt.
+    async fn claim_job_inner(
+        &self,
+        job_id: &str,
+        runner_hd_id: &str,
+        attempt: i32,
+        boot_id: Option<Uuid>,
+    ) -> Result<JobClaim, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        if let Some(boot_id) = boot_id {
+            let admitted: Option<bool> = sqlx::query_scalar(
+                "SELECT NOT draining AND NOT retired FROM ci_executor_boot WHERE boot_id=$1 FOR UPDATE",
+            ).bind(boot_id).fetch_optional(&mut *tx).await.map_err(StoreError::sql)?;
+            if admitted != Some(true) {
+                tx.commit().await.map_err(StoreError::sql)?;
+                return Ok(JobClaim::InstanceDraining);
+            }
+        }
         // Same transaction-scoped runner lock as maintenance intent. The
         // subsequent snapshot sees a committed fence, or maintenance sees
         // this running job and must drain it before submitting.
@@ -1400,10 +1448,11 @@ impl Store {
             .bind(runner_hd_id).execute(&mut *tx).await.map_err(StoreError::sql)?;
         let cordoned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND phase NOT IN ('passed','superseded'))")
             .bind(runner_hd_id).fetch_one(&mut *tx).await.map_err(StoreError::sql)?;
-        if cordoned { return Ok(false); }
+        if cordoned { return Ok(JobClaim::RunnerCordoned); }
         let row = sqlx::query(
             "UPDATE ci_job
                 SET status = 'running', runner_hd_id = $2, attempt = $3,
+                    executor_boot = $4,
                     started_at = COALESCE(started_at, now())
               WHERE id = $1
                 AND status IN ('pending','queued')
@@ -1415,6 +1464,7 @@ impl Store {
         .bind(job_id)
         .bind(runner_hd_id)
         .bind(attempt)
+        .bind(boot_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
@@ -1424,8 +1474,8 @@ impl Store {
                 .bind(job_id).bind(runner_hd_id).bind(attempt).execute(&mut *tx).await.map_err(StoreError::sql)?;
             Self::add_event(&mut tx, &run, Some(job_id), Some(&key), None, "ci.job.status.v1", "running", None).await?;
             tx.commit().await.map_err(StoreError::sql)?;
-            Ok(true)
-        } else { tx.commit().await.map_err(StoreError::sql)?; Ok(false) }
+            Ok(JobClaim::Claimed)
+        } else { tx.commit().await.map_err(StoreError::sql)?; Ok(JobClaim::Unavailable) }
     }
 
     /// Only an executor with a verified VM release may clear drain evidence.
@@ -1448,7 +1498,7 @@ impl Store {
             .bind(run_id).fetch_one(&self.pool).await.map_err(StoreError::sql)
     }
 
-    /// Record why an attempt failed, without deciding the job's fate.
+    /// Count an actual pre-claim failure, independent of transport deliveries.
     ///
     /// A failed delivery is negative-acked and retried on the backoff ladder —
     /// 60s, then 5 minutes, then 15 — and until this existed the reason was
@@ -1458,27 +1508,32 @@ impl Store {
     /// `queued`, and the log on the orchestrator was the only place the cause
     /// appeared at all.
     ///
-    /// Guarded on non-terminal so a late-arriving attempt cannot scribble over
-    /// the outcome of one that finished.
-    pub async fn note_job_error(&self, job_id: &str, error: &str) -> Result<(), StoreError> {
+    /// The UPDATE races atomically with a regional claim. Never annotate or
+    /// fail another boot's work based on an earlier ownership observation.
+    pub async fn record_unclaimed_job_error(&self, job_id: &str, error: &str) -> Result<Option<i32>, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
         let row = sqlx::query(
-            "UPDATE ci_job SET error = $2
-              WHERE id = $1 AND status NOT IN ('success','failure','skipped','cancelled')
-              RETURNING run_id, job_key, status",
+            "UPDATE ci_job SET error = $2,
+                    preclaim_failures = preclaim_failures + 1,
+                    status = CASE WHEN preclaim_failures + 1 >= $3 THEN 'failure' ELSE status END,
+                    finished_at = CASE WHEN preclaim_failures + 1 >= $3 THEN now() ELSE finished_at END
+              WHERE id = $1 AND status IN ('pending','queued') AND executor_boot IS NULL
+                AND NOT EXISTS (SELECT 1 FROM ci_host_work w WHERE w.job_id=ci_job.id)
+              RETURNING run_id, job_key, status, preclaim_failures",
         )
         .bind(job_id)
         .bind(error)
+        .bind(crate::bus::MAX_PRECLAIM_FAILURES)
         .fetch_optional(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
-        if let Some(row) = row {
+        if let Some(row) = &row {
             Self::add_event(&mut tx, &row.get::<String,_>("run_id"), Some(job_id),
                 Some(&row.get::<String,_>("job_key")), None, "ci.job.status.v1",
                 &row.get::<String,_>("status"), Some(error)).await?;
         }
         tx.commit().await.map_err(StoreError::sql)?;
-        Ok(())
+        Ok(row.map(|row| row.get("preclaim_failures")))
     }
 
     /// Record which machine a running job landed on.
@@ -1511,6 +1566,36 @@ impl Store {
         .await
         .map_err(StoreError::sql)?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Fill in VM identity only for the boot and attempt that won the claim.
+    pub async fn start_job_for_boot(&self, job_id: &str, runner_hd_id: &str,
+        sandbox_id: &str, fingerprint: &str, attempt: i32, boot_id: Uuid) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE ci_job SET sandbox_id=$3,fingerprint=$4
+             WHERE id=$1 AND runner_hd_id=$2 AND attempt=$5 AND executor_boot=$6
+               AND status='running'",
+        ).bind(job_id).bind(runner_hd_id).bind(sandbox_id).bind(fingerprint)
+            .bind(attempt).bind(boot_id).execute(&self.pool).await.map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn set_job_outputs_for_boot(&self, job_id: &str, outputs: &serde_json::Value,
+        attempt: i32, boot_id: Uuid) -> Result<bool, StoreError> {
+        let result = sqlx::query("UPDATE ci_job SET outputs=$2 WHERE id=$1 AND status='running' AND attempt=$3 AND executor_boot=$4")
+            .bind(job_id).bind(outputs).bind(attempt).bind(boot_id).execute(&self.pool).await.map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn set_job_status_for_boot(&self, job_id: &str, status: JobStatus,
+        error: Option<&str>, attempt: i32, boot_id: Uuid) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let row = sqlx::query("UPDATE ci_job SET status=$2,error=CASE WHEN $2 IN ('success','skipped') THEN $3 ELSE COALESCE($3,error) END,finished_at=CASE WHEN $2 IN ('success','failure','skipped','cancelled') THEN now() ELSE finished_at END WHERE id=$1 AND status='running' AND attempt=$4 AND executor_boot=$5 RETURNING run_id,job_key")
+            .bind(job_id).bind(status.as_str()).bind(error).bind(attempt).bind(boot_id)
+            .fetch_optional(&mut *tx).await.map_err(StoreError::sql)?;
+        if let Some(row) = &row { Self::add_event(&mut tx, &row.get::<String,_>("run_id"), Some(job_id), Some(&row.get::<String,_>("job_key")), None, "ci.job.status.v1", status.as_str(), error).await?; }
+        tx.commit().await.map_err(StoreError::sql)?;
+        Ok(row.is_some())
     }
 
     /// Move a job from `pending` to `queued`.
@@ -2626,7 +2711,7 @@ mod tests {
         store.create_run(&run_id, &RunRequest::default(), &test_plan()).await.unwrap();
         let job = store.jobs_of(&run_id).await.unwrap().remove(0);
 
-        store.note_job_error(&job.id, "attempt 1 failed; retrying").await.unwrap();
+        assert_eq!(store.record_unclaimed_job_error(&job.id, "attempt 1 failed; retrying").await.unwrap(), Some(1));
         assert_eq!(store.get_job(&job.id).await.unwrap().unwrap().error.as_deref(), Some("attempt 1 failed; retrying"));
         store.set_job_status(&job.id, JobStatus::Success, None).await.unwrap();
         let finished = store.get_job(&job.id).await.unwrap().unwrap();
@@ -3653,6 +3738,101 @@ jobs:
         assert_eq!(pool.release_orphans(&runners, "new-controller").await.unwrap(), 1);
         assert_eq!(pool.sweep_stale_builds(&runners, "new-controller").await.unwrap(), 1);
         assert_eq!(pool.get(&sandbox).await.unwrap().unwrap().status, "idle");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn boot_claim_is_atomic_with_drain_and_cannot_be_completed_by_another_boot() {
+        let store = test_store().await;
+        let run = crate::vm::new_id();
+        store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+        let job = job_id(&run, "build-x86_64");
+        let admitted = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        for boot in [admitted, other] {
+            sqlx::query("INSERT INTO ci_executor_boot(boot_id,deployment_id,draining) VALUES($1,$2,FALSE)")
+                .bind(boot).bind(format!("test-{boot}")).execute(store.pool()).await.unwrap();
+        }
+
+        assert_eq!(store.claim_job_for_boot(&job, "hd-1", 1, admitted).await.unwrap(), JobClaim::Claimed);
+        assert_eq!(store.claim_job_for_boot(&job, "hd-2", 2, other).await.unwrap(), JobClaim::Unavailable,
+            "a regional redelivery cannot steal a running attempt");
+        assert!(!store.set_job_status_for_boot(&job, JobStatus::Success, None, 1, other).await.unwrap(),
+            "another boot cannot complete the winner's attempt");
+
+        let waiting = job_id(&run, "build-aarch64");
+        let mut draining = store.pool().begin().await.unwrap();
+        sqlx::query("UPDATE ci_executor_boot SET draining=TRUE WHERE boot_id=$1")
+            .bind(admitted).execute(&mut *draining).await.unwrap();
+        let late_claim = store.claim_job_for_boot(&waiting, "hd-1", 1, admitted);
+        tokio::pin!(late_claim);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut late_claim).await.is_err(),
+            "claim must serialize with the in-flight drain transaction");
+        draining.commit().await.unwrap();
+        let rejected = late_claim.await.unwrap();
+        // Resuming after the rejected transaction cannot turn its result into
+        // a terminal/duplicate verdict and authorize an ACK of queued work.
+        sqlx::query("UPDATE ci_executor_boot SET draining=FALSE WHERE boot_id=$1")
+            .bind(admitted).execute(store.pool()).await.unwrap();
+        assert_eq!(rejected, JobClaim::InstanceDraining,
+            "a draining boot cannot turn an outstanding delivery into new work");
+        assert_eq!(store.claim_job_for_boot(&waiting, "hd-2", 1, other).await.unwrap(), JobClaim::Claimed,
+            "the peer remains able to claim the exact rejected job");
+        assert!(store.set_job_status_for_boot(&job, JobStatus::Success, None, 1, admitted).await.unwrap(),
+            "drain does not prevent already-owned work from finishing");
+        assert_eq!(store.get_job(&job).await.unwrap().unwrap().status, "success");
+        assert_eq!(store.get_job(&waiting).await.unwrap().unwrap().executor_boot, Some(other));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn delivery_failure_cannot_overwrite_a_regional_claim() {
+        let store = test_store().await;
+        let run = crate::vm::new_id();
+        store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+        let job = job_id(&run, "build-x86_64");
+        let boot = Uuid::new_v4();
+        // Hold a winning claim uncommitted so the losing delivery's UPDATE
+        // takes its snapshot before the winner commits and must recheck it.
+        let mut winner = store.pool().begin().await.unwrap();
+        sqlx::query("UPDATE ci_job SET status='running',executor_boot=$2,attempt=7,error='winner diagnostic' WHERE id=$1")
+            .bind(&job).bind(boot).execute(&mut *winner).await.unwrap();
+        let losing_error = store.record_unclaimed_job_error(&job, "loser exhausted retries");
+        tokio::pin!(losing_error);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut losing_error).await.is_err());
+        winner.commit().await.unwrap();
+        assert_eq!(losing_error.await.unwrap(), None);
+        assert_eq!(store.record_unclaimed_job_error(&job, "loser retry diagnostic").await.unwrap(), None);
+        assert!(!store.set_job_status_for_boot(&job, JobStatus::Running, Some("loser owned error"), 7, Uuid::new_v4()).await.unwrap());
+        let claimed = store.get_job(&job).await.unwrap().unwrap();
+        assert_eq!(claimed.status, "running");
+        assert_eq!(claimed.attempt, 7);
+        assert_eq!(claimed.executor_boot, Some(boot));
+        assert_eq!(claimed.error.as_deref(), Some("winner diagnostic"));
+
+        // Genuine pre-claim failures still record retry diagnostics and reach
+        // a terminal failure, rather than silently leaving pending jobs behind.
+        let unclaimed = job_id(&run, "build-aarch64");
+        assert_eq!(store.record_unclaimed_job_error(&unclaimed, "retry").await.unwrap(), Some(1));
+        let pending = store.get_job(&unclaimed).await.unwrap().unwrap();
+        assert_eq!(pending.status, "pending");
+        assert_eq!(pending.error.as_deref(), Some("retry"));
+        // Independent dispatchers share one persisted failure budget. Neither
+        // can lose the other's increment, and three failures remain retryable.
+        let (a, b) = tokio::join!(
+            store.record_unclaimed_job_error(&unclaimed, "retry a"),
+            store.record_unclaimed_job_error(&unclaimed, "retry b"),
+        );
+        let mut counts = [a.unwrap().unwrap(), b.unwrap().unwrap()];
+        counts.sort();
+        assert_eq!(counts, [2, 3]);
+        assert_eq!(store.get_job(&unclaimed).await.unwrap().unwrap().status, "pending");
+        assert_eq!(store.record_unclaimed_job_error(&unclaimed, "exhausted").await.unwrap(), Some(4));
+        let failed = store.get_job(&unclaimed).await.unwrap().unwrap();
+        assert_eq!(failed.status, "failure");
+        assert_eq!(failed.error.as_deref(), Some("exhausted"));
+        assert_eq!(store.record_unclaimed_job_error(&unclaimed, "late retry").await.unwrap(), None);
+        assert_eq!(store.get_job(&unclaimed).await.unwrap().unwrap().error.as_deref(), Some("exhausted"));
     }
 
     // ---- log retention ---------------------------------------------------

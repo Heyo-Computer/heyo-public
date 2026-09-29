@@ -93,9 +93,9 @@ pub fn backoff_for(attempt: u32) -> Duration {
     BACKOFF[idx]
 }
 
-/// How long the redelivery ladder takes to exhaust every delivery.
+/// How long the failure retry ladder takes, excluding drain handoffs.
 ///
-/// The waits *between* [`MAX_DELIVER`] deliveries — so `MAX_DELIVER - 1` rungs,
+/// The waits *between* [`MAX_PRECLAIM_FAILURES`] failures — one fewer rungs,
 /// saturating at the last entry. With the ladder above and four deliveries that
 /// is 60s + 5m + 15m = 21 minutes.
 ///
@@ -107,13 +107,16 @@ pub fn backoff_for(attempt: u32) -> Duration {
 /// legitimately retrying, and overwrites the real error with "no runner took
 /// this job", which is both wrong and the opposite of a lead.
 pub fn ladder_total() -> Duration {
-    (1..MAX_DELIVER as u32).map(backoff_for).sum()
+    (1..MAX_PRECLAIM_FAILURES as u32).map(backoff_for).sum()
 }
 
-/// A job is worth retrying a few times — a runner rebooting mid-build is
-/// transient — but not forever: past this it is the workflow that is broken, and
-/// redelivering forever hides that behind a queue that never drains.
-pub const MAX_DELIVER: i64 = 4;
+/// Bound actual pre-claim failures in Postgres, not queue deliveries. Draining
+/// an instance and returning its outstanding pull must not spend this budget.
+pub const MAX_PRECLAIM_FAILURES: i32 = 4;
+
+/// Unlimited transport redelivery. Claimed jobs cannot execute again, and
+/// pre-claim failures have their own durable limit above.
+pub const MAX_DELIVER: i64 = -1;
 
 /// What a queue message carries: enough to find the work, nothing more.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,8 +304,7 @@ impl Bus {
     /// returns the consumer that is already there and ignores the config passed
     /// with it, so an installation upgrading into this would silently keep its
     /// old four-hour window and none of this would take effect. A mismatch is
-    /// therefore repaired by deleting and recreating, which costs one
-    /// redelivery of anything in flight at the moment of the upgrade.
+    /// therefore repaired in place, preserving in-flight delivery state.
     pub async fn consumer_for(&self, route: &Route) -> Result<PullConsumer, BusError> {
         let durable = self.durable_for(route)?;
         let filter = self.subject_for(route)?;
@@ -332,32 +334,31 @@ impl Bus {
                 reason: e.to_string(),
             })?;
 
-        // Only the window matters here; every other field is either derived from
-        // the route or unchanged since this consumer was created.
         let mut consumer = consumer;
-        let current = consumer.info().await.map(|i| i.config.ack_wait).ok();
-        if current == Some(ACK_WAIT) {
+        let mut current = consumer.info().await.map_err(|e| BusError::Consumer {
+            durable: durable.clone(),
+            reason: e.to_string(),
+        })?.config.clone();
+        if current.ack_wait == ACK_WAIT && current.max_deliver == MAX_DELIVER && current.backoff == BACKOFF {
             return Ok(consumer);
         }
-        tracing::info!(
-            "{durable}: ack_wait is {:?}, recreating it as {ACK_WAIT:?} so a dead \
-             dispatcher releases its job promptly",
-            current
-        );
+        tracing::info!("{durable}: updating acknowledgement timing and transport delivery limit in place");
+        current.ack_wait = ACK_WAIT;
+        current.max_deliver = MAX_DELIVER;
+        current.backoff = BACKOFF.to_vec();
+        // Keep immutable consumer settings. Updating avoids resetting pending
+        // acknowledgements or delivery counts while another region is working.
         stream
-            .delete_consumer(&durable)
+            .update_consumer(current)
             .await
             .map_err(|e| BusError::Consumer {
                 durable: durable.clone(),
-                reason: format!("deleting the stale consumer: {e}"),
-            })?;
-        stream
-            .get_or_create_consumer(&durable, config)
-            .await
-            .map_err(|e| BusError::Consumer {
-                durable,
                 reason: e.to_string(),
-            })
+            })?;
+        stream.get_consumer(&durable).await.map_err(|e| BusError::Consumer {
+            durable,
+            reason: e.to_string(),
+        })
     }
 
     /// What is on a route's queue, and whether anything is reading it.
@@ -517,7 +518,7 @@ mod tests {
     /// nats-server overrides `ack_wait` with `backoff[0]` when a ladder is set,
     /// so the two must agree or the configured window is silently discarded.
     /// This is a compile-time guard on the pair; the server's behaviour itself
-    /// is pinned by `an_existing_consumer_with_the_wrong_ack_wait_is_recreated`.
+    /// is pinned by `an_existing_consumer_is_updated_without_losing_pending_delivery`.
     #[test]
     fn the_first_backoff_step_is_the_ack_wait() {
         assert_eq!(
@@ -562,15 +563,14 @@ mod tests {
         let _ = bus.js.delete_stream(bus.events_stream()).await;
     }
 
-    /// The ladder is three waits, not four: `MAX_DELIVER` deliveries have
-    /// `MAX_DELIVER - 1` gaps between them.
+    /// Four actual failures have three retry waits between them.
     #[test]
     fn the_ladder_totals_the_waits_between_deliveries() {
         assert_eq!(ladder_total(), Duration::from_secs(60 + 5 * 60 + 15 * 60));
         assert_eq!(ladder_total().as_secs(), 1260);
     }
 
-    /// The guard that keeps the reaper behind the ladder. If `MAX_DELIVER` or
+    /// The guard that keeps the reaper behind the ladder. If `MAX_PRECLAIM_FAILURES` or
     /// `BACKOFF` grows this fails, and `CI_RUNNER_WAIT_SECS`'s default has to
     /// move with it — which is the point, because the failure it prevents is
     /// silent and shows up only for jobs whose first delivery happens to fail.
@@ -745,7 +745,8 @@ mod tests {
     /// right and the four-hour window would still be there.
     #[tokio::test]
     #[ignore = "needs CI_TEST_NATS_URL"]
-    async fn an_existing_consumer_with_the_wrong_ack_wait_is_recreated() {
+    async fn an_existing_consumer_is_updated_without_losing_pending_delivery() {
+        use futures::StreamExt;
         let prefix = test_prefix();
         let bus = test_bus(&prefix).await;
         let route = Route::Runner("hd-ackwait".into());
@@ -753,32 +754,50 @@ mod tests {
 
         // Stand in for a consumer created by a previous build.
         let stream = bus.js.get_stream(&bus.jobs_stream).await.unwrap();
-        stream
+        let mut old = stream
             .get_or_create_consumer(
                 &durable,
                 PullConfig {
                     durable_name: Some(durable.clone()),
                     filter_subject: bus.subject_for(&route).unwrap(),
                     ack_wait: Duration::from_secs(4 * 60 * 60),
-                    max_deliver: MAX_DELIVER,
-                    backoff: BACKOFF.to_vec(),
+                    max_deliver: 4,
+                    backoff: Vec::new(),
                     ..Default::default()
                 },
             )
             .await
             .expect("the old consumer");
 
+        bus.publish_job(&route, &JobMessage {
+            run_id: "run".into(), job_id: "job".into(), job_key: "build".into(),
+        }).await.unwrap();
+        let mut batch = old.fetch().max_messages(1).messages().await.unwrap();
+        let pending = batch.next().await.unwrap().unwrap();
+        let created = old.info().await.unwrap().created;
         let mut reconciled = bus.consumer_for(&route).await.expect("consumer");
-        assert_eq!(
-            reconciled.info().await.unwrap().config.ack_wait,
-            ACK_WAIT,
-            "an upgrade must not silently keep the old window"
-        );
+        let info = reconciled.info().await.unwrap();
+        assert_eq!(info.config.ack_wait, ACK_WAIT);
+        assert_eq!(info.config.max_deliver, -1);
+        assert_eq!(info.config.backoff, BACKOFF);
+        assert_eq!(info.created, created, "must update rather than recreate");
+        assert_eq!(info.num_ack_pending, 1);
+        pending.double_ack().await.unwrap();
+
+        // A correct AckWait alone must not hide an old finite delivery limit.
+        let mut limited = reconciled.info().await.unwrap().config.clone();
+        limited.max_deliver = 4;
+        stream.update_consumer(limited).await.unwrap();
+        let mut updated = bus.consumer_for(&route).await.unwrap();
+        assert_eq!(updated.info().await.unwrap().config.max_deliver, -1);
 
         // And binding again is a no-op rather than a delete/recreate cycle,
         // which would redeliver in-flight work on every reconnect.
         let mut again = bus.consumer_for(&route).await.expect("consumer");
         assert_eq!(again.info().await.unwrap().config.ack_wait, ACK_WAIT);
+        assert_eq!(again.info().await.unwrap().created, created);
+        assert_eq!(again.info().await.unwrap().num_ack_pending, 0);
+        cleanup(&bus).await;
     }
 
     /// A client that retries a submit it never saw the response to must not

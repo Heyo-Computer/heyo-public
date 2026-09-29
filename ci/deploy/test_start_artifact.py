@@ -62,14 +62,11 @@ class ArtifactBootTest(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
         self.assertNotIn("supervisor-started", result.stdout)
 
-    def test_recovery_plan_is_passed_without_evaluation(self):
-        binary = b'#!/bin/sh\nprintf "arg:<%s>\\n" "$@"\n'
-        (self.release / "ci").write_bytes(binary)
-        (self.release / "SHA256SUMS").write_text(hashlib.sha256(binary).hexdigest() + "  ci\n")
+    def test_legacy_recovery_plan_is_rejected_before_install(self):
         plan = self.state / "recovery plan;not-a-command.json"
         result = self.boot(recovery_plan=plan)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("arg:<--hold-executor-recovery>\narg:<" + str(plan) + ">", result.stdout)
+        self.assert_refused(result)
+        self.assertIn("singleton recovery plans are no longer supported", result.stderr)
 
     def test_requires_explicit_broker(self):
         self.assert_refused(self.boot(CI_NATS_URL=""))

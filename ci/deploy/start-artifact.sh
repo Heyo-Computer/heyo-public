@@ -2,6 +2,7 @@
 # Boot an immutable CI build without starting or stopping its external broker.
 # Arguments: read-only release directory, runtime directory, persistent state directory.
 set -euo pipefail
+[[ $# -eq 3 ]] || { echo 'expected release, runtime and state directories; singleton recovery plans are no longer supported' >&2; exit 2; }
 release=${1:?release directory required}
 runtime=${2:?runtime directory required}
 state=${3:?persistent state directory required}
@@ -27,7 +28,4 @@ echo "Starting CI revision $CI_EXPECTED_SHA"
 mkdir -p "$state"/{logs,workspaces,artifacts}
 cd "$runtime"
 # Older rootfs images contain a start.sh that couples CI to NATS. Never invoke it.
-if [[ $# -eq 4 ]]; then
-    exec ./ci --hold-executor-recovery "$4"
-fi
 exec ./ci
