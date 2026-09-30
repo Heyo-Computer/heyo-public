@@ -35,11 +35,12 @@ class ArtifactBootTest(unittest.TestCase):
         probe.write_text('#!/bin/sh\nif [ "$3" = / ] || [ "${ROOTFS_ONLY:-}" = 1 ]; then echo 1; else echo 2; fi\n')
         probe.chmod(0o755)
 
-    def boot(self, **extra_env):
+    def boot(self, recovery_plan=None, **extra_env):
         env = {**os.environ, "CI_EXPECTED_SHA": self.sha, "CI_NATS_URL": "nats://broker.internal:4222",
                "PATH": str(self.tools) + os.pathsep + os.environ["PATH"], **extra_env}
         return subprocess.run(["bash", str(Path(__file__).with_name("start-artifact.sh")),
-                               str(self.release), str(self.runtime), str(self.state)],
+                               str(self.release), str(self.runtime), str(self.state)] +
+                              ([str(recovery_plan)] if recovery_plan is not None else []),
                               env=env, text=True, capture_output=True)
 
     def assert_refused(self, result):
@@ -60,6 +61,12 @@ class ArtifactBootTest(unittest.TestCase):
         result = self.boot(CI_TEST_EXIT="7")
         self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
         self.assertNotIn("supervisor-started", result.stdout)
+
+    def test_legacy_recovery_plan_is_rejected_before_install(self):
+        plan = self.state / "recovery plan;not-a-command.json"
+        result = self.boot(recovery_plan=plan)
+        self.assert_refused(result)
+        self.assertIn("singleton recovery plans are no longer supported", result.stderr)
 
     def test_requires_explicit_broker(self):
         self.assert_refused(self.boot(CI_NATS_URL=""))

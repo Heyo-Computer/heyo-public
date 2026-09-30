@@ -1680,12 +1680,15 @@ mod repo_workflow {
             assert_eq!(plan.jobs[i].needs, [predecessor]);
             assert!(plan.jobs[i].condition.is_none(), "do not skip a dependency stage");
         }
-        for (i, region, deployment) in [(1, "us3", "orchestrator-us3-next"), (2, "eu1", "orchestrator-eu1")] {
+        let preflight = include_str!("../../.ci/diagnostics/regional-rollout-preflight.yml");
+        for (i, region, deployment) in [(1, "us3", "orchestrator-us3"), (2, "eu1", "orchestrator-eu1")] {
             let steps = &plan.jobs[i].steps;
             assert_eq!(steps[0].uses.as_deref(), Some("ci/rollout-host-app-lb"));
             assert_eq!(steps[0].with["target"], format!("app-lb-{region}"));
             assert_eq!(steps[1].uses.as_deref(), Some("ci/rollout-service"));
             assert_eq!(steps[1].with["deployment"], deployment);
+            assert!(preflight.contains(&format!("('{region}', '{deployment}')")),
+                "preflight and release must use the canonical service identity, not a candidate alias");
             assert_eq!(steps[1].with["url"], format!("https://admin.{region}.heyo.work"));
             assert_eq!(steps[1].with["mount-path"], "/opt/orchestrator-release",
                 "reuse the registered private release mount instead of adding an unauthenticated mount");

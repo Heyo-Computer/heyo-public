@@ -944,6 +944,7 @@ dependencies = [
  "hmac 0.12.1",
  "maud",
  "reqwest 0.12.28",
+ "rustls 0.23.43",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -8,6 +8,7 @@ pub const GENERATION: &str = "x-heyo-peer-generation";
 pub const ENVIRONMENT: &str = "x-heyo-peer-environment";
 pub const PROBE: &str = "x-heyo-peer-probe";
 pub const ACTIVE_PROBE: &str = "x-heyo-peer-active-probe";
+const SNAPSHOT_EVIDENCE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Correlation belongs to the executing workflow, not the latest proposal.
 /// Authorization permits only an already-eligible member under the active policy.
@@ -116,7 +117,7 @@ impl Router {
         // This expiry gates a new selector transition, not ongoing routing:
         // last-valid assignments may still serve during control-plane loss.
         let snapshot = state.snapshot.as_ref().filter(|_| !state.fenced
-            && state.observed_at.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(30)))?;
+            && state.observed_at.is_some_and(|at| at.elapsed() < SNAPSHOT_EVIDENCE_TTL))?;
         let prepared = enabled && (snapshot.policies.iter()
             .find(|p| p.generation == snapshot.proposal_generation)
             .and_then(|p| p.policy.regions.iter().find(|r| r.region == snapshot.region))
@@ -425,7 +426,11 @@ impl Router {
         let target = s.drain_target.as_deref();
         let (outgoing, local) = state.counters.iter().filter(|((_, region), _)| Some(region.as_str()) == target)
             .fold((0u64, 0u64), |a, (_, b)| (a.0 + b.0, a.1 + b.1));
-        let prepared = enabled && !state.fenced && (s.policies.iter().find(|p| p.generation == s.proposal_generation)
+        // A fresh admin poll must not renew evidence from a stale authority
+        // snapshot. Keep routing and counters intact, but block every rollout
+        // gate (which requires prepared) until discovery succeeds again.
+        let fresh = state.observed_at.is_some_and(|at| at.elapsed() < SNAPSHOT_EVIDENCE_TTL);
+        let prepared = enabled && !state.fenced && fresh && (s.policies.iter().find(|p| p.generation == s.proposal_generation)
             .and_then(|p| p.policy.regions.iter().find(|r| r.region == s.region)).is_some_and(|r| r.weight == 0)
             || state.local.iter().any(|b| b.is_healthy() && !b.is_draining()));
         serde_json::json!({"gatewayId":spec.gateway_id,"bootId":self.boot_id,"operationId":s.operation_id,
@@ -498,6 +503,37 @@ mod tests {
         router.fence();
         assert!(router.preparation(true).is_none());
         assert!(router.admit(&spec, "svc", "eu1", &http::HeaderMap::new(), &secrets).is_err());
+    }
+
+    #[test]
+    fn drain_reports_expire_without_losing_assignments_and_require_valid_refresh() {
+        let (router, spec, secrets, mut snapshot, local) = setup();
+        router.apply(snapshot.clone(), &spec, "svc", "eu1", local.clone()).unwrap();
+        let held = router.admit(&spec, "svc", "eu1", &http::HeaderMap::new(), &secrets).unwrap();
+        snapshot.version = 2;
+        snapshot.closed_through_generation = 1;
+        router.apply(snapshot.clone(), &spec, "svc", "eu1", local.clone()).unwrap();
+        assert_eq!(router.status(&spec, true)["report"]["prepared"], true);
+        router.state.lock().unwrap().observed_at = Some(std::time::Instant::now() - SNAPSHOT_EVIDENCE_TTL);
+        for _ in 0..2 {
+            let status = router.status(&spec, true);
+            assert_eq!(status["report"]["prepared"], false, "polling must not refresh authority evidence");
+            assert_eq!(status["report"]["localTarget"], 1);
+            assert_eq!(status["report"]["outgoingTarget"], 1);
+            assert_eq!(status["report"]["peerAdmissionClosed"], true);
+        }
+        drop(held);
+        assert_eq!(router.status(&spec, true)["report"]["localTarget"], 0);
+        assert_eq!(router.status(&spec, true)["report"]["prepared"], false, "zero requests alone is not drain proof");
+        let mut old = snapshot.clone();
+        old.version = 1;
+        assert!(!router.apply(old, &spec, "svc", "eu1", local.clone()).unwrap());
+        assert_eq!(router.status(&spec, true)["report"]["prepared"], false);
+        // Re-observing the same current version is sufficient; an authority
+        // need not manufacture a new version just to renew its observation.
+        router.apply(snapshot, &spec, "svc", "eu1", local).unwrap();
+        assert_eq!(router.status(&spec, true)["report"]["prepared"], true);
+        assert_eq!(router.status(&spec, true)["report"]["outgoingTarget"], 0);
     }
 
     fn probe_fixture() -> (Arc<Router>,RegionalSpec,SecretStore,Snapshot,ProbeRequest) {

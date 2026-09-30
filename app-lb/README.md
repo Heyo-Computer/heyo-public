@@ -1,7 +1,48 @@
 # app-lb
 
 An application load balancer for [heyvm](https://heyo.computer) Firecracker/KVM microVMs,
-built on [Pingora](https://github.com/cloudflare/pingora).
+built on [Pingora 0.9](https://github.com/cloudflare/pingora/releases/tag/0.9.0).
+
+The 0.9 upgrade retains app-lb's routing and process lifecycle. It adopts
+Pingora's default upstream hop-by-hop header sanitization (including headers
+nominated by `Connection`), normalized valid WebSocket upgrades, and bounded
+HTTP/2 defaults (100 concurrent streams and a 64 KiB decoded header list).
+The existing TLS listener still does not advertise HTTP/2 via ALPN; this upgrade
+does not enable a new listener protocol.
+Arbitrary non-WebSocket HTTP upgrades are no longer passed through by default.
+The `pg-fc-sql/1` upgrade is explicitly preserved for authenticated cross-region
+PostgreSQL tunnels, including their initial JSON POST and bidirectional stream.
+Other requests retain Pingora's default upstream header sanitization.
+This dependency upgrade does **not** enable graceful binary replacement or
+regional ingress evacuation; host updates still use the existing restart path.
+
+The foreground process is the sole management owner: it holds the state lock,
+admin API, discovery, autoscaling, ACME, authentication, and request reservations.
+It supervises one forwarding subprocess, which owns the HTTP/TLS listeners and
+streams request/response bodies. The private `--forwarding-worker` entry point
+branches before management stores are opened; it is not an operator command.
+Request decisions cross a versioned Unix-socket protocol in a mode-0700 directory.
+Control frames are limited to 1 MiB. Request heads exceeding that limit after
+encoding receive HTTP 431 before admission, rather than terminating a worker;
+oversized manager-generated responses receive HTTP 500. Application response
+bodies stream directly through the worker and are not subject to this limit.
+Workers receive memory-only TLS snapshots, refreshed every five seconds, and
+cannot persist them or issue certificates.
+
+Completion releases the backend attempt and regional assignment; connection
+failure releases only the attempt and never permits regional replay. A lost
+request-control connection is not proof of drain: the manager retains its
+reservations until explicit completion/cancellation or confirmed worker exit.
+Cancelled HTTP tasks finish any pending control exchange before acknowledging
+cancellation. A worker that loses management authority exits; the manager reaps
+it before starting a replacement. On Linux, manager death also kills its worker.
+New requests depend on the manager being available.
+
+This is **not hot takeover**. A crashed worker interrupts its streams, and a
+replacement starts only after it exits. Candidate readiness, listener handoff,
+and zero-interruption regional ingress maintenance remain separate work. The
+host updater still restarts the service; do not use this split as evidence that
+updating a region's ingress is safe without traffic evacuation.
 
 This directory was imported from the standalone
 [`Heyo-Computer/app-lb`](https://github.com/Heyo-Computer/app-lb) repository
@@ -64,7 +105,8 @@ enable it on existing flattened discovery. Hierarchical discovery uses the separ
 `discovery.regional` opt-in below. Fleet registration, coordinated gateway upgrades
 and live two-region acceptance remain separate work.
 
-Run the isolated two-process regression with Python 3 and OpenSSL installed:
+Linux CI runs the isolated two-process regression with Python 3 and OpenSSL.
+To run it separately:
 
 ```sh
 cargo build --locked --manifest-path app-lb/Cargo.toml --features reqwest/rustls-tls-native-roots
@@ -77,6 +119,8 @@ extra feature. The test never disables TLS verification or touches deployed
 services. It checks request preservation, single POST delivery, peer admission,
 WebSocket echo, and a held response body draining across spec replay while new
 traffic uses another local backend.
+Set `APP_LB_TEST_BINARY` to the absolute binary path when using a custom
+`CARGO_TARGET_DIR`; otherwise the test uses `app-lb/target/debug/app-lb`.
 
 The workload is checked in as `testdata/regional_app.py`, rather than depending
 on a temporary app archive. Its region and immutable runtime revision are explicit
@@ -123,6 +167,12 @@ boot/operation envelope and sequenced preparation/adoption/drain report, with
 `Cache-Control: no-store`. Operator maintenance or missing peer credentials prevents
 preparation evidence. A changed runtime identity fences its predecessor rather than
 resetting the predecessor's outstanding counters.
+
+After 30 seconds without an accepted discovery snapshot, reports also set
+`prepared=false`, blocking every Orchestrator policy/drain gate. Polling the admin
+endpoint cannot renew that evidence. Last-valid routing and in-flight counters
+remain intact during the outage; an accepted current snapshot renews evidence,
+but an ignored older version does not.
 
 Even a cold gateway reports authenticated admission metadata: protocol, environment,
 host placement, namespace, routes and discovery authority, plus route conflicts,
@@ -536,6 +586,7 @@ Configuration is environment-only:
 | `APP_LB_PROXY_ADDR` | `0.0.0.0:6188` | Proxy listener |
 | `APP_LB_ADMIN_ADDR` | `127.0.0.1:9090` | Admin API listener |
 | `APP_LB_STATE_PATH` | `app-lb-state.json` | Names the state *directory* — see below |
+| `APP_LB_INSTANCE_LOCK` | `/run/app-lb/instance.lock` | Host-wide single-instance lock, so two app-lbs never manage the same daemon's sandboxes. A different path only for instances on separate daemons; `off` disables it |
 | `APP_LB_SECRETS_PATH` | `app-lb-secrets.json` | Where stored secrets persist (written `0600`) |
 | `APP_LB_SECRET_KEY` | *(unset)* | 32-byte hex key (or any passphrase) that seals the secrets file with AES-256-GCM |
 | `APP_LB_TOKENS_PATH` | `app-lb-tokens.json` | Where minted [app-tokens](#app-tokens) persist (written `0600`; only hashes) |
@@ -554,6 +605,7 @@ Configuration is environment-only:
 | `APP_LB_AUTH_URL` | *(unset)* | Base URL of the Heyo auth service. **Setting it enables [federated auth](#managed-mode-federated-auth-and-namespaces)**: a bearer that is not an app-token is resolved to namespace grants by `GET /api/auth/scopes`. Needs `APP_LB_ADMIN_AUTH=1` |
 | `APP_LB_AUTH_CACHE_SECS` | `60` | How long a resolved grant is trusted before re-fetching (never past the token's own expiry). Also the ceiling on revocation latency |
 | `APP_LB_AUTH_TIMEOUT_SECS` | `5` | Timeout for one scopes lookup. An unreachable auth service fails closed |
+| `APP_LB_HOME_URL` | *(unset)* | The Heyo front end namespace users open the dashboard from (e.g. `https://heyo.computer/namespaces`). Linked from `/login` and when a [namespace session](#opening-the-dashboard-for-one-namespace) is refused or expires |
 | `APP_LB_TLS_CERT` | *(unset)* | PEM cert path; set with `APP_LB_TLS_KEY`. The fallback cert when ACME is on |
 | `APP_LB_TLS_KEY` | *(unset)* | PEM private-key path |
 | `APP_LB_PROXY_TLS_ADDR` | `0.0.0.0:6189` | HTTPS listener (bound when ACME is on or cert+key are set) |
@@ -1011,6 +1063,20 @@ persisted and in-memory deployment record; it never tears down a VM or queues
 disk/workspace cleanup. The separate path makes older servers reject the request
 rather than ignore a safety flag. Ordinary `DELETE /deployments/:id` keeps its
 existing drain-and-teardown behavior.
+
+`DELETE /deployments/:id/retired-record` additionally permits **settled terminal
+rollout history** and read-only release mounts for a managed Firecracker service.
+It requires authenticated fleet-admin access and the current `If-Match` ETag.
+First withdraw routes, scale to zero, drain, and explicitly clean up the approved
+VM generations through the runtime/disk APIs. This endpoint never performs that
+resource cleanup. Both ownership names and historical sandbox IDs must be absent
+from complete runtime and disk inventories. Running, uncertain or unsettled
+rollouts, correlated allocations, workspace state and job history remain blockers.
+Before removing the registration it durably archives the exact spec and state to
+`<state-dir>/retired/<sha256>.json`; these reports are not loaded as deployments.
+Archive failure preserves the registration. Export this report to the operator's
+audit store; the endpoint does not upload it to S3. It does not assert backend
+retirement or prevent an external authority from recreating a deployment.
 
 Before operational cleanup, also inventory references held outside this app-lb
 (Orchestrator, Cloud, service routes and host configuration). This local endpoint
@@ -1907,6 +1973,7 @@ that is the state of the deployment, and it has to belong to the deployment.
 | `store` | Where snapshots go: `s3://bucket[/prefix]` (via the `aws` CLI and its own credentials; `APP_LB_DISK_ARCHIVE_ENDPOINT` applies), an `http(s)://` `art serve`, or the absolute path of a local store. |
 | `ref` | The tag the newest snapshot is published under in an artifact store. Defaults to `workspace-<deployment id>`. S3 keys by deployment id instead: `<prefix>/<id>/<digest>.tar.gz` plus a `latest` pointer. |
 | `auth` | A secret reference for the artifact store, like `artifact.auth`. |
+| `snapshot_interval_secs` | Recycle the replica for a snapshot at least this often (minimum `300`). Unset, a snapshot is taken only when the replica retires for another reason. See **Scheduled snapshots** below. |
 
 What happens:
 
@@ -1950,6 +2017,19 @@ capturing`, `workspace restore pending: …`).
 To force a snapshot of a running replica, recycle it: `heyctl restart <id>`
 drains it, the capture runs, and the autoscaler boots its replacement from the
 result.
+
+**Scheduled snapshots.** Without `snapshot_interval_secs`, a replica that runs
+for days holds days of work that exist nowhere else: if its sandbox is lost
+rather than retired — a host failure, or a sandbox destroyed out of band — the
+workspace comes back from the last capture. With it set, the autoscaler does
+what `heyctl restart` does whenever the replica's uptime reaches the interval:
+drain, capture, then resume the same VM (`idle_action: retain`) or boot a new one
+from the result. The clock is the replica's uptime, not the snapshot's age, so a
+replica just booted from an old snapshot is not recycled straight away. Each
+snapshot is an outage of drain + capture + resume — seconds to minutes, growing
+with the workspace — so pick an interval that bounds the loss you can accept
+(`21600`, six hours, is a reasonable start). The daemon can only export a
+stopped VM's image, which is why this is a recycle and not a live copy.
 
 Rules and caveats, each of which the spec validation enforces or the docs
 above imply:
@@ -2862,6 +2942,131 @@ owns any more.
 store, it is small (single-digit MB across a whole host), and deleting a daemon's persistence
 records to reclaim 23 KB is not a trade worth making.
 
+## Plugins
+
+Plugins are optional capabilities compiled into app-lb that you switch on at
+runtime from the **Plugins** page (`/plugins`) or with `heyctl plugins`. Each
+one's `{enabled, config}` record lives in `app-lb-plugins.d/<id>.json` beside
+the state file.
+
+A plugin's routes live under `/api/plugins/<id>/…`. Reads are on the view tier
+and actions on the CRUD tier, and every route answers 409 while the plugin is
+disabled. If a plugin fails to start, it stays enabled and the failure shows
+as `last_error` on its card.
+
+Plugin configs never contain credentials. A config names a secret in app-lb's
+secret store (`POST /secrets`) instead, and the plugin reads it at the moment
+it uses it, so rotating the secret needs no re-apply.
+
+```sh
+heyctl plugins ls
+heyctl plugins set pgfc -f pgfc.json --enable
+heyctl plugins disable pgfc
+```
+
+### pg-fc databases (`pgfc`)
+
+This plugin monitors and configures [pg-fc](../pg-fc) pools through their
+JSON admin API. It shows:
+
+- host health and schema counts by tier
+- every schema, with start/stop/reboot/restore/reap actions
+- dedicated databases: create one (the password is shown once, as a
+  connection string) or revoke one
+- the pooler's runtime settings
+- maintenance passes, recent events and log tails
+
+app-lb holds the pg-fc dashboard credential and calls pg-fc on the page's
+behalf, so the browser never sees it. A 401 from pg-fc becomes a 502 naming
+the misconfigured node, rather than looking like your session failed.
+
+Store the password, then configure one entry per pooler:
+
+```sh
+heyctl create secret pg-fc --from-stdin password < pg-fc-password.txt
+```
+
+```json
+{
+  "nodes": [
+    {
+      "name": "local",
+      "url": "http://127.0.0.1:34199",
+      "user": "admin",
+      "password": {"secret": "pg-fc", "key": "password"},
+      "pg_host": "db.example.com"
+    }
+  ],
+  "poll_secs": 15
+}
+```
+
+- `url` is `PG_VM_POOL_DASHBOARD_LISTEN`.
+- `pg_host` and `pg_port` (default 6432) only feed the connection strings
+  the page shows; `pg_host` defaults to the host in `url`.
+- A schema's Postgres log is read by running a command inside its VM, so that
+  route sits on the CRUD tier with the actions.
+
+### vapi inference (`vapi`)
+
+This plugin watches and drives [vapi](https://github.com/Heyo-Computer/vapi)
+gateways — the LLM inference server — through their OpenAI-compatible API and
+their dashboard JSON. It shows:
+
+- the model each gateway is serving, its uptime, queue depth and response-cache
+  hit rate
+- every registered worker: running and waiting requests against its concurrency
+  limit, KV-cache utilisation, prefix-cache hit rate
+- the gateway's admission settings (max queued requests, first-token and
+  stream-idle timeouts, the response cache), changeable from the page
+- a prompt box that runs a completion through app-lb
+
+app-lb holds the vapi API key and calls the gateway on the page's behalf, so
+the browser never sees it. A 401 from vapi becomes a 502 naming the
+misconfigured gateway, rather than looking like your session failed.
+
+The tier split is the point. Reading a gateway's stats is view-tier; running a
+completion is CRUD-tier, because it occupies a worker, evicts other callers'
+KV blocks and costs time on a GPU that has one of everything. Changing
+admission settings is CRUD-tier too. One vapi key cannot make that distinction;
+app-lb's two tiers can.
+
+Store a key, then configure one entry per gateway:
+
+```sh
+heyctl create secret vapi --from-stdin api_key < vapi-key.txt
+```
+
+```json
+{
+  "gateways": [
+    {
+      "name": "local",
+      "url": "http://127.0.0.1:8080",
+      "api_key": {"secret": "vapi", "key": "api_key"}
+    }
+  ],
+  "poll_secs": 15
+}
+```
+
+- `url` is vapi's `gateway.bind`. `api_key` is one of its `[[auth.keys]]`, and
+  can be omitted entirely when the gateway has none configured.
+- Which key it is matters beyond access: vapi gives each key its own
+  prefix-cache namespace, so calls made through this plugin share a cache with
+  each other and with nobody else.
+- The plugin's poller reads `/health` (open even with keys configured) and
+  `/dashboard/stats` (not). A gateway that answers the first and refuses the
+  second is reported as **up with an error**, so a wrong key sends you here
+  rather than to the gateway.
+
+This is a control plane, not a data plane. The proxy buffers whole responses
+and refuses `"stream": true`; application traffic to a gateway belongs in a
+static (`upstreams`) deployment, which streams, load-balances and health-checks
+it like any other backend. Audio transcription (`/v1/audio/transcriptions`) is
+not proxied either — a multipart upload of tens of megabytes is data-plane
+work.
+
 ## Clients
 
 | | |
@@ -3541,6 +3746,20 @@ is renewed while app-lb is alive, and VMs from a previous run are re-adopted on 
 (matched by their `applb-<deployment>-<nonce>` name). VMs app-lb did not create are never
 touched.
 
+A VM whose name points at a deployment this LB's state does **not** hold is stopped, never
+destroyed: its disk stays, `/disks` lists it, and the disk sweep reclaims it after
+`APP_LB_DISK_TTL_SECS` like any other unclaimed disk. An LB with *no* deployments at all
+touches nothing, because empty state is indistinguishable from the wrong state file. Both
+rules exist because "ours but unknown" can also mean "another app-lb's": on 2026-09-29 a
+second instance started by `app-lb --version` (arguments were ignored then) destroyed every
+sandbox the live one served, workspaces uncaptured.
+
+Only one app-lb runs per host. Startup takes `/run/app-lb/instance.lock` (the temp directory
+when `/run` is not writable) and a second instance refuses to start, naming the holder.
+`APP_LB_INSTANCE_LOCK` points it elsewhere — only for instances that talk to *different*
+heyvm daemons — or `off`. `app-lb --version` and `--help` print and exit; any other argument
+is refused without starting anything.
+
 Booting a VM takes long enough that an admin request can delete or rebuild the deployment
 while a create is still in flight. The autoscaler therefore re-checks, after every create and
 promotion, that the deployment it is working on is still the registry's — and kills any VM the
@@ -3653,6 +3872,27 @@ nothing; its specs and create bodies are byte-for-byte what they were. An auth
 service that predates `namespaces[]` still works: the caller's own account is
 used, with a warning, which is right for a user in one account and wrong for a
 user in several.
+
+### Opening the dashboard for one namespace
+
+`/login`'s password form admits platform administrators only. A namespace
+owner reaches the dashboard from Heyo instead: the front end asks the auth
+service for a token confined to that namespace at the user's own tier
+(`POST /api/auth/namespace-token`, one hour, no refresh), and posts it from a
+form in a new tab to **`POST /login/handoff`** (`token`, `namespace`,
+form-encoded). app-lb resolves the token like any bearer and, if the grant
+reaches the namespace, sets it as the session cookie and navigates to
+`/dashboard?namespace=<ns>`.
+
+That page pins itself to the namespace: the picker and the fleet-wide sections
+(global applications, regional gateways, certificates, namespaces, app-tokens,
+deploy jobs) are hidden, and a view-tier grant gets no write controls. When the
+token runs out the page says so and links back to `APP_LB_HOME_URL`; there is
+no refresh here, by design.
+
+The handoff is the one cookie write that is cross-site on purpose, so it skips
+the origin check every other one has. The most a forged post can do is sign the
+victim into the forger's own namespace, which the page names.
 
 ### Caching, and what it costs
 

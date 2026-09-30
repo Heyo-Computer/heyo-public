@@ -18,6 +18,7 @@ mod artifact;
 mod auth;
 mod auth_providers;
 mod autoscale;
+mod cli;
 mod config;
 mod deployment;
 mod discovery;
@@ -33,13 +34,16 @@ mod health;
 mod host_bundle;
 mod host_update;
 mod incus;
+mod instance_lock;
 mod jobs;
 mod jwt;
 mod metrics;
 mod mounts;
 mod namespaces;
 mod obs;
+mod plugins;
 mod proxy;
+mod request_control;
 mod registry;
 mod allocation;
 mod retirement;
@@ -52,6 +56,8 @@ mod tls;
 mod tokens;
 mod unpack;
 mod vm;
+mod worker;
+mod worker_rpc;
 mod workspace;
 mod workflows;
 
@@ -62,12 +68,10 @@ use crate::autoscale::Autoscaler;
 use crate::config::LbConfig;
 use crate::jobs::{JobConfig, Jobs};
 use crate::metrics::Metrics;
-use crate::proxy::LbProxy;
 use crate::registry::Registry;
 use crate::secrets::SecretStore;
-use crate::tls::{CertStore, SniResolver};
+use crate::tls::CertStore;
 use crate::vm::VmManager;
-use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
 use pingora_core::services::background::background_service;
 use std::sync::Arc;
@@ -291,7 +295,17 @@ fn init_tracing(events: Option<obs::LogSink>) {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--forwarding-worker") {
+        let path = std::env::args_os().nth(2).expect("worker control directory required");
+        worker::run(path.into());
+    }
     if let Some(code) = host_update::helper_main() { std::process::exit(code); }
+    // After the internal helper entry points above, which take their own
+    // arguments. Anything else that is not empty is a refusal: see `cli`.
+    let command = cli::parse(std::env::args().skip(1));
+    if command != cli::Command::Serve {
+        std::process::exit(cli::run(&command));
+    }
     // Before the subscriber, because shipping app-lb's own events means adding a
     // layer to it, and a subscriber can only be built once. Reads the environment
     // and allocates a channel — no threads, nothing that a later fork would lose.
@@ -460,6 +474,24 @@ fn main() {
         }
     }
 
+    // Before anything can reach the daemon: two app-lbs sharing one heyvm each
+    // see the other's sandboxes as orphans. See `instance_lock`.
+    let lock_setting = instance_lock::setting(std::env::var("APP_LB_INSTANCE_LOCK").ok().as_deref());
+    let holder = format!("pid {} state={}", std::process::id(), cfg.state_path);
+    let _instance_lock = match instance_lock::acquire_setting(&lock_setting, &holder) {
+        Ok(Some((file, path))) => {
+            tracing::info!(path = %path.display(), "holding the host's app-lb instance lock");
+            Some(file)
+        }
+        Ok(None) => {
+            tracing::warn!("APP_LB_INSTANCE_LOCK=off: nothing stops a second app-lb on this host from managing the same sandboxes");
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "refusing to start");
+            std::process::exit(1);
+        }
+    };
     let registry = Arc::new(Registry::new(&cfg.state_path));
     let _controller_lock = registry.controller_lock().unwrap_or_else(|e| {
         tracing::error!(error=%e,"cannot exclusively own deployment state; refusing controller startup");
@@ -511,6 +543,20 @@ fn main() {
             "restored declared namespaces; some objects were unreadable and were left on disk"
         ),
     }
+    // Plugins: which built-in plugins run, and with what configuration, is an
+    // object per plugin beside the other stores. The host is built once the
+    // secret store exists, which plugins resolve their credentials through.
+    let plugin_store = plugins::PluginStore::new(plugins::plugin_dir(&cfg.state_path));
+    match plugin_store.load() {
+        (0, 0) => tracing::debug!(dir = %plugin_store.dir().display(), "no plugin records"),
+        (n, 0) => tracing::info!(count = n, "restored plugin records"),
+        (n, skipped) => tracing::warn!(
+            count = n,
+            skipped,
+            dir = %plugin_store.dir().display(),
+            "restored plugin records; some were unreadable and were left on disk"
+        ),
+    }
     let auth_providers = Arc::new(crate::auth_providers::AuthProviderStore::new(
         crate::auth_providers::auth_provider_dir(&cfg.state_path),
     ));
@@ -557,6 +603,13 @@ fn main() {
             std::path::Path::new(&cfg.secrets_path).display()
         ),
     }
+    let plugin_host = Arc::new(plugins::PluginHost::new(
+        vec![
+            plugins::pgfc::PgFcPlugin::new(secrets.clone()),
+            plugins::vapi::VapiPlugin::new(secrets.clone()),
+        ],
+        plugin_store,
+    ));
     let tokens = Arc::new(tokens::TokenStore::new(&cfg.tokens_path));
     match tokens.load() {
         Ok(0) => tracing::info!(path = %tokens.path().display(), "no app-tokens"),
@@ -972,39 +1025,25 @@ fn main() {
             event_feed.clone(),
             &cfg.public_ips,
             cfg.deploy_host_base().map(str::to_string),
+            plugin_host.clone(),
         ).with_views(Arc::new(fleet::ViewStore::open(
             std::path::Path::new(&cfg.state_path).with_extension("views.json"), secrets.clone(),
             ["APP_LB_FLEET_FILE", "APP_LB_CONTROL_PLANE_FILE"].map(|key| std::env::var_os(key).map(Into::into)),
         ).unwrap_or_else(|error| panic!("invalid view configuration: {error}")))),
     );
 
-    let mut proxy_svc = pingora_proxy::http_proxy_service(
-        &server.configuration,
-        LbProxy::new(
-            registry.clone(),
-            metrics,
-            challenges,
-            auth,
-            obs.as_ref().and_then(|o| o.access.clone()),
-            siem.as_ref().map(|s| s.sink.clone()),
-            guard.clone(),
-            event_feed,
-            auth_providers.clone(),
-            secrets.clone(),
-        ),
-    );
-    proxy_svc.add_tcp(&cfg.proxy_addr);
-
-    // HTTPS listener, alongside the plaintext one. The acceptor is built with no
-    // certificate attached: `CertStore` supplies one per handshake keyed on SNI,
-    // which is what lets a certificate issued moments ago serve without a
-    // restart. See `src/tls.rs`.
-    if cfg.tls_enabled() {
-        let settings = TlsSettings::with_callbacks(Box::new(SniResolver::new(certs)))
-            .expect("failed to build TLS settings");
-        proxy_svc.add_tls_with_settings(&cfg.tls_addr, None, settings);
-        tracing::info!(tls = %cfg.tls_addr, "HTTPS listener enabled");
-    }
+    let proxy_svc = background_service("forwarding-worker", worker::Supervisor {
+        control: Arc::new(request_control::RequestControl::new(
+            registry.clone(), metrics.clone(), challenges, auth, guard.clone(),
+            event_feed, auth_providers.clone(), secrets.clone(),
+        )),
+        metrics,
+        access_log: obs.as_ref().and_then(|o| o.access.clone()),
+        security: siem.as_ref().map(|s| s.sink.clone()),
+        certs,
+        proxy_addr: cfg.proxy_addr.clone(),
+        tls_addr: cfg.tls_enabled().then(|| cfg.tls_addr.clone()),
+    });
 
     tracing::info!(proxy = %cfg.proxy_addr, admin = %cfg.admin_addr, "starting app-lb");
 
@@ -1056,6 +1095,9 @@ fn main() {
         "workspaces",
         workspace::WorkspaceWorker::new(workspaces.clone()),
     ));
+    // Plugins own their tasks; this only starts the enabled ones and stops
+    // them on shutdown. Not a dependency of the proxy, like the others.
+    server.add_service(background_service("plugins", plugins::PluginService::new(plugin_host)));
     let proxy_handle = server.add_service(proxy_svc);
     // Don't accept traffic until the autoscaler has adopted existing VMs and
     // built the warm pool; otherwise the first requests all eat a cold start.

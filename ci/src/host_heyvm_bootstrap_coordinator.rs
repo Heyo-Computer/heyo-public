@@ -40,6 +40,21 @@ async fn reconnect_daemon(d:&Dispatcher,req:&Request)->Result<()> {
     Ok(())
 }
 
+impl Target {
+    pub(crate) fn validate_admission(&self, repository: &str, coordinator: Option<&str>, heyvmd: bool) -> Result<()> {
+        ensure!(crate::repos::same_repo(repository, &self.repository), "host target is not authorized for this repository");
+        ensure!(coordinator.is_some_and(|runner| runner != self.runner_hd_id),
+            "host replacement requires a mapped coordinator on a different runner");
+        if heyvmd {
+            ensure!(matches!(self.process_manager.as_deref(), Some("systemd" | "supervisor")),
+                "heyvmd target requires an explicit process manager");
+            ensure!(std::path::Path::new(&self.executable).file_name().is_some_and(|name| name == "heyvmd"),
+                "daemon rollout target must name heyvmd");
+        }
+        Ok(())
+    }
+}
+
 pub fn validate_plan(plan: &JobPlan) -> Result<()> {
     for (i, step) in plan.steps.iter().enumerate().filter(|(_,s)| matches!(s.uses.as_deref(),Some(ACTION|HEYVMD_ACTION))) {
         ensure!(i+1==plan.steps.len() && !step.continue_on_error && !plan.continue_on_error,
@@ -62,7 +77,7 @@ fn mapping(raw: &str, alias: &str) -> Result<Target> {
     Ok(t)
 }
 
-async fn trusted(d:&Dispatcher, alias:&str)->Result<Target>{
+pub(crate) async fn trusted(d:&Dispatcher, alias:&str)->Result<Target>{
     let managed;
     let raw=match d.config.host_heyvm_bootstrap_targets.as_deref(){Some(v)=>v,None=>{managed=d.secrets.host_heyvm_bootstrap_targets().await?;managed.as_str()}};
     mapping(raw,alias)
@@ -99,6 +114,9 @@ fn launcher_spec(id:&str, namespace:&str, command:String)->Value { json!({"id":i
 pub async fn request(d:&Dispatcher,msg:&JobMessage,plan:&JobPlan,step:&str,alias:&str,token_expression:&str,workflow:&str,name:&str,timeout:Duration,component:&str)->Result<String>{
     validate_plan(plan)?; crate::submission::authorize_publication(&d.store,&msg.run_id).await.map_err(anyhow::Error::msg)?;
     let target=trusted(d,alias).await?; let secret=crate::host_maintenance::token_secret(token_expression)?;
+    if let Some(policy) = &plan.release_policy {
+        ensure!(policy.hosts.get(alias) == Some(&target), "host target changed since release admission");
+    }
     let run=d.store.get_run(&msg.run_id).await?.ok_or_else(||anyhow::anyhow!("missing run"))?;
     ensure!(crate::repos::same_repo(REPOSITORY,&run.repo_url),"only the private Heyo repository may bootstrap hosts");
     let release=crate::release::get(&d.store,&msg.run_id).await.map_err(anyhow::Error::msg)?.filter(|r|r.status=="published")
@@ -163,16 +181,19 @@ async fn launcher_job(http:&reqwest::Client,base:&str,token:&str,launcher:&str,j
     Ok(job.clone())
 }
 
-fn receipt(job:&Value,req:&Request,launcher:&str)->Result<Value>{
+fn receipt(job:&Value,req:&Request,launcher:&str,allow_rollback:bool)->Result<Value>{
     ensure!(job["deployment"]==launcher && matches!(job["kind"].as_str(),Some("update"|"host-update")),"launcher job identity differs");
     ensure!(job["status"]=="succeeded","launcher did not succeed");
     let logs=job["log"].as_array().ok_or_else(||anyhow::anyhow!("launcher logs missing"))?;
     let lines:Vec<_>=logs.iter().filter_map(Value::as_str).flat_map(str::lines).filter_map(|s|s.strip_prefix("HEYO_HEYVM_BOOTSTRAP_RESULT=")).collect();
     ensure!(lines.len()==1,"exactly one bootstrap receipt is required"); let value:Value=serde_json::from_slice(&STANDARD.decode(lines[0])?)?;
     for (key,want) in [("protocol","host-heyvm-bootstrap-v1"),("operation_id",req.artifact.operation_id.as_str()),("request_sha256",req.request_sha256.as_str()),
-        ("target_alias",req.alias.as_str()),("heyvm_sha256",req.artifact.heyvm_sha256.as_str()),("config_sha256",req.config_sha256.as_str()),
-        ("systemd_drop_in_sha256",req.systemd_drop_in_sha256.as_str()),("backend_server_id",req.target.backend_server_id.as_str()),("region",req.target.region.as_str())]{ensure!(value[key]==want,"bootstrap receipt {key} differs");}
-    ensure!(value["status"]=="succeeded","bootstrap rolled back or failed"); Ok(value)
+        ("target_alias",req.alias.as_str()),("backend_server_id",req.target.backend_server_id.as_str()),("region",req.target.region.as_str())]{ensure!(value[key]==want,"bootstrap receipt {key} differs");}
+    if allow_rollback && value["status"]=="rolled_back" { return Ok(value); }
+    ensure!(value["status"]=="succeeded","bootstrap rolled back or failed");
+    for (key,want) in [("heyvm_sha256",req.artifact.heyvm_sha256.as_str()),("config_sha256",req.config_sha256.as_str()),
+        ("systemd_drop_in_sha256",req.systemd_drop_in_sha256.as_str())]{ensure!(value[key]==want,"bootstrap receipt {key} differs");}
+    Ok(value)
 }
 
 async fn finish(store:&Store,id:&str,passed:bool,note:&str,result:Option<&Value>)->Result<()> {
@@ -195,7 +216,7 @@ async fn finish(store:&Store,id:&str,passed:bool,note:&str,result:Option<&Value>
 }
 
 async fn reconcile(d:&Dispatcher,id:&str,token:&str,configured:Option<&Target>)->Result<()> {
-    let _effect = d.executor.effect_permit().await.map_err(anyhow::Error::msg)?;
+    let _effect = d.executor.effect_permit_for(Some(id)).await.map_err(anyhow::Error::msg)?;
     let row=sqlx::query("SELECT h.*,d.run_id,d.job_id FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment d ON d.id=h.id WHERE h.id=$1 AND h.phase NOT IN ('passed','failed','superseded')").bind(id).fetch_optional(d.store.pool()).await?;let Some(row)=row else{return Ok(())};
     let req:Request=serde_json::from_value(row.get("request"))?;let phase:String=row.get("phase");let deadline:chrono::DateTime<chrono::Utc>=row.get("deadline");
     let run:String=row.get("run_id");let job:String=row.get("job_id");
@@ -217,7 +238,7 @@ async fn reconcile(d:&Dispatcher,id:&str,token:&str,configured:Option<&Target>)-
         if matches.len()==1 {job_id=matches[0]["id"].as_str().map(str::to_string);} else if matches.is_empty(){return Ok(())} else {bail!("launcher job ambiguity; target remains fenced")}
         if let Some(j)=&job_id{sqlx::query("UPDATE ci_host_heyvm_bootstrap SET launcher_job_id=$2,phase='polling',updated_at=now() WHERE id=$1 AND phase='armed' AND launcher_job_id IS NULL").bind(id).bind(j).execute(d.store.pool()).await?;}return Ok(())}
     let Some(job_id)=job_id else{return Ok(())};let jobv=launcher_job(&http,base,token,&launcher,&job_id).await?;
-    match jobv["status"].as_str(){Some("queued"|"running")=>{},Some("succeeded")=>match receipt(&jobv,&req,&launcher){Ok(r)=>{
+    match jobv["status"].as_str(){Some("queued"|"running")=>{},Some("succeeded")=>match receipt(&jobv,&req,&launcher,false){Ok(r)=>{
         reconnect_daemon(d,&req).await?;
         finish(&d.store,id,true,"Exact native host executable receipt and runner tunnel reconnection verified; target uncordoned.",Some(&r)).await?},Err(_)=>finish(&d.store,id,false,"Launcher receipt was missing, ambiguous, mismatched, or reported rollback; target remains fenced.",None).await?},_=>finish(&d.store,id,false,"Launcher/bootstrap failed or rolled back; target remains fenced.",None).await?};
     let _=run;Ok(())
@@ -225,7 +246,7 @@ async fn reconcile(d:&Dispatcher,id:&str,token:&str,configured:Option<&Target>)-
 
 /// Stop and release the coordinator VM before host drain/network activity.
 pub(crate) async fn release(d:&Dispatcher,id:&str)->Result<()> {
-    let _effect = d.executor.effect_permit().await.map_err(anyhow::Error::msg)?;
+    let _effect = d.executor.effect_permit_for(Some(id)).await.map_err(anyhow::Error::msg)?;
     let mut tx=d.store.pool().begin().await?;
     let row=sqlx::query("SELECT s.job_id,j.sandbox_id,j.runner_hd_id,j.attempt FROM ci_host_heyvm_bootstrap h JOIN ci_service_deployment s ON s.id=h.id JOIN ci_job j ON j.id=s.job_id WHERE h.id=$1 AND h.phase='releasing' FOR UPDATE OF h SKIP LOCKED").bind(id).fetch_optional(&mut *tx).await?;
     let Some(row)=row else{return Ok(())};let job:String=row.get("job_id");let sandbox:String=row.try_get("sandbox_id")?;let runner:String=row.try_get("runner_hd_id")?;
@@ -241,7 +262,7 @@ pub async fn owns_job(store:&Store,job:&str)->Result<bool>{Ok(sqlx::query_scalar
 
 /// Explicit receipt-only recovery. Never redeliver the original installer or rewrite run history.
 pub async fn recover(d:&Dispatcher,run_id:&str,id:&str)->Result<Value> {
-    let _effect = d.executor.effect_permit().await.map_err(anyhow::Error::msg)?;
+    let _effect = d.executor.effect_permit_for(Some(id)).await.map_err(anyhow::Error::msg)?;
     let run=d.store.get_run(run_id).await?.ok_or_else(||anyhow::anyhow!("missing run"))?;
     ensure!(crate::repos::same_repo(REPOSITORY,&run.repo_url),"only the private Heyo repository may recover hosts");
     let mut tx=d.store.pool().begin().await?;
@@ -253,6 +274,9 @@ pub async fn recover(d:&Dispatcher,run_id:&str,id:&str)->Result<Value> {
         .bind(id).bind(run_id).fetch_one(&mut *tx).await?;
     let phase:String=row.get("phase");
     if phase=="passed" { return Ok(json!({"operation_id":id,"status":"already_passed"})); }
+    if phase=="superseded" && row.get::<Option<Value>,_>("result").is_some_and(|r|r["status"]=="rollback_verified") {
+        return Ok(json!({"operation_id":id,"status":"rollback_verified"}));
+    }
     ensure!(phase=="failed"&&row.get::<bool,_>("delivery_armed"),"only failed, delivered bootstrap operations can be recovered");
     let other:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_host_maintenance WHERE runner_hd_id=$1 AND phase<>'passed') OR EXISTS(SELECT 1 FROM ci_host_heyvm_bootstrap WHERE runner_hd_id=$1 AND id<>$2 AND phase NOT IN ('passed','superseded'))")
         .bind(&runner).bind(id).fetch_one(&mut *tx).await?;
@@ -269,7 +293,7 @@ pub async fn recover(d:&Dispatcher,run_id:&str,id:&str)->Result<Value> {
     let http=client()?; let base=req.target.app_lb_admin_url.trim_end_matches('/');
     let launcher:String=row.get("launcher_deployment_id");
     let original_job:String=row.try_get("launcher_job_id")?;
-    let original=receipt(&launcher_job(&http,base,token,&launcher,&original_job).await?,&req,&launcher)?;
+    let original=receipt(&launcher_job(&http,base,token,&launcher,&original_job).await?,&req,&launcher,true)?;
 
     // A fresh, isolated launcher runs only read-only verification. Retrying this request
     // may repeat verification, but can never repeat installation or service restart.
@@ -277,26 +301,28 @@ pub async fn recover(d:&Dispatcher,run_id:&str,id:&str)->Result<Value> {
     let mapping=serde_json::to_string(&BTreeMap::from([(req.alias.clone(),req.target.clone())]))?;
     let command=crate::host_heyvm_bootstrap::verification_recipe(&mapping,&req.alias,&req.artifact)?;
     let mut spec=launcher_spec(&verifier,&req.target.app_lb_namespace,command);
-    spec["update"]["timeout_secs"]=json!(30);
+    spec["update"]["timeout_secs"]=json!(90);
     body(http.post(format!("{base}/deployments")).bearer_auth(token).json(&spec).send().await?).await?;
     let actual=body(http.get(format!("{base}/deployments/{verifier}")).bearer_auth(token).send().await?).await?;
     ensure!(same_spec(&actual,&spec),"verification launcher differs");
     let started=body(http.post(format!("{base}/deployments/{verifier}/update")).bearer_auth(token).send().await?).await?;
     let verify_job=started["id"].as_str().ok_or_else(||anyhow::anyhow!("verification job ID missing"))?;
-    let live=tokio::time::timeout(Duration::from_secs(45),async {
+    let live=tokio::time::timeout(Duration::from_secs(100),async {
         loop {
             let job=launcher_job(&http,base,token,&verifier,verify_job).await?;
             if matches!(job["status"].as_str(),Some("queued"|"running")) {tokio::time::sleep(Duration::from_secs(1)).await;continue}
-            return receipt(&job,&req,&verifier);
+            return receipt(&job,&req,&verifier,true);
         }
     }).await??;
     ensure!(live==original,"live verification differs from original receipt");
     ensure!(trusted(d,&req.alias).await?==req.target,"bootstrap target configuration drifted during recovery");
     reconnect_daemon(d,&req).await?;
-    let result=json!({"operation_id":id,"status":"recovered","receipt":live,"original_job_id":original_job,
+    let rolled_back=live["status"]=="rolled_back";
+    let result=json!({"operation_id":id,"status":if rolled_back{"rollback_verified"}else{"recovered"},"receipt":live,"original_job_id":original_job,
         "verification_deployment":verifier,"verification_job_id":verify_job,"recovered_at":chrono::Utc::now()});
-    sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase='passed',result=$2,updated_at=now() WHERE id=$1").bind(id).bind(&result).execute(&mut *tx).await?;
-    let note=format!("Bootstrap {id} recovered by explicit receipt and live-state verification; host fence released. Original failed run preserved. Verification job: {verify_job}");
+    sqlx::query("UPDATE ci_host_heyvm_bootstrap SET phase=$3,result=$2,updated_at=now() WHERE id=$1").bind(id).bind(&result)
+        .bind(if rolled_back{"superseded"}else{"passed"}).execute(&mut *tx).await?;
+    let note=format!("Bootstrap {id} {} by explicit receipt and live-state verification; host fence released. Original failed run preserved. Verification job: {verify_job}",if rolled_back{"rollback verified"}else{"recovered"});
     Store::add_event(&mut tx,run_id,Some(&job.id),None,None,"ci.host.bootstrap.recovered.v1","recovered",Some(&note)).await?;
     tx.commit().await?;
     Ok(result)
@@ -345,6 +371,36 @@ mod tests {
         assert!(terminal_phase("failed"));
         assert!(terminal_phase("superseded"));
         assert!(!terminal_phase("draining"));
+    }
+
+    #[test]
+    fn rollback_receipt_is_recovery_only_and_keeps_identity_checks() {
+        let req:Request=serde_json::from_value(json!({
+            "alias":"daemon", "token_secret":"ADMIN", "request_sha256":"request",
+            "config_sha256":"config", "systemd_drop_in_sha256":"drop",
+            "artifact":{"operation_id":"op", "artifact_url":"https://example/artifact",
+                "artifact_sha256":"artifact", "artifact_size":1, "inner_path":"heyvm.tar.gz",
+                "inner_archive_sha256":"inner", "heyvm_sha256":"binary", "component":"heyvmd"},
+            "target":{"repository":REPOSITORY, "app_lb_admin_url":"https://example/admin",
+                "app_lb_deployment":"host", "app_lb_namespace":"default", "runner_hd_id":"runner",
+                "backend_server_id":"backend", "executable":"/usr/local/bin/heyvmd", "unit":"heyvmd.service",
+                "state_dir":"/state", "config_json_path":"/config", "systemd_drop_in_path":"/drop",
+                "local_health_url":"http://127.0.0.1/health", "target_alias":"daemon", "region":"region-a"}
+        })).unwrap();
+        let mut value=json!({"protocol":"host-heyvm-bootstrap-v1", "operation_id":"op",
+            "request_sha256":"request", "target_alias":"daemon", "backend_server_id":"backend",
+            "region":"region-a", "status":"rolled_back"});
+        let job=|v:&Value| json!({"deployment":"launcher", "kind":"host-update", "status":"succeeded",
+            "log":[format!("HEYO_HEYVM_BOOTSTRAP_RESULT={}",STANDARD.encode(serde_json::to_vec(v).unwrap()))]});
+        assert!(receipt(&job(&value),&req,"launcher",false).is_err());
+        assert_eq!(receipt(&job(&value),&req,"launcher",true).unwrap(),value);
+        value["region"]=json!("other");
+        assert!(receipt(&job(&value),&req,"launcher",true).is_err());
+        value["region"]=json!("region-a");
+        value["status"]=json!("rollback_failed");
+        assert!(receipt(&job(&value),&req,"launcher",true).is_err());
+        value["status"]=json!("succeeded");
+        assert!(receipt(&job(&value),&req,"launcher",true).is_err());
     }
 
     #[test]

@@ -6,7 +6,7 @@ the disposable SSL_CERT_FILE. Certificate and hostname verification stay enabled
 import base64, concurrent.futures, hashlib, json, os, pathlib, socket, subprocess, tempfile, threading, time, urllib.request, urllib.error
 from regional_app import RegionalApp, server
 
-BINARY = str(pathlib.Path(__file__).resolve().parents[1] / 'target/debug/app-lb')
+BINARY = os.environ.get('APP_LB_TEST_BINARY', str(pathlib.Path(__file__).resolve().parents[1] / 'target/debug/app-lb'))
 
 def port():
     with socket.socket() as s:
@@ -23,6 +23,24 @@ class App(RegionalApp):
         assert held_release.wait(10), 'held request was not released'
 
     def respond(self):
+        if self.path == '/sql-tunnel':
+            if self.headers.get('Upgrade', '').lower() != 'pg-fc-sql/1' or 'upgrade' not in self.headers.get('Connection', '').lower().split(','):
+                self.send_error(400, 'SQL upgrade headers missing')
+                return
+            assert self.command == 'POST'
+            assert not any(k.lower().startswith('x-heyo-peer') for k in self.headers)
+            assert json.loads(self.rfile.read(int(self.headers['Content-Length']))) == {'startup': [0, 17, 255], 'claim': 'fixture'}
+            self.send_response(101)
+            self.send_header('Upgrade', 'pg-fc-sql/1')
+            self.send_header('Connection', 'Upgrade')
+            self.end_headers()
+            self.wfile.write(b'\x00SQL-ready\xff')
+            self.wfile.flush()
+            payload = self.rfile.read(7)
+            self.wfile.write(payload[::-1])
+            self.wfile.flush()
+            self.close_connection = True
+            return
         if self.path == '/socket':
             assert not any(k.lower().startswith('x-heyo-peer') for k in self.headers)
             accept = base64.b64encode(hashlib.sha1((self.headers['Sec-WebSocket-Key']+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
@@ -68,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix='heyo-gateway-smoke-') as tmp:
         directory=root/name; directory.mkdir()
         proxy,admin,tlsport=port(),port(),port()
         env={k:v for k,v in os.environ.items() if not k.startswith('APP_LB_')}
-        env.update({'APP_LB_PROXY_ADDR':f'127.0.0.1:{proxy}','APP_LB_ADMIN_ADDR':f'127.0.0.1:{admin}','APP_LB_MOUNTS_DIR':str(directory/'mounts'),'APP_LB_WORKSPACES_DIR':str(directory/'workspaces'),'APP_LB_IMAGES_DIR':str(directory/'images'),'APP_LB_BUILD_DIR':str(directory/'build'),'APP_LB_SIEM':'0','SSL_CERT_FILE':str(ca),'APP_LB_DISK_TTL_SECS':'0','APP_LB_DAEMON_URL':'http://127.0.0.1:9'})
+        env.update({'APP_LB_PROXY_ADDR':f'127.0.0.1:{proxy}','APP_LB_ADMIN_ADDR':f'127.0.0.1:{admin}','APP_LB_MOUNTS_DIR':str(directory/'mounts'),'APP_LB_WORKSPACES_DIR':str(directory/'workspaces'),'APP_LB_IMAGES_DIR':str(directory/'images'),'APP_LB_BUILD_DIR':str(directory/'build'),'APP_LB_SIEM':'0','SSL_CERT_FILE':str(ca),'APP_LB_DISK_TTL_SECS':'0','APP_LB_DAEMON_URL':'http://127.0.0.1:9','APP_LB_INSTANCE_LOCK':str(directory/'instance.lock')})
         if tls: env.update({'APP_LB_PROXY_TLS_ADDR':f'[::1]:{tlsport}','APP_LB_TLS_CERT':str(cert),'APP_LB_TLS_KEY':str(key)})
         log=open(directory/'log','w')
         p=subprocess.Popen([BINARY],cwd=directory,env=env,stdout=log,stderr=log);processes.append((p,log,directory))
@@ -122,6 +140,23 @@ with tempfile.TemporaryDirectory(prefix='heyo-gateway-smoke-') as tmp:
                 ws.sendall(bytes([0x81,0x80|len(payload)])+mask+bytes(v^mask[i%4] for i,v in enumerate(payload)))
                 assert stream.read(2)==bytes([0x81,len(payload)])
                 assert stream.read(len(payload))==payload
+        # pg-fc sends a JSON POST before switching to raw, bidirectional SQL.
+        # A WebSocket-only check misses Pingora stripping this custom upgrade.
+        with socket.create_connection(('127.0.0.1',source),timeout=5) as tunnel:
+            body=json.dumps({'startup':[0,17,255],'claim':'fixture'}).encode()
+            tunnel.sendall(b'POST /sql-tunnel HTTP/1.1\r\nHost: smoke.example\r\nConnection: Upgrade\r\nUpgrade: pg-fc-sql/1\r\nContent-Type: application/json\r\nContent-Length: '+str(len(body)).encode()+b'\r\n\r\n'+body)
+            with tunnel.makefile('rb') as stream:
+                assert stream.readline().startswith(b'HTTP/1.1 101')
+                response_headers=[]
+                while (line:=stream.readline()) not in (b'\r\n',b''):
+                    response_headers.append(line.lower())
+                assert b'upgrade: pg-fc-sql/1\r\n' in response_headers
+                assert stream.read(11)==b'\x00SQL-ready\xff'
+                payload=b'\x00\xffsql\x13\x80'
+                tunnel.sendall(payload)
+                assert stream.read(len(payload))==payload[::-1]
+        assert request(f'http://127.0.0.1:{source}/sql-tunnel',{},
+            {**h,'Connection':'Upgrade','Upgrade':'unsupported/1'})[0]==400
         with concurrent.futures.ThreadPoolExecutor() as pool:
             held=pool.submit(request,f'http://127.0.0.1:{source}/held',None,h)
             assert held_started.wait(5), 'request did not reach the app'
@@ -147,7 +182,7 @@ with tempfile.TemporaryDirectory(prefix='heyo-gateway-smoke-') as tmp:
         # peer response for proof of application readiness.
         time.sleep(7)
         assert request(f'http://127.0.0.1:{source}/after-probe',headers=h)[0]==200
-        print('PASS: two app-lb processes; verified HTTPS; Host/query/body/Authorization preserved; peer headers consumed; POST executes once; WebSocket round trip; invalid admission and second hop rejected; held response body drains to zero across spec replay while 12 new requests use alternate backend; health reconciliation retains serving path')
+        print('PASS: two app-lb processes; verified HTTPS; Host/query/body/Authorization preserved; peer headers consumed; POST executes once; WebSocket and SQL upgrade round trips; unsupported upgrade rejected; invalid admission and second hop rejected; held response body drains to zero across spec replay while 12 new requests use alternate backend; health reconciliation retains serving path')
     except Exception:
         for p,log,directory in processes:
             log.flush();print(directory.name,(directory/'log').read_text()[-4500:])

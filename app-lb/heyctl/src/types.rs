@@ -61,6 +61,9 @@ pub struct WorkspaceSpec {
     #[serde(rename = "ref")]
     pub artifact_ref: Option<String>,
     pub auth: Option<SecretRef>,
+    /// Recycle the replica for a snapshot at least this often. Unset: only
+    /// when it retires for another reason.
+    pub snapshot_interval_secs: Option<u64>,
 }
 
 /// Where a deployment's workspace stands: the snapshot its pool runs from,
@@ -1502,6 +1505,28 @@ pub struct DiskInventory {
     pub totals: DiskTotals,
     pub disks: Vec<DiskInfo>,
     pub archives: Vec<DiskArchiveView>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /api/plugins` and `/api/plugins/:id` — a built-in plugin, its stored
+/// record and its live status.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct PluginView {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for `config`. Advisory; app-lb validates on write.
+    pub config_schema: Value,
+    pub enabled: bool,
+    /// Kept while disabled, so re-enabling does not lose it.
+    pub config: Value,
+    pub updated_at: u64,
+    /// Why the last apply failed. A plugin can be enabled *and* failing.
+    pub last_error: Option<String>,
+    /// Whatever the plugin reports about itself; shape is per plugin.
+    pub status: Value,
     #[serde(flatten)]
     pub extra: Extra,
 }

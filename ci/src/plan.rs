@@ -61,6 +61,9 @@ pub struct JobPlan {
     /// Cells of this base job that may run at once. `None` is unlimited.
     pub max_parallel: Option<usize>,
     pub fail_fast: bool,
+    /// Frozen operator policy and resolved target identities, absent on legacy jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_policy: Option<crate::release_policy::Snapshot>,
 }
 
 impl JobPlan {
@@ -133,6 +136,7 @@ impl Plan {
                     steps: job.steps.clone(),
                     max_parallel: strategy.and_then(|s| s.max_parallel),
                     fail_fast: strategy.map(|s| s.fail_fast).unwrap_or(true),
+                    release_policy: None,
                 };
                 substitute_matrix(&mut cell);
                 crate::host_maintenance::validate_plan(&cell).map_err(|e| PlanError::Workflow(e.to_string()))?;

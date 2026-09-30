@@ -35,7 +35,6 @@ mod host_maintenance;
 #[path = "../../ui/ui.rs"]
 mod heyo_ui;
 mod image;
-mod lifecycle;
 mod managed_update;
 mod nats_auth;
 mod native;
@@ -45,6 +44,7 @@ mod plan;
 mod pool;
 mod release;
 mod release_git;
+mod release_policy;
 mod repos;
 mod runners;
 mod secrets;
@@ -70,8 +70,31 @@ use vm::Vms;
 
 #[tokio::main]
 async fn main() {
+    // WSS client setup cannot infer a provider when the dependency graph
+    // enables both ring and AWS-LC. Select it before any TLS client is built.
+    if rustls::crypto::aws_lc_rs::default_provider().install_default().is_err() {
+        eprintln!("ci: rustls crypto provider was already installed");
+    }
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !args.is_empty() {
+        if matches!(args[0].as_str(), "--hold-executor-recovery" | "--transfer-executor-recovery") {
+            eprintln!("{} is no longer supported; executor ownership is scoped to each process boot", args[0]);
+            std::process::exit(2);
+        }
+        if args[0] == "--inspect-executor" && args.len() == 1 {
+            let result: anyhow::Result<serde_json::Value> = async {
+                let config = Config::from_env()?;
+                let store = Store::connect(&config.database_url, config.log_dir.clone(), config.db_statement_timeout).await?;
+                let boots: Vec<serde_json::Value> = sqlx::query_scalar("SELECT jsonb_build_object('bootId',boot_id,'deployment',deployment_id,'registeredAt',registered_at,'readyAt',ready_at,'retired',retired) FROM ci_executor_boot ORDER BY registered_at DESC,boot_id")
+                    .fetch_all(store.pool()).await?;
+                Ok(serde_json::json!({"boots":boots}))
+            }.await;
+            match result {
+                Ok(value) => println!("{value}"),
+                Err(error) => { eprintln!("executor inspection failed: {error}"); std::process::exit(1); }
+            }
+            return;
+        }
         if args[0] == "--reconcile-service-rollout" && args.len() == 3 {
             let result: anyhow::Result<()> = async {
                 let config = Config::from_env()?;
@@ -122,7 +145,7 @@ async fn main() {
             return;
         }
         if args[0] != "--check-workflows" || args.len() < 2 {
-            eprintln!("usage: ci [--check-workflows FILE ... | --prepare-host-bootstrap PLAN_JSON INSPECTION_JSON BUNDLE OUTPUT_JSON | --deliver-host-bootstrap TARGET inspect|admit INPUT_JSON BUNDLE JOURNAL_JSON | --check-host-bootstrap TARGET MANIFEST_JSON INTENT_SHA256]");
+            eprintln!("usage: ci [--inspect-executor | --check-workflows FILE ... | --prepare-host-bootstrap PLAN_JSON INSPECTION_JSON BUNDLE OUTPUT_JSON | --deliver-host-bootstrap TARGET inspect|admit INPUT_JSON BUNDLE JOURNAL_JSON | --check-host-bootstrap TARGET MANIFEST_JSON INTENT_SHA256]");
             std::process::exit(2);
         }
         let mut failed = false;
@@ -292,8 +315,6 @@ async fn main() {
         bus.jobs_stream(),
         bus.events_stream()
     );
-    bus.clone().spawn_outbox_publisher(store.clone());
-
     let artifacts = match artifacts::sink_for(&config) {
         Ok(s) => Arc::from(s),
         Err(e) => {
@@ -319,8 +340,7 @@ async fn main() {
         );
     }
 
-    // Bind before registering non-expiring ownership. A failed bind must not
-    // leave a boot that can never serve as the durable executor.
+    // Register only after binding so failed listeners do not advertise a boot.
     let listener = match tokio::net::TcpListener::bind(config.listen_addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -330,17 +350,9 @@ async fn main() {
     };
     // Deployment IDs are scoped to their regional authority; both regions may
     // legitimately use the same ID for instances of the one CI application.
-    let executor_identity = config.managed_deployment.clone().unwrap_or_else(|| match (&config.controller_deployment, &config.controller_app_lb_url) {
-        (Some(id), Some(base)) => format!("{}/deployments/{id}", base.trim_end_matches('/')),
-        _ => config.instance_id.clone(),
-    });
-    let executor = if config.managed_deployment.is_some() {
-        executor::ExecutorOwner::register_managed(store.pool().clone(),&executor_identity).await
-    } else {
-        executor::ExecutorOwner::register(store.pool().clone(),&executor_identity).await
-    };
+    let executor_identity = executor::identity(&config);
+    let executor = executor::ExecutorInstance::register(store.pool().clone(), &executor_identity).await;
     let dispatcher = Arc::new(Dispatcher {
-        lifecycle: Arc::new(lifecycle::Lifecycle::default()),
         executor: Arc::new(match executor {
             Ok(owner) => owner,
             Err(e) => { eprintln!("ci: refusing to start — {e}"); std::process::exit(1); }
@@ -370,12 +382,29 @@ async fn main() {
     }
     objects.clone().spawn_refresh_loop();
 
-    spawn_log_sweeper(config.clone(), store.clone());
+    start_execution(dispatcher.clone()).await;
 
-    // A previous process may have died holding VMs. Reclaim before taking work,
-    // or the pool leaks its capacity one restart at a time. This instance's own
-    // id is fresh, so VMs leased by the process this one replaced no longer look
-    // like somebody's live work.
+    let app = web::router(
+        config.clone(),
+        runners.clone(),
+        store.clone(),
+        dispatcher.clone(),
+    );
+    tracing::info!("listening on http://{}", config.listen_addr);
+
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+    {
+        tracing::error!("server stopped: {e}");
+        std::process::exit(1);
+    }
+    tracing::info!("shut down cleanly");
+}
+
+async fn start_execution(dispatcher: Arc<Dispatcher>) {
+    dispatcher.bus.clone().spawn_outbox_publisher(dispatcher.store.clone());
+    spawn_log_sweeper(dispatcher.config.clone(), dispatcher.store.clone());
     if let Ok(_effect) = dispatcher.executor.effect_permit().await {
         if let Err(e) = dispatcher.reclaim_pool().await {
             tracing::warn!("could not reclaim the VM pool: {e}");
@@ -401,27 +430,11 @@ async fn main() {
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             if let Err(error) = executor.mark_ready().await {
-                tracing::warn!(%error, "could not refresh executor handoff readiness");
+                tracing::warn!(%error, "could not refresh CI instance readiness");
             }
         }
     });
 
-    let app = web::router(
-        config.clone(),
-        runners.clone(),
-        store.clone(),
-        dispatcher.clone(),
-    );
-    tracing::info!("listening on http://{}", config.listen_addr);
-
-    if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-    {
-        tracing::error!("server stopped: {e}");
-        std::process::exit(1);
-    }
-    tracing::info!("shut down cleanly");
 }
 
 /// Delete step and VM logs older than `CI_LOG_RETENTION_DAYS`.

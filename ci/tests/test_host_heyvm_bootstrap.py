@@ -134,6 +134,46 @@ class Tests(unittest.TestCase):
                 with self.assertRaises(ValueError): b.service(host,target,"heyvmd")
             self.assertEqual(exe.read_bytes(),b"old")
 
+    def test_service_startup_wait_keeps_strict_isolation(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            target=self.target(pathlib.Path(td)); exe=pathlib.Path(target["executable"]); exe.parent.mkdir(); exe.write_bytes(b"old")
+            host=FakeHost(target,b"old",b"new"); command=host.command
+            host.command=lambda argv: command(argv).replace("KillMode=process", "KillMode=control-group")
+            with patch.object(host,"cgroup_pids",side_effect=[{10,11},{10}]), patch.object(b.time,"sleep") as sleep:
+                self.assertEqual(b.wait_for_service(host,target,"heyvmd")["pid"],10)
+                sleep.assert_called_once_with(1)
+            with patch.object(host,"cgroup_pids",return_value={10,11}), patch.object(b.time,"monotonic",side_effect=[0,30]), patch.object(b.time,"sleep") as sleep:
+                with self.assertRaises(b.ServiceStarting): b.wait_for_service(host,target,"heyvmd")
+                sleep.assert_not_called()
+            with patch.object(host,"proc_exe",return_value="/wrong/executable"), patch.object(b.time,"sleep") as sleep:
+                with self.assertRaisesRegex(ValueError,"executable differs"): b.wait_for_service(host,target,"heyvmd")
+                sleep.assert_not_called()
+
+    def test_rollback_recovery_is_read_only_and_rejects_drift(self):
+        from unittest.mock import patch
+        for drift in (None,"binary","health","journal"):
+            temp,target,host,result,old,new=self.run_install("health")
+            try:
+                self.assertEqual(result["status"],"rolled_back")
+                journal=pathlib.Path(target["state_dir"])/"op-1.json"
+                if drift=="binary": pathlib.Path(target["executable"]).write_bytes(new)
+                if drift=="health": host.health=lambda _: {"status":"healthy","backendId":"other","backendRegion":"eu1"}
+                if drift=="journal":
+                    data=json.loads(journal.read_text()); data["status"]="rollback_failed"; journal.write_text(json.dumps(data))
+                before=journal.read_bytes(); host.calls.clear()
+                def snapshot(path,limit,**options):
+                    p=pathlib.Path(path)
+                    if not p.exists(): return {"present":False}
+                    return {"present":True,"mode":stat.S_IMODE(p.stat().st_mode),"bytes":__import__('base64').b64encode(p.read_bytes()).decode()}
+                with patch.object(b,"secure_file",snapshot), patch.object(b,"atomic",side_effect=AssertionError("write")), patch.object(b,"download",side_effect=AssertionError("download")):
+                    if drift:
+                        with self.assertRaises(ValueError): b.verify_existing(target,self.req(new),host)
+                    else: self.assertEqual(b.verify_existing(target,self.req(new),host),result)
+                self.assertEqual(journal.read_bytes(),before)
+                self.assertTrue(all(call[:2]==("systemctl","show") for call in host.calls))
+            finally: temp.cleanup()
+
     def test_archives_reject_traversal_links_ambiguity_and_hashes(self):
         binary=b"\x7fELFpayload"; inner=tar([("heyvm",binary,"file")]); outer=tar([("validation/heyvm.tar.gz",inner,"file")],False)
         req=self.req(binary); req.update(artifact_size=len(outer),artifact_sha256=b.sha(outer),inner_archive_sha256=b.sha(inner))

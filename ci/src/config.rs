@@ -304,6 +304,8 @@ pub struct Config {
     pub application_orchestrator_url: Option<String>,
     pub application_lifecycle_token: Option<String>,
     pub expected_sha: Option<String>,
+    /// Operator-owned repository release policies, injected from HeyoSecret.
+    pub release_policies: Option<String>,
     /// Operator-owned runner/backend/archive-database mapping; never workflow supplied.
     pub host_maintenance_targets: Option<String>,
     /// Repository-scoped managed systemd app-lb targets; never workflow supplied.
@@ -650,6 +652,7 @@ impl Config {
             application_orchestrator_url: opt("CI_APPLICATION_ORCHESTRATOR_URL").map(|u| u.trim_end_matches('/').to_string()),
             application_lifecycle_token: opt("CI_APPLICATION_LIFECYCLE_TOKEN"),
             expected_sha: opt("HEYO_REVISION").or_else(||opt("CI_EXPECTED_SHA")),
+            release_policies: opt("CI_RELEASE_POLICIES"),
             host_maintenance_targets: opt("CI_HOST_MAINTENANCE_TARGETS"),
             host_app_lb_targets: opt("CI_HOST_APP_LB_TARGETS"),
             host_heyvm_bootstrap_targets: opt("CI_HOST_HEYVM_BOOTSTRAP_TARGETS"),

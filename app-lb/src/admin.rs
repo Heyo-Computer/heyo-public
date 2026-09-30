@@ -51,6 +51,9 @@ const NETWORK_HTML: &str = include_str!("network.html");
 /// The disk console at `GET /storage`.
 const DISKS_HTML: &str = include_str!("disks.html");
 
+/// The plugin console at `GET /plugins`.
+const PLUGINS_HTML: &str = include_str!("plugins.html");
+
 /// How to turn a deployment's hostname into a URL somebody can click.
 ///
 /// The dashboard runs on the *admin* listener, so it cannot infer the data
@@ -235,6 +238,11 @@ struct AdminState {
     disks: Option<Arc<crate::disks::DiskStore>>,
     /// The disk console, with the display name already substituted.
     disks_html: Arc<str>,
+    /// The built-in plugins and their records. Always present: the set is
+    /// compiled in, and an empty set is a page that says so.
+    plugins: Arc<crate::plugins::PluginHost>,
+    /// The plugin console, with the display name already substituted.
+    plugins_html: Arc<str>,
     /// The network topology console, with the display name already substituted.
     network_html: Arc<str>,
     /// How to turn a deployment's hostname into a link, given where the data
@@ -247,6 +255,27 @@ struct AdminState {
     /// already resolved from config (explicit, else the first wildcard). `None`
     /// disables host synthesis. See [`assume_host`].
     deploy_base_domain: Option<Arc<str>>,
+    /// `APP_LB_HOME_URL`: the Heyo front end a namespace user opens this
+    /// dashboard from, linked when their session is refused or runs out. They
+    /// cannot sign in here directly — see [`browser_login::handoff`].
+    home_url: Option<Arc<str>>,
+}
+
+/// `APP_LB_HOME_URL`, when it is an absolute http(s) URL.
+fn home_url_from_env() -> Option<Arc<str>> {
+    let raw = std::env::var("APP_LB_HOME_URL").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() { return None; }
+    match reqwest::Url::parse(raw) {
+        // The parsed form, not the raw one: serialising percent-encodes
+        // anything that could break out of the attribute or script string the
+        // templates put it in.
+        Ok(u) if matches!(u.scheme(), "https" | "http") => Some(Arc::from(u.as_str())),
+        _ => {
+            tracing::warn!(value = %raw, "ignoring APP_LB_HOME_URL: not an absolute http(s) URL");
+            None
+        }
+    }
 }
 
 impl AdminState {
@@ -293,6 +322,7 @@ impl AdminApi {
         feed: Arc<crate::feed::Feed>,
         public_ips: &[std::net::IpAddr],
         deploy_base_domain: Option<String>,
+        plugins: Arc<crate::plugins::PluginHost>,
     ) -> Self {
         let ingress = Arc::new(Ingress::from_ips(public_ips));
         // Render the display name into the page once; the placeholder appears in
@@ -304,6 +334,8 @@ impl AdminApi {
         let siem_html: Arc<str> = Arc::from(SIEM_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
         let disks_html: Arc<str> =
             Arc::from(DISKS_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
+        let plugins_html: Arc<str> =
+            Arc::from(PLUGINS_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
         let network_html: Arc<str> =
             Arc::from(NETWORK_HTML.replace("{{APP_NAME}}", &html_escape(&name)));
 
@@ -360,6 +392,8 @@ impl AdminApi {
                 ui_cookies: Arc::new(crate::heyo_ui::CookieConfig::from_env("APP_LB")),
                 disks,
                 disks_html,
+                plugins,
+                plugins_html,
                 network_html,
                 public_url,
                 feed,
@@ -367,6 +401,7 @@ impl AdminApi {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .map(Arc::from),
+                home_url: home_url_from_env(),
             },
         }
     }
@@ -827,6 +862,11 @@ async fn authorize(
     let browser_navigation = req.method() == axum::http::Method::GET
         && !req.headers().contains_key(header::AUTHORIZATION)
         && req.headers().get(header::ACCEPT).and_then(|h| h.to_str().ok()).is_some_and(|h| h.contains("text/html"));
+    // A page's own `fetch` (Fetch Metadata says `dest: empty`). With browser
+    // sessions on, its 401 must not advertise Basic: Chrome would answer with
+    // a native password prompt over the page, where the page itself should be
+    // saying the session ran out.
+    let script_fetch = req.headers().get("sec-fetch-dest").and_then(|h| h.to_str().ok()) == Some("empty");
     let header = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -915,6 +955,10 @@ async fn authorize(
             observe_auth_failure(&state, peer, &path, AuthAction::AdminRejected, scheme);
             if browser_navigation && state.gate_admin && state.federated.is_some() {
                 return axum::response::Redirect::to("/login").into_response();
+            }
+            if script_fetch && state.gate_admin && state.federated.is_some() {
+                return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")], "unauthorized\n")
+                    .into_response();
             }
             unauthorized()
         }
@@ -2027,6 +2071,77 @@ async fn storage_console(
     Html(render_page(&state, &state.disks_html, &headers))
 }
 
+// ---- plugins --------------------------------------------------------------
+
+/// `GET /plugins` — the plugin console.
+async fn plugins_console(
+    State(state): State<AdminState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    Html(render_page(&state, &state.plugins_html, &headers))
+}
+
+/// `GET /api/plugins` — every built-in plugin, its record and its live status.
+///
+/// View tier: the console renders it. A plugin's configuration never holds a
+/// credential (those are secret references), so there is nothing here the
+/// view tier should not read.
+async fn list_plugins(State(state): State<AdminState>) -> Response {
+    Json(state.plugins.list().await).into_response()
+}
+
+/// `GET /api/plugins/:id`
+async fn get_plugin(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    match state.plugins.get(&id).await {
+        Some(view) => Json(view).into_response(),
+        None => err(StatusCode::NOT_FOUND, format!("no plugin named {id:?}")).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PutPlugin {
+    enabled: bool,
+    /// Omitted keeps the stored configuration.
+    #[serde(default)]
+    config: Option<serde_json::Value>,
+}
+
+/// `PUT /api/plugins/:id` — `{enabled, config?}`.
+async fn put_plugin(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(body): Json<PutPlugin>,
+) -> Response {
+    set_plugin(&state, &id, body.enabled, body.config).await
+}
+
+/// `POST /api/plugins/:id/enable`
+async fn enable_plugin(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    set_plugin(&state, &id, true, None).await
+}
+
+/// `POST /api/plugins/:id/disable`
+async fn disable_plugin(State(state): State<AdminState>, Path(id): Path<String>) -> Response {
+    set_plugin(&state, &id, false, None).await
+}
+
+async fn set_plugin(
+    state: &AdminState,
+    id: &str,
+    enabled: bool,
+    config: Option<serde_json::Value>,
+) -> Response {
+    use crate::plugins::SetError;
+    match state.plugins.set(id, enabled, config).await {
+        Ok(view) => Json(view).into_response(),
+        Err(e @ SetError::NotFound) => err(StatusCode::NOT_FOUND, e.to_string()).into_response(),
+        Err(e @ SetError::Invalid(_)) => err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e @ SetError::Io(_)) => {
+            err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
 /// `GET /network` — the network topology console.
 ///
 /// A 2D-canvas visualiser of the request path: ingress → hostnames →
@@ -2344,6 +2459,51 @@ struct CreateProviderBody {
     /// auth service's address and derives it.
     #[serde(default)]
     jwks_url: Option<String>,
+    /// Request-only tweaks laid over the resulting `jwt` policy — above all
+    /// over a preset's, which is otherwise replaced wholesale. They make
+    /// "Heyo sign-in, for this account only, with a browser redirect" one POST
+    /// instead of a preset followed by an edit.
+    #[serde(default)]
+    require: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default)]
+    cookie: Option<String>,
+    #[serde(default)]
+    login_url: Option<String>,
+    #[serde(default)]
+    login_redirect_param: Option<String>,
+}
+
+impl CreateProviderBody {
+    fn has_jwt_tweaks(&self) -> bool {
+        self.require.is_some()
+            || self.cookie.is_some()
+            || self.login_url.is_some()
+            || self.login_redirect_param.is_some()
+    }
+}
+
+/// Lay the request-only tweaks over a materialised JWT policy. `require` is
+/// merged claim by claim, so a preset's `role` check survives an added
+/// `accountId`.
+fn apply_jwt_tweaks(
+    jwt: &mut crate::config::JwtSpec,
+    require: Option<BTreeMap<String, serde_json::Value>>,
+    cookie: Option<String>,
+    login_url: Option<String>,
+    login_redirect_param: Option<String>,
+) {
+    if let Some(require) = require {
+        jwt.require.extend(require);
+    }
+    if cookie.is_some() {
+        jwt.cookie = cookie;
+    }
+    if login_url.is_some() {
+        jwt.login_url = login_url;
+    }
+    if login_redirect_param.is_some() {
+        jwt.login_redirect_param = login_redirect_param;
+    }
 }
 
 /// `GET /auth-providers[?namespace=]` — the providers this caller may see.
@@ -2380,6 +2540,8 @@ async fn create_auth_provider(
     caller: Option<axum::Extension<Caller>>,
     Json(body): Json<CreateProviderBody>,
 ) -> Response {
+    let has_tweaks = body.has_jwt_tweaks();
+    let tweaks = (body.require, body.cookie, body.login_url, body.login_redirect_param);
     let mut spec = body.spec;
 
     // Apply the preset before validation, so what is stored and what is checked
@@ -2434,6 +2596,19 @@ async fn create_auth_provider(
                 .into_response();
             }
         }
+    }
+
+    if has_tweaks {
+        let Some(jwt) = spec.jwt.as_mut() else {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "`require`, `cookie`, `login_url` and `login_redirect_param` tune a JWT \
+                 policy, and this provider has none — name a `preset` or send a `jwt` block",
+            )
+            .into_response();
+        };
+        let (require, cookie, login_url, login_redirect_param) = tweaks;
+        apply_jwt_tweaks(jwt, require, cookie, login_url, login_redirect_param);
     }
 
     // Bind the secret references to this provider's own namespace before
@@ -3043,6 +3218,7 @@ fn render_page(state: &AdminState, page: &str, headers: &axum::http::HeaderMap) 
         .unwrap_or_default();
     page.replace("{{HTML_ATTRS}}", &state.ui_cookies.attrs(cookies))
         .replace("{{WHO}}", &who)
+        .replace("{{HOME_URL}}", &state.home_url.as_deref().map(html_escape).unwrap_or_default())
 }
 
 /// `GET /__ui/*path` — the platform stylesheet, theme script and fonts.
@@ -4112,10 +4288,21 @@ async fn uncordon_upstream(
     Json(upstream_traffic_status(&deployment, &upstream)).into_response()
 }
 
+#[cfg(test)]
 fn record_only_refusal(d: &Deployment, workspace_state: bool) -> Option<&'static str> {
+    record_removal_refusal(d, workspace_state, false)
+}
+
+fn record_removal_refusal(d: &Deployment, workspace_state: bool, archive_history: bool) -> Option<&'static str> {
     let state = d.state();
+    if archive_history && d.spec.vm.as_ref().is_none_or(|vm| vm.driver != crate::config::Driver::Firecracker) {
+        return Some("retired record archival requires a managed Firecracker deployment");
+    }
     if state.create_attempts.iter().any(|a| a.allocation.is_some()) {
         return Some("correlated allocation receipts must be retained");
+    }
+    if archive_history && state.create_attempts.iter().any(|a| !a.runtime_observed) {
+        return Some("unobserved allocation attempts require reconciliation");
     }
     if !d.spec.routes.is_empty() {
         return Some("record-only removal requires a route-less deployment");
@@ -4132,14 +4319,22 @@ fn record_only_refusal(d: &Deployment, workspace_state: bool) -> Option<&'static
     if !state.suspended.is_empty() {
         return Some("record-only removal requires zero suspended VMs");
     }
-    if crate::rollout::reserved(d) || state.active_prefix.is_some() || !state.rollouts.is_empty() {
+    if crate::rollout::reserved(d) || (!archive_history && (state.active_prefix.is_some() || !state.rollouts.is_empty())) {
         return Some("record-only removal requires no retained rollout generations");
+    }
+    if archive_history && state.rollouts.iter().any(|op| match op.status.as_str() {
+        "succeeded" => !op.readiness_verified || !op.previous_stopped,
+        "failed" => !op.failure_settled,
+        _ => true,
+    }) {
+        return Some("only settled terminal rollout history can be archived");
     }
     if d.spec.vm.as_ref().is_some_and(|vm| vm.workspace.is_some()) || workspace_state {
         return Some("record-only removal requires no workspace configuration or retained workspace state");
     }
     if d.spec.build.is_some() || d.spec.artifact.is_some() || d.spec.update.is_some()
-        || d.spec.vm.as_ref().is_some_and(|vm| !vm.mounts.is_empty())
+        || d.spec.vm.as_ref().is_some_and(|vm| vm.workspace_archive.is_some()
+            || vm.mounts.iter().any(|mount| !archive_history || !mount.read_only))
     {
         return Some("record-only removal requires no build, artifact, host-update or mount job configuration");
     }
@@ -4210,6 +4405,27 @@ async fn deregister_record(
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    remove_deployment_record(state, id, headers, false).await
+}
+
+async fn deregister_retired_record(
+    State(state): State<AdminState>,
+    caller: Option<axum::Extension<Caller>>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if caller.as_ref().is_none_or(|caller| !fleet_handoff_authorized(&caller.0)) {
+        return forbidden("authenticated fleet admin required");
+    }
+    remove_deployment_record(state, id, headers, true).await
+}
+
+async fn remove_deployment_record(
+    state: AdminState,
+    id: String,
+    headers: axum::http::HeaderMap,
+    archive_history: bool,
+) -> Response {
     // Match rollout cutover's lock order and wait out adoption/promotion and
     // orphan sweeps, not just allocations. A separate endpoint makes an old
     // server reject this request instead of ignoring a query flag and tearing down.
@@ -4240,9 +4456,10 @@ async fn deregister_record(
             };
             return err(status, message).into_response();
         }
-        if let Some(message) = record_only_refusal(
+        if let Some(message) = record_removal_refusal(
             &d,
             state.autoscaler.workspaces().has_retained_state(&id),
+            archive_history,
         ) {
             return err(StatusCode::CONFLICT, message).into_response();
         }
@@ -4271,8 +4488,29 @@ async fn deregister_record(
         if !inventory.complete {
             return err(StatusCode::SERVICE_UNAVAILABLE, "complete disk inventory is required for record-only removal").into_response();
         }
-        if inventory.disks.iter().any(|disk| disk.deployment.as_deref() == Some(id.as_str())) {
+        let saved = d.state();
+        let historical_ids: std::collections::HashSet<&String> = crate::rollout::protected_ids(&saved)
+            .chain(saved.create_attempts.iter().filter_map(|attempt| attempt.sandbox_id.as_ref())).collect();
+        if inventory.disks.iter().any(|disk| disk.deployment.as_deref() == Some(id.as_str())
+            || historical_ids.contains(&disk.sandbox_id)) {
             return err(StatusCode::CONFLICT, "retained disks still reference this deployment").into_response();
+        }
+        if archive_history {
+            // Names may have changed outside this controller. Check historical
+            // IDs as well as ownership, including stopped runtimes with no disks.
+            let vms = state.autoscaler.vms();
+            match (vms.list().await, vms.list_inactive().await) {
+                (Ok(active), Ok(inactive)) => {
+                    if active.iter().chain(inactive.iter()).any(|vm| historical_ids.contains(&vm.id)) {
+                        return err(StatusCode::CONFLICT, "runtime still references a historical sandbox ID").into_response();
+                    }
+                }
+                _ => return err(StatusCode::SERVICE_UNAVAILABLE, "historical runtime inventory unavailable").into_response(),
+            }
+            if let Err(error) = state.registry.archive_record(&d) {
+                tracing::error!(deployment = %id, %error, "failed to archive retired deployment");
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "deployment history was not archived; record retained").into_response();
+            }
         }
         // Unlink first. A failure leaves the live registry untouched; a crash
         // between unlink and the in-memory removal merely keeps the record
@@ -4489,7 +4727,8 @@ impl VmTarget {
 
 /// Resolve a deployment to a VM that can run something, waking one if asked.
 ///
-/// The waiting half is the proxy's cold-start path (`proxy::wait_for_capacity`)
+/// The waiting half is the request manager's cold-start path
+/// (`request_control::wait_for_capacity`)
 /// reused verbatim, so an `exec` against a sleeping sandbox nudges the
 /// autoscaler and waits exactly as a request would — including the autoscaler's
 /// preference for resuming a suspended VM over booting a fresh one.
@@ -4547,7 +4786,7 @@ async fn hold_a_vm(
         )
         .into_response());
     }
-    match crate::proxy::wait_for_capacity(&d, &[], &state.metrics, &state.feed).await {
+    match crate::request_control::wait_for_capacity(&d, &[], &state.metrics, &state.feed).await {
         Some(b) => match b.try_hold() {
             Some(slot) => Ok(VmTarget::Ready(slot)),
             None => Err(err(
@@ -5635,6 +5874,12 @@ fn router(state: AdminState) -> Router {
         // hostnames may as well know.
         .route("/ingress", get(ingress))
         .route("/storage", get(storage_console))
+        // The plugin console and the list it renders. Fleet-wide, like the
+        // disk console: a plugin is a host-level capability, not a
+        // deployment's.
+        .route("/plugins", get(plugins_console))
+        .route("/api/plugins", get(list_plugins))
+        .route("/api/plugins/:id", get(get_plugin))
         // The network topology console. View tier, like the dashboard it sits
         // beside: it renders `/metrics` and `/ingress`, so it must work with
         // the browser's cached view credentials.
@@ -5649,6 +5894,7 @@ fn router(state: AdminState) -> Router {
         .route("/deployments/:id/rollouts/:operation", get(get_rollout))
         .route("/deployments/:id", get(get_one).put(update).delete(deregister))
         .route("/deployments/:id/record", axum::routing::delete(deregister_record))
+        .route("/deployments/:id/retired-record", axum::routing::delete(deregister_retired_record))
         .route("/deployments/:id/discovery-status", get(discovery_status))
         .route("/deployments/:id/scaling", patch(scale))
         .route("/deployments/:id/vms/:sandbox_id", delete(evict_vm))
@@ -5728,6 +5974,12 @@ fn router(state: AdminState) -> Router {
             "/auth-providers/:namespace/:name",
             get(get_auth_provider).delete(delete_auth_provider),
         )
+        // Switching a plugin on can open a public hostname onto this host or
+        // hand out database credentials, so it is CRUD-tier. The item `PUT`
+        // shares its path with the view-tier `GET` above, as `/namespaces` does.
+        .route("/api/plugins/:id", put(put_plugin))
+        .route("/api/plugins/:id/enable", post(enable_plugin))
+        .route("/api/plugins/:id/disable", post(disable_plugin))
         .route("/tokens", post(mint_token).get(list_tokens))
         .route(
             "/tokens/:id",
@@ -5794,12 +6046,29 @@ fn router(state: AdminState) -> Router {
         .route("/control-plane/config", get(view_configuration).put(configure_views))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth));
 
+    // Each plugin's own routes, under `/api/plugins/<id>/…`, on the same two
+    // tiers. They carry no state of ours, so the gate goes on them here and
+    // they are merged after `with_state` below.
+    let (plugin_view, plugin_crud) = state.plugins.routers();
+    let plugin_view = if plugin_view.has_routes() {
+        plugin_view.route_layer(middleware::from_fn_with_state(state.clone(), require_view_auth))
+    } else {
+        plugin_view
+    };
+    let plugin_crud = if plugin_crud.has_routes() && state.gate_admin {
+        plugin_crud.route_layer(middleware::from_fn_with_state(state.clone(), require_crud_auth))
+    } else {
+        plugin_crud
+    };
+
     Router::new()
         .route("/healthz", get(healthz))
         // Embedded static assets contain no fleet state. Sign-in needs them
         // before the browser has a credential; inventory stays behind its gate.
         .route("/__ui/*path", get(ui_asset))
         .route("/login", get(browser_login::page).post(browser_login::login)
+            .layer(axum::extract::DefaultBodyLimit::max(8192)))
+        .route("/login/handoff", post(browser_login::handoff)
             .layer(axum::extract::DefaultBodyLimit::max(8192)))
         .route("/logout", post(browser_login::logout))
         .merge(views)
@@ -5811,6 +6080,8 @@ fn router(state: AdminState) -> Router {
         .merge(crud)
         .merge(open)
         .with_state(state)
+        .merge(plugin_view)
+        .merge(plugin_crud)
 }
 
 #[async_trait]
@@ -6113,6 +6384,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preset_tweaks_merge_over_the_heyo_jwks_policy() {
+        let body: CreateProviderBody = serde_json::from_value(serde_json::json!({
+            "name": "heyo", "namespace": "acme", "preset": "heyo-jwks",
+            "require": {"accountId": ["acct-1"]}, "cookie": "heyo_token",
+            "login_url": "https://auth.example/login"
+        }))
+        .unwrap();
+        assert!(body.has_jwt_tweaks());
+        let mut jwt = crate::config::JwtSpec::heyo_jwks("https://auth.example/.well-known/jwks.json".into());
+        apply_jwt_tweaks(&mut jwt, body.require, body.cookie, body.login_url, body.login_redirect_param);
+        // The preset's role check survives; the account check is added.
+        assert_eq!(jwt.require["role"], serde_json::json!(["user", "admin"]));
+        assert_eq!(jwt.require["accountId"], serde_json::json!(["acct-1"]));
+        assert_eq!(jwt.cookie.as_deref(), Some("heyo_token"));
+        assert_eq!(jwt.login_url.as_deref(), Some("https://auth.example/login"));
+        assert_eq!(jwt.audience.as_deref(), Some("heyo-gate"));
+
+        let plain: CreateProviderBody =
+            serde_json::from_value(serde_json::json!({"name": "heyo", "preset": "heyo-jwks"})).unwrap();
+        assert!(!plain.has_jwt_tweaks());
+    }
+
+    #[test]
     fn discovery_bootstrap_cannot_shadow_another_route() {
         let registry = Registry::new("unused.json");
         let spec = |id: &str, host: &str, prefix: &str| -> DeploymentSpec {
@@ -6308,6 +6602,7 @@ mod tests {
             registry: Arc<Registry>,
             root: PathBuf,
             mutations: Arc<AtomicUsize>,
+            inactive: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         }
 
         impl Drop for Fixture {
@@ -6327,13 +6622,16 @@ mod tests {
             std::fs::create_dir_all(&root).unwrap();
             let mutations = Arc::new(AtomicUsize::new(0));
             let mutation_count = mutations.clone();
+            let inactive = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let inactive_rows = inactive.clone();
             let app = Router::new()
                 .route("/deployed-sandboxes", get(move || async move {
                     if inventory_available { Json(serde_json::json!([])).into_response() }
                     else { StatusCode::SERVICE_UNAVAILABLE.into_response() }
                 }))
-                .route("/sandboxes/inactive", get(|| async {
-                    Json(serde_json::json!({"sandboxes": [], "next_cursor": null}))
+                .route("/sandboxes/inactive", get(move || {
+                    let rows = inactive_rows.lock().unwrap().clone();
+                    async move { Json(serde_json::json!({"sandboxes": rows, "next_cursor": null})) }
                 }))
                 .route("/storage", get(|| async {
                     Json(serde_json::json!({
@@ -6399,8 +6697,12 @@ mod tests {
                 None, None, Arc::new(crate::guard::Guard::new(root.join("guard.json"), false)),
                 Some(disks), PublicUrl::from_config(false, "127.0.0.1:80", "127.0.0.1:443"),
                 feed, &[], None,
+                Arc::new(crate::plugins::PluginHost::new(
+                    Vec::new(),
+                    crate::plugins::PluginStore::new(root.join("plugins")),
+                )),
             );
-            Fixture { state: api.state, registry, root, mutations }
+            Fixture { state: api.state, registry, root, mutations, inactive }
         }
 
         mod retirement_tests {
@@ -6652,6 +6954,109 @@ mod tests {
                 "vm": {"driver": "firecracker", "port": 8080},
                 "scaling": {"min_replicas": 0, "warm_pool": 0}
             })).unwrap()))
+        }
+
+        fn completed_history(d: &Deployment) {
+            let op = crate::rollout::Operation {
+                operation_id: "finished-1".into(), deployment: d.spec.id.clone(),
+                source_revision: "before".into(), target_spec_sha256: crate::rollout::fingerprint(&d.spec),
+                status: "succeeded".into(), phase: "complete".into(), readiness_verified: true,
+                previous_stopped: true, error: None, preparation_stage: None,
+                spec: d.spec.clone(), prepared: None, prefix: "applb-obsolete-r123-".into(),
+                allocations: vec![crate::rollout::Allocation { name: "applb-obsolete-r123-0".into(),
+                    sandbox_id: Some("sb-retired".into()), attempted: true }],
+                previous: vec!["sb-predecessor".into()], stopped: vec!["sb-predecessor".into()],
+                deadline: 1, drain_deadline: Some(1), reclaimed_candidate_ids: vec![], failure_settled: false,
+            };
+            d.mutate_state(|s| {s.active_prefix = Some(op.prefix.clone()); s.rollouts = vec![op];});
+        }
+
+        #[test]
+        fn retired_record_requires_settled_history_without_relaxing_normal_delete() {
+            let d = empty();
+            completed_history(&d);
+            assert!(record_only_refusal(&d, false).is_some());
+            assert_eq!(record_removal_refusal(&d, false, true), None);
+            for (status, settled, ready, stopped, permitted) in [
+                ("failed", false, true, true, false), ("failed", true, false, false, true),
+                ("running", true, true, true, false), ("reconciliation_required", true, true, true, false),
+                ("unknown", true, true, true, false), ("succeeded", false, false, true, false),
+                ("succeeded", false, true, false, false), ("succeeded", false, true, true, true),
+            ] {
+                d.mutate_state(|s| {let op = &mut s.rollouts[0]; op.status = status.into();
+                    op.failure_settled = settled; op.readiness_verified = ready; op.previous_stopped = stopped;});
+                assert_eq!(record_removal_refusal(&d, false, true).is_none(), permitted, "{status}/{settled}/{ready}/{stopped}");
+            }
+        }
+
+        #[tokio::test]
+        async fn retired_record_archives_exact_history_and_does_not_resurrect_on_restart() {
+            let f = fixture(true).await;
+            let d = f.registry.get("obsolete").unwrap();
+            completed_history(&d);
+            let saved = (*d.state()).clone();
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::IF_MATCH, deployment_etag(&d.spec).unwrap().parse().unwrap());
+            assert_eq!(remove_deployment_record(f.state.clone(), "obsolete".into(), headers, true).await.status(), StatusCode::NO_CONTENT);
+            let files: Vec<_> = std::fs::read_dir(f.registry.state_dir().join("retired")).unwrap().map(Result::unwrap).collect();
+            assert_eq!(files.len(), 1);
+            let report: serde_json::Value = serde_json::from_slice(&std::fs::read(files[0].path()).unwrap()).unwrap();
+            assert_eq!(report["state"], serde_json::to_value(saved).unwrap());
+            assert_eq!(report["spec"], serde_json::to_value(&d.spec).unwrap());
+            let restarted = Registry::new(f.root.join("deployments.json"));
+            restarted.load().unwrap();
+            restarted.require_complete_load().unwrap();
+            assert!(restarted.get("obsolete").is_none());
+            assert_eq!(f.mutations.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn retired_record_archive_failure_keeps_registration_and_history() {
+            let f = fixture(true).await;
+            let d = f.registry.get("obsolete").unwrap();
+            completed_history(&d);
+            let saved = (*d.state()).clone();
+            std::fs::write(f.registry.state_dir().join("retired"), b"not a directory").unwrap();
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::IF_MATCH, deployment_etag(&d.spec).unwrap().parse().unwrap());
+            assert_eq!(remove_deployment_record(f.state.clone(), "obsolete".into(), headers, true).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(f.registry.get("obsolete").is_some());
+            assert!(persisted(&f.registry.state_dir()));
+            assert_eq!(*d.state(), saved);
+            assert_eq!(f.mutations.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn retired_record_refuses_renamed_historical_runtime_and_missing_inventory() {
+            for available in [true, false] {
+                let f = fixture(available).await;
+                let d = f.registry.get("obsolete").unwrap();
+                completed_history(&d);
+                if available {
+                    f.inactive.lock().unwrap().push(serde_json::json!({
+                        "id":"sb-retired", "name":"applb-other-000000000001", "status":"stopped",
+                        "image":"artifacts", "uptime_secs":0, "is_deployed":true, "status_changed_at":"", "urls":[]
+                    }));
+                }
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(header::IF_MATCH, deployment_etag(&d.spec).unwrap().parse().unwrap());
+                let result = remove_deployment_record(f.state.clone(), "obsolete".into(), headers, true).await;
+                assert_eq!(result.status(), if available {StatusCode::CONFLICT} else {StatusCode::SERVICE_UNAVAILABLE});
+                assert!(f.registry.get("obsolete").is_some());
+                assert!(!f.registry.state_dir().join("retired").exists());
+                assert_eq!(f.mutations.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn retired_record_requires_authentication_even_on_ungated_crud() {
+            let f = fixture(true).await;
+            let request = Request::builder().method("DELETE").uri("/deployments/obsolete/retired-record")
+                .body(Body::empty()).unwrap();
+            let mut app = router(f.state.clone());
+            std::future::poll_fn(|cx| <Router as Service<Request<Body>>>::poll_ready(&mut app, cx)).await.unwrap();
+            assert_eq!(app.call(request).await.unwrap().status(), StatusCode::FORBIDDEN);
+            assert!(f.registry.get("obsolete").is_some());
         }
 
         #[test]
@@ -7154,6 +7559,7 @@ mod tests {
                     .replace("{{HTML_ATTRS}}", r#"data-theme="light""#)
                     .replace("{{WHO}}", "ops@example.com")
                     .replace("{{SESSION_ACTION}}", "")
+                    .replace("{{HOME_URL}}", "")
                     .replace("{{LEDE}}", "")
                     .replace("{{CARDS}}", "");
                 assert!(!rendered.contains("{{"), "{name} left a placeholder unfilled");
@@ -7393,14 +7799,29 @@ mod tests {
     mod page_consistency {
         use super::*;
 
-        fn pages() -> [(&'static str, &'static str); 5] {
+        fn pages() -> [(&'static str, &'static str); 6] {
             [
                 ("dashboard", DASHBOARD_HTML),
                 ("directory", DIRECTORY_HTML),
                 ("siem", SIEM_HTML),
                 ("disks", DISKS_HTML),
+                ("plugins", PLUGINS_HTML),
                 ("network", NETWORK_HTML),
             ]
+        }
+
+        /// Every page links every other: a page missing from one nav bar is
+        /// a page nobody finds.
+        #[test]
+        fn every_page_links_every_page() {
+            for (name, html) in pages() {
+                for href in ["/", "/dashboard", "/siem", "/storage", "/plugins", "/metrics"] {
+                    assert!(
+                        html.contains(&format!(r#"<a href="{href}""#)),
+                        "{name}'s nav has no link to {href}",
+                    );
+                }
+            }
         }
 
         /// The theme is a **cookie** now, not this origin's localStorage, and no

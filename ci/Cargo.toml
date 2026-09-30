@@ -19,6 +19,8 @@ heyo-sdk = "=0.1.12"
 # JetStream. Pinned to the version heyvm itself links (mvm-ctrl/Cargo.toml) so a
 # future decision to share a stream is a routing change, not a version upgrade.
 async-nats = "0.47"
+# Select one provider explicitly: the SDK and NATS enable both ring and AWS-LC.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 
 tokio = { version = "1", features = [
     "rt-multi-thread",

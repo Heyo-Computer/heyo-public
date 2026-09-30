@@ -1,0 +1,36 @@
+[
+  {
+    "id": "example",
+    "name": "Example",
+    "description": "A plugin that is switched on and failing.",
+    "config_schema": {
+      "properties": {
+        "url": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "enabled": true,
+    "config": {
+      "url": "http://127.0.0.1:34199"
+    },
+    "updated_at": 1760000000,
+    "last_error": "connection refused",
+    "status": {
+      "state": "retrying"
+    }
+  },
+  {
+    "id": "idle",
+    "name": "Idle",
+    "description": "A plugin nobody switched on.",
+    "config_schema": {
+      "type": "object"
+    },
+    "enabled": false,
+    "config": null,
+    "updated_at": 0,
+    "status": {}
+  }
+]

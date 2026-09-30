@@ -65,6 +65,10 @@ enum Command {
     /// Read a namespace's event feed — the RSS of deployments that opted in.
     Feed(cmd::feed::FeedArgs),
 
+    /// List, enable, disable and configure app-lb's built-in plugins.
+    #[command(subcommand, visible_alias = "plugin")]
+    Plugins(cmd::plugins::PluginsCmd),
+
     /// Manage stored contexts.
     Config {
         #[command(subcommand)]
@@ -307,6 +311,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Whoami => cmd::auth::whoami(g),
         Command::Token(cmd) => cmd::token::run(&Ctx::new(g)?, cmd),
         Command::Feed(args) => cmd::feed::run(&Ctx::new(g)?, args),
+        Command::Plugins(cmd) => cmd::plugins::run(&Ctx::new(g)?, cmd),
         Command::Completion { shell } => {
             let mut command = Cli::command();
             let name = command.get_name().to_string();

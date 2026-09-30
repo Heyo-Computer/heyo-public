@@ -14,6 +14,22 @@ impl Drop for Proxies {
 
 fn free_port() -> u16 { std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port() }
 
+fn forwarding_children(parent: u32) -> Result<Vec<u32>> {
+    let mut children = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{parent}/task"))? {
+        let path = task?.path().join("children");
+        let Ok(contents) = std::fs::read_to_string(path) else { continue; };
+        for pid in contents.split_whitespace() {
+            let pid: u32 = pid.parse()?;
+            let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            if cmd.split(|b| *b == 0).any(|arg| arg == b"--forwarding-worker") { children.push(pid); }
+        }
+    }
+    children.sort_unstable();
+    children.dedup();
+    Ok(children)
+}
+
 fn openssl(root: &Path, args: &[&str]) {
     let output = std::process::Command::new("openssl").args(args).current_dir(root).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -145,13 +161,19 @@ async fn two_real_gateways_scenario() -> Result<()> {
     let cloud_creates = create_count.clone();
     let archive_drift = Arc::new(AtomicUsize::new(0));
     let drift_on_download = archive_drift.clone();
-    let control = Router::new().route("/snapshot", get(|State(db): State<sea_orm::DatabaseConnection>, headers: HeaderMap,
-        Query(query): Query<service_discovery::DiscoveryQuery>| async move {
+    let discovery_unavailable = Arc::new(AtomicUsize::new(0));
+    let discovery_failure = discovery_unavailable.clone();
+    let control = Router::new().route("/snapshot", get(move |State(db): State<sea_orm::DatabaseConnection>, headers: HeaderMap,
+        Query(query): Query<service_discovery::DiscoveryQuery>| {
+        let discovery_failure = discovery_failure.clone();
+        async move {
         if headers.get("authorization").is_none_or(|v| v != "Bearer discovery-test") { return (StatusCode::UNAUTHORIZED, Json(json!({}))); }
+        if discovery_failure.load(Ordering::SeqCst) != 0 { return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({}))); }
         match service_discovery::read_regional_snapshot(&db, "smoke", query.region.as_deref().unwrap_or(""),
             query.gateway_id.as_deref().unwrap_or(""), query.boot_id.as_deref().unwrap_or("")).await {
             Ok(snapshot) => (StatusCode::OK, Json(snapshot)),
             Err(_) => (StatusCode::CONFLICT, Json(json!({"error":"unpublished or unpinned"}))),
+        }
         }
     })).route("/v1/secrets/read", post(move |headers: HeaderMap| {
         let token = secret_token.clone();
@@ -357,6 +379,39 @@ async fn two_real_gateways_scenario() -> Result<()> {
         .await.unwrap_err().to_string().contains("binding changed"));
     let request = |port, path: &str| client.get(format!("http://127.0.0.1:{port}{path}")).header("host","smoke.example").bearer_auth("application-value");
     assert_eq!(request(proxy_ports[1],"/before").send().await?.error_for_status()?.text().await?,"eu1:fixture-v1");
+    // Replacing forwarding must not replace the manager, its route state, or
+    // its regional boot identity. This intentionally tests crash recovery, not
+    // a zero-interruption hot takeover (a separate protocol).
+    let manager_pid = proxies.0[1].id();
+    let children = forwarding_children(manager_pid)?;
+    assert_eq!(children.len(), 1, "exactly one forwarding child per manager");
+    let old_worker = children[0];
+    assert_eq!(request(proxy_ports[1],"/oversized-head").header("x-large", "x".repeat(300_000))
+        .send().await?.status(), StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+    assert_eq!(request(proxy_ports[1],"/after-oversized-head").send().await?.error_for_status()?.text().await?, "eu1:fixture-v1");
+    assert_eq!(forwarding_children(manager_pid)?, vec![old_worker], "oversized headers must not restart the worker");
+    let observer = &state.config.discovery_observers[1];
+    let status_url = format!("{}/deployments/smoke/discovery-status", observer.base_url);
+    let before: Value = client.get(&status_url).bearer_auth(&token).send().await?.error_for_status()?.json().await?;
+    assert!(std::process::Command::new("kill").args(["-KILL", &old_worker.to_string()]).status()?.success());
+    let mut recovered = false;
+    for _ in 0..100 {
+        assert!(proxies.0[1].try_wait()?.is_none(), "manager must survive worker failure");
+        let after: Value = client.get(&status_url).bearer_auth(&token).send().await?.error_for_status()?.json().await?;
+        assert_eq!(before["regional"]["bootId"], after["regional"]["bootId"]);
+        let children = forwarding_children(manager_pid)?;
+        if children.len() == 1 && children[0] != old_worker {
+            if let Ok(response) = request(proxy_ports[1],"/worker-replaced").send().await {
+                if response.status().is_success() {
+                    assert_eq!(response.text().await?, "eu1:fixture-v1");
+                    recovered = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(recovered, "replacement worker must serve through the unchanged manager");
     let held_request = request(proxy_ports[1],"/held").timeout(Duration::from_secs(60));
     let held = tokio::spawn(async move { held_request.send().await?.error_for_status()?.text().await });
     tokio::time::timeout(Duration::from_secs(5),entered.notified()).await?;
@@ -379,6 +434,32 @@ async fn two_real_gateways_scenario() -> Result<()> {
     assert_eq!(snapshot["closedThroughGeneration"],2);
     assert_eq!(snapshot["activeGeneration"],2);
     assert!(regional_reports::ready(&db,"smoke","withdraw-eu",2,regional_reports::Gate::AdmissionDrained).await?);
+    // Keep the authenticated admin endpoints reachable while discovery fails.
+    // Fresh polling must not turn an expired routing snapshot into permission
+    // for maintenance, even when every request counter is zero.
+    discovery_unavailable.store(1,Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    super::regional_observers::observe_policy(&state,&db,"smoke","withdraw-eu",2,&participants).await?;
+    for gate in [regional_reports::Gate::Prepared,regional_reports::Gate::Adopted,
+        regional_reports::Gate::AssignmentsDrained,regional_reports::Gate::AdmissionDrained] {
+        assert!(!regional_reports::ready(&db,"smoke","withdraw-eu",2,gate).await?,
+            "fresh admin responses must not attest stale discovery");
+    }
+    for port in &proxy_ports {
+        assert_eq!(request(*port,"/authority-unavailable").send().await?.error_for_status()?.text().await?,"us3:fixture-v1");
+    }
+    assert_eq!(eu_admissions.load(Ordering::SeqCst),admissions);
+    discovery_unavailable.store(0,Ordering::SeqCst);
+    let mut renewed = false;
+    for _ in 0..100 {
+        super::regional_observers::observe_policy(&state,&db,"smoke","withdraw-eu",2,&participants).await?;
+        if regional_reports::ready(&db,"smoke","withdraw-eu",2,regional_reports::Gate::AdmissionDrained).await? {
+            renewed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(renewed,"valid discovery must renew evidence without another withdrawal");
     // The new candidate is deliberately unknown/draining in discovery and
     // distinct from the healthy retained replica. Probe it through real HTTPS
     // gateways, never through a controller-to-VM health request.

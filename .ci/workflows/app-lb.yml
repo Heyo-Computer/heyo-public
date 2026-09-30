@@ -32,9 +32,9 @@ on:
   submit:
     paths:
       # app-lb's subtree covers `app-lb/heyctl/` too — `**` crosses segments.
-      # The workspace has no path dependency outside its own directory, so
-      # unlike the `heyo` monorepo there is no sibling crate to list here.
       - 'app-lb/**'
+      # The one path dependency outside it: the pg-fc plugin's wire types.
+      - 'pg-fc/api/**'
       # This workflow and the image it builds in — named precisely rather than
       # as `.ci/**`, so adding a workflow for another crate here does not
       # rebuild this one. The image is shared with `app-obs.yml`, so editing
@@ -271,6 +271,30 @@ jobs:
           ( cd dist && sha256sum app-lb heyctl REVISION > SHA256SUMS )
           ls -la dist
           cat dist/BUILD-INFO
+
+      # Keep the disposable CA feature out of the shipped release binary.
+      # Exercise real proxy traffic, including TLS, rather than only linking.
+      - name: Prepare protocol test tools
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          export TZ=Etc/UTC
+          timeout 120 apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=20 update
+          timeout 120 apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=20 install -y --no-install-recommends python3 openssl
+        timeout-minutes: 5
+
+      - name: Build protocol test binary
+        working-directory: /workspace
+        run: |
+          set -eu
+          export HEYO_BUILD_GIT_SHA='${{ ci.sha }}'
+          cargo build --locked --manifest-path app-lb/Cargo.toml --features reqwest/rustls-tls-native-roots
+        timeout-minutes: 15
+
+      - name: Verify proxy protocol compatibility
+        working-directory: /workspace
+        run: APP_LB_TEST_BINARY="$CARGO_TARGET_DIR/debug/app-lb" python3 -u -B app-lb/testdata/gateway_smoke.py
+        timeout-minutes: 3
 
       # Lands in whichever sink the orchestrator is configured for — `disk`
       # (CI_ARTIFACT_DIR) by default, or the central `art serve` when

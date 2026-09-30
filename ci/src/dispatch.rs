@@ -32,7 +32,7 @@ use crate::expr::Context;
 use crate::plan::JobPlan;
 use crate::pool::Pool;
 use crate::runners::Runners;
-use crate::store::{JobStatus, RunStatus, StepStatus, Store, step_id};
+use crate::store::{JobClaim, JobStatus, RunStatus, StepStatus, Store, step_id};
 use crate::vm::{ExecOutput, SizeCheck, Vm, VmError, Vms, sandbox_name};
 use crate::workflow::{Fallback, Step};
 use async_nats::jetstream::AckKind;
@@ -162,8 +162,7 @@ impl QueueVerdict {
 }
 
 pub struct Dispatcher {
-    pub lifecycle: Arc<crate::lifecycle::Lifecycle>,
-    pub executor: Arc<crate::executor::ExecutorOwner>,
+    pub executor: Arc<crate::executor::ExecutorInstance>,
     pub config: Arc<Config>,
     pub store: Store,
     pub pool: Pool,
@@ -206,7 +205,7 @@ impl Dispatcher {
         actor: Option<&crate::web::identity::Identity>,
         repo: Option<&crate::store::Repo>,
     ) -> Result<Submitted, DispatchError> {
-        let _admission = self.lifecycle.admission(&self.store).await
+        let _admission = self.executor.admission_permit().await
             .map_err(DispatchError::ControllerUnavailable)?;
         self.submit_admitted(req, actor, repo).await
     }
@@ -243,6 +242,16 @@ impl Dispatcher {
         let repo_url = match repo {
             Some(r) => r.url.clone(),
             None => req.repository.url.clone(),
+        };
+
+        // Policy comes from the CI service's operator configuration, never the
+        // submitted tree. Resolve every target before admitting any run.
+        let release_policy = crate::release_policy::select(self.config.release_policies.as_deref(), &repo_url)
+            .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+        let operator_plan = match &release_policy {
+            Some(policy) => Some(crate::release_policy::prepare(self, &repo_url, policy).await
+                .map_err(|e| DispatchError::Workflow(e.to_string()))?),
+            None => None,
         };
 
         // A registered workflow object decides the path glob and the id; without
@@ -341,8 +350,12 @@ impl Dispatcher {
         // not only on a page nobody has open.
         let mut warnings: Vec<String> = Vec::new();
 
-        for source in &sources {
-            let files = crate::trigger::find_workflows(&workspace.root, &source.pattern)?;
+        for (source_index, source) in sources.iter().enumerate() {
+            let mut files = crate::trigger::find_workflows(&workspace.root, &source.pattern)?;
+            if let Some(policy) = &release_policy {
+                files = crate::release_policy::workflows(files, policy, source_index == 0)
+                    .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+            }
             patterns_tried.push(source.pattern.clone());
             if files.is_empty() {
                 continue;
@@ -421,8 +434,11 @@ impl Dispatcher {
                         continue;
                     }
                 }
-                let mut plan = crate::plan::Plan::build(&wf)
-                    .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+                let mut plan = match operator_plan.as_ref().filter(|_| is_release) {
+                    Some(plan) => plan.clone(),
+                    None => crate::plan::Plan::build(&wf)
+                        .map_err(|e| DispatchError::Workflow(e.to_string()))?,
+                };
                 if is_release {
                     crate::submission::validate_release_plan(&plan)
                         .map_err(DispatchError::Workflow)?;
@@ -563,7 +579,6 @@ impl Dispatcher {
         warnings.extend(skipped.into_iter().map(|s| format!("no run started — {s}")));
         let mut tx = self.store.pool().begin().await
             .map_err(|e| DispatchError::Workflow(format!("begin submission: {e}")))?;
-        crate::lifecycle::Lifecycle::admit_in(&mut tx).await.map_err(DispatchError::Workflow)?;
         for (id, request, plan) in &planned {
             Store::create_run_in(&mut tx, id, request, plan).await?;
             Store::record_source_in(&mut tx, id, &source_bytes).await?;
@@ -616,7 +631,7 @@ impl Dispatcher {
         failed_only: bool,
         actor: Option<&crate::web::identity::Identity>,
     ) -> Result<Submitted, DispatchError> {
-        let _admission = self.lifecycle.admission(&self.store).await
+        let _admission = self.executor.admission_permit().await
             .map_err(DispatchError::ControllerUnavailable)?;
         let run = self
             .store
@@ -666,6 +681,30 @@ impl Dispatcher {
             )));
         }
 
+        // A published release is not an ordinary partial submit. Re-planning
+        // it would remove the release workflow, and running the merge again
+        // could publish a second candidate. Admit a failed-only attempt from
+        // the persisted plans and immutable publication/submission evidence.
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM ci_submission WHERE release_run_id=$1)",
+        )
+        .bind(run_id)
+        .fetch_one(self.store.pool())
+        .await
+        .map_err(|e| DispatchError::Workflow(format!("inspect release submission: {e}")))?
+        {
+            if !failed_only {
+                return Err(DispatchError::Workflow(
+                    "full release reruns are unsupported because they could publish the merge again; use Re-run failed jobs on the latest failed release attempt".into(),
+                ));
+            }
+            let submitted = self.retry_published_release(run_id, actor).await?;
+            for id in &submitted.run_ids {
+                self.advance_run(id).await?;
+            }
+            return Ok(submitted);
+        }
+
         let bytes = self.store.source_bytes(run_id).await?;
 
         let req = crate::trigger::SubmitRequest {
@@ -713,6 +752,162 @@ impl Dispatcher {
             submitted.run_ids.join(", ")
         );
         Ok(submitted)
+    }
+
+    async fn retry_published_release(
+        &self,
+        run_id: &str,
+        actor: Option<&crate::web::identity::Identity>,
+    ) -> Result<Submitted, DispatchError> {
+        let retry = crate::vm::new_id();
+        let mut tx = self.store.pool().begin().await
+            .map_err(|e| DispatchError::Workflow(format!("begin release retry: {e}")))?;
+        let source = sqlx::query(
+            "SELECT r.status,rel.status AS release_status
+               FROM ci_run r JOIN ci_submission sub ON sub.release_run_id=r.id
+               LEFT JOIN ci_release rel ON rel.run_id=r.id
+              WHERE r.id=$1 FOR UPDATE OF r,sub",
+        ).bind(run_id).fetch_optional(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("lock release retry source: {e}")))?
+            .ok_or_else(|| DispatchError::Workflow(
+                "release retry requires one unambiguous admitted submission".into()))?;
+        if source.get::<Option<String>, _>("release_status").as_deref() != Some("published") {
+            return Err(DispatchError::Workflow(
+                "release retry requires a confirmed published release; reconcile publication before retrying failed jobs".into(),
+            ));
+        }
+        if !matches!(source.get::<String, _>("status").as_str(), "failure" | "cancelled") {
+            return Err(DispatchError::Workflow(
+                "only a failed or cancelled published release can retry failed jobs".into(),
+            ));
+        }
+        let merge_complete: bool = sqlx::query_scalar(
+            "SELECT count(*)=1 AND bool_and(j.status='success') FROM ci_job j,
+             LATERAL jsonb_array_elements(j.plan->'steps') s
+             WHERE j.run_id=$1 AND s->>'uses'='ci/merge-release'",
+        ).bind(run_id).fetch_one(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("inspect publication job: {e}")))?;
+        if !merge_complete {
+            return Err(DispatchError::Workflow(
+                "reconcile the published merge job before retrying; release retry never repeats publication".into(),
+            ));
+        }
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ci_job WHERE run_id=$1 AND status NOT IN ('success','failure','skipped','cancelled'))
+                 OR EXISTS(SELECT 1 FROM ci_service_deployment WHERE run_id=$1 AND status NOT IN ('passed','failed'))
+                 OR EXISTS(SELECT 1 FROM ci_service_deployment d JOIN ci_service_rollout s ON s.id=d.id
+                            WHERE d.run_id=$1 AND d.status='failed' AND d.phase IS DISTINCT FROM 'settled_failure')",
+        ).bind(run_id).fetch_one(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("inspect release retry settlement: {e}")))?;
+        if active {
+            return Err(DispatchError::Workflow(
+                "release work is still active or an earlier rollout failure is not terminally settled; reconcile it before retrying".into(),
+            ));
+        }
+        let partial_effect: Option<String> = sqlx::query_scalar(
+            "SELECT j.job_key FROM ci_job j JOIN ci_step s ON s.job_id=j.id
+              WHERE j.run_id=$1 AND j.status<>'success' AND s.status='success'
+                AND s.uses IN ('ci/deploy-service','ci/deploy-app-lb','ci/deploy-controller',
+                               'ci/host-heyvm-maintenance','ci/bootstrap-host-heyvm',
+                               'ci/rollout-host-heyvmd','ci/rollout-service','ci/rollout-host-app-lb')
+                AND NOT (s.uses IN ('ci/rollout-service','ci/rollout-host-app-lb')
+                    AND COALESCE(j.plan->'native_labels','[]'::jsonb)='[]'::jsonb
+                    AND (EXISTS(SELECT 1 FROM ci_service_deployment d WHERE d.step_id=s.id AND d.status='passed')
+                         OR EXISTS(SELECT 1 FROM ci_release_carried_deployment c
+                                   JOIN ci_service_deployment d ON d.id=c.deployment_id
+                                   WHERE c.job_id=j.id AND c.step_index=s.idx AND d.status='passed')))
+              ORDER BY j.created_at LIMIT 1",
+        ).bind(run_id).fetch_optional(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("inspect completed release effects: {e}")))?;
+        if let Some(job) = partial_effect {
+            return Err(DispatchError::Workflow(format!(
+                "release job {job:?} already completed a deployment step before failing; reconcile that deployment instead of repeating the job"
+            )));
+        }
+
+        // The unique retry_of index is the concurrent duplicate guard. Since
+        // every accepted child is itself a submission, an old ancestor also
+        // remains permanently ineligible for replay.
+        let has_child: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ci_submission WHERE retry_of=$1)",
+        ).bind(run_id).fetch_one(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("inspect release retry lineage: {e}")))?;
+        if has_child {
+            return Err(DispatchError::Workflow(
+                "this release attempt already has a retry; retry failed jobs on the latest descendant instead".into(),
+            ));
+        }
+
+        sqlx::query(
+            "INSERT INTO ci_run(id,workflow_id,workflow_path,workflow_name,repo_url,git_ref,sha,before_sha,
+                                actor_subject,actor_email,source,status,repo_id,changes,rerun_of,default_branch,release_base_sha)
+             SELECT $2,workflow_id,workflow_path,workflow_name,repo_url,git_ref,sha,before_sha,$3,$4,
+                    'rerun','queued',repo_id,changes,$1,default_branch,release_base_sha FROM ci_run WHERE id=$1",
+        ).bind(run_id).bind(&retry).bind(actor.map(|a| &a.subject)).bind(actor.map(|a| &a.email))
+            .execute(&mut *tx).await.map_err(|e| DispatchError::Workflow(format!("create release retry: {e}")))?;
+        let copied_source = sqlx::query("INSERT INTO ci_run_source(run_id,descriptor) SELECT $2,descriptor FROM ci_run_source WHERE run_id=$1")
+            .bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("copy release source: {e}")))?;
+        if copied_source.rows_affected() != 1 {
+            return Err(DispatchError::Workflow(
+                "release retry requires the original persisted source descriptor".into(),
+            ));
+        }
+        let jobs = sqlx::query("SELECT job_key,status,outputs FROM ci_job WHERE run_id=$1 ORDER BY created_at,id")
+            .bind(run_id).fetch_all(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("read release jobs: {e}")))?;
+        sqlx::query(
+            "INSERT INTO ci_job(id,run_id,job_key,base_id,display,network,status,matrix,outputs,plan,carried_from,started_at,finished_at)
+             SELECT $2||'.'||job_key,$2,job_key,base_id,display,network,
+                    CASE WHEN status='success' THEN 'success' ELSE 'pending' END,matrix,
+                    CASE WHEN status='success' THEN outputs ELSE '{}'::jsonb END,plan,
+                    CASE WHEN status='success' THEN $1 ELSE NULL END,
+                    CASE WHEN status='success' THEN now() ELSE NULL END,
+                    CASE WHEN status='success' THEN now() ELSE NULL END
+               FROM ci_job WHERE run_id=$1",
+        ).bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("copy release job plans: {e}")))?;
+        sqlx::query(
+            "INSERT INTO ci_release_carried_deployment(job_id,step_index,deployment_id)
+             SELECT $2||'.'||j.job_key,s.idx,d.id FROM ci_job j
+               JOIN ci_step s ON s.job_id=j.id JOIN ci_service_deployment d ON d.step_id=s.id
+              WHERE j.run_id=$1 AND s.status='success' AND d.status='passed'
+                AND s.uses IN ('ci/rollout-service','ci/rollout-host-app-lb')
+             UNION
+             SELECT $2||'.'||j.job_key,c.step_index,c.deployment_id FROM ci_job j
+               JOIN ci_release_carried_deployment c ON c.job_id=j.id WHERE j.run_id=$1",
+        ).bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("preserve completed deployment receipts: {e}")))?;
+        sqlx::query("INSERT INTO ci_submission(release_run_id,validation_count,retry_of) SELECT $2,validation_count,$1 FROM ci_submission WHERE release_run_id=$1")
+            .bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("record release retry: {e}")))?;
+        let copied_validations = sqlx::query("INSERT INTO ci_submission_validation(release_run_id,validation_run_id,ordinal) SELECT $2,validation_run_id,ordinal FROM ci_submission_validation WHERE release_run_id=$1")
+            .bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("copy frozen validations: {e}")))?;
+        let expected: i64 = sqlx::query_scalar("SELECT validation_count::bigint FROM ci_submission WHERE release_run_id=$1")
+            .bind(&retry).fetch_one(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("verify frozen validations: {e}")))?;
+        if copied_validations.rows_affected() as i64 != expected {
+            return Err(DispatchError::Workflow(
+                "release retry found incomplete frozen validation membership".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status,error)
+             SELECT $2,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,'published',NULL FROM ci_release WHERE run_id=$1",
+        ).bind(run_id).bind(&retry).execute(&mut *tx).await
+            .map_err(|e| DispatchError::Workflow(format!("copy published release: {e}")))?;
+        Store::add_event(&mut tx, &retry, None, None, None, "ci.run.status.v1", "queued", None).await?;
+        for job in jobs {
+            let key: String = job.get("job_key");
+            let status = if job.get::<String, _>("status") == "success" { "success" } else { "pending" };
+            Store::add_event(&mut tx, &retry, Some(&crate::store::job_id(&retry, &key)), Some(&key), None,
+                "ci.job.status.v1", status, None).await?;
+        }
+        tx.commit().await.map_err(|e| DispatchError::Workflow(format!("commit release retry: {e}")))?;
+        Ok(Submitted { run_ids: vec![retry.clone()], warnings: vec![
+            format!("release retry reuses published candidate and frozen validation artifacts from {run_id}")
+        ], submission: Some(retry) })
     }
 
     /// Fill a failed-only re-run's jobs with the results their counterparts
@@ -1137,10 +1332,11 @@ impl Dispatcher {
         let pool = self.runners.snapshot();
         let placement = Self::place(&pool, plan)?;
 
-        // A resolved node is a pinned queue, whatever put it there — `uses:
-        // default`, an explicit node, or a named VM. Only "any host in this
-        // network" goes on the network's shared queue.
-        if let Some(node) = placement.node {
+        // Movable jobs use the shared queue even before a drain, so queued
+        // work does not become stranded when its preferred host goes away.
+        // Explicit VM targets can never move to a different host.
+        if let Some(node) = placement.node
+            && (plan.fallback != Fallback::Any || placement.vm.is_some()) {
             return Ok(Route::Runner(node.id.clone()));
         }
         if placement.network.network_id.is_empty() {
@@ -1175,7 +1371,7 @@ impl Dispatcher {
             .map_err(|e| DispatchError::StepFailed(e.to_string()))?
             || crate::host_heyvm_bootstrap_coordinator::owns_job(&self.store, &msg.job_id).await
             .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Ok(JobStatus::Running); }
-        let (runner, existing_vm) = self.pick_runner(&plan).await?;
+        let (runner, existing_vm) = self.pick_runner(&plan, &msg.run_id).await?;
 
         // The one place a job's failure and its runner are both in hand. A
         // transport-level failure means the cached iroh tunnel is dead — the
@@ -1213,18 +1409,19 @@ impl Dispatcher {
         //
         // Another delivery may already own this job. Redelivery cannot grant
         // a second execution, even if the first controller stopped heartbeating.
-        if !self.store.claim_job(&msg.job_id, &runner, attempt).await? {
-            if crate::host_maintenance::cordoned(&self.store, &runner).await
-                .map_err(|e| DispatchError::StepFailed(e.to_string()))? {
-                return Err(DispatchError::MaintenancePaused);
-            }
-            if self.store.has_host_work(&msg.job_id).await? {
-                tracing::info!(job = %msg.job_key, "execution already claimed; dropping duplicate delivery");
+        // Use the reason recorded by the claim transaction. Re-reading drain
+        // or cordon state here can race a resume and ACK an unclaimed job.
+        match self.store.claim_job_for_boot(&msg.job_id, &runner, attempt, self.executor.boot_id()).await? {
+            JobClaim::Claimed => {}
+            JobClaim::InstanceDraining => return Err(DispatchError::InstanceDraining),
+            JobClaim::RunnerCordoned => return Err(DispatchError::MaintenancePaused),
+            JobClaim::Unavailable => {
+                tracing::info!(job = %msg.job_key, "job already owned or no longer runnable; dropping duplicate delivery");
                 return Ok(JobStatus::Running);
             }
-            tracing::info!(job = %msg.job_key, "no longer runnable; dropping delivery");
-            return Ok(JobStatus::Success);
         }
+        let mut preparation_quiescent = false;
+        let result = async {
         tracing::info!(job = %plan.key, runner = %runner, attempt, "acquiring a VM");
 
         // CI owns disposable job machines, not a stopped VM cache. Keep parsing
@@ -1235,7 +1432,17 @@ impl Dispatcher {
         let needs_source = existing_vm.is_none()
             && (plan.vm.build.is_some() || !plan.vm.cache_key_files.is_empty());
         let prepared = if needs_source {
-            Some(self.prepare_source(&runner, &plan, msg, Duration::from_secs(40 * 60)).await?)
+            match self.prepare_source(&runner, &plan, msg, Duration::from_secs(40 * 60)).await {
+                Ok(source) => Some(source),
+                Err(error) => {
+                    // At this first preparation call no image request exists.
+                    // A terminal source failure or unsupported endpoint is
+                    // conclusive; expiry/transport/protocol errors are not.
+                    preparation_quiescent = matches!(&error, DispatchError::Image(
+                        crate::image::ImageError::Source(_) | crate::image::ImageError::Capability));
+                    return Err(error);
+                }
+            }
         } else { None };
 
         // `vm.build` becomes `vm.image` here, building the image on the runner
@@ -1250,11 +1457,27 @@ impl Dispatcher {
         // so a redelivery re-derives the name rather than inheriting one.
         let disk_requirement = runner_disk_requirement(&plan.vm);
         if existing_vm.is_none() && let Some(build) = plan.vm.build.clone() {
-            let image = self
+            let image = match self
                 .ensure_image(&runner, &plan, &build, prepared.as_ref().expect("build requires preparation"), msg)
-                .await?;
+                .await {
+                    Ok(image) => image,
+                    Err(error) => {
+                        // Only the daemon's terminal build response settles
+                        // image work. Source replay failures do not settle it.
+                        preparation_quiescent = matches!(&error, DispatchError::Image(crate::image::ImageError::Build { .. }));
+                        return Err(error);
+                    }
+                };
             plan.vm.image = Some(image);
             plan.vm.build = None;
+        }
+        preparation_quiescent = true;
+
+        // Persist before acquire_vm (including disk reclamation), or opening
+        // an existing VM. Cancellation and pre-VM finalization cannot race past
+        // this boundary; instance drain still allows already-claimed work.
+        if !self.store.begin_job_execution(&msg.job_id, attempt, self.executor.boot_id()).await? {
+            return Err(DispatchError::Cancelled("job ended before VM acquisition".into()));
         }
 
         // Two ways to get a machine, and they share nothing but the handle.
@@ -1293,7 +1516,8 @@ impl Dispatcher {
 
         if !self
             .store
-            .start_job(&msg.job_id, &runner, vm.id(), &fingerprint, attempt)
+            .start_job_for_boot(&msg.job_id, &runner, vm.id(), &fingerprint, attempt,
+                self.executor.boot_id())
             .await?
         {
             // Something else finished this job while we were booting a VM.
@@ -1345,7 +1569,10 @@ impl Dispatcher {
 
         let status = match &outcome {
             Ok(outputs) => {
-                self.store.set_job_outputs(&msg.job_id, outputs).await?;
+                // Cancellation can win after the final step. It must suppress
+                // outputs without skipping the VM's cleanup handoff below.
+                self.store.set_job_outputs_for_boot(&msg.job_id, outputs, attempt,
+                    self.executor.boot_id()).await?;
                 JobStatus::Success
             }
             // Cancelled stays cancelled. `continue_on_error` is about a step
@@ -1370,9 +1597,21 @@ impl Dispatcher {
             if self.release_vm(&plan, &vm, guest_corrupted).await && outcome.is_ok() {
                 self.store.end_host_work(&msg.job_id, &runner, attempt).await?;
             }
-            self.store.set_job_status(&msg.job_id, status, error.as_deref()).await?;
+            self.store.set_job_status_for_boot(&msg.job_id, status, error.as_deref(), attempt,
+                self.executor.boot_id()).await?;
         }
         Ok(status)
+        }.await;
+        // Only the delivery that actually acquired this claim may finalize it.
+        // A dropped outer future retains ownership: it did not reach this point.
+        if let Err(error) = &result {
+            if error.is_tunnel_failure() { self.runners.evict(&runner).await; }
+            if let Some(status) = self.store.finish_job_preparation(&msg.job_id, attempt,
+                self.executor.boot_id(), &error.to_string(), preparation_quiescent).await? {
+                return Ok(status);
+            }
+        }
+        result
     }
 
     /// Reconstruct this run's immutable source on a runner. This owns secret
@@ -1422,7 +1661,7 @@ impl Dispatcher {
     /// `target`: the node and the VM are one decision, and reading the target
     /// twice is how the queue a job was routed to and the machine it runs on
     /// come to disagree.
-    async fn pick_runner(&self, plan: &JobPlan) -> Result<(String, Option<String>), DispatchError> {
+    async fn pick_runner(&self, plan: &JobPlan, run: &str) -> Result<(String, Option<String>), DispatchError> {
         let pool = self.runners.snapshot();
         let placement = Self::place(&pool, plan)?;
         // `place` only ever yields a VM alongside the node holding it, so this
@@ -1431,9 +1670,17 @@ impl Dispatcher {
 
         let driver = driver_name(plan.vm.driver);
 
-        if let Some(node) = placement.node {
-            if crate::host_maintenance::cordoned(&self.store, &node.id).await
-                .map_err(|e| DispatchError::StepFailed(e.to_string()))? { return Err(DispatchError::MaintenancePaused); }
+        let mut pinned = placement.node;
+        if let Some(node) = pinned {
+            let cordoned = crate::host_maintenance::cordoned(&self.store, &node.id).await
+                .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+            if (cordoned || !node.status.is_dispatchable()) && plan.fallback == Fallback::Any && vm.is_none() {
+                pinned = None;
+            } else if cordoned {
+                return Err(DispatchError::MaintenancePaused);
+            }
+        }
+        if let Some(node) = pinned {
             if !node.status.is_dispatchable() {
                 return Err(DispatchError::RunnerOffline {
                     runner: node.name.clone(),
@@ -1493,6 +1740,15 @@ impl Dispatcher {
                     skipped.push(format!("{} could not be reached", candidate.name));
                 }
             }
+        }
+        // Keep successive jobs together when possible, without binding an
+        // entire run to a server. Eligibility was checked above on every claim.
+        let previous: Option<String> = sqlx::query_scalar("SELECT runner_hd_id FROM ci_job WHERE run_id=$1 AND runner_hd_id IS NOT NULL ORDER BY started_at DESC NULLS LAST,id DESC LIMIT 1")
+            .bind(run).fetch_optional(self.store.pool()).await
+            .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+        if let Some(previous) = previous
+            && candidates.iter().any(|(id, _)| id == &previous) {
+            return Ok((previous, vm));
         }
         if let Some(runner) = roomiest_runner(candidates, required) {
             return Ok((runner, vm));
@@ -2655,8 +2911,28 @@ impl Dispatcher {
                 .map_err(DispatchError::StepFailed)?;
         }
 
+        if matches!(action, "ci/rollout-service" | "ci/rollout-host-app-lb") {
+            let completed: Option<String> = sqlx::query_scalar(
+                "SELECT d.id FROM ci_release_carried_deployment c
+                 JOIN ci_step s ON s.job_id=c.job_id AND s.idx=c.step_index
+                 JOIN ci_service_deployment d ON d.id=c.deployment_id
+                 WHERE s.id=$1 AND d.status='passed'",
+            ).bind(sid).fetch_optional(self.store.pool()).await
+                .map_err(|e| DispatchError::StepFailed(format!("read carried deployment receipt: {e}")))?;
+            if let Some(id) = completed {
+                return Ok((format!("[ci] retained completed deployment {id}; no deployment repeated\n"), json!({})));
+            }
+        }
+
         match action {
             "ci/merge-release" => {
+                if let Some(policy) = &plan.release_policy {
+                    crate::release_policy::check_targets(self, policy).await
+                        .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                    if policy.token_expressions.iter().any(|expression| ctx.substitute(expression).trim().is_empty()) {
+                        return Err(DispatchError::StepFailed("operator release policy has an unresolved credential; merge refused".into()));
+                    }
+                }
                 let manifests: Vec<String> = serde_json::from_str(&required("manifests")?)
                     .map_err(|_| DispatchError::StepFailed("with.manifests must be a JSON array of manifest paths".into()))?;
                 let tags = with("tags").map(|raw| serde_json::from_str(&raw)
@@ -3290,16 +3566,10 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
         };
 
         loop {
-            // Do not pull during a global drain's quiesced phase. In particular,
-            // a stale delivery must not hold an effect permit while waiting for
-            // the rollout that needs that same permit to finish.
-            if dispatcher.lifecycle.work(&dispatcher.store).await.is_err() {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-            // Acquire before pulling: a standby must never remove a delivery
-            // from the shared consumer merely to hold or redeliver it.
-            let effect = match dispatcher.executor.effect_permit().await {
+            // Acquire before pulling: a draining boot must never remove a new
+            // delivery from the shared consumer. The claim transaction repeats
+            // this check under the durable boot-row lock.
+            let admission = match dispatcher.executor.admission_permit().await {
                 Ok(permit) => permit,
                 Err(_) => {
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -3329,7 +3599,7 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                 // host at a time, each getting its full budget from pickup.
                 Route::Runner(_) => {
                     let _permit = permit;
-                    let _effect = effect;
+                    let _admission = admission;
                     process_delivery(Arc::clone(&dispatcher), msg, job, attempt).await;
                 }
                 // The network's shared queue is where "any host" jobs wait, and
@@ -3345,7 +3615,7 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
                     let dispatcher = Arc::clone(&dispatcher);
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let _effect = effect;
+                        let _admission = admission;
                         process_delivery(dispatcher, msg, job, attempt).await;
                     });
                 }
@@ -3408,22 +3678,6 @@ async fn process_delivery(
         })
     };
 
-    // Quiescence can race an already outstanding pull. Return that delivery
-    // without beginning execution, releasing the caller's effect permit so
-    // handoff can finish. The pull-loop gate prevents repeatedly taking it
-    // while closed and consuming the entire redelivery budget.
-    let _work = match dispatcher.lifecycle.work(&dispatcher.store).await {
-        Ok(permit) => permit,
-        Err(e) => {
-            heartbeat.abort();
-            tracing::debug!(job = %job.job_key, "returning delivery across executor handoff: {e}");
-            if let Err(error) = msg.ack_with(AckKind::Nak(Some(Duration::from_secs(30)))).await {
-                tracing::warn!(job = %job.job_key, %error, "could not return delivery; broker acknowledgement timeout retains recovery");
-            }
-            return;
-        }
-    };
-
     // `CI_MAX_JOB_SECONDS` is enforced here, and only here. It used to
     // reach JetStream as `ack_wait` and nothing else, so once the ack
     // window stopped being derived from it the setting would have become
@@ -3440,6 +3694,9 @@ async fn process_delivery(
     // moment the job is taken, not from when it was submitted.
     let ceiling = dispatcher.config.max_job_duration;
     let outcome = loop {
+        if dispatcher.executor.admission_permit().await.is_err() {
+            break Err(DispatchError::InstanceDraining);
+        }
         let result = bounded_from_pickup(ceiling, &job.job_key, dispatcher.run_job(&job, attempt)).await;
         if matches!(result, Err(DispatchError::MaintenancePaused)) {
             // Preserve this delivery and its retry budget. Re-select on every
@@ -3454,6 +3711,11 @@ async fn process_delivery(
     heartbeat.abort();
 
     match outcome {
+        Err(DispatchError::InstanceDraining) => {
+            // The job was never claimed. Return an outstanding pull to the
+            // shared consumer so the other region can execute it.
+            let _ = msg.ack_with(AckKind::Nak(Some(Duration::from_secs(1)))).await;
+        }
         Ok(status) => {
             tracing::info!(job = %job.job_key, "finished: {}", status.as_str());
             let _ = msg.ack().await;
@@ -3476,7 +3738,9 @@ async fn process_delivery(
                 Ok(true) => {
                     let detail = format!("Execution outcome requires reconciliation; automatic retry withheld: {e}");
                     tracing::warn!(job = %job.job_key, "{detail}");
-                    if let Err(error) = dispatcher.store.note_job_error(&job.job_id, &detail).await {
+                    if let Err(error) = dispatcher.store.set_job_status_for_boot(
+                        &job.job_id, JobStatus::Running, Some(&detail), attempt, dispatcher.executor.boot_id(),
+                    ).await {
                         tracing::error!(job = %job.job_key, %error, "could not persist unresolved execution");
                         return;
                     }
@@ -3489,38 +3753,23 @@ async fn process_delivery(
                 }
                 Ok(false) => {}
             }
-            // Retryable up to `MAX_DELIVER`. Past that JetStream stops
-            // redelivering, so the job is marked failed here rather than
-            // left `running` forever with nothing coming back to it.
-            tracing::warn!(job = %job.job_key, attempt, "failed: {e}");
-            if attempt >= crate::bus::MAX_DELIVER as i32 {
-                let _ = dispatcher
-                    .store
-                    .set_job_status(
-                        &job.job_id,
-                        JobStatus::Failure,
-                        Some(&format!("giving up after {attempt} attempts: {e}")),
-                    )
-                    .await;
+            // Drain handoffs and lost ACKs are deliveries, not failures.
+            // Persist the actual failure count atomically with the ownership
+            // check; a peer may have claimed this job since the error occurred.
+            let failures = match dispatcher.store.record_unclaimed_job_error(&job.job_id, &e.to_string()).await {
+                Ok(count) => count,
+                Err(error) => {
+                    tracing::error!(job = %job.job_key, %error, "could not persist delivery failure; refusing ACK");
+                    return;
+                }
+            };
+            if failures.is_none_or(|count| count >= crate::bus::MAX_PRECLAIM_FAILURES) {
+                tracing::warn!(job = %job.job_key, ?failures, "no retry: job claimed, terminal, or failure budget exhausted: {e}");
                 let _ = msg.ack().await;
             } else {
-                // Negative-ack with the ladder's delay rather than
-                // waiting out `ack_wait`, which is job-length.
-                let delay = crate::bus::backoff_for(attempt as u32);
-                // Written on *every* attempt, not only the last. The
-                // ladder is 60s, 5 minutes, then 15, so a job that can
-                // never work — an image the host does not have is the
-                // usual one — used to show an empty error for twenty
-                // minutes before the fourth delivery finally recorded
-                // the reason. Saying it now, with what happens next, is
-                // the difference between a page that explains the wait
-                // and one that looks like nothing is happening.
-                let detail = format!(
-                    "attempt {attempt} of {} failed: {e}. Retrying in {}s.",
-                    crate::bus::MAX_DELIVER,
-                    delay.as_secs()
-                );
-                let _ = dispatcher.store.note_job_error(&job.job_id, &detail).await;
+                let failures = failures.unwrap();
+                let delay = crate::bus::backoff_for(failures as u32);
+                tracing::warn!(job = %job.job_key, failures, retry_seconds = delay.as_secs(), "pre-claim failure: {e}");
                 let _ = msg
                     .ack_with(async_nats::jetstream::AckKind::Nak(Some(delay)))
                     .await;
@@ -3722,10 +3971,10 @@ impl Dispatcher {
             // What the queue says, asked once per distinct route: the reaper
             // is batched, and one NATS round trip per job would turn a backlog
             // into a burst of them.
-            let route = placed.as_ref().map(|p| match p.node {
-                Some(node) => Route::Runner(node.id.clone()),
-                None => Route::Network(p.network.network_id.clone()),
-            });
+            let route = match &plan {
+                Some(plan) => self.route_for(plan).await.ok(),
+                None => None,
+            };
             let verdict = match &route {
                 None => QueueVerdict::Unknown,
                 Some(r) => {
@@ -4201,7 +4450,6 @@ impl Dispatcher {
             loop {
                 ticker.tick().await;
                 let Ok(_effect) = images.executor.effect_permit().await else { continue };
-                let Ok(_work) = images.lifecycle.work(&images.store).await else { continue };
                 for runner in images.served_runner_ids() {
                     let result = async {
                         let options = images.runners.options_for(&runner).await?;
@@ -4227,7 +4475,6 @@ impl Dispatcher {
             loop {
                 ticker.tick().await;
                 let Ok(_effect) = self.executor.effect_permit().await else { continue };
-                let Ok(_work) = self.lifecycle.work(&self.store).await else { continue };
                 if let Err(e) = self.pool.renew_leases(self.lease()).await {
                     // Not fatal, and not worth giving up a VM over: the lease
                     // has time left, and the next tick may well succeed.
@@ -4613,6 +4860,7 @@ fn or_none(items: &[String]) -> String {
 
 #[derive(Debug)]
 pub enum DispatchError {
+    InstanceDraining,
     MaintenancePaused,
     ControllerUnavailable(String),
     DiskPressure(String),
@@ -4812,6 +5060,7 @@ impl std::fmt::Display for DispatchError {
             Self::BadPlan(e) => write!(f, "the stored plan could not be read: {e}"),
             Self::Condition(e) => write!(f, "an `if:` condition could not be evaluated: {e}"),
             Self::UnknownJob(id) => write!(f, "no job {id} exists"),
+            Self::InstanceDraining => write!(f, "CI instance is draining; job returned to the shared queue"),
             Self::MaintenancePaused => write!(f, "runner is cordoned for host maintenance; job remains queued"),
             Self::UnknownRunner { wanted, network } => write!(
                 f,
@@ -5411,6 +5660,7 @@ mod tests {
             sandbox_id: None,
             status: "success".into(),
             attempt: 1,
+            executor_boot: None,
             matrix: serde_json::json!({}),
             outputs: serde_json::json!({}),
             plan: serde_json::json!({}),
@@ -6416,8 +6666,7 @@ mod tests {
         );
 
         Arc::new(Dispatcher {
-            lifecycle: Arc::new(crate::lifecycle::Lifecycle::default()),
-            executor: Arc::new(crate::executor::ExecutorOwner::register(store.pool().clone(), &format!("dispatch-test-{}", uuid::Uuid::new_v4())).await.expect("executor")),
+            executor: Arc::new(crate::executor::ExecutorInstance::register(store.pool().clone(), &format!("dispatch-test-{}", uuid::Uuid::new_v4())).await.expect("executor")),
             config: config.clone(),
             store: store.clone(),
             pool: Pool::new(store.pool().clone()),
@@ -6436,7 +6685,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
-    async fn delivery_racing_quiescence_releases_the_handoff_permit() {
+    async fn delivery_racing_instance_drain_returns_to_shared_queue() {
         let base = std::env::var("CI_TEST_DATABASE_URL").unwrap();
         let admin = sqlx::PgPool::connect(&base).await.unwrap();
         let schema = format!("delivery_{}", uuid::Uuid::new_v4().simple());
@@ -6449,7 +6698,7 @@ mod tests {
         let d = test_dispatcher(root.path()).await;
         unsafe { std::env::set_var("CI_TEST_DATABASE_URL", base); }
         sqlx::raw_sql("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES('run','test','ci.yml','running');
-            INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES('job','run','deploy','deploy','Deploy','success');
+            INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES('job','run','deploy','deploy','Deploy','queued');
             INSERT INTO ci_step(id,job_id,idx,name,uses,status) VALUES('step','job',0,'Request','ci/deploy-controller','success');
             INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES('op','step','run','job','ci','hash','running','source','main');
             INSERT INTO ci_controller_rollout(id,request,phase) VALUES('op','{}','quiesced');")
@@ -6458,6 +6707,15 @@ mod tests {
         let consumer = d.bus.consumer_for(&route).await.unwrap();
         let job = JobMessage { run_id: "run".into(), job_id: "job".into(), job_key: "deploy".into() };
         d.bus.publish_job(&route, &job).await.unwrap();
+        // Cross the old four-delivery boundary using real drain handoffs.
+        // No execution failure or claim may result from any of them.
+        d.executor.pause(uuid::Uuid::new_v4()).await.unwrap();
+        for expected_delivery in 1..=5 {
+            let (message, _slot) = tokio::time::timeout(Duration::from_secs(5),
+                pull_with_capacity(&consumer, Arc::new(tokio::sync::Semaphore::new(1)))).await.unwrap().unwrap().unwrap();
+            assert_eq!(message.info().unwrap().delivered, expected_delivery);
+            process_delivery(d.clone(), message, job.clone(), expected_delivery as i32).await;
+        }
         let (message, _slot) = pull_with_capacity(&consumer, Arc::new(tokio::sync::Semaphore::new(1))).await.unwrap().unwrap();
         let effect = d.executor.effect_permit().await.unwrap();
         let running = d.clone();
@@ -6465,11 +6723,18 @@ mod tests {
             let _effect = effect;
             process_delivery(running, message, job, 1).await;
         });
-        tokio::time::timeout(Duration::from_secs(2), task).await.expect("closed work cannot wait for rollout while retaining the handoff permit").unwrap();
-        let fence = tokio::time::timeout(Duration::from_secs(2), d.executor.handoff_fence()).await.unwrap().unwrap();
-        d.lifecycle.verify_handoff_quiesced(&d.store, "op").await.unwrap();
-        assert_eq!(d.store.get_job("job").await.unwrap().unwrap().status, "success");
+        tokio::time::timeout(Duration::from_secs(2), task).await.expect("draining delivery must release its local work guard").unwrap();
+        let fence = tokio::time::timeout(Duration::from_secs(2), d.executor.idle_guard()).await.unwrap().unwrap();
+        assert_eq!(d.store.get_job("job").await.unwrap().unwrap().status, "queued");
+        assert!(!d.store.has_host_work("job").await.unwrap());
+        let failures: i32 = sqlx::query_scalar("SELECT preclaim_failures FROM ci_job WHERE id='job'")
+            .fetch_one(d.store.pool()).await.unwrap();
+        assert_eq!(failures, 0, "drain handoffs must not spend the failure budget");
         drop(fence);
+        let (redelivery, _) = tokio::time::timeout(Duration::from_secs(5),
+            pull_with_capacity(&consumer, Arc::new(tokio::sync::Semaphore::new(1)))).await.unwrap().unwrap().unwrap();
+        assert_eq!(serde_json::from_slice::<JobMessage>(&redelivery.payload).unwrap().job_id, "job");
+        redelivery.ack().await.unwrap();
     }
 
     #[tokio::test]
@@ -6537,7 +6802,7 @@ mod tests {
         assert!(crate::managed_update::reconcile(&d).await.is_err());
         assert_eq!(posts.load(Ordering::SeqCst),1);
         // The failed HTTP observation must not retain the local effect permit.
-        drop(tokio::time::timeout(Duration::from_secs(1),d.executor.handoff_fence()).await.unwrap().unwrap());
+        drop(tokio::time::timeout(Duration::from_secs(1),d.executor.idle_guard()).await.unwrap().unwrap());
         crate::managed_update::reconcile(&d).await.unwrap(); assert_eq!(posts.load(Ordering::SeqCst),2);
         assert_eq!(d.store.get_run("run").await.unwrap().unwrap().status,"running");
         assert!(crate::managed_update::reconcile(&d).await.is_err(),"changed regional identity cannot complete the release");
@@ -6547,6 +6812,96 @@ mod tests {
         crate::managed_update::reconcile(&d).await.unwrap(); assert_eq!(posts.load(Ordering::SeqCst),2);
         server.abort();
         sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
+    async fn published_release_failed_only_retry_preserves_identity_and_single_flight() {
+        let workspace = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(workspace.path()).await;
+        let validation = crate::workflow::Workflow::parse("build.yml", "jobs:\n  build:\n    steps: [{run: cargo test}]\n").unwrap();
+        let release = crate::workflow::Workflow::parse("release.yml", r#"
+on: release
+jobs:
+  merge:
+    steps: [{uses: ci/merge-release, with: {manifests: '[]'}}]
+  us:
+    needs: [merge]
+    steps: [{uses: ci/rollout-service}]
+  eu:
+    needs: [us]
+    steps: [{uses: ci/rollout-host-app-lb}, {uses: ci/rollout-service}]
+"#).unwrap();
+        let validation_plan = crate::plan::Plan::build(&validation).unwrap();
+        let release_plan = crate::plan::Plan::build(&release).unwrap();
+        let source_run = format!("release-{}", crate::vm::new_id());
+        let validation_run = format!("validation-{}", crate::vm::new_id());
+        let sha = "a".repeat(40);
+        let request = crate::store::RunRequest { repo_url: "https://example.test/repo.git".into(),
+            git_ref: "refs/heads/main".into(), sha: sha.clone(), changes: crate::paths::Changes::unknown("frozen"), ..Default::default() };
+        let mut tx = d.store.pool().begin().await.unwrap();
+        Store::create_run_in(&mut tx, &validation_run, &request, &validation_plan).await.unwrap();
+        Store::create_run_in(&mut tx, &source_run, &request, &release_plan).await.unwrap();
+        sqlx::query("INSERT INTO ci_run_source(run_id,descriptor) VALUES($1,'frozen-source'),($2,'frozen-source')")
+            .bind(&validation_run).bind(&source_run).execute(&mut *tx).await.unwrap();
+        crate::submission::record(&mut tx, &source_run, std::slice::from_ref(&validation_run)).await.unwrap();
+        tx.commit().await.unwrap();
+        let validation_job = d.store.jobs_of(&validation_run).await.unwrap().remove(0);
+        d.store.create_step(&crate::store::step_id(&validation_job.id, 0), &validation_job.id, 0, "test", None).await.unwrap();
+        d.store.finish_step(&crate::store::step_id(&validation_job.id, 0), StepStatus::Success, Some(0), None).await.unwrap();
+        d.store.set_job_status(&validation_job.id, JobStatus::Success, None).await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='success' WHERE id=$1").bind(&validation_run).execute(d.store.pool()).await.unwrap();
+        let jobs = d.store.jobs_of(&source_run).await.unwrap();
+        for job in &jobs {
+            d.store.set_job_status(&job.id, if job.job_key == "eu" { JobStatus::Failure } else { JobStatus::Success }, None).await.unwrap();
+        }
+        let eu_job = jobs.iter().find(|j| j.job_key == "eu").unwrap();
+        let completed_step = crate::store::step_id(&eu_job.id, 0);
+        d.store.create_step(&completed_step, &eu_job.id, 0, "app-lb", Some("ci/rollout-host-app-lb")).await.unwrap();
+        d.store.finish_step(&completed_step, StepStatus::Success, Some(0), None).await.unwrap();
+        let operation = format!("host-{source_run}");
+        sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES($1,$2,$3,$4,'app-lb-eu1','hash','passed',$5,'refs/heads/main')")
+            .bind(&operation).bind(&completed_step).bind(&source_run).bind(&eu_job.id).bind(&sha)
+            .execute(d.store.pool()).await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id=$1").bind(&source_run).execute(d.store.pool()).await.unwrap();
+        let prepared = json!({"source_sha":sha,"release_sha":sha,"git_ref":"refs/heads/main","versions":{},"tags":[]});
+        sqlx::query("INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status) VALUES($1,'request',$2,$2,'refs/heads/main','{}',$2,$3,'published')")
+            .bind(&source_run).bind(&sha).bind(&prepared).execute(d.store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_artifact(id,run_id,job_id,name,sink,digest,size_bytes,uri) VALUES('frozen-artifact',$1,$2,'bundle','artifacts',$3,17,'blob')")
+            .bind(&validation_run).bind(&validation_job.id).bind("b".repeat(64)).execute(d.store.pool()).await.unwrap();
+
+        assert!(d.rerun(&source_run, false, None).await.err().unwrap().to_string().contains("full release reruns are unsupported"));
+        let admitted = d.retry_published_release(&source_run, None).await.unwrap();
+        let retry = &admitted.run_ids[0];
+        assert_eq!(crate::submission::validations(&d.store, retry).await.unwrap(), [validation_run.clone()]);
+        assert_eq!(crate::submission::artifact_run(&d.store, retry, "build.yml").await.unwrap(), validation_run);
+        assert_eq!(d.store.source_bytes(retry).await.unwrap(), b"frozen-source");
+        let copied = crate::release::get(&d.store, retry).await.unwrap().unwrap();
+        assert_eq!(copied.status, "published");
+        assert_eq!(copied.prepared.release_sha, sha);
+        let retry_jobs = d.store.jobs_of(retry).await.unwrap();
+        assert_eq!(retry_jobs.iter().find(|j| j.job_key == "us").unwrap().status, "success");
+        assert_eq!(retry_jobs.iter().find(|j| j.job_key == "eu").unwrap().status, "pending");
+        let retry_eu = retry_jobs.iter().find(|j| j.job_key == "eu").unwrap();
+        let retained: Vec<(i32, String)> = sqlx::query_as("SELECT step_index,deployment_id FROM ci_release_carried_deployment WHERE job_id=$1")
+            .bind(&retry_eu.id).fetch_all(d.store.pool()).await.unwrap();
+        assert_eq!(retained, vec![(0, operation.clone())], "retain only app-lb, not the failed service step");
+        assert!(d.retry_published_release(&source_run, None).await.err().unwrap().to_string().contains("latest descendant"));
+
+        d.store.set_job_status(&retry_eu.id, JobStatus::Failure, None).await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id=$1").bind(retry).execute(d.store.pool()).await.unwrap();
+        let (first, duplicate) = tokio::join!(d.retry_published_release(retry, None), d.retry_published_release(retry, None));
+        assert_ne!(first.is_ok(), duplicate.is_ok(), "only one concurrent retry may be admitted");
+        let descendant = first.or(duplicate).unwrap().run_ids.remove(0);
+        let inherited: String = sqlx::query_scalar("SELECT deployment_id FROM ci_release_carried_deployment WHERE job_id=$1 AND step_index=0")
+            .bind(crate::store::job_id(&descendant, "eu")).fetch_one(d.store.pool()).await.unwrap();
+        assert_eq!(inherited, operation, "receipt survives more than one retry");
+
+        sqlx::query("UPDATE ci_release SET status='unknown' WHERE run_id=$1").bind(retry).execute(d.store.pool()).await.unwrap();
+        sqlx::query("UPDATE ci_run SET status='failure' WHERE id=$1").bind(retry).execute(d.store.pool()).await.unwrap();
+        assert!(d.retry_published_release(retry, None).await.err().unwrap().to_string().contains("confirmed published"));
+        assert!(crate::submission::authorize_publication(&d.store, &validation_run).await.is_err(),
+            "reusing validation membership must not relax validation-only publication restrictions");
     }
 
     #[tokio::test]
@@ -6667,6 +7022,65 @@ jobs:
 
     #[tokio::test]
     #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; fake source builder"]
+    async fn failed_preparation_does_not_block_ci_app_drain() {
+        use axum::{Json, Router, http::StatusCode, routing::{get, post}};
+        let terminal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mode = terminal.clone();
+        let unexpected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = unexpected.clone();
+        let app = Router::new()
+            .route("/sources/prepare", post(move || {
+                let failed = mode.load(Ordering::SeqCst);
+                async move { Json(json!({"sourceId":"src-test", "status":if failed {"failed"} else {"preparing"}, "error":"checkout rejected"})) }
+            }))
+            .route("/sources/src-test", get(|| async { StatusCode::NOT_FOUND }))
+            .fallback(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::INTERNAL_SERVER_ERROR }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        unsafe { std::env::set_var("CI_TEST_DAEMON", format!("http://{}", listener.local_addr().unwrap())); }
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        for failed in [false, true] {
+            terminal.store(failed, Ordering::SeqCst);
+            let workspace = tempfile::tempdir().unwrap();
+            let d = test_dispatcher(workspace.path()).await;
+            let yaml = "jobs:\n  build:\n    vm:\n      driver: firecracker\n      build: {dockerfile: Dockerfile}\n    steps: [{run: echo test}]\n";
+            let workflow = crate::workflow::Workflow::parse("prep.yml", yaml).unwrap();
+            let plan = crate::plan::Plan::build(&workflow).unwrap();
+            let run = crate::vm::new_id();
+            let mut tx = d.store.pool().begin().await.unwrap();
+            crate::store::Store::create_run_in(&mut tx, &run, &crate::store::RunRequest {
+                repo_url: "https://github.com/example/ci-test.git".into(), ..Default::default()
+            }, &plan).await.unwrap();
+            crate::store::Store::record_source_in(&mut tx, &run, &serde_json::to_vec(&json!({
+                "baseRevision":"a".repeat(40), "targetTree":"b".repeat(40),
+                "patchBase64":"", "workflows":{"prep.yml":yaml}
+            })).unwrap()).await.unwrap();
+            tx.commit().await.unwrap();
+            let job = d.store.jobs_of(&run).await.unwrap().remove(0);
+            let msg = JobMessage { run_id: run.clone(), job_id: job.id.clone(), job_key: job.job_key.clone() };
+            let status = d.run_claimed(&msg, 1, plan.jobs[0].clone(), "hd-local".into(), None).await.unwrap();
+            assert_eq!(status, JobStatus::Failure);
+            let job = d.store.get_job(&job.id).await.unwrap().unwrap();
+            assert_eq!(job.status, "failure");
+            assert!(job.error.as_deref().unwrap().contains(if failed { "checkout rejected" } else { "prepared source expired" }));
+            assert!(job.sandbox_id.is_none());
+            assert_eq!(d.store.has_host_work(&job.id).await.unwrap(), !failed);
+            let operation = uuid::Uuid::new_v4();
+            d.executor.pause(operation).await.unwrap();
+            d.executor.quiesce(operation).await.unwrap();
+            assert_eq!(unexpected.load(Ordering::SeqCst), 0, "preparation failure must never reach VM APIs");
+            d.store.end_host_work(&job.id, "hd-local", 1).await.unwrap();
+            sqlx::query("DELETE FROM ci_run WHERE id=$1").bind(&run).execute(d.store.pool()).await.unwrap();
+            d.bus.js_delete_streams().await.unwrap();
+        }
+        server.abort();
+        unsafe { std::env::remove_var("CI_TEST_DAEMON"); }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; fake source builder"]
     async fn cached_image_is_rebuilt_before_the_current_job_creates_a_vm() {
         use axum::{Json, Router, routing::post};
         let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -6755,7 +7169,7 @@ jobs:
             let run = crate::vm::new_id(); let sandbox = format!("sb-{run}");
             d.store.create_run(&run, &crate::store::RunRequest { repo_url: "https://example.test/repo.git".into(), ..Default::default() }, &plan).await.unwrap();
             let job = d.store.jobs_of(&run).await.unwrap().remove(0);
-            assert!(d.store.claim_job(&job.id, "hd-local", 1).await.unwrap());
+            assert_eq!(d.store.claim_job_for_boot(&job.id, "hd-local", 1, d.executor.boot_id()).await.unwrap(), JobClaim::Claimed);
             d.store.start_job(&job.id, "hd-local", &sandbox, "fp", 1).await.unwrap();
             d.pool.register(&sandbox, "hd-local", "fp", "wf", None, &job.id, d.lease()).await.unwrap();
             // A bad handoff must not publish a terminal job or a cleanup intent.
@@ -6778,16 +7192,10 @@ jobs:
             assert_eq!(status, if scenario == "cancel" { "cancelled" } else { "failure" });
             assert!(handoff(&d, &job.id, "hd-local", 1, &sandbox, JobStatus::Success, None).await.is_err());
             assert_eq!(sqlx::query_scalar::<_,String>("SELECT status FROM ci_job WHERE id=$1").bind(&job.id).fetch_one(d.store.pool()).await.unwrap(), status);
-            let rollout = format!("rollout-{run}");
-            d.store.create_step(&rollout, &job.id, 0, "controller", None).await.unwrap();
-            sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,sha,git_ref) VALUES($1,$1,$2,$3,'ci','test','running','test','main')")
-                .bind(&rollout).bind(&run).bind(&job.id).execute(d.store.pool()).await.unwrap();
-            sqlx::query("INSERT INTO ci_controller_rollout(id,request,phase) VALUES($1,'{}','draining')")
-                .bind(&rollout).execute(d.store.pool()).await.unwrap();
-            assert!(d.lifecycle.work(&d.store).await.is_ok(), "cleanup is allowed during drain");
-            assert!(!d.lifecycle.quiesce(&d.store, &rollout).await.unwrap());
-            let message: String = sqlx::query_scalar("SELECT message FROM ci_service_deployment WHERE id=$1").bind(&rollout).fetch_one(d.store.pool()).await.unwrap();
-            assert!(message.contains(&sandbox));
+            let drain = uuid::Uuid::new_v4();
+            d.executor.pause(drain).await.unwrap();
+            assert!(d.executor.effect_permit().await.is_ok(), "cleanup is allowed during drain");
+            assert!(d.executor.quiesce(drain).await.is_err());
             // Restart + expired lease must not hand a cleanup-owned VM to a job.
             sqlx::query("UPDATE ci_vm_pool SET leased_until=now()-interval '1 hour' WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
             assert_eq!(d.pool.release_orphans(&["hd-local".into()], "restarted-instance").await.unwrap(), 0);
@@ -6829,9 +7237,8 @@ jobs:
             assert_eq!(report["job"]["sandbox"], sandbox);
             assert!(sqlx::query_scalar::<_,bool>("SELECT uploaded_at IS NULL FROM ci_debug_report WHERE job_id=$1 AND sandbox_id=$2")
                 .bind(&job.id).bind(&sandbox).fetch_one(d.store.pool()).await.unwrap(), "S3 unavailability must not retain the VM");
-            assert!(d.lifecycle.quiesce(&d.store, &rollout).await.unwrap(), "verified cleanup unblocks drain");
-            sqlx::query("DELETE FROM ci_controller_rollout WHERE id=$1").bind(&rollout).execute(d.store.pool()).await.unwrap();
-            sqlx::query("DELETE FROM ci_service_deployment WHERE id=$1").bind(&rollout).execute(d.store.pool()).await.unwrap();
+            d.executor.quiesce(drain).await.expect("verified cleanup unblocks instance drain");
+            d.executor.resume(drain).await.unwrap();
             sqlx::query("DELETE FROM ci_vm_pool WHERE sandbox_id=$1").bind(&sandbox).execute(d.store.pool()).await.unwrap();
             sqlx::query("DELETE FROM ci_debug_report WHERE job_id=$1").bind(&job.id).execute(d.store.pool()).await.unwrap();
             sqlx::query("DELETE FROM ci_run WHERE id=$1").bind(&run).execute(d.store.pool()).await.unwrap();
@@ -6848,6 +7255,10 @@ jobs:
         struct Remote { posts: Vec<Value>, stops: Vec<String>, status: String, wrong: bool, lost: bool, hidden: bool, old: bool, stop_failure: bool }
         let remote = Arc::new(std::sync::Mutex::new(Remote::default()));
         let app = Router::new()
+            .route("/v1/secrets", get(|axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String,String>>| async move {
+                Json(json!({"secrets":[{"path":format!("{}/CLOUD_KEY",q["prefix"])}]}))
+            }))
+            .route("/v1/secrets/read", post(|| async { Json(json!({"valueBase64":"ZmFrZS1rZXk="})) }))
             .route("/storage", get(|| async { Json(json!({"free_bytes":1u64 << 50})) }))
             .route("/capabilities", get(|| async { Json(json!({"supportedDrivers":["firecracker","kvm","avf"]})) }))
             .route("/sandbox/{id}/stop", post(|State(remote): State<Arc<std::sync::Mutex<Remote>>>, Path(id): Path<String>| async move {
@@ -6876,7 +7287,7 @@ jobs:
                     let r = remote.lock().unwrap();
                     if r.hidden || r.posts.is_empty() { return StatusCode::NOT_FOUND.into_response(); }
                     let p = &r.posts[0]; assert_eq!(id, p["maintenanceId"]);
-                    Json(json!({"maintenanceId":id,"backendServerId":p["backendServerId"],"operationType":"host_heyvm_upgrade",
+                    Json(json!({"maintenanceId":id,"backendServerId":p["backendServerId"],"operationType":"host_heyvm_upgrade_receipt_v1",
                         "target":p["target"],"requestedBy":p["requestedBy"],"targetSha256":if r.wrong { json!("wrong") } else { p["sha256"].clone() },
                         "artifactArchiveId":p["artifactArchiveId"],"artifactUserId":p["artifactUserId"],"status":r.status,
                         "completedAt":if matches!(r.status.as_str(), "completed" | "failed") { json!("2026-09-16T00:00:00Z") } else { Value::Null }})).into_response()
@@ -6890,12 +7301,42 @@ jobs:
         unsafe {
             std::env::set_var("CI_TEST_DAEMON", &base);
             std::env::set_var("CI_HOST_MAINTENANCE_TARGETS", json!({"selected":target}).to_string());
+            std::env::set_var("CI_HEYOSECRET_URL", &base);
+            std::env::set_var("CI_HEYOSECRET_TOKEN", "test-only");
         }
         let workspace = tempfile::tempdir().unwrap();
         let d = test_dispatcher(workspace.path()).await;
         let mut networks = d.runners.snapshot().networks.clone();
         networks[0].runners.push(crate::runners::Runner { id: "hd-other".into(), name: "other".into(), status: crate::runners::RunnerStatus::Online, last_seen_at: None });
         d.runners.set_test_pool(crate::runners::Pool { networks, default_network_id: "local".into(), default_node_id: "hd-local".into(), ..Default::default() });
+        // A dependent job is not tied to its predecessor's server. Choose the
+        // lexically later host first so this also distinguishes affinity from
+        // the equal-capacity tie breaker (which would choose hd-local).
+        let workflow = crate::workflow::Workflow::parse("drain.yml", "jobs:\n  build:\n    steps: [{run: echo build}]\n  test:\n    needs: [build]\n    steps: [{run: echo test}]\n").unwrap();
+        let plan = crate::plan::Plan::build(&workflow).unwrap();
+        let run = crate::vm::new_id();
+        d.store.create_run(&run, &crate::store::RunRequest::default(), &plan).await.unwrap();
+        let build = crate::store::job_id(&run, "build");
+        let test = crate::store::job_id(&run, "test");
+        assert!(d.store.claim_job(&build, "hd-other", 1).await.unwrap());
+        let test_plan = plan.jobs.iter().find(|p| p.key == "test").unwrap();
+        assert_eq!(d.pick_runner(test_plan, &run).await.unwrap().0, "hd-other");
+        let drain = uuid::Uuid::new_v4();
+        maintenance::runner_drain(&d.store, "hd-other", drain, true).await.unwrap();
+        d.advance_run(&run).await.unwrap();
+        assert_eq!(d.store.get_job(&test).await.unwrap().unwrap().status, "pending", "wait for build results");
+        d.store.set_job_outputs(&build, &json!({"artifact":"shared-build-digest"})).await.unwrap();
+        d.store.set_job_status(&build, JobStatus::Success, None).await.unwrap();
+        d.store.end_host_work(&build, "hd-other", 1).await.unwrap();
+        d.advance_run(&run).await.unwrap();
+        assert_eq!(d.store.get_job(&test).await.unwrap().unwrap().status, "queued");
+        assert_eq!(d.store.needs_context(&run).await.unwrap()["build"]["outputs"]["artifact"], "shared-build-digest");
+        assert_eq!(d.pick_runner(test_plan, &run).await.unwrap().0, "hd-local");
+        assert!(d.store.claim_job(&test, "hd-local", 1).await.unwrap());
+        assert_eq!(maintenance::runner_drain_status(&d.store, "hd-other").await.unwrap()["drained"], true);
+        d.store.set_job_status(&test, JobStatus::Success, None).await.unwrap();
+        d.store.end_host_work(&test, "hd-local", 1).await.unwrap();
+        maintenance::runner_drain(&d.store, "hd-other", drain, false).await.unwrap();
         for scenario in ["success", "failed", "identity", "cancel-before", "cancel-after", "deadline", "old-cloud"] {
             *remote.lock().unwrap() = Remote { status: "maintenance".into(), lost: true, ..Default::default() };
             let workflow = crate::workflow::Workflow::parse("maintenance.yml", "jobs:\n  upgrade:\n    steps: [{uses: ci/promote-service-archive}, {uses: ci/host-heyvm-maintenance}]\n  existing:\n    steps: [{run: echo existing}]\n  waiting:\n    steps: [{run: echo waiting}]\n  other:\n    steps: [{run: echo other}]\n").unwrap();
@@ -6953,8 +7394,11 @@ jobs:
             assert!(!d.store.claim_job(&other.id, "hd-local", 1).await.unwrap());
             assert!(d.store.claim_job(&other.id, "hd-other", 1).await.unwrap(), "another runner remains usable");
             let mut pinned = job_plan.clone(); pinned.target.node = Some("local".into());
-            assert!(matches!(d.pick_runner(&pinned).await, Err(DispatchError::MaintenancePaused)), "pinned placement must honor the fence");
-            assert_eq!(d.pick_runner(&job_plan).await.unwrap().0, "hd-other", "unpinned placement must choose the unfenced runner");
+            assert!(matches!(d.pick_runner(&pinned, &run).await, Err(DispatchError::MaintenancePaused)), "pinned placement must honor the fence");
+            assert_eq!(d.pick_runner(&job_plan, &run).await.unwrap().0, "hd-other", "unpinned placement must choose the unfenced runner");
+            pinned.fallback = Fallback::Any;
+            assert!(matches!(d.route_for(&pinned).await.unwrap(), Route::Network(_)));
+            assert_eq!(d.pick_runner(&pinned, &run).await.unwrap().0, "hd-other", "fallback jobs must leave a drained host");
             assert_eq!(d.run_job(&msg, 2).await.unwrap(), JobStatus::Running, "duplicate delivery must not reacquire a VM");
             maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
             assert!(remote.lock().unwrap().posts.is_empty());
@@ -7035,11 +7479,36 @@ jobs:
             maintenance::poll(&d.store, &id, "fake-key", Some(&target)).await.unwrap();
             assert_eq!(remote.lock().unwrap().posts.len(), posts);
             assert_eq!(maintenance::cordoned(&d.store, "hd-local").await.unwrap(), !success, "failure must be sticky");
+            if scenario == "identity" {
+                assert!(maintenance::recover(&d, "wrong-run", &id).await.is_err());
+                assert!(maintenance::recover(&d, &run, &id).await.is_err(), "foreign receipt cannot release fence");
+                remote.lock().unwrap().wrong = false;
+                // An executed skipped job must not be reset, even with a valid receipt.
+                sqlx::query("UPDATE ci_job SET status='skipped' WHERE id=$1").bind(&existing.id).execute(d.store.pool()).await.unwrap();
+                assert!(maintenance::recover(&d, &run, &id).await.is_err());
+                sqlx::query("UPDATE ci_job SET status='success' WHERE id=$1").bind(&existing.id).execute(d.store.pool()).await.unwrap();
+                sqlx::query("UPDATE ci_job SET status='skipped',started_at=NULL,queued_at=NULL,sandbox_id=NULL WHERE id=$1")
+                    .bind(&waiting.id).execute(d.store.pool()).await.unwrap();
+                let result = maintenance::recover(&d, &run, &id).await.unwrap();
+                assert_eq!(result["status"], "recovered");
+                assert!(!maintenance::cordoned(&d.store, "hd-local").await.unwrap());
+                assert_eq!(d.store.get_job(&job.id).await.unwrap().unwrap().status, "success");
+                assert_eq!(d.store.get_job(&waiting.id).await.unwrap().unwrap().status, "queued");
+                assert_eq!(remote.lock().unwrap().posts.len(), posts, "recovery must never re-POST upgrade");
+                assert_eq!(maintenance::recover(&d, &run, &id).await.unwrap()["status"], "already_passed");
+                let events: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_event_outbox WHERE run_id=$1 AND event_type='ci.host.maintenance.recovered.v1'")
+                    .bind(&run).fetch_one(d.store.pool()).await.unwrap();
+                assert_eq!(events, 1, "recovery is idempotent and audited");
+            }
             // Disposable fixture cleanup only; production has no automatic uncordon.
             sqlx::query("DELETE FROM ci_host_maintenance WHERE id=$1").bind(&id).execute(d.store.pool()).await.unwrap();
             d.pool.forget(&sandbox).await.unwrap();
         }
         server.abort();
+        unsafe {
+            std::env::remove_var("CI_HEYOSECRET_URL");
+            std::env::remove_var("CI_HEYOSECRET_TOKEN");
+        }
     }
 
     #[tokio::test]
