@@ -244,6 +244,9 @@ pub async fn detach_form(State(st): State<DashState>, Path(db): Path<String>) ->
 /// detach and promote are for, and dropping the row would strand the Postgres
 /// objects it names.
 fn forget(st: &DashState, db: &str) -> anyhow::Result<bool> {
+    if st.registry.physical().reserves_database(db) || st.registry.physical_sources().get(db).is_some() {
+        anyhow::bail!("{db} has physical ownership; its logical record must remain unchanged");
+    }
     if st.registry.replication().is_pinned(db) {
         anyhow::bail!(
             "{db} is still replicating — detach or promote it first, or its publication, \
@@ -402,12 +405,32 @@ pub async fn api_node_info(State(st): State<DashState>) -> Json<wire::NodeInfo> 
         physical_prepare: true,
         physical_handoff: true,
         physical_successor: true,
+        physical_reseed: true,
+        physical_standby_bind: true,
     })
 }
 
 pub async fn api_physical_prepare(State(st): State<DashState>, Path(db): Path<String>, Json(req): Json<wire::PhysicalPrepareRequest>) -> Response {
     match crate::replication::physical::prepare_source(&st.registry, &db, &req.generation).await {
         Ok(record) => (StatusCode::ACCEPTED, Json(record)).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_physical_reseed(State(st): State<DashState>, Path(db): Path<String>, Json(req): Json<wire::PhysicalReseedRequest>) -> Response {
+    match crate::replication::physical::reseed_source(&st.registry, &db, req).await {
+        Ok(record) => (StatusCode::ACCEPTED, Json(record)).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_physical_standby_bind(State(st): State<DashState>, Path(db): Path<String>, Json(req): Json<wire::PhysicalPrepareRequest>) -> Response {
+    match crate::replication::physical::bind_standby_source(&st.registry, &db, &req.generation).await {
+        Ok(record) => Json(record).into_response(), Err(e) => api_err(&e).into_response(),
+    }
+}
+
+pub async fn api_accept_physical_standby_bind(State(st): State<DashState>, Json(req): Json<wire::PhysicalStandbyBindRequest>) -> Response {
+    match crate::replication::physical::accept_standby_bind(&st.registry, req).await {
+        Ok(record) => Json(record).into_response(), Err(e) => api_err(&e).into_response(),
     }
 }
 

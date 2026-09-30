@@ -43,6 +43,8 @@ pub enum PhysicalPhase {
     Candidate,
     Seeding,
     Verified,
+    StandbyBinding,
+    Standby,
     Prepared,
     Promoting,
     Promoted,
@@ -87,6 +89,8 @@ pub struct PhysicalRecord {
     pub phase: PhysicalPhase,
     #[serde(default)]
     pub handoff_barrier: Option<String>,
+    #[serde(default)]
+    pub standby_lsn: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -96,7 +100,8 @@ impl PhysicalRecord {
     }
 
     pub fn handoff_started(&self) -> bool {
-        phase_number(self.phase) >= phase_number(PhysicalPhase::Prepared)
+        matches!(self.phase, PhysicalPhase::Prepared | PhysicalPhase::Promoting
+            | PhysicalPhase::Promoted | PhysicalPhase::Binding | PhysicalPhase::Activated)
     }
 }
 
@@ -289,6 +294,32 @@ impl PhysicalSourceStore {
         Ok(record)
     }
 
+    /// Archive a source preparation whose slot is irrecoverably lost.  The
+    /// caller must prove the runtime slot state before invoking this journal
+    /// transition; this method enforces that no writer handoff was started.
+    pub fn create_reseed(&self, record: PhysicalSourceRecord, prior_generation: &str) -> Result<PhysicalSourceRecord> {
+        validate_source(&record)?;
+        if record.predecessor.as_deref() != Some(prior_generation) || record.fence.is_some()
+            || record.handoff.is_some() || record.handoff_candidate.is_some() {
+            bail!("invalid physical source reseed intent");
+        }
+        let mut journal = self.journal.lock().unwrap();
+        if let Some(existing) = journal.current.get(&record.database) {
+            if existing.generation == record.generation {
+                let mut retry = existing.clone(); retry.source_lsn = record.source_lsn.clone(); retry.last_error = None;
+                if retry == record { return Ok(existing.clone()); }
+                bail!("conflicting retry of physical source reseed intent");
+            }
+            if existing.generation != prior_generation || !source_reseed_follows(existing, &record) {
+                bail!("physical source reseed does not match an unfenced failed preparation");
+            }
+        } else { bail!("physical source reseed requires a prior preparation"); }
+        let mut next = journal.clone();
+        let old = next.current.insert(record.database.clone(), record.clone()).unwrap(); next.history.push(old);
+        source_journal(next.current.values().cloned().collect(), next.history.clone())?;
+        persist_journal(&self.path, &next)?; *journal = next; Ok(record)
+    }
+
     /// Atomically archives the old current source and installs a new source
     /// intent proven by an activated incoming candidate.
     pub fn create_successor(&self, record: PhysicalSourceRecord, incoming: &PhysicalRecord, current_binding: &str) -> Result<PhysicalSourceRecord> {
@@ -445,6 +476,37 @@ impl PhysicalStore {
         Ok(record)
     }
 
+    /// Replace a failed preparation without asserting writer ancestry.  This
+    /// is intentionally separate from `create`/`create_successor`: the old
+    /// current record (and both VM identities it owns) is retained in history.
+    pub fn create_reseed(&self, record: PhysicalRecord, prior_generation: &str, current_binding: &str) -> Result<PhysicalRecord> {
+        validate_record(&record)?;
+        if record.phase != PhysicalPhase::Intent || record.candidate_id.is_some()
+            || record.handoff_barrier.is_some() || record.predecessor.as_deref() != Some(prior_generation)
+            || record.previous_vm_id.as_deref() != Some(current_binding) {
+            bail!("invalid physical reseed intent");
+        }
+        let mut journal = self.journal.lock().unwrap();
+        if let Some(existing) = journal.current.get(&record.database) {
+            if existing.generation == record.generation {
+                let mut retry = existing.clone();
+                retry.phase = PhysicalPhase::Intent; retry.candidate_id = None; retry.last_error = None; retry.standby_lsn = None;
+                if retry == record { return Ok(existing.clone()); }
+                bail!("conflicting retry of physical reseed intent");
+            }
+            if existing.generation != prior_generation || !candidate_reseed_follows(existing, &record) {
+                bail!("physical reseed does not match the failed preparation and binding");
+            }
+        } else { bail!("physical reseed requires a prior preparation"); }
+        ensure_candidate_unique(&journal, &record)?;
+        let mut next = journal.clone();
+        let old = next.current.insert(record.database.clone(), record.clone()).unwrap();
+        next.history.push(old);
+        persist_journal(&self.path, &next)?;
+        *journal = next;
+        Ok(record)
+    }
+
     pub fn advance(
         &self,
         database: &str,
@@ -458,7 +520,17 @@ impl PhysicalStore {
         if current.generation != generation || current.phase != expected_phase {
             bail!("stale physical replication update for database {database:?}: generation or phase no longer matches");
         }
-        if phase_number(next_phase) != phase_number(expected_phase) + 1 {
+        let legal = matches!((expected_phase, next_phase),
+            (PhysicalPhase::Intent, PhysicalPhase::Creating)
+            | (PhysicalPhase::Creating, PhysicalPhase::Candidate)
+            | (PhysicalPhase::Candidate, PhysicalPhase::Seeding)
+            | (PhysicalPhase::Seeding, PhysicalPhase::Verified)
+            | (PhysicalPhase::StandbyBinding, PhysicalPhase::Standby)
+            | (PhysicalPhase::Prepared, PhysicalPhase::Promoting)
+            | (PhysicalPhase::Promoting, PhysicalPhase::Promoted)
+            | (PhysicalPhase::Promoted, PhysicalPhase::Binding)
+            | (PhysicalPhase::Binding, PhysicalPhase::Activated));
+        if !legal {
             bail!("illegal physical replication phase transition from {expected_phase:?} to {next_phase:?}");
         }
         let mut updated = current.clone();
@@ -483,6 +555,24 @@ impl PhysicalStore {
         Ok(updated)
     }
 
+    pub fn begin_standby_binding(&self, database: &str, generation: &str, source_lsn: &str) -> Result<PhysicalRecord> {
+        validate_lsn(source_lsn)?;
+        let mut journal = self.journal.lock().unwrap();
+        let current = journal.current.get(database).context("no physical candidate")?;
+        if current.generation != generation { bail!("stale physical standby generation"); }
+        if current.phase == PhysicalPhase::StandbyBinding {
+            if current.standby_lsn.as_deref() == Some(source_lsn) { return Ok(current.clone()); }
+            bail!("physical standby source LSN changed");
+        }
+        if current.phase != PhysicalPhase::Verified || current.handoff_barrier.is_some() {
+            bail!("only an unpromoted verified candidate can be bound as standby");
+        }
+        let mut updated = current.clone(); updated.phase = PhysicalPhase::StandbyBinding; updated.standby_lsn = Some(source_lsn.into());
+        validate_record(&updated)?;
+        let mut next = journal.clone(); next.current.insert(database.into(), updated.clone());
+        persist_journal(&self.path, &next)?; *journal = next; Ok(updated)
+    }
+
     /// Persist the peer-verified source grant before any guest promotion effect.
     pub fn begin_handoff(&self, database: &str, generation: &str, barrier: &str) -> Result<PhysicalRecord> {
         validate_lsn(barrier)?;
@@ -493,9 +583,10 @@ impl PhysicalStore {
             if current.handoff_barrier.as_deref() == Some(barrier) { return Ok(current.clone()); }
             bail!("physical handoff barrier changed");
         }
-        if current.phase != PhysicalPhase::Verified { bail!("physical candidate is not verified"); }
+        if !matches!(current.phase, PhysicalPhase::Verified | PhysicalPhase::Standby) { bail!("physical candidate is not verified or bound standby"); }
         let mut updated = current.clone();
         updated.handoff_barrier = Some(barrier.to_owned());
+        updated.standby_lsn = None;
         updated.phase = PhysicalPhase::Prepared;
         validate_record(&updated)?;
         let mut next = journal.clone();
@@ -538,11 +629,13 @@ fn phase_number(phase: PhysicalPhase) -> u8 {
         PhysicalPhase::Candidate => 2,
         PhysicalPhase::Seeding => 3,
         PhysicalPhase::Verified => 4,
-        PhysicalPhase::Prepared => 5,
-        PhysicalPhase::Promoting => 6,
-        PhysicalPhase::Promoted => 7,
-        PhysicalPhase::Binding => 8,
-        PhysicalPhase::Activated => 9,
+        PhysicalPhase::StandbyBinding => 5,
+        PhysicalPhase::Standby => 6,
+        PhysicalPhase::Prepared => 7,
+        PhysicalPhase::Promoting => 8,
+        PhysicalPhase::Promoted => 9,
+        PhysicalPhase::Binding => 10,
+        PhysicalPhase::Activated => 11,
     }
 }
 
@@ -559,6 +652,9 @@ fn validate_record(record: &PhysicalRecord) -> Result<()> {
     } else if record.handoff_barrier.is_some() {
         bail!("preparation cannot contain a handoff barrier");
     }
+    if matches!(record.phase, PhysicalPhase::StandbyBinding | PhysicalPhase::Standby) {
+        validate_lsn(record.standby_lsn.as_deref().context("standby phase requires a durable source LSN")?)?;
+    } else if record.standby_lsn.is_some() { bail!("non-standby phase cannot contain a standby LSN"); }
     let derived = PhysicalRecord::candidate_name(&record.generation);
     if record.candidate_name != derived { bail!("candidate name must be derived from the generation"); }
     validate_token("source node", &record.source_node, 128)?;
@@ -680,18 +776,44 @@ fn decode_journal<T: DeserializeOwned>(bytes: &[u8], label: &str, path: &Path) -
     }
 }
 
+fn source_reseed_follows(old: &PhysicalSourceRecord, new: &PhysicalSourceRecord) -> bool {
+    new.predecessor.as_deref() == Some(old.generation.as_str())
+        && new.database == old.database && new.source_vm_id == old.source_vm_id
+        && new.peer == old.peer && new.system_identifier == old.system_identifier
+        && new.pg_major == old.pg_major && old.repl.as_ref().is_none_or(|login| new.repl.as_ref() == Some(login))
+        && old.fence.is_none() && old.handoff.is_none() && old.handoff_candidate.is_none()
+}
+
+fn candidate_reseed_follows(old: &PhysicalRecord, new: &PhysicalRecord) -> bool {
+    new.predecessor.as_deref() == Some(old.generation.as_str())
+        && new.database == old.database && new.source_vm_id == old.source_vm_id
+        && new.source_node == old.source_node && new.system_identifier == old.system_identifier
+        && new.pg_major == old.pg_major && old.repl.as_ref().is_none_or(|login| new.repl.as_ref() == Some(login))
+        && new.previous_vm_id == old.previous_vm_id
+        && !old.handoff_started()
+        && !matches!(old.phase, PhysicalPhase::StandbyBinding | PhysicalPhase::Standby)
+}
+
 fn source_journal(current: Vec<PhysicalSourceRecord>, history: Vec<PhysicalSourceRecord>) -> Result<Journal<PhysicalSourceRecord>> {
     let mut by_database = HashMap::new();
     let mut generations = std::collections::HashSet::new();
-    let mut source_vms = std::collections::HashSet::new();
-    for record in current.iter().chain(history.iter()) {
+    let mut source_vms = HashMap::<&str, &PhysicalSourceRecord>::new();
+    for record in history.iter().chain(current.iter()) {
         validate_source(record)?;
-        if !generations.insert(record.generation.clone()) || !source_vms.insert(record.source_vm_id.clone()) {
-            bail!("duplicate physical source generation or VM identity");
+        if !generations.insert(record.generation.clone()) {
+            bail!("duplicate physical source generation");
+        }
+        if let Some(previous) = source_vms.insert(&record.source_vm_id, record) {
+            if !source_reseed_follows(previous, record) {
+                bail!("duplicate physical source VM is not a same-source reseed");
+            }
         }
     }
-    for record in &history {
-        if record.handoff.is_none() { bail!("historical physical source operation lacks an irrevocable grant"); }
+    for (index, record) in history.iter().enumerate() {
+        if record.handoff.is_none() && !history[index + 1..].iter().chain(current.iter())
+            .any(|next| source_reseed_follows(record, next)) {
+            bail!("historical physical source lacks a handoff grant or reseed successor");
+        }
     }
     for record in current {
         if by_database.insert(record.database.clone(), record).is_some() { bail!("duplicate current physical source record for a database"); }
@@ -712,8 +834,11 @@ fn candidate_journal(current: Vec<PhysicalRecord>, history: Vec<PhysicalRecord>)
             bail!("duplicate physical candidate generation, name, or VM identity");
         }
     }
-    for record in &history {
-        if record.phase != PhysicalPhase::Activated { bail!("historical physical candidate was not activated"); }
+    for (index, record) in history.iter().enumerate() {
+        if record.phase != PhysicalPhase::Activated && !history[index + 1..].iter().chain(current.iter())
+            .any(|next| candidate_reseed_follows(record, next)) {
+            bail!("historical physical candidate lacks activation or reseed successor");
+        }
     }
     for record in current {
         if by_database.insert(record.database.clone(), record).is_some() { bail!("duplicate current physical replication record for a database"); }
@@ -778,7 +903,7 @@ mod tests {
         std::env::temp_dir().join(format!("pgfc-physical-{label}-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
     }
     fn record(database: &str, generation: &str) -> PhysicalRecord {
-        PhysicalRecord { database: database.into(), generation: generation.into(), predecessor: None, candidate_name: PhysicalRecord::candidate_name(generation), repl: None, candidate_id: None, previous_vm_id: Some("logical-vm-1".into()), source_node: "eu2".into(), source_vm_id: "source-vm-1".into(), system_identifier: "7431234567890123456".into(), pg_major: 18, slot: "physical_acme".into(), phase: PhysicalPhase::Intent, handoff_barrier: None, last_error: None }
+        PhysicalRecord { database: database.into(), generation: generation.into(), predecessor: None, candidate_name: PhysicalRecord::candidate_name(generation), repl: None, candidate_id: None, previous_vm_id: Some("logical-vm-1".into()), source_node: "eu2".into(), source_vm_id: "source-vm-1".into(), system_identifier: "7431234567890123456".into(), pg_major: 18, slot: "physical_acme".into(), phase: PhysicalPhase::Intent, handoff_barrier: None, standby_lsn: None, last_error: None }
     }
     fn source(database: &str, generation: &str) -> PhysicalSourceRecord {
         PhysicalSourceRecord { database: database.into(), generation: generation.into(), predecessor: None, source_vm_id: "source-vm-1".into(),
@@ -914,6 +1039,67 @@ mod tests {
         assert_eq!(resumed.candidate_id.as_deref(), Some("candidate-1"));
         assert!(loaded.create(record("other", "g1")).is_err());
         let _ = std::fs::remove_file(p);
+    }
+    #[test]
+    fn reseed_archives_all_old_vm_ownership_and_standby_branch_reloads() {
+        let p = path("reseed-standby"); let store = PhysicalStore::load(p.clone()).unwrap();
+        store.create(record("acme", "g1")).unwrap();
+        for (from, to, id) in [(PhysicalPhase::Intent, PhysicalPhase::Creating, None),
+            (PhysicalPhase::Creating, PhysicalPhase::Candidate, Some("failed-candidate".into())),
+            (PhysicalPhase::Candidate, PhysicalPhase::Seeding, None), (PhysicalPhase::Seeding, PhysicalPhase::Verified, None)] {
+            store.advance("acme", "g1", from, to, id).unwrap();
+        }
+        let mut next = record("acme", "g2"); next.predecessor = Some("g1".into());
+        store.create_reseed(next.clone(), "g1", "logical-vm-1").unwrap();
+        assert_eq!(store.create_reseed(next, "g1", "logical-vm-1").unwrap().generation, "g2");
+        for (from, to, id) in [(PhysicalPhase::Intent, PhysicalPhase::Creating, None),
+            (PhysicalPhase::Creating, PhysicalPhase::Candidate, Some("fresh-candidate".into())),
+            (PhysicalPhase::Candidate, PhysicalPhase::Seeding, None), (PhysicalPhase::Seeding, PhysicalPhase::Verified, None)] {
+            store.advance("acme", "g2", from, to, id).unwrap();
+        }
+        assert!(store.begin_standby_binding("acme", "stale", "0/20").is_err());
+        store.begin_standby_binding("acme", "g2", "0/20").unwrap();
+        assert!(store.begin_handoff("acme", "g2", "0/21").is_err());
+        let mut third = record("acme", "g3"); third.predecessor = Some("g2".into());
+        assert!(store.create_reseed(third.clone(), "g2", "logical-vm-1").is_err());
+        store.advance("acme", "g2", PhysicalPhase::StandbyBinding, PhysicalPhase::Standby, None).unwrap();
+        assert!(store.create_reseed(third, "g2", "logical-vm-1").is_err());
+        let loaded = PhysicalStore::load(p.clone()).unwrap();
+        assert_eq!(loaded.get("acme").unwrap().phase, PhysicalPhase::Standby);
+        assert!(loaded.owns_vm("logical-vm-1") && loaded.owns_vm("failed-candidate") && loaded.owns_vm("fresh-candidate"));
+        loaded.begin_handoff("acme", "g2", "0/21").unwrap();
+        assert_eq!(loaded.get("acme").unwrap().phase, PhysicalPhase::Prepared);
+        let _ = std::fs::remove_file(p);
+    }
+    #[test]
+    fn source_reseed_retains_identity_and_rejects_unrelated_vm_reuse() {
+        let p = path("source-reseed"); let store = PhysicalSourceStore::load(p.clone()).unwrap();
+        store.create(source("acme", "g1")).unwrap();
+        assert!(store.create(source("other", "g2")).is_err());
+        let mut next = source("acme", "g2"); next.predecessor = Some("g1".into());
+        let mut changed = next.clone(); changed.system_identifier = "1234".into();
+        assert!(store.create_reseed(changed, "g1").is_err());
+        store.create_reseed(next.clone(), "g1").unwrap();
+        store.create_reseed(next, "g1").unwrap();
+        let loaded = PhysicalSourceStore::load(p.clone()).unwrap();
+        assert_eq!(loaded.get("acme").unwrap().generation, "g2");
+        let mut third = source("acme", "g3"); third.predecessor = Some("g2".into());
+        loaded.create_reseed(third, "g2").unwrap();
+        assert_eq!(PhysicalSourceStore::load(p.clone()).unwrap().get("acme").unwrap().generation, "g3");
+        let _ = std::fs::remove_file(p);
+    }
+    #[test]
+    fn journal_rejects_unrelated_unfinished_history() {
+        let old = source("acme", "g1");
+        let mut next = source("acme", "g2"); next.predecessor = Some("g1".into());
+        assert!(source_journal(vec![next.clone()], vec![old.clone()]).is_ok());
+        next.predecessor = None;
+        assert!(source_journal(vec![next], vec![old]).is_err());
+        let old = record("acme", "g1");
+        let mut next = record("acme", "g2"); next.predecessor = Some("g1".into());
+        assert!(candidate_journal(vec![next.clone()], vec![old.clone()]).is_ok());
+        next.source_node = "unrelated-peer".into();
+        assert!(candidate_journal(vec![next], vec![old]).is_err());
     }
     #[test]
     fn hostile_values_are_rejected() {

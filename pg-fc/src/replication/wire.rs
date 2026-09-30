@@ -71,10 +71,29 @@ pub struct NodeInfo {
     pub physical_handoff: bool,
     #[serde(default)]
     pub physical_successor: bool,
+    #[serde(default)]
+    pub physical_reseed: bool,
+    #[serde(default)]
+    pub physical_standby_bind: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct PhysicalPrepareRequest { pub generation: String }
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PhysicalReseedRequest { pub generation: String, pub prior_generation: String }
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct PhysicalStandbyBindRequest {
+    pub database: String,
+    pub generation: String,
+    pub candidate_id: String,
+    pub source_node: String,
+    pub source_vm_id: String,
+    pub system_identifier: String,
+    pub pg_major: u32,
+    pub source_lsn: String,
+}
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct PhysicalHandoffRequest {
@@ -116,6 +135,8 @@ pub struct PhysicalReplicaRequest {
     pub repl: Login,
     pub primary: PrimaryEndpoint,
     pub slot: String,
+    #[serde(default)]
+    pub reseed_from: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -405,7 +426,7 @@ mod tests {
             candidate_name: "repl-seed-g1".into(), candidate_id: Some("candidate-e1".into()),
             previous_vm_id: Some("old-e0".into()), source_node: "us3".into(), source_vm_id: "source-u0".into(),
             system_identifier: "7431234567890123456".into(), pg_major: 18, slot: "physical_acme".into(),
-            phase: crate::replication::PhysicalPhase::Verified, handoff_barrier: None, last_error: None,
+            phase: crate::replication::PhysicalPhase::Verified, handoff_barrier: None, standby_lsn: None, last_error: None,
             repl: Some(Login { role: "repl_acme".into(), password: "not-for-status".into() }),
         };
         let mut value = serde_json::to_value(PhysicalRecordJson::from(&record)).unwrap();

@@ -107,6 +107,10 @@ impl PeerClient {
         self.post("/api/replication/peer/physical-handoff", req).await
     }
 
+    pub async fn physical_standby_bind(&self, req: &wire::PhysicalStandbyBindRequest) -> Result<wire::PhysicalRecordJson> {
+        self.post("/api/replication/peer/physical-standby-bind", req).await
+    }
+
     pub async fn physical_grant(&self, database: &str) -> Result<wire::PhysicalHandoffGrantJson> {
         self.get(&format!("/api/replication/peer/physical-grants/{}", enc(database))).await
     }

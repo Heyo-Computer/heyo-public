@@ -1221,6 +1221,32 @@ cannot remove credentials or slots owned by an ongoing physical migration.
 Preparation itself does not activate the candidate. A planned handoff is a
 separate controller operation described below.
 
+#### Recovering a lost preparation as a standby
+
+When the logical pairing is already `failed` and both its logical slot and the
+prior physical slot report `wal_status=lost`, POST
+`/api/replication/<database>/physical-reseed` on the still-running writer with
+`{"generation":"<new-unique-generation>","prior_generation":"<failed-generation>"}`.
+This separately authorized operation checks the live primary identity,
+`wal_level`, replication login, pairing identity, and lost slots. It archives
+the previous source and candidate intents without deleting their slots, VMs,
+or bound replica and then uses the normal `pg_basebackup` seed machinery. A
+retry of the same generation resumes its exact candidate; it cannot create a
+second candidate after an ambiguous create.
+
+After the new candidate reaches `verified`, POST
+`/api/replication/<database>/physical-standby-bind` on the writer with the same
+generation. The source remains unfenced and writable. The destination persists
+`standby-binding`, verifies the exact source identity and fresh source LSN,
+waits for replay, CASes the old destination binding to the exact candidate,
+clears the warm cache, reattaches by VM ID, and persists `standby`. Recovery
+retries only a durable `standby-binding`; it never promotes it. The old logical
+record remains `failed`, and all old VM ownership remains in journal history.
+The standby serves locally in recovery/read-only mode and is not `activated` or
+writer authority. A later handoff still requires the ordinary explicit source
+grant and fence. This recovery path therefore makes no zero-downtime writer
+failover claim.
+
 #### Planned physical handoff
 
 POST `/api/replication/<database>/physical-handoff` on the source with the
