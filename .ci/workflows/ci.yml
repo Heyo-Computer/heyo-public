@@ -274,6 +274,9 @@ jobs:
           cargo test --release --locked --bin ci store::tests::boot_claim_is_atomic_with_drain_and_cannot_be_completed_by_another_boot -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci store::tests::delivery_failure_cannot_overwrite_a_regional_claim -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci store::tests::regional_claims_and_expiry_cannot_reassign_unresolved_execution -- --ignored --exact --test-threads=1
+          cargo test --release --locked --bin ci store::tests::preparation_failure_releases_instance_without_erasing_runner_work -- --ignored --exact --test-threads=1
+          cargo test --release --locked --bin ci store::tests::preparation_boundary_cannot_release_execution_or_legacy_claims -- --ignored --exact --test-threads=1
+          cargo test --release --locked --bin ci dispatch::tests::failed_preparation_does_not_block_ci_app_drain -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci dispatch::tests::delivery_racing_instance_drain_returns_to_shared_queue -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci bus::tests::an_existing_consumer_is_updated_without_losing_pending_delivery -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci dispatch::tests::durable_vm_cleanup_recovers_without_guessing_ownership -- --ignored --exact --test-threads=1
