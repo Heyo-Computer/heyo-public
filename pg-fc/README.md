@@ -203,7 +203,7 @@ Config via env (all optional):
 | `PG_VM_POOL_FAST_BRINGUP_SECS` | `5` | how fast a bring-up must have been for its VM to be reaped on the short timeout. Measured per entry, not assumed from whether the VM already existed, so a loaded host where restarts have gone slow falls back to the long timeout on its own |
 | `PG_VM_POOL_IDLE_DRAIN_WINDOW_SECS` | `600` | the shortest time in which the reaper may stop the **whole** live fleet. Bounds the rate of change so a synchronized expiry ramps down instead of falling off a cliff; `0` disables the limit. Applies to the untracked reaper too — see "Draining as a ramp" |
 | `PG_VM_POOL_KEEPALIVE_SCHEMAS` | none | comma-separated schemas exempt from idle reaping |
-| `PG_VM_POOL_DATA_DISK_GB` | `4` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (2GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
+| `PG_VM_POOL_DATA_DISK_GB` | `2` | persistent per-schema disk size — a *cap*, not an upfront allocation: the guest formats a small (2GB) filesystem inside it and grows it online as the database grows (see "Reclaiming disk slack") |
 | `PG_VM_POOL_READY_TIMEOUT_SECS` | `300` | max wait for VM+Postgres readiness |
 | `PG_VM_POOL_DISK_GROW_PCT` | unset (off) | guest-filesystem used% at or above which a schema's data **device** is grown (doubled, offline). Setting it is the on/off switch for device growth — see "Growing the device" |
 | `PG_VM_POOL_DISK_GROW_URGENT_PCT` | `95` | used% at or above which a **warm** VM's device is grown without waiting for it to go idle — online under the running VM when heyvmd has the online resize route, otherwise stop, resize, and let the next connect boot it, dropping the sessions it had. Once every host's heyvmd has the route, 70–80 grows early at no cost. Must be >= `PG_VM_POOL_DISK_GROW_PCT`; `0` disables the online path. Without it a schema whose write load never pauses can never grow — see "Growing the device" |
@@ -1631,7 +1631,8 @@ the pairing's database objects before reverting to ordinary settings.
   revocable — but it is a durable credential, not a short-lived one.
 - **TLS terminates at the pooler.** The pooler→VM hop stays plaintext over the
   host-local tap, which is the same boundary every other client has.
-- **No automatic failover**, no fencing, no quorum. The replica is writable
+- **No automatic failover**, no automatic fencing, no quorum. The
+  fence routes described above are operator-driven. The replica is writable
   throughout, so writing to it before a promote is invisible to the primary and
   will conflict. Promoting is an operator's decision.
 

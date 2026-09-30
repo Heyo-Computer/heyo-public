@@ -350,7 +350,7 @@ npm install && npm run build
 Register with Claude Code:
 
 ```bash
-claude mcp add heyo -- node /home/sarocu/Projects/heyo-public/mcp/dist/index.js
+claude mcp add heyo -- node /path/to/hws/mcp/dist/index.js
 ```
 
 Credentials come from the environment the host launches it in, so nothing is

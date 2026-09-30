@@ -99,6 +99,7 @@ Every value resolves flag → environment → default.
 | `ART_ADMIN_PASSWORD` | `--admin-password` | *(unset)* | Dashboard password. **Unset means the dashboard is not served at all.** |
 | `ART_ADMIN_USER` | `--admin-user` | `admin` | Dashboard username. |
 | `ART_DASHBOARD_OPEN` | `--dashboard-open` | `false` | Serve the dashboard with no login. For a listener already on a private network. Takes `1`/`true`/`yes`/`on`. Conflicts with `ART_ADMIN_PASSWORD`. |
+| `ART_DASHBOARD_GATE` | `--dashboard-gate` | `false` | Serve the dashboard behind an upstream app-lb auth gate, trusting its `x-auth-request-*` identity. Conflicts with the two above. |
 | `ART_FORCE_NO_TMPFILE` | — | unset | Force the named-temp-file insert path. Testing only. |
 | `ART_TEST_DIR` | — | `$TMPDIR` | Where tests create their scratch directories. |
 | `RUST_LOG` | — | `art=info,artifacts=info` | Tracing filter. |
@@ -116,6 +117,7 @@ art ls [--blobs|--tags|--manifests]         art usage
 art tag <name> <ref>                        art untag <name>
 art label <ref> [--name N] [--description D|-] [--clear]
 art manifest <ref>                          art rm <ref> [--force]
+art public <ref> [--off]                    art init
 art verify [<ref>|--all]                    art gc [--dry-run] [--min-age 1h]
 
 art dockerfile put <path> [--context DIR|ARCHIVE] [--tag NAME]
@@ -365,7 +367,8 @@ script would simply fail to load.
 same pattern as the vault/`tk` image:
 
 ```sh
-heyvm mvm build --local-only -f Dockerfile -n artifacts --size-mb 768
+# from the repository root — the build needs ui/ as well as this crate
+heyvm mvm build --local-only -f artifacts/Dockerfile -n artifacts --size-mb 768
 art heyvm sparsify artifacts     # 768 MiB -> ~110 MiB
 ```
 

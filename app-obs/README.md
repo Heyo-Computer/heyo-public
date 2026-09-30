@@ -170,6 +170,7 @@ The JSON behind it:
 | `GET /api/platform-status` | Current app-lb topology, health/drain state, and staleness |
 | `GET /api/deployments/<id>?window=` | Bucketed series and summary figures |
 | `GET /api/deployments/<id>/logs?window=&from=&to=&level=&backend=&q=&limit=&before=` | Log lines, newest first |
+| `GET/POST /api/alerts`, `DELETE /api/alerts/<id>` | Webhook alert rules |
 | `GET /stats` | Ingest counters, and rows still buffered in memory |
 | `GET /healthz` | Always open, never queued behind a query |
 
@@ -242,6 +243,7 @@ Configuration is environment-only:
 | `APP_OBS_QUEUE_CAPACITY` | `65536` | Ingest queue depth before records are dropped |
 | `APP_OBS_QUERY_CONCURRENCY` | `4` | Dashboard queries in flight before a `503` |
 | `APP_OBS_QUERY_TIMEOUT_SECS` | `30` | Ceiling on one query |
+| `APP_OBS_ALERTS_FILE` | `<APP_OBS_DATA_DIR>/alerts.json` | Where alert rules are persisted |
 
 `APP_OBS_RETAIN_DAYS` counts back from and including today: `7` keeps seven
 days, and the eighth-oldest day is removed. Future-dated partitions are never

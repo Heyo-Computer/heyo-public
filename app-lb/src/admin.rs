@@ -6296,7 +6296,7 @@ async fn whoami(caller: Option<axum::Extension<Caller>>) -> impl IntoResponse {
     match &caller {
         Caller::Ungated => {
             body["admin_scope"] = "unchecked".into();
-            body["detail"] = "this listener has no credential configured, so every request                               is admitted and no scope is checked. APP_LB_ADMIN_PASSWORD is                               what turns the gate on."
+            body["detail"] = "this listener has no credential configured, so every request                               is admitted and no scope is checked. APP_LB_DASHBOARD_PASSWORD is                               what turns the gate on."
                 .into();
         }
         Caller::Operator => {

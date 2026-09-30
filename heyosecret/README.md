@@ -39,8 +39,9 @@ Configured via environment (prefix `HEYOSECRET_`), an optional
 | `HEYOSECRET_INTERNAL_API_KEY` (or `PLATFORM_INTERNAL_API_KEY`) | yes | — | Bearer key for the machine API |
 | `HEYOSECRET_MASTER_KEY` | yes | — | ≥32 bytes; derives the value-encryption key |
 | `HEYOSECRET_ADMIN_PASSWORD` | no | — | Enables the dashboard; login password |
-| `HEYOSECRET_COOKIE_SECURE` | no | `false` | Set `true` behind TLS to add `Secure` to the session cookie |
-| `HEYOSECRET_SESSION_TTL_SECONDS` | no | `43200` (12h) | Dashboard session lifetime |
+| `cookie_secure` (TOML only; `HEYOSECRET_COOKIE_SECURE` is not read) | no | `false` | Set `true` behind TLS to add `Secure` to the session cookie |
+| `session_ttl_seconds` (TOML only; `HEYOSECRET_SESSION_TTL_SECONDS` is not read) | no | `43200` (12h) | Dashboard session lifetime |
+| `HEYOSECRET_DASHBOARD_GATE` | no | `false` | Trust app-lb's forwarded identity instead of a password; refused together with `HEYOSECRET_ADMIN_PASSWORD` |
 | `HEYOSECRET_SERVER_PORT` | no | `4455` | Listen port |
 
 The session-cookie signing key is derived from `master_key + admin_password`
