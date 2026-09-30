@@ -315,6 +315,23 @@
 body[data-tier="view"] #local-view button:not(#dep-prev):not(#dep-next),
 body[data-tier="view"] [data-admin-only] { display: none; }
 #ns-banner a { margin-left: .5em; }
+/* Workloads: namespace × deployment with a cell per server. Wide fleets
+   scroll sideways inside the card rather than widening the page. */
+.wl-scroll { overflow-x: auto; }
+table.wl { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.wl th, table.wl td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; font-variant-numeric: tabular-nums; vertical-align: top; }
+table.wl th.srv, table.wl td.srv { text-align: center; }
+table.wl .mono, #server-detail .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+table.wl .sub, #server-detail .sub { color: var(--muted); font-size: 11px; }
+table.wl tr.total td { font-weight: 600; border-top: 1px solid var(--axis); }
+button.linkish { font: inherit; background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; text-align: inherit; }
+button.linkish:hover { text-decoration: underline; }
+button.cellbtn { font: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+button.cellbtn:hover .tag, button.cellbtn:focus-visible .tag { outline: 1px solid var(--axis); }
+.wl-scope { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: baseline; margin-bottom: 10px; font-size: 12px; color: var(--text-2); }
+#server-detail .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 14px; margin-bottom: 10px; }
+#server-detail .head h3 { margin: 0; font-size: 15px; font-weight: 650; }
+#server-detail .head .spacer { flex: 1 1 auto; }
 </style>
 <!-- The theme used to be read from localStorage by a blocking script here.
      It is now stamped on <html> by the server from a cookie, which is both
@@ -332,7 +349,7 @@ body[data-tier="view"] [data-admin-only] { display: none; }
       <a href="/siem" data-local-nav>Security</a>
       <a href="/storage" data-local-nav>Disks</a>
       <a href="/plugins" data-local-nav>Plugins</a>
-      <a href="/network" data-local-nav>Network</a>
+      <a href="/network" id="network-nav">Network</a>
       <a href="/metrics" data-local-nav>Metrics</a>
     </nav>
     <div class="topbar-right">
@@ -349,6 +366,12 @@ body[data-tier="view"] [data-admin-only] { display: none; }
   </header>
 
   <div class="card" id="ns-banner" hidden role="status"></div>
+
+  <section aria-labelledby="workloads-title" data-fleet-only>
+    <div class="section-title" id="workloads-title">Workloads <span class="count" id="workloads-count"></span></div>
+    <div class="card" id="workloads" aria-live="polite">Loading workloads across servers…</div>
+    <div class="card" id="server-detail" hidden aria-live="polite"></div>
+  </section>
 
   <section aria-labelledby="services-title" data-fleet-only>
     <div class="section-title" id="services-title">Global applications</div>
@@ -510,6 +533,9 @@ document.querySelector(".topbar-app").textContent = pinnedNamespace
 document.title = localView ? location.host + " · Heyo" : "Heyo control plane";
 document.getElementById("local-title").textContent = "Selected gateway: " + location.host + " · host & pools";
 document.getElementById("uptime").hidden = !localView;
+// The global topology is the default away from a local view; a local page
+// keeps its own gateway's picture.
+document.getElementById("network-nav").href = localView ? "/network?view=local" : "/network";
 
 // Hamburger menu: collapse the nav on narrow screens. The open/closed state
 // lives on the nav (`.open`) and is mirrored to the button's `aria-expanded`
@@ -2527,6 +2553,176 @@ function renderFleet(result) {
     }).join("")}</div>`;
 }
 
+// ---- workloads across servers ---------------------------------------------
+//
+// `GET /fleet/deployments` is a rollup of each configured gateway's own pool
+// gauges: rows are namespace × deployment, cells are one server each. A
+// server that could not be read shows as unavailable, never as zero. Clicking
+// a namespace narrows the rollup; clicking a server opens its drill-down,
+// fetched through this origin from `/fleet/gateways/:id/metrics`.
+const HEALTH_TAG = { healthy: "ok", degraded: "slow", starting: "boot", draining: "drain", down: "down", idle: "idle" };
+let fleetNs = NS_RE.test(pageParams.get("fleet_namespace") || "") ? pageParams.get("fleet_namespace") : "";
+let serverDetail = null; // { id, ns, offset } while the drill-down is open
+
+// Static and site deployments have no desired count; show what is ready.
+const readyOf = (ready, desired) => desired ? `${fmt(ready)}/${fmt(desired)}` : fmt(ready);
+
+function healthTag(health, text, title) {
+  return `<span class="tag ${HEALTH_TAG[health] || "idle"}"${title ? ` title="${esc(title)}"` : ""}>${esc(text)}</span>`;
+}
+
+function setFleetNs(ns) {
+  fleetNs = ns;
+  const params = new URLSearchParams(location.search);
+  if (ns) params.set("fleet_namespace", ns); else params.delete("fleet_namespace");
+  const q = params.toString();
+  history.replaceState(null, "", location.pathname + (q ? "?" + q : "") + location.hash);
+  if (serverDetail) { serverDetail.ns = ns; serverDetail.offset = 0; }
+  pollWorkloads();
+}
+
+async function pollWorkloads() {
+  const ns = fleetNs;
+  let result;
+  try { result = await api("GET", "fleet/deployments" + (ns ? "?namespace=" + encodeURIComponent(ns) : "")); }
+  catch (_) { result = { ok: false }; }
+  if (ns === fleetNs) renderWorkloads(result);
+  if (serverDetail) loadServerDetail();
+}
+
+function renderWorkloads(result) {
+  const target = $("workloads");
+  if (!result.ok) {
+    $("workloads-count").textContent = "";
+    target.textContent = result.status === 401 || result.status === 403
+      ? "Workloads require an authenticated fleet-wide view."
+      : "Workload rollup unavailable — retrying. No current per-server state is known.";
+    return;
+  }
+  if (!result.data.configured) {
+    target.textContent = "No servers are configured for this control plane.";
+    return;
+  }
+  const { gateways, rows, totals } = result.data;
+  $("workloads-count").textContent = `${rows.length} deployment${rows.length === 1 ? "" : "s"} · ${gateways.length} server${gateways.length === 1 ? "" : "s"}`;
+  const scope = fleetNs
+    ? `<span>Namespace <span class="chip ns">${esc(fleetNs)}</span></span><button class="linkish" data-wl-ns="">All namespaces</button>`
+    : `<span>All namespaces · select a namespace to narrow, a server to drill in.</span>`;
+  const srvHead = gateways.map(g => {
+    const state = g.error ? healthTag("down", "unavailable", g.error)
+      : g.truncated ? healthTag("degraded", "truncated", "more deployments than the rollup reads") : "";
+    return `<th class="srv"><button class="linkish" data-wl-gw="${esc(g.id)}" title="Open ${esc(g.id)} details">${esc(g.region)} · ${esc(g.id)}</button>${state ? "<br>" + state : ""}</th>`;
+  }).join("");
+  const cellOf = (row, g) => {
+    const c = row.cells.find(x => x.gateway === g.id);
+    if (!c) return `<td class="srv"><span class="sub">—</span></td>`;
+    if (c.error) return `<td class="srv">${healthTag("down", "?", c.error)}</td>`;
+    const title = `${c.health} · ${c.ready} ready · ${c.pending} pending · ${c.draining} draining · ${c.in_flight} in-flight`;
+    return `<td class="srv"><button class="cellbtn" data-wl-gw="${esc(g.id)}" data-wl-row-ns="${esc(row.namespace)}">${healthTag(c.health, readyOf(c.ready, c.desired), title)}</button></td>`;
+  };
+  const body = rows.map(row => `<tr>
+      <td><button class="linkish" data-wl-ns="${esc(row.namespace)}">${esc(row.namespace)}</button></td>
+      <td class="mono">${esc(row.id)}${row.hosts.length ? `<div class="sub">${esc(row.hosts.slice(0, 2).join(", "))}${row.hosts.length > 2 ? " …" : ""}</div>` : ""}</td>
+      ${gateways.map(g => cellOf(row, g)).join("")}
+      <td class="srv">${healthTag(row.health, readyOf(row.totals.ready, row.totals.desired), row.health)}</td>
+    </tr>`).join("");
+  const totalRow = `<tr class="total"><td colspan="2">Total</td>${gateways.map(g => `<td class="srv">${g.error ? "—" : readyOf(g.totals.ready, g.totals.desired)}</td>`).join("")}
+    <td class="srv">${readyOf(totals.ready, totals.desired)}</td></tr>`;
+  const perServer = fleetNs ? `<div class="section-title" style="margin-top:18px">Servers · namespace ${esc(fleetNs)}</div>
+    <div class="wl-scroll"><table class="wl"><thead><tr><th>server</th><th>deployments</th><th>ready / desired</th><th>pending</th><th>draining</th><th>in-flight</th><th>observed</th></tr></thead><tbody>
+    ${gateways.map(g => `<tr><td><button class="linkish" data-wl-gw="${esc(g.id)}">${esc(g.region)} · ${esc(g.id)}</button></td>
+      ${g.error ? `<td colspan="5">${healthTag("down", "unavailable")} <span class="sub">${esc(g.error)}</span></td>`
+        : `<td>${fmt(g.deployments)}</td><td>${readyOf(g.totals.ready, g.totals.desired)}</td><td>${fmt(g.totals.pending)}</td><td>${fmt(g.totals.draining)}</td><td>${fmt(g.totals.in_flight)}</td>`}
+      <td>${g.generated_at ? esc(new Date(g.generated_at * 1000).toLocaleTimeString()) : "—"}</td></tr>`).join("")}
+    </tbody></table></div>` : "";
+  target.innerHTML = `<div class="wl-scope">${scope}</div>
+    <div class="wl-scroll"><table class="wl"><thead><tr><th>namespace</th><th>deployment</th>${srvHead}<th class="srv">all servers</th></tr></thead>
+    <tbody>${body || `<tr><td colspan="${gateways.length + 3}" class="empty">No deployments${fleetNs ? " in namespace " + esc(fleetNs) : ""} on the servers that answered.</td></tr>`}
+    ${rows.length ? totalRow : ""}</tbody></table></div>
+    <div class="note">Cells are ready / desired backends (ready alone where nothing is desired, as for static upstreams) as each server's app-lb reports its own pool. Each server runs its own VMs, so the totals are per-server sums; nothing here places or scales anything.</div>
+    ${perServer}`;
+}
+
+$("workloads").addEventListener("click", (e) => {
+  const ns = e.target.closest("[data-wl-ns]");
+  if (ns) { setFleetNs(ns.dataset.wlNs); return; }
+  const gw = e.target.closest("[data-wl-gw]");
+  if (gw) openServer(gw.dataset.wlGw, gw.dataset.wlRowNs ?? fleetNs);
+});
+
+function openServer(id, ns) {
+  serverDetail = { id, ns: ns || "", offset: 0 };
+  const panel = $("server-detail");
+  panel.hidden = false;
+  panel.innerHTML = `Loading ${esc(id)}…`;
+  loadServerDetail();
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function loadServerDetail() {
+  const want = serverDetail;
+  if (!want) return;
+  const q = new URLSearchParams({ offset: want.offset });
+  if (want.ns) q.set("namespace", want.ns);
+  let r;
+  try { r = await api("GET", "fleet/gateways/" + encodeURIComponent(want.id) + "/metrics?" + q); }
+  catch (_) { r = { ok: false }; }
+  if (serverDetail !== want) return;
+  renderServerDetail(want, r);
+}
+
+function renderServerDetail(want, r) {
+  const panel = $("server-detail");
+  const head = (title, link) => `<div class="head"><h3>${title}</h3>
+    ${want.ns ? `<span class="chip ns">${esc(want.ns)}</span>` : ""}<span class="spacer"></span>
+    ${link || ""}<button class="btn btn-sm" data-sd="close">Close</button></div>`;
+  if (!r.ok) {
+    panel.innerHTML = head(esc(want.id)) + `<div>${healthTag("down", "unavailable")} ${esc(errMsg(r))}</div>`;
+    return;
+  }
+  const d = r.data, p = d.fleet, h = d.host;
+  const vmState = (v) => v.draining ? healthTag("draining", "draining") : v.healthy ? healthTag("healthy", "serving") : healthTag("down", "down");
+  const rows = d.deployments.map(x => {
+    const vms = x.vms.map(v => `<div class="mono">${esc(v.sandbox_id)}${v.addr ? ` <span class="sub">${esc(v.addr)}</span>` : ""} ${vmState(v)} <span class="sub">${fmt(v.in_flight)} in-flight · up ${fmtDur(v.uptime_secs)}</span></div>`)
+      .concat(x.pending_vms.map(v => `<div class="mono">${esc(v.sandbox_id)} ${healthTag("starting", "booting")} <span class="sub">${fmtDur(v.age_secs)}</span></div>`)).join("");
+    const m = x.metrics;
+    return `<tr><td><button class="linkish" data-sd-ns="${esc(x.namespace)}">${esc(x.namespace)}</button></td>
+      <td class="mono">${esc(x.id)}<div class="sub">${esc(x.kind)}${x.routed ? "" : " · unrouted"}</div></td>
+      <td>${healthTag(x.health, x.health)}</td>
+      <td>${readyOf(x.pool.ready, x.pool.desired_replicas)}</td><td>${fmt(x.pool.pending)}</td><td>${fmt(x.pool.draining)}</td><td>${fmt(x.pool.total_in_flight)}</td>
+      <td>${m ? `${fmt(m.requests.total)} · ${fmt(m.requests.c5xx)} 5xx` : "—"}</td>
+      <td>${m && m.latency_ms.count ? `${fmtMs(m.latency_ms.p50)} / ${fmtMs(m.latency_ms.p99)}` : "—"}</td>
+      <td>${vms || `<span class="sub">none</span>`}</td></tr>`;
+  }).join("");
+  const last = Math.min(d.offset + d.deployments.length, d.matched);
+  const pager = d.matched > d.limit ? `<div class="wl-scope"><span>${fmt(d.offset + 1)}–${fmt(last)} of ${fmt(d.matched)}</span>
+      <button class="btn btn-sm" data-sd="prev" ${d.offset ? "" : "disabled"}>Previous</button>
+      <button class="btn btn-sm" data-sd="next" ${last < d.matched ? "" : "disabled"}>Next</button></div>` : "";
+  panel.innerHTML = head(`${esc(d.region)} · ${esc(d.id)}`, `<a href="${esc(d.dashboard_url)}">Open this server's dashboard ↗</a>`) +
+    `<div class="kv">
+      <div><div class="label">deployments</div><div class="value">${fmt(p.deployments)}</div></div>
+      <div><div class="label">ready</div><div class="value">${fmt(p.ready)}</div></div>
+      <div><div class="label">pending</div><div class="value">${fmt(p.pending)}</div></div>
+      <div><div class="label">draining</div><div class="value">${fmt(p.draining)}</div></div>
+      <div><div class="label">in-flight</div><div class="value">${fmt(p.total_in_flight)}</div></div>
+      ${h && h.available ? `<div><div class="label">host CPU</div><div class="value">${fmt(h.cpu_percent, 0)}%</div></div>
+      <div><div class="label">host memory</div><div class="value">${fmtBytes(h.memory_used_bytes)}</div></div>` : ""}
+      <div><div class="label">sampled</div><div class="value">${esc(new Date(d.generated_at * 1000).toLocaleTimeString())}</div></div>
+    </div>` + pager +
+    `<div class="wl-scroll" style="margin-top:12px"><table class="wl"><thead><tr><th>namespace</th><th>deployment</th><th>health</th><th>ready / desired</th><th>pending</th><th>draining</th><th>in-flight</th><th>requests</th><th>p50 / p99</th><th>VMs</th></tr></thead>
+    <tbody>${rows || `<tr><td colspan="10" class="empty">No deployments on this page.</td></tr>`}</tbody></table></div>`;
+}
+
+$("server-detail").addEventListener("click", (e) => {
+  const ns = e.target.closest("[data-sd-ns]");
+  if (ns) { setFleetNs(ns.dataset.sdNs); return; }
+  const act = e.target.closest("[data-sd]");
+  if (!act || !serverDetail) return;
+  if (act.dataset.sd === "close") { serverDetail = null; $("server-detail").hidden = true; return; }
+  serverDetail.offset = Math.max(0, serverDetail.offset + (act.dataset.sd === "next" ? 50 : -50));
+  loadServerDetail();
+});
+
 async function pollSlow() {
   clearTimeout(slowTimer);
   let interval = SLOW_REFRESH_MS;
@@ -2536,6 +2732,7 @@ async function pollSlow() {
     if (!pinnedNamespace) await Promise.all([
       api("GET", "fleet").then(renderFleet).catch(() => renderFleet({ ok: false })),
       pollServices(),
+      localView ? null : pollWorkloads(),
     ]);
     if (!localView) {
       $("updated").textContent = "checked " + new Date().toLocaleTimeString();

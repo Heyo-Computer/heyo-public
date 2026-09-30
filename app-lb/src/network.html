@@ -192,6 +192,7 @@
       <a href="/metrics">Metrics</a>
     </nav>
     <div class="topbar-right">
+      <a class="btn btn-sm" id="scope-toggle" hidden></a>
       <span class="pill"><span class="dot" id="livedot"></span><span id="updated">connecting…</span></span>
       <span class="topbar-user">{{WHO}}</span>
       <button class="btn btn-sm" id="pausebtn">Pause</button>
@@ -224,6 +225,14 @@
 
 <script>
 "use strict";
+// Two scopes. Global (the default on a control plane): `GET /fleet/network`
+// laid out region → server (with its ingress addresses) → deployments → VMs,
+// polled every five seconds. Local (`?view=local`, or wherever the fleet view
+// is not configured or not permitted): this gateway's own /metrics + /ingress.
+const pageParams = new URLSearchParams(location.search);
+const forceLocal = pageParams.get("view") === "local";
+const GLOBAL_REFRESH_MS = 5000;
+let globalMode = false;
 
 // Hamburger menu: collapse the nav on narrow screens. The open/closed state
 // lives on the nav (`.open`) and is mirrored to the button's `aria-expanded`
@@ -356,6 +365,7 @@ function deploymentIsColdIdle(d) {
 // deterministic layout — no force simulation — because the topology is small
 // and a stable picture is easier to read than one that wiggles every poll.
 function layout(data) {
+  if (globalMode) return layoutGlobal(data);
   nodes = [];
   edges = [];
   const W = canvas.clientWidth, H = canvas.clientHeight;
@@ -487,6 +497,118 @@ function layout(data) {
   }
 }
 
+// Global layout: region → server → deployment → VM, one column each. Node ids
+// are qualified by server, since the same deployment id can run on several.
+function layoutGlobal(data) {
+  nodes = [];
+  edges = [];
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  const margin = 64;
+  const colW = (W - 2 * margin) / 3;
+  const colX = [margin, margin + colW, margin + 2 * colW, W - margin];
+  const placeColumn = (x, items, make) => {
+    const n = items.length;
+    const gap = Math.min(96, H / Math.max(n + 1, 2));
+    let y = H / 2 - ((n - 1) * gap) / 2;
+    for (const item of items) { nodes.push(make(item, x, y)); y += gap; }
+  };
+  const regions = data.regions || [];
+  const servers = [], deps = [], vms = [];
+  for (const r of regions) {
+    for (const g of r.gateways) {
+      servers.push({ region: r.region, g });
+      for (const d of g.deployments) {
+        d.metrics = d.metrics || { requests: { total: 0, c2xx: 0, c5xx: 0, errors: 0 }, latency_ms: { count: 0 } };
+        const key = g.id + "/" + (d.namespace || "default") + "/" + d.id;
+        deps.push({ key, g, d });
+        if (deploymentIsColdIdle(d)) continue;
+        for (const v of (d.vms || [])) vms.push({ key, g, d, vm: v });
+        for (const v of (d.pending_vms || [])) vms.push({ key, g, d, vm: v, pending: true });
+      }
+    }
+  }
+  placeColumn(colX[0], regions, (r, x, y) => ({ type: "region", id: r.region, x, y, r: 14, label: r.region, data: r }));
+  placeColumn(colX[1], servers, (s, x, y) => {
+    const ip = s.g.ingress && (s.g.ingress.ipv4[0] || s.g.ingress.ipv6[0]);
+    return { type: "gateway", id: s.g.id, x, y, r: 11, label: s.g.id + (ip ? " · " + ip : ""),
+      data: s.g, region: s.region, error: !!s.g.error };
+  });
+  placeColumn(colX[2], deps, (e, x, y) => ({
+    type: "deployment", id: e.key, x, y, r: 12,
+    label: (e.d.namespace && e.d.namespace !== "default" ? e.d.namespace + "/" : "") + e.d.id,
+    data: e.d, gateway: e.g.id, coldIdle: deploymentIsColdIdle(e.d),
+  }));
+  const VM_CAP = 80;
+  const shown = vms.length > VM_CAP ? vms.slice(0, VM_CAP) : vms;
+  placeColumn(colX[3], shown, (e, x, y) => ({
+    type: "vm", id: e.key + "/" + (e.vm.sandbox_id || "?"), x, y, r: 7,
+    state: e.pending ? "boot" : vmState(e.vm), dep: e.key, depData: e.d, gateway: e.g.id,
+    vm: e.vm, pending: !!e.pending, label: (e.vm.sandbox_id || "").slice(0, 8),
+  }));
+  if (vms.length > VM_CAP) {
+    nodes.push({ type: "vm-more", id: "vm-more", x: colX[3], y: H / 2 + Math.min(96, H / 2), r: 0,
+      label: "+" + (vms.length - VM_CAP) + " more" });
+  }
+  const find = (type, id) => nodes.find(n => n.type === type && n.id === id);
+  for (const s of servers) {
+    const rn = find("region", s.region), gn = find("gateway", s.g.id);
+    if (rn && gn) edges.push({ a: rn, b: gn, kind: "net", particles: makeParticles(s.g.error ? 0 : 2) });
+  }
+  for (const e of deps) {
+    const gn = find("gateway", e.g.id), dn = find("deployment", e.key);
+    if (gn && dn) {
+      const dens = Math.min(6, 1 + Math.floor((e.d.pool.total_in_flight || 0) / 2));
+      edges.push({ a: gn, b: dn, kind: "net", particles: makeParticles(e.d.routed ? Math.max(1, dens) : 0) });
+    }
+  }
+  for (const e of shown) {
+    const dn = find("deployment", e.key), vn = find("vm", e.key + "/" + (e.vm.sandbox_id || "?"));
+    if (dn && vn) {
+      const n = vn.state === "live" ? Math.min(4, 1 + Math.floor(e.vm.in_flight || 0)) : 0;
+      edges.push({ a: dn, b: vn, kind: "vm", state: vn.state, particles: makeParticles(n) });
+    }
+  }
+}
+
+function renderGlobalPanel(live) {
+  const kind = $("panel-kind"), name = $("panel-name"), body = $("panel-body");
+  const gatewayLine = (g) => `<div style="padding:6px 0;border-bottom:1px solid var(--grid)">
+      <div style="font-size:13px;font-weight:600">${esc(g.id)} ${g.error ? `<span class="tag down">unavailable</span>` : `<span class="tag ok">${g.deployments.length} deployments</span>`}</div>
+      <div style="font-size:12px;color:var(--muted)">${esc(g.ingress ? [...g.ingress.ipv4, ...g.ingress.ipv6].join(", ") || "no public IPs" : "ingress unknown")}</div></div>`;
+  if (live.type === "region") {
+    kind.textContent = "Region";
+    name.textContent = live.id;
+    body.innerHTML = `<div class="note">Servers observed in this region. Each app-lb drives its own VM daemon.</div>` +
+      live.data.gateways.map(gatewayLine).join("");
+  } else if (live.type === "gateway") {
+    const g = live.data;
+    kind.textContent = "Server · " + live.region;
+    name.textContent = g.id;
+    const vmCount = g.deployments.reduce((n, d) => n + (d.vms || []).length, 0);
+    body.innerHTML = (g.error ? `<div class="note"><span class="tag down">unavailable</span> ${esc(g.error)}. Its workloads are unknown, not zero.</div>` : "") +
+      `<div class="section-title">Ingress</div>` +
+      kv("IPv4", g.ingress ? g.ingress.ipv4.join(", ") || "—" : "unknown") +
+      kv("IPv6", g.ingress ? g.ingress.ipv6.join(", ") || "—" : "unknown") +
+      (g.ingress_error ? kv("ingress error", g.ingress_error) : "") +
+      `<div class="section-title">Workloads</div>` +
+      kv("deployments", g.deployments.length) + kv("VMs", vmCount) +
+      kv("sampled", g.generated_at ? new Date(g.generated_at * 1000).toLocaleTimeString() : "—") +
+      (g.truncated ? `<div class="note">More deployments than this view reads; open the server's dashboard for the rest.</div>` : "") +
+      `<div style="margin-top:12px"><a href="${esc(g.dashboard_url)}" style="color:var(--accent);font-size:12px">Open this server's dashboard ↗</a></div>` +
+      g.deployments.map(d => depSummaryRow(d)).join("");
+  } else if (live.type === "deployment") {
+    kind.textContent = "Deployment · " + live.gateway;
+    name.textContent = live.data.id;
+    body.innerHTML = depDetail(live.data);
+  } else if (live.type === "vm") {
+    const d = live.depData;
+    kind.textContent = (live.pending ? "VM (cold-booting)" : "VM") + " · " + live.gateway;
+    name.textContent = live.vm.sandbox_id || "—";
+    body.innerHTML = `<div class="badges"><span class="badge ns">${esc(d.namespace || "default")}</span>
+      <span class="badge">${esc(d.id)}</span></div>` + vmDetail(live.vm, live.pending, d);
+  }
+}
+
 // ---- drawing --------------------------------------------------------------
 
 function stateColor(state) {
@@ -500,7 +622,7 @@ function drawNode(n, t) {
   const isSel = selected && selected.type === n.type && selected.id === n.id;
   const isHover = hovered && hovered.type === n.type && hovered.id === n.id;
 
-  if (n.type === "ingress") {
+  if (n.type === "ingress" || n.type === "region") {
     // A rounded square for the entry point.
     ctx.fillStyle = STATE.surface;
     ctx.strokeStyle = STATE.accent;
@@ -510,9 +632,10 @@ function drawNode(n, t) {
     ctx.rect(-s, -s, s * 2, s * 2);
     ctx.fill();
     ctx.stroke();
-  } else if (n.type === "hostname") {
+  } else if (n.type === "hostname" || n.type === "gateway") {
     ctx.fillStyle = STATE.surface;
-    ctx.strokeStyle = STATE.accent;
+    // An unreadable server is drawn in the "down" colour, never as empty.
+    ctx.strokeStyle = n.error ? STATE.down : STATE.accent;
     ctx.lineWidth = isSel || isHover ? 2.5 : 1.5;
     ctx.beginPath();
     ctx.arc(0, 0, n.r, 0, Math.PI * 2);
@@ -554,7 +677,7 @@ function drawNode(n, t) {
       ctx.fillStyle = isSel ? STATE.text : STATE.text;
       // Truncate long hostnames so they do not collide with the next column.
       let label = n.label;
-      const max = n.type === "hostname" ? 28 : 20;
+      const max = n.type === "hostname" || n.type === "gateway" ? 28 : 20;
       if (label.length > max) label = label.slice(0, max - 1) + "…";
       ctx.fillText(label, n.r + 6, 0);
     }
@@ -668,6 +791,7 @@ function renderPanel(node) {
   // deployment closes the panel rather than showing stale data.
   const live = nodes.find(n => n.type === node.type && n.id === node.id);
   if (!live) { closePanel(); return; }
+  if (globalMode) { renderGlobalPanel(live); return; }
 
   const kind = $("panel-kind");
   const name = $("panel-name");
@@ -801,7 +925,7 @@ function vmDetail(vm, pending, d) {
   // The state value is a badge rather than text, so it reads at a glance the
   // same way the canvas node and the dashboard row do.
   return kv("sandbox", vm.sandbox_id) +
-    kv("address", vm.addr) +
+    (vm.addr ? kv("address", vm.addr) : "") +
     `<div class="kv"><div class="label">state</div><div class="value">${st}</div></div>` +
     kv("in-flight", fmt(vm.in_flight)) +
     kv("uptime", fmtDur(vm.uptime_secs)) +
@@ -846,10 +970,57 @@ async function pollIngress() {
   } catch (e) { /* keep the last known; the metrics poll owns the indicator */ }
 }
 
+// The global poll. A failure after global mode was established keeps the
+// last picture and marks it stale rather than silently switching scope.
+async function pollGlobal() {
+  try {
+    const r = await fetch("fleet/network", { headers: { accept: "application/json" }, cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    render(await r.json());
+  } catch (e) {
+    $("updated").textContent = "disconnected — retrying";
+    $("livedot").classList.add("stale");
+  } finally {
+    if (!paused) timer = setTimeout(pollGlobal, GLOBAL_REFRESH_MS);
+  }
+}
+
+function startLocal(offerGlobal) {
+  const toggle = $("scope-toggle");
+  toggle.hidden = !offerGlobal;
+  toggle.textContent = "Global view";
+  toggle.href = "/network";
+  poll();
+  pollIngress();
+  // Ingress barely moves; a slow refresh is plenty and keeps the network tab off
+  // the fast poll the dashboard shares with /metrics.
+  setInterval(pollIngress, 10000);
+}
+
+async function start() {
+  if (!forceLocal) {
+    try {
+      const r = await fetch("fleet/network", { headers: { accept: "application/json" }, cache: "no-store" });
+      if (r.status === 200) {
+        globalMode = true;
+        const toggle = $("scope-toggle");
+        toggle.hidden = false;
+        toggle.textContent = "Local view";
+        toggle.href = "/network?view=local";
+        document.querySelector(".legend .title").textContent = "VM states · all servers";
+        render(await r.json());
+        timer = setTimeout(pollGlobal, GLOBAL_REFRESH_MS);
+        return;
+      }
+    } catch (e) { /* fall back to the local view below */ }
+  }
+  startLocal(forceLocal);
+}
+
 $("pausebtn").addEventListener("click", () => {
   paused = !paused;
   $("pausebtn").textContent = paused ? "Resume" : "Pause";
-  if (!paused) { poll(); }
+  if (!paused) { globalMode ? pollGlobal() : poll(); }
   else { clearTimeout(timer); }
 });
 
@@ -893,11 +1064,7 @@ new MutationObserver(resolveColors).observe(document.documentElement, {
 });
 
 sizeCanvas();
-poll();
-pollIngress();
-// Ingress barely moves; a slow refresh is plenty and keeps the network tab off
-// the fast poll the dashboard shares with /metrics.
-setInterval(pollIngress, 10000);
+start();
 requestAnimationFrame(loop);
 </script>
 </body>

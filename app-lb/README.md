@@ -2616,6 +2616,93 @@ The same application can appear at several gateways. Local controls remain on
 each gateway's linked dashboard; this view does not move lifecycle ownership
 from Orchestrator or alter routing/maintenance gates.
 
+### Fleet workloads, server drill-down and network
+
+A control-plane app-lb (for example us2, fronting per-server app-lbs on us2, us4
+and us5, each driving its own colocated `heyvmd`) rolls up the same configured
+gateways into a global workload view. These are still **observations**: app-lb
+does not place, scale or route anything across servers because of them.
+
+The checked-in example is [`.heyo/fleet/fleet.json`](../.heyo/fleet/fleet.json):
+
+```json
+[
+  {"id":"us2","region":"US2","url":"https://admin.us2.heyo.work/","auth":{"secret":"fleet-observer-us2","key":"token"}},
+  {"id":"us4","region":"US4","url":"https://admin.us4.heyo.computer/","auth":{"secret":"fleet-observer-us4","key":"token"}},
+  {"id":"us5","region":"US5","url":"https://admin.us5.heyo.computer/","auth":{"secret":"fleet-observer-us5","key":"token"}}
+]
+```
+
+PUT the array as `config.gateways` at `/control-plane/config` on the
+control-plane app-lb — that is what heyo's `scripts/provision-fleet.py` does as
+it adds each server, and it keeps the list editable at runtime. (Pointing
+`APP_LB_FLEET_FILE` at the file works too, but then the view is managed by the
+file and `PUT /control-plane/config` answers 409.) Each gateway's
+`fleet-observer-<id>` secret (key `token`, in the `default` namespace unless
+`auth.namespace` says otherwise) holds an app-token minted **on that server**:
+
+```sh
+heyctl token mint fleet-observer --admin view --all-deployments -q
+```
+
+The token must be view tier and cover every deployment (`--all-deployments`, no namespace
+wall), so that `covers_fleet()` holds on the target: a deployment- or
+namespace-scoped observer sees only part of a server and the rollup would
+silently under-count it. View tier is enough; the rollup never mutates. For
+Heyo-managed installs, provision the values through HeyoSecret-backed service
+configuration, never in the fleet file.
+
+| Route | Who | Returns |
+| --- | --- | --- |
+| `GET /fleet/deployments[?namespace=]` | fleet view; or a namespace caller naming a namespace it may view | namespace × deployment rows, one cell per server |
+| `GET /fleet/gateways/:id/metrics[?namespace=&offset=]` | same as above | one page (50) of one server's deployments with VM rows |
+| `GET /fleet/network` | fleet view only | region → server → ingress + deployments + VMs |
+
+`/fleet/deployments` pages through each server's
+`/metrics?summary=true&limit=100&offset=…` (at most 20 pages per server; beyond
+that the server reports `truncated: true`), concurrently across servers with a
+15-second per-server deadline, and answers:
+
+```json
+{"configured":true,"fleet_view":true,"namespace":"team-a",
+ "gateways":[{"id":"us4","region":"US4","dashboard_url":"https://admin.us4.heyo.computer/dashboard?view=local",
+   "observed_at":1790000000,"generated_at":1790000000,"deployments":3,"truncated":false,
+   "totals":{"ready":4,"pending":0,"draining":0,"desired":4,"in_flight":2},"error":null}],
+ "rows":[{"namespace":"team-a","id":"web","kind":"vm","routed":true,"hosts":["web.example.com"],
+   "health":"degraded","totals":{"ready":2,"pending":0,"draining":0,"desired":4,"in_flight":1},
+   "cells":[{"gateway":"us4","region":"US4","ready":2,"pending":0,"draining":0,"desired":2,"in_flight":1,"health":"healthy","error":null},
+            {"gateway":"us5","region":"US5","ready":null,"pending":null,"draining":null,"desired":null,"in_flight":null,"health":null,"error":"gateway unavailable"}]}],
+ "totals":{"ready":4,"pending":0,"draining":0,"desired":4,"in_flight":2}}
+```
+
+A server that cannot be read keeps its `error` and contributes an error cell to
+every row; it is never shown as zero capacity, and the other servers' rows are
+unaffected. `health` is derived from pool gauges only (`healthy`, `degraded`,
+`starting`, `draining`, `down`, `idle`), not from a probe. Totals are per-server
+sums: each server runs its own VMs, so they are distinct backends.
+
+Every remote document is deserialized into an allowlist: id, namespace, kind,
+routed flag, exact routed hostnames, pool gauges, VM id/state/load, request and
+latency counters, and ingress IP literals. Specs, env, upstreams, `urls`,
+`account_id`, site roots and any field a gateway adds later are dropped. VM guest
+addresses are returned only to fleet-wide callers.
+
+A caller without fleet coverage (a namespace token or a confined Heyo grant) may
+use `/fleet/deployments` and the gateway drill-down only with `?namespace=` for
+a namespace it may view, and only against gateways configured with
+`use_caller_auth:true`; its own Heyo identity is forwarded and the destination
+checks it again. Service-credential gateways are never queried on its behalf:
+they appear with `error: "fleet-wide view required for this gateway"` (403 on
+the drill-down). `/fleet/network` and `/fleet` stay fleet-wide only.
+
+On the dashboard, the control-plane view's **Workloads** section renders the
+rollup: select a namespace to narrow (kept in the page URL as
+`?fleet_namespace=`), a server column or cell to open that server's drill-down
+in place. `/network` defaults to the global topology from `/fleet/network`
+(polled every five seconds) and falls back to the local view when the fleet
+view is not configured or not permitted; `?view=local` forces the local view
+and the header links between the two.
+
 After building the debug binary, `node app-lb/testdata/unified_dashboard.cjs`
 checks real dashboard rendering with asymmetric observation/inventory fixtures,
 default-versus-local polling, explicit drill-downs and unavailable-region display.
