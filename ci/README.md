@@ -2022,14 +2022,17 @@ contains both Linux executables.
 
 After restarting the service, bootstrap retries transient health connection
 failures and HTTP 502/503/504 responses for 30 seconds. A reachable endpoint with
-the wrong backend identity still fails immediately. Rollback journals retain
+the wrong backend identity still fails immediately. It also waits up to 30 seconds
+for systemd activation and temporary heyvmd child processes to finish; the daemon
+must still be the sole control-group member before verification succeeds.
+Rollback journals retain
 the original exception type and installer source line, plus a separate rollback
 failure when applicable; command arguments and exception messages are not logged.
 
-For a failed attempt whose installer succeeded, explicitly invoke
+For a failed attempt whose installer succeeded or restored its predecessor, explicitly invoke
 `POST /api/runs/{run_id}/bootstrap/{operation_id}/recover` with that repository's
 submit bearer token. This is a production scheduling-state change, not a status
-query. It requires the original successful launcher receipt and unchanged trusted
+query. It requires the original terminal launcher receipt and unchanged trusted
 target mapping, then launches a fresh **read-only** app-lb verification job to check
 the host journal, active executable, config, drop-in, permissions, environment,
 and health identity. It never downloads or reinstalls the binary or restarts the
@@ -2039,7 +2042,13 @@ Successful recovery atomically releases this operation's fence and emits
 `ci.host.bootstrap.recovered.v1` in the run's `/events` API. The original failed
 run, job, step, and deployment history remain failed; the recovery response and
 audit event are the evidence of recovery. Repeating a completed recovery returns
-`already_passed` without running another verification job. A request interrupted
+`already_passed` without running another verification job. A verified rollback
+returns `rollback_verified` and supersedes the failed bootstrap operation, allowing
+a new attempt without marking the original deployment successful. Recovery checks
+the exact predecessor files, permissions, executable hashes, stable process, and
+backend health; a `rollback_failed` journal cannot release the fence. Repeating a
+completed rollback recovery returns `rollback_verified` without another verifier.
+A request interrupted
 before commit retains the fence; inspect events before retrying. Verification
 launcher records are retained for audit, not automatically deleted.
 

@@ -177,7 +177,7 @@ async fn recover_bootstrap(
     if let Err(response) = readable_run(&state, &reader, &run_id).await {
         return response;
     }
-    match tokio::time::timeout(std::time::Duration::from_secs(90),
+    match tokio::time::timeout(std::time::Duration::from_secs(120),
         crate::host_heyvm_bootstrap_coordinator::recover(&state.dispatcher, &run_id, &operation_id)).await {
         Ok(Ok(result)) => axum::Json(result).into_response(),
         Ok(Err(e)) => {

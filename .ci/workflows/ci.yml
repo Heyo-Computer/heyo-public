@@ -283,7 +283,10 @@ jobs:
           cargo test --release --locked --bin ci web::tests::managed_frontends_preserve_auth_and_reject_wrong_boot_without_retry -- --ignored --exact --test-threads=1
 
       - name: Test CI boot and deployment templates
-        run: python3 /workspace/ci/deploy/test_start_artifact.py
+        run: |
+          set -eu
+          python3 /workspace/ci/deploy/test_start_artifact.py
+          python3 /workspace/ci/tests/test_host_heyvm_bootstrap.py
 
       # `ci` takes no arguments at all — no clap, no `env::args` anywhere in
       # `src/` — and is configured entirely from `CI_*` variables, so there is
