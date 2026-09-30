@@ -257,7 +257,7 @@ enter = "heyvm exec {handle} --session printer --env IS_SANDBOX=1 -- {child}"
 # (Optional) Tear the sandbox down. Runs from `Drop`, so it fires on panic
 # and on early returns too. Failures are logged and swallowed — sync_out and
 # destroy are best-effort cleanup.
-destroy = "heyvm delete -y {handle}"
+destroy = "heyvm rm -y {handle}"
 
 # (Optional) Preflight script run *inside* the sandbox right after `create`
 # succeeds. printer wraps it through `enter` automatically. Failure here
@@ -331,7 +331,7 @@ mounts = []
 [sandbox.commands]
 # create  = "heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude >&2 && echo printer-{spec_slug}"
 # enter   = "heyvm exec {handle} --session printer --env IS_SANDBOX=1 -- {child}"
-# destroy = "heyvm delete -y {handle}"
+# destroy = "heyvm rm -y {handle}"
 # sync_in / sync_out are unset for the heyvm driver: cwd is bind-mounted at
 # create time, so file edits round-trip live.
 
@@ -387,7 +387,7 @@ root) declare one block per agent:
 [[agent]]
 kind = "acp"
 # Lookup name. Must be unique across every installed plugin's manifests.
-# Reserved names (`claude`, `opencode`, `acp`) are refused at install time
+# Reserved names (`acp`, `claude`, `codex`, `amp`, `opencode`) are refused at install time
 # because they would shadow the built-in --agent choices.
 name = "poolside"
 # Launch command (binary on $PATH, or absolute path). Required.

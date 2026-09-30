@@ -105,7 +105,7 @@ Fill in at least:
 
 - `DATABASE_URL` — orchestrator Postgres.
 - `JWT_SECRET` — must match the value CICD and Cloud use to sign internal calls.
-- `CLOUD_INTERNAL_API_KEY` + `ORCHESTRATOR_CLOUD_INTERNAL_URL` — for the orchestrator → cloud callbacks.
+- `CLOUD_INTERNAL_API_KEY` (the orchestrator's own internal API key; `INTERNAL_API_KEY` also works) + `CLOUD_INTERNAL_URL` — for the orchestrator → cloud callbacks. Multi-word `ORCHESTRATOR_*` names such as `ORCHESTRATOR_CLOUD_INTERNAL_URL`, `ORCHESTRATOR_AGENT_MODEL` or `ORCHESTRATOR_DB_MAX_CONNECTIONS` are not read from the environment; set those keys in the TOML config file.
 - `ORCHESTRATOR_AGENT_API_KEY` (or the provider-specific `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `MISTRAL_API_KEY`) — for the agentic workflow phases.
 
 Set `ORCHESTRATOR_PROXY_BASE_DOMAINS` to a comma-separated list of wildcard proxy base domains when backend deployment URLs must be probed through `ORCHESTRATOR_BACKEND_API_URL` instead of public DNS.

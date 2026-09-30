@@ -1,7 +1,7 @@
 # ui — one look, one sign-in, one theme
 
-Five apps in this repository serve a web UI: **app-lb**, **app-obs**, **ci**,
-**heyosecret** and **artifacts**. They are one product and a person moves
+Six apps in this repository serve a web UI: **app-lb**, **app-obs**, **ci**,
+**heyosecret**, **artifacts** and **queue**. They are one product and a person moves
 between them in one sitting, so they share this directory.
 
 | File | What it is |
@@ -38,13 +38,13 @@ let attrs = state.ui_cookies.attrs(cookie_header);   // data-theme="…" data-co
 heyo_ui::topbar_html("ci", &nav, who)
 ```
 
-**It is included, not depended on.** The five apps sit on three axum versions
+**It is included, not depended on.** The six apps sit on three axum versions
 (0.7 through 0.8.9) and two Rust editions (2021 and 2024), so `ui.rs` names no
 framework type: it takes `Option<&str>` and closures and returns plain data.
 That also means no `Cargo.toml` entry and no lockfile change — which matters
 because each app's CI workflow fingerprints its warm VM on its lockfile. The
 cost is one compiled copy per app, and the tests at the bottom of `ui.rs`
-running five times, which is five independent proofs the contract holds.
+running six times, which is six independent proofs the contract holds.
 
 ## The two cookies
 

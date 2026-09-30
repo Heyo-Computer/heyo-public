@@ -147,7 +147,10 @@ A gate carries either a reference or an inline identity, never both — app-lb
 refuses the pair rather than silently overriding one, so `set auth
 --provider-ref` clears any identity already written there. What stays the
 deployment's own: `public_paths`, `base_path`, `cookie_name`,
-`session_ttl_secs`, `redirect_url`, `forward_identity`.
+`session_ttl_secs`, `redirect_url`, `forward_identity`, `session_scope`. Note that
+`--public-path` writes a bare-string entry, which means scope `admin`, not
+open; write `{"path": "/healthz", "scope": "public"}` for an unauthenticated
+path.
 
 A reference to a provider that is not declared in the deployment's namespace is
 refused at registration, with the provider named — not discovered on the first

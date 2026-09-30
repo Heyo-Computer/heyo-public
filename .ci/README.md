@@ -16,14 +16,15 @@ to "did this commit pass"; every file here holds one job. See
 | `pg-fc.yml` | `release` | `pg-vm-pool` | `pg-fc` — tested host binary, `SHA256SUMS`, `BUILD-INFO` |
 | `heyosecret.yml` | `release` | `heyosecret` | `heyosecret` — binary, `migrations/`, `heyosecret.conf`, `SHA256SUMS`, `BUILD-INFO` |
 
-The other crates here (`computer`, `heyosecret-client`, `orchestrator`,
-`printer`) have no release workflow yet. Adding one
+The other crates here (`computer`, `heyosecret-client`, `printer`) have no
+release workflow yet. `orchestrator.yml` tests and packages the orchestrator,
+and `regional-*.yml` validate and sequence regional releases. Adding one
 is the recipe at the bottom.
 
 Six crates pull `ui/ui.rs` in with `#[path]` and embed the stylesheet, the theme
 script and six fonts through `include_bytes!`, so a change under `ui/` is a
 change to each of their binaries even though the lockfile cannot see it. Only
-`art.yml` and `queue.yml` list `ui/**` in their `paths:`. `app-lb.yml`,
+`art.yml`, `queue.yml` and `heyosecret.yml` list `ui/**` in their `paths:`. `app-lb.yml`,
 `app-obs.yml` and `ci.yml` do not, so a stylesheet change does not rebuild them
 — worth closing next time one of those files is touched.
 
@@ -109,8 +110,9 @@ ART_URL=https://art.us2.heyo.work ART_API_KEY=… sh .ci/install.sh
 
 That installs `app-lb`, `app-obs`, `ci` and `art` — binaries into
 `/usr/local/bin`, supervisor programs into `/etc/supervisor/conf.d`, and `ci`'s
-migrations into `/var/lib/ci/migrations`, which is where the shipped `ci.conf`
-points `CI_MIGRATIONS_DIR`. Nothing is restarted unless you pass `--restart`.
+migrations into `/var/lib/ci/migrations`. `ci` compiles its migrations in and
+the shipped `ci.conf` leaves `CI_MIGRATIONS_DIR` unset; the copied files are
+only used if you set it. Nothing is restarted unless you pass `--restart`.
 
 `art` is there because app-lb needs it beside itself: a deployment whose
 `vm.workspace.store` is a local path is restored and captured by app-lb running
@@ -300,23 +302,17 @@ From the **repository root**, not from a subdirectory:
 git submit
 ```
 
-No `--archive`. This repository's whole history bundles to **3.2 MB** against a
-64 MB `CI_MAX_SOURCE_BYTES`, so the default payload fits easily — which is worth
-stating because the private `heyo` monorepo is 322 MB and cannot. Two things
-follow from being on the good side of that line:
+The client sends a pinned base revision plus the exact patch to build; no
+repository, bundle or history is uploaded, and `--archive` has been removed. The
+runner fetches the base from `origin` and applies the patch, so the base commit
+must be pushed first. Two things follow:
 
-- **`.git` exists in the guest.** A bundle is cloned inside the VM by the
-  checkout step, so `git describe`, `git log` and `git rev-parse` work in a
-  step. `codegraph.yml` uses that for its version stamp.
-- **Path filters actually filter.** `ci` reads a submit's changed-file set out
-  of the bundle's own history (`git diff --name-only <before> HEAD`). A commit
-  touching only `app-lb/` starts no `codegraph` run at all.
-
-If you ever do submit with `--archive`, both go away: a tarball has no history,
-so the change set is *unknown*, and an unknown change set **matches every filter
-by design** — the alternative is skipping a build for a commit nobody proved was
-irrelevant, which is a green tick on work that never ran. That is the safe
-direction, not a bug; `${{ ci.changes_reason }}` says which case a run is in.
+- **`.git` exists in the guest.** `git describe`, `git log` and `git rev-parse`
+  work in a step (a `--dirty` submission may have a synthetic `HEAD`).
+  `codegraph.yml` uses that for its version stamp.
+- **Path filters actually filter.** The client computes the changed paths across
+  the full trunk-to-feature diff, and `ci` matches `paths:` against them. A
+  commit touching only `app-lb/` starts no `codegraph` run at all.
 
 ## Adding a workflow
 

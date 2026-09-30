@@ -1091,7 +1091,8 @@ claim says so if the two disagree.
 The daemon's TTL reaper skips stopped sandboxes, so a parked VM would keep its
 disks for ever without something here to say when it is no longer wanted. The
 lease loop sweeps, every tick, idle VMs on the hosts this instance serves that
-are either unused for `CI_VM_IDLE_SECS` or carry a fingerprint no job has
+are idle (the window is now zero and not configurable; `CI_VM_IDLE_SECS` no
+longer exists) or carry a fingerprint no job has
 touched in that window — the machine a retired `vm:` block or toolchain left
 behind, sitting beside the one that replaced it. Claimed VMs are refused in the
 query; `draining` keeps a taken VM out of circulation until the daemon confirms
@@ -1133,7 +1134,7 @@ not a disk reservation against concurrent allocations or unknown build scratch.
 
 Firecracker network pressure uses the same bounded eviction policy. A `/24`
 contains 64 `/30` TAP links, and stopped reusable VMs retain their link while
-they remain cached (normally up to `CI_VM_IDLE_SECS`). When the backend
+they remain cached (until the next idle sweep). When the backend
 explicitly rejects a cold create with its "no usable /30 TAP subnet" capacity
 verdict, CI atomically takes the oldest idle CI cache on that same runner,
 destroys it, confirms that the daemon reports it absent, and retries the create
@@ -1230,7 +1231,8 @@ boot and serialize with that boot's drain transition. Other boots remain active.
 Native callbacks retain their per-job lease-token checks and can be handled by
 another active frontend; there is no singleton execution handoff.
 
-`uses: default` resolves through **`~/.heyo/daemon.json`** — heyvmd mints
+`uses: default` resolves through **`daemon.json`** in `$MVM_DATA_DIR`, else
+`~/.heyo` (override with `CI_DAEMON_STATE_PATH`) — heyvmd mints
 `backend_id` there on first start and registers and heartbeats under it, so it is
 the identity the cloud knows the machine by, and it is the same file
 `heyvm network add-host` reads. The daemon's `/daemon/name` route is *not* the
@@ -1265,12 +1267,12 @@ did, the keepalive would queue behind the build it exists to protect.
 ## Workflow objects
 
 ```bash
-serverctl create workflow build \
+heyctl create workflow build \
   --repo git@github.com:me/app.git \
   --network prod-runners \
   --path '.ci/workflows/*.yml'
 
-serverctl get workflows
+heyctl get workflows
 ```
 
 Stored by app-lb, polled by `ci`. An object points at a repository and a path
@@ -1289,7 +1291,9 @@ works with no objects at all.
 ## Secrets
 
 `${{ secrets.X }}` and `${{ vars.X }}` resolve from heyosecret under
-`ci/<workflow>/<environment>/`.
+`ci/<workflow>/<environment>/`, where `<workflow>` is the workflow object's id
+(or, without one, the registered repository's name) and `<environment>` is the
+job's `env.CI_ENVIRONMENT`, defaulting to `default`.
 
 **This process is the policy layer, because heyosecret has none.** Its token can
 read, write and revoke every secret at every path; `readAccess`/`writeAccess` are
@@ -1311,8 +1315,8 @@ pool, and app-lb's update flow re-probes upstreams after the commands run, so "i
 exited 0 but never came back" is a failed deploy rather than a green one.
 
 ```bash
-serverctl apply -f deploy/ci.json
-serverctl update ci
+heyctl apply -f deploy/ci.json
+heyctl update ci
 ```
 
 Identity comes from app-lb: `x-auth-request-user` (the stable Google `sub`, and
@@ -1600,7 +1604,7 @@ redirects or silently substitute another backend. The public client checks echoe
 backend identities and CI checks the target boot; existing Cloud exec/proxy is not
 a fallback. Private backend safety verification and composed real-process/live
 acceptance remain required. See the single acceptance checklist in
-`docs/MULTI_REGION_DESIGN.md` for local evidence and remaining gates.
+`docs/design/MULTI_REGION_DESIGN.md` for local evidence and remaining gates.
 
 ### Migrations
 
@@ -2462,7 +2466,8 @@ Not built yet:
 - **Composite `uses:` actions.** Artifact, release and deployment actions above are built in. Fetching
   an `action.yml` from a repository is a different feature with a different trust
   model.
-- **Triggers other than `submit`.** `on: [schedule]` parses and is reported as
-  unsupported rather than silently ignored.
-- **`serverctl set workflow`.** Create, get and delete exist; editing means
+- **Triggers other than `submit` and `release`.** `on: [schedule]` parses, but a
+  submit only runs files whose `on:` includes `submit`; the rest are skipped
+  (logged server-side, or refused when named with `--only`).
+- **`heyctl set workflow`.** Create, get and delete exist; editing means
   re-creating with the same id.

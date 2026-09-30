@@ -430,8 +430,9 @@ entries can be either `KnownInstaller::Cargo { git }` (clone-and-build) or
 
 - Only single-binary crates are supported in v1; multi-bin crates need a
   `--bin` flag (not implemented).
-- No `remove-plugin` / `update` yet — for now, blow away
-  `~/.printer/plugins/<name>/` and reinstall.
+- No `remove-plugin` yet — blow away `~/.printer/plugins/<name>/` to
+  uninstall. `printer reinstall-plugin <name>` (or `--all`) refreshes an
+  installed plugin from its recorded source.
 - Plugin binaries are not added to your shell `PATH` automatically; invoke
   them through `printer <name>`.
 

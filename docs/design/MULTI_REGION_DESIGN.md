@@ -2203,7 +2203,7 @@ and a request path that continues without a control-plane call per request.
 
 ### Operator experience: one concise JSON service file
 
-The [app-lb deployment file](../app-lb/examples/README.md) style is implemented:
+The [app-lb deployment file](../../app-lb/examples/README.md) style is implemented:
 one declarative file with `id`, `routes`, `vm`, `scaling` and `health` is also
 accepted by Orchestrator's service deployment endpoint. The regional overrides and
 traffic fields below remain proposed extensions; existing app-lb does not accept
@@ -2392,7 +2392,7 @@ ownership are prerequisites to active replicas, not consequences of adding a gat
 
 ## Existing implementation foundation and next regional change
 
-The opt-in [regional service rollout API](../orchestrator/docs/regional-rollouts.md)
+The opt-in [regional service rollout API](../../orchestrator/docs/regional-rollouts.md)
 now persists per-region replica slots and runtime overrides, region exclusions,
 observed app-lb drain gates, health/bake gates, and explicit rollback. This is a
 service deployment operation over already configured discovery ingress, not the
@@ -2459,12 +2459,12 @@ Verified against the repository when preparing this proposal:
 
 | Existing source | Reuse | Missing capability |
 | --- | --- | --- |
-| [Service deployment](../orchestrator/src/handlers/service_deploy.rs) | `desiredReplicas`, `replicaRegions`, region-preserving replacement, rollout ownership, and final regional-coverage verification | Continuous regional minimum/capacity reconciliation and a coordinated regional maintenance barrier |
-| [Service specification](../orchestrator/src/handlers/service_spec.rs) | app-lb-style `.heyo/services` JSON translated into service deployment requests | Proposed per-region runtime/resource overrides and traffic weights |
-| [Service discovery](../orchestrator/src/handlers/service_discovery.rs) | PostgreSQL-backed endpoint sets, versions, region, health and draining | Gateway registration, coherent regional assignments and consumer observations |
-| [app-lb discovery](../app-lb/src/discovery.rs) | Polling, version comparison, retaining the last good upstream set | Parser drops endpoint region; upstream conversion accepts only plaintext, pathless HTTP with explicit port |
-| [app-lb registry](../app-lb/src/registry.rs) | Atomic local snapshots and local JSON persistence | Local files are not an authoritative shared routing store |
-| [app-lb selection](../app-lb/src/deployment.rs) | Least-in-flight local backend selection; durable static-upstream cordon state and atomic in-flight admission/drain tracking | Regional selection and coordinated load feedback |
+| [Service deployment](../../orchestrator/src/handlers/service_deploy.rs) | `desiredReplicas`, `replicaRegions`, region-preserving replacement, rollout ownership, and final regional-coverage verification | Continuous regional minimum/capacity reconciliation and a coordinated regional maintenance barrier |
+| [Service specification](../../orchestrator/src/handlers/service_spec.rs) | app-lb-style `.heyo/services` JSON translated into service deployment requests | Proposed per-region runtime/resource overrides and traffic weights |
+| [Service discovery](../../orchestrator/src/handlers/service_discovery.rs) | PostgreSQL-backed endpoint sets, versions, region, health and draining | Gateway registration, coherent regional assignments and consumer observations |
+| [app-lb discovery](../../app-lb/src/discovery.rs) | Polling, version comparison, retaining the last good upstream set | Parser drops endpoint region; upstream conversion accepts only plaintext, pathless HTTP with explicit port |
+| [app-lb registry](../../app-lb/src/registry.rs) | Atomic local snapshots and local JSON persistence | Local files are not an authoritative shared routing store |
+| [app-lb selection](../../app-lb/src/deployment.rs) | Least-in-flight local backend selection; durable static-upstream cordon state and atomic in-flight admission/drain tracking | Regional selection and coordinated load feedback |
 
 Private companion repository integration: `cloud/src/repositories/mvm_ctrl_backend_server_repository.rs`
 currently filters placement by region, driver, environment/pool, physical identity

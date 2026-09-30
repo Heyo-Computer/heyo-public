@@ -662,7 +662,7 @@ in and do.
 
 ```sh
 heyctl set update app-obs \
-  --workdir /home/sarocu/Projects/app-obs \
+  --workdir /srv/app-obs \
   -c 'git pull --ff-only' \
   -c 'cargo build --release' \
   -c 'supervisorctl restart app-obs'
@@ -709,6 +709,10 @@ heyctl describe deployment web     # prints the redirect URI to register with Go
 heyctl get deployments -o wide     # AUTH column: which deployments are gated
 heyctl set auth web --clear        # remove the gate
 ```
+
+`--public-path` writes a bare-string entry, which app-lb reads as scope `admin`:
+the path skips Google but still needs an admin-tier app-token. For a path open to
+everyone, write `{"path": "/healthz", "scope": "public"}` with `heyctl edit`.
 
 Both allow flags are repeatable and take any number of entries, and the two lists are **OR'd** —
 one match admits the caller:

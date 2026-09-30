@@ -1381,8 +1381,9 @@ pub struct SetAuthArgs {
     #[arg(long = "allow-email", value_name = "EMAIL")]
     pub allow_emails: Vec<String>,
 
-    /// A path prefix served without the gate — health endpoints, webhook
-    /// receivers. Repeatable; passing any replaces the list.
+    /// A path prefix that bypasses sign-in, written with scope `admin` (an
+    /// admin-tier app-token is still required). Use `heyctl edit` for scope
+    /// `public`. Repeatable; passing any replaces the list.
     #[arg(long = "public-path", value_name = "PATH")]
     pub public_paths: Vec<String>,
 

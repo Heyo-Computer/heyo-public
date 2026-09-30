@@ -1,4 +1,4 @@
-# Heyo Public Monorepo
+# hws — Heyo Web Services
 
 ## Two Regions, One Heyo System
 

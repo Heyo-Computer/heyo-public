@@ -193,10 +193,12 @@ built above and `ORCHESTRATOR_TEST_DATABASE_URL` to a disposable test database.
 Public transition-admission APIs remain gated; do not edit shared DB rows to enable
 this feature. These local checks do not establish live multi-region acceptance.
 
-Only Firecracker and KVM are supported. This is not a limitation of taste: app-lb routes
+Of the heyvm drivers, only Firecracker and KVM are supported. This is not a limitation of taste: app-lb routes
 directly to `SandboxInfo.guest_ip`, which the daemon only populates for tap-networked
 Firecracker/KVM backends on a local daemon. A Libvirt VM would boot fine and then be
-unroutable, so the driver is rejected at registration.
+unroutable, so the driver is rejected at registration. The one other accepted driver is
+`lxc`: an Incus system container from an OCI image, which app-lb creates through Incus
+itself (`APP_LB_LXC_*`), not through heyvm.
 
 ## Requirements
 
@@ -1226,7 +1228,10 @@ needs to know nothing about OAuth. It sees only requests that got through.
     "client_secret": {"secret": "google", "key": "client_secret"},
     "allowed_domains": ["example.com"],       // matched on the Workspace `hd` claim
     "allowed_emails": ["contractor@gmail.com"],
-    "public_paths": ["/healthz", "/hooks/"],  // served without the gate
+    "public_paths": [                         // bare strings mean scope "admin"
+      {"path": "/healthz", "scope": "public"},
+      {"path": "/hooks/", "scope": "public"}
+    ],
     "session_ttl_secs": 43200,
     "base_path": "/__applb/auth",             // where app-lb's own endpoints live
     "forward_identity": true
@@ -3521,6 +3526,13 @@ credential the machine *can* present behind them.
 // on the deployment fronting the admin listener
 "public_paths": ["/healthz", "/metrics", "/deployments", "/secrets", "/jobs", "/certs"]
 ```
+
+> **Scopes changed this recipe.** A bare `public_paths` string now means scope
+> `admin`, and a listed path accepts only an app-token of that tier — not Basic
+> auth and not the Google session. The machine credential for these paths is an
+> admin-tier `applb_…` token (`heyctl token mint NAME --admin admin --all-deployments`), and `/healthz` needs an
+> explicit `{"path": "/healthz", "scope": "public"}`. See
+> [`docs/app-lb-auth.md`](../docs/app-lb-auth.md#public-paths-and-scopes).
 
 ```sh
 # and on app-lb itself, so those paths are not simply open
