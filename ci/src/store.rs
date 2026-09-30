@@ -1470,12 +1470,54 @@ impl Store {
         .map_err(StoreError::sql)?;
         if let Some(row) = row {
             let run: String = row.get("run_id"); let key: String = row.get("job_key");
-            sqlx::query("INSERT INTO ci_host_work(job_id,runner_hd_id,attempt) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")
-                .bind(job_id).bind(runner_hd_id).bind(attempt).execute(&mut *tx).await.map_err(StoreError::sql)?;
+            sqlx::query("INSERT INTO ci_host_work(job_id,runner_hd_id,attempt,phase,executor_boot) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
+                .bind(job_id).bind(runner_hd_id).bind(attempt)
+                .bind(if boot_id.is_some() { "preparing" } else { "execution" }).bind(boot_id)
+                .execute(&mut *tx).await.map_err(StoreError::sql)?;
             Self::add_event(&mut tx, &run, Some(job_id), Some(&key), None, "ci.job.status.v1", "running", None).await?;
             tx.commit().await.map_err(StoreError::sql)?;
             Ok(JobClaim::Claimed)
         } else { tx.commit().await.map_err(StoreError::sql)?; Ok(JobClaim::Unavailable) }
+    }
+
+    /// Commit before any VM acquisition/open/start effects. Serialize with
+    /// preparation finalization and cancellation on the job row, not a global lock.
+    pub async fn begin_job_execution(&self, job: &str, attempt: i32, boot: Uuid) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let owned: Option<String> = sqlx::query_scalar("SELECT runner_hd_id FROM ci_job WHERE id=$1 AND attempt=$2 AND executor_boot=$3 AND status='running' FOR UPDATE")
+            .bind(job).bind(attempt).bind(boot).fetch_optional(&mut *tx).await.map_err(StoreError::sql)?;
+        let Some(runner) = owned else { return Ok(false) };
+        let changed = sqlx::query("UPDATE ci_host_work SET phase='execution' WHERE job_id=$1 AND runner_hd_id=$2 AND attempt=$3 AND executor_boot=$4 AND phase='preparing'")
+            .bind(job).bind(runner).bind(attempt).bind(boot).execute(&mut *tx).await.map_err(StoreError::sql)?.rows_affected();
+        tx.commit().await.map_err(StoreError::sql)?;
+        Ok(changed == 1)
+    }
+
+    /// The caller's preparation future has ended; it cannot issue VM effects.
+    /// Unknown runner-side preparation survives as runner maintenance evidence,
+    /// but no longer belongs to this CI app. Never infer this from missing VM rows.
+    pub async fn finish_job_preparation(&self, job: &str, attempt: i32, boot: Uuid,
+        error: &str, quiescent: bool) -> Result<Option<JobStatus>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let row = sqlx::query("SELECT run_id,job_key,status,runner_hd_id FROM ci_job WHERE id=$1 AND attempt=$2 AND executor_boot=$3 FOR UPDATE")
+            .bind(job).bind(attempt).bind(boot).fetch_optional(&mut *tx).await.map_err(StoreError::sql)?;
+        let Some(row) = row else { return Ok(None) };
+        let runner: String = row.get("runner_hd_id");
+        let changed = sqlx::query("UPDATE ci_host_work SET phase='detached_preparation' WHERE job_id=$1 AND runner_hd_id=$2 AND attempt=$3 AND executor_boot=$4 AND phase='preparing'")
+            .bind(job).bind(&runner).bind(attempt).bind(boot).execute(&mut *tx).await.map_err(StoreError::sql)?.rows_affected();
+        if changed != 1 { return Ok(None) }
+        let existing: String = row.get("status");
+        let status = JobStatus::parse(&existing).filter(|s| s.is_terminal()).unwrap_or(JobStatus::Failure);
+        sqlx::query("UPDATE ci_job SET status=$2,error=CASE WHEN status='cancelled' THEN COALESCE(error,$3) ELSE $3 END,finished_at=COALESCE(finished_at,now()),executor_boot=NULL WHERE id=$1")
+            .bind(job).bind(status.as_str()).bind(error).execute(&mut *tx).await.map_err(StoreError::sql)?;
+        if quiescent {
+            sqlx::query("DELETE FROM ci_host_work WHERE job_id=$1 AND runner_hd_id=$2 AND attempt=$3 AND executor_boot=$4 AND phase='detached_preparation'")
+                .bind(job).bind(runner).bind(attempt).bind(boot).execute(&mut *tx).await.map_err(StoreError::sql)?;
+        }
+        Self::add_event(&mut tx, &row.get::<String,_>("run_id"), Some(job), Some(&row.get::<String,_>("job_key")),
+            None, "ci.job.status.v1", status.as_str(), Some(error)).await?;
+        tx.commit().await.map_err(StoreError::sql)?;
+        Ok(Some(status))
     }
 
     /// Only an executor with a verified VM release may clear drain evidence.
@@ -3782,6 +3824,80 @@ jobs:
             "drain does not prevent already-owned work from finishing");
         assert_eq!(store.get_job(&job).await.unwrap().unwrap().status, "success");
         assert_eq!(store.get_job(&waiting).await.unwrap().unwrap().executor_boot, Some(other));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn preparation_failure_releases_instance_without_erasing_runner_work() {
+        use crate::executor::ExecutorInstance;
+        let store = test_store().await;
+        for (quiescent, cancelled) in [(true, false), (false, false), (false, true)] {
+            let run = crate::vm::new_id();
+            store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+            let job = job_id(&run, "build-x86_64");
+            let runner = format!("runner-{run}");
+            let owner = ExecutorInstance::register(store.pool().clone(), &run).await.unwrap();
+            let boot = owner.boot_id();
+            assert_eq!(store.claim_job_for_boot(&job, &runner, 1, boot).await.unwrap(), JobClaim::Claimed);
+            assert!(owner.has_work().await.unwrap());
+            assert!(store.finish_job_preparation(&job, 2, boot, "stale attempt", true).await.unwrap().is_none());
+            assert!(store.finish_job_preparation(&job, 1, Uuid::new_v4(), "wrong boot", true).await.unwrap().is_none());
+            if cancelled { store.cancel_run(&run).await.unwrap(); }
+            let expected = if cancelled { JobStatus::Cancelled } else { JobStatus::Failure };
+            assert_eq!(store.finish_job_preparation(&job, 1, boot, "preparation failed", quiescent).await.unwrap(), Some(expected));
+            let result = store.get_job(&job).await.unwrap().unwrap();
+            assert_eq!(result.status, expected.as_str());
+            assert_eq!(result.executor_boot, None);
+            assert!(!owner.has_work().await.unwrap(), "terminal preparation must release CI-app drain");
+            assert_eq!(store.has_host_work(&job).await.unwrap(), !quiescent,
+                "uncertain daemon work must still block runner maintenance");
+            if !quiescent {
+                let evidence: (String, Option<Uuid>) = sqlx::query_as("SELECT phase,executor_boot FROM ci_host_work WHERE job_id=$1")
+                    .bind(&job).fetch_one(store.pool()).await.unwrap();
+                assert_eq!(evidence, ("detached_preparation".into(), Some(boot)));
+            }
+            assert!(!store.begin_job_execution(&job, 1, boot).await.unwrap());
+            assert!(!store.claim_job(&job, "another-region", 2).await.unwrap());
+            let operation = Uuid::new_v4();
+            owner.pause(operation).await.unwrap();
+            owner.quiesce(operation).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn preparation_boundary_cannot_release_execution_or_legacy_claims() {
+        let store = test_store().await;
+        for legacy in [false, true] {
+            let run = crate::vm::new_id();
+            store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+            let job = job_id(&run, "build-x86_64");
+            let owner = crate::executor::ExecutorInstance::register(store.pool().clone(), &run).await.unwrap();
+            let boot = owner.boot_id();
+            assert_eq!(store.claim_job_for_boot(&job, "runner", 1, boot).await.unwrap(), JobClaim::Claimed);
+            if legacy {
+                // Old writer omits the new columns; absence of a VM is not proof.
+                sqlx::query("DELETE FROM ci_host_work WHERE job_id=$1").bind(&job).execute(store.pool()).await.unwrap();
+                sqlx::query("INSERT INTO ci_host_work(job_id,runner_hd_id,attempt) VALUES($1,'runner',1)")
+                    .bind(&job).execute(store.pool()).await.unwrap();
+            } else {
+                let operation = Uuid::new_v4();
+                owner.pause(operation).await.unwrap();
+                assert!(store.begin_job_execution(&job, 1, boot).await.unwrap(), "already-owned jobs finish during drain");
+            }
+            assert!(store.get_job(&job).await.unwrap().unwrap().sandbox_id.is_none());
+            assert!(store.finish_job_preparation(&job, 1, boot, "timeout", true).await.unwrap().is_none());
+            assert!(owner.has_work().await.unwrap());
+        }
+        let run = crate::vm::new_id();
+        store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+        let job = job_id(&run, "build-x86_64");
+        let owner = crate::executor::ExecutorInstance::register(store.pool().clone(), &run).await.unwrap();
+        let boot = owner.boot_id();
+        assert_eq!(store.claim_job_for_boot(&job, "runner", 1, boot).await.unwrap(), JobClaim::Claimed);
+        let (began, finished) = tokio::join!(store.begin_job_execution(&job, 1, boot),
+            store.finish_job_preparation(&job, 1, boot, "preparation ended", false));
+        assert_ne!(began.unwrap(), finished.unwrap().is_some(), "only one side of the VM boundary may win");
     }
 
     #[tokio::test]

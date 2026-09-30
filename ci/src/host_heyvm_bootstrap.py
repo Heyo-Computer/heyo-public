@@ -160,6 +160,10 @@ class Host:
             return json.loads(response.read(1024 * 1024 + 1))
 
 
+class ServiceStarting(ValueError):
+    pass
+
+
 def service(host, target, component="heyvm"):
     if target.get("process_manager", "systemd") == "supervisor":
         text = host.command(["supervisorctl", "pid", target["unit"]]).strip()
@@ -170,11 +174,10 @@ def service(host, target, component="heyvm"):
     keys = "LoadState ActiveState KillMode MainPID ExecStart ControlGroup".split()
     text = host.command(["systemctl", "show", target["unit"], "--property=" + ",".join(keys)])
     values = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
-    if values.get("LoadState") != "loaded" or values.get("ActiveState") != "active": raise ValueError("unsafe service state")
+    if values.get("LoadState") != "loaded": raise ValueError("unsafe service state")
+    if values.get("ActiveState") == "activating": raise ServiceStarting("service is activating")
+    if values.get("ActiveState") != "active": raise ValueError("unsafe service state")
     pid = int(values.get("MainPID", "0")); command = values.get("ExecStart", "")
-    if values.get("KillMode") != "process":
-        if component != "heyvmd" or values.get("KillMode") != "control-group" or host.cgroup_pids(values.get("ControlGroup", "")) != {pid}:
-            raise ValueError("unsafe service process group")
     # systemctl show serializes ExecCommand with an authoritative path= field.
     paths = re.findall(r"(?:^|[ {;])path=([^ ;}]+)", command)
     # The legacy eu1 service starts a stable symlink. Before the one-time
@@ -183,7 +186,26 @@ def service(host, target, component="heyvm"):
     # rather than incorrectly requiring their string representations to match.
     if pid <= 1 or len(paths) != 1 or paths[0] != target["executable"] or host.proc_exe(pid) != os.path.realpath(target["executable"]):
         raise ValueError("service executable differs")
+    if values.get("KillMode") != "process":
+        if component != "heyvmd" or values.get("KillMode") != "control-group":
+            raise ValueError("unsafe service process group")
+        members = host.cgroup_pids(values.get("ControlGroup", ""))
+        if pid not in members: raise ValueError("service main process is outside its group")
+        if members != {pid}: raise ServiceStarting("service group is not yet isolated")
     return {"boot_id": host.boot_id(), "pid": pid, "starttime": host.starttime(pid), "disk_sha256": sha(pathlib.Path(target["executable"]).read_bytes()), "running_sha256": host.proc_digest(pid)}
+
+
+def wait_for_service(host, target, component="heyvm"):
+    # Type=simple returns before startup helpers exit. Never relax isolation:
+    # wait for the same strict check, with a deadline, before proceeding.
+    deadline = None
+    while True:
+        try:
+            return service(host, target, component)
+        except ServiceStarting:
+            if deadline is None: deadline = time.monotonic() + 30
+            if time.monotonic() >= deadline: raise
+            time.sleep(1)
 
 
 def wait_for_health(host, url):
@@ -275,7 +297,7 @@ def restore(host, target, journal):
         elif pathlib.Path(path).exists() or pathlib.Path(path).is_symlink(): pathlib.Path(path).unlink(); fsync_dir(pathlib.Path(path).parent)
     if not daemon: host.command(["systemctl", "daemon-reload"])
     restart(host, target)
-    now = service(host, target, journal.get("component", "heyvm"))
+    now = wait_for_service(host, target, journal.get("component", "heyvm"))
     before = journal["service"]
     if now["disk_sha256"] != before["disk_sha256"] or now["running_sha256"] != before["running_sha256"] or host.proc_exe(now["pid"]) != os.path.realpath(target["executable"]):
         raise ValueError("rollback verification failed")
@@ -290,7 +312,7 @@ def install(target, req, binary, host=None):
         if old.get("status") in TERMINAL: return old["result"]
         raise ValueError("operation is nonterminal; operator reconciliation required")
     component=req.get("component", "heyvm"); daemon=component == "heyvmd"
-    before = service(host, target, component)
+    before = wait_for_service(host, target, component)
     if before["disk_sha256"] != before["running_sha256"]: raise ValueError("predecessor executable drift")
     predecessors={"executable": secure_file(target["executable"], MAX_HEYVM, allow_symlink=True)}
     if not daemon: predecessors.update(config=secure_file(target["config_json_path"], MAX_SMALL_BACKUP), drop_in=secure_file(target["systemd_drop_in_path"], MAX_SMALL_BACKUP))
@@ -303,7 +325,7 @@ def install(target, req, binary, host=None):
         if not daemon:
             atomic(target["config_json_path"], config, 0o600); atomic(target["systemd_drop_in_path"], drop, 0o644); host.command(["systemctl", "daemon-reload"])
         restart(host, target)
-        now = service(host, target, component)
+        now = wait_for_service(host, target, component)
         if now["boot_id"] != before["boot_id"] or now["pid"] == before["pid"] or now["starttime"] == before["starttime"]: raise ValueError("service generation did not change")
         if now["disk_sha256"] != req["heyvm_sha256"] or now["running_sha256"] != req["heyvm_sha256"] or host.proc_exe(now["pid"]) != os.path.realpath(target["executable"]): raise ValueError("new executable verification failed")
         if not daemon and (pathlib.Path(target["config_json_path"]).read_bytes() != config or pathlib.Path(target["systemd_drop_in_path"]).read_bytes() != drop): raise ValueError("installed file verification failed")
@@ -312,7 +334,7 @@ def install(target, req, binary, host=None):
         health = wait_for_health(host, target["local_health_url"])
         if health.get("backendId", health.get("backend_id")) != target["backend_server_id"] or health.get("backendRegion", health.get("backend_region")) != target["region"] or health.get("status") not in ("ok", "healthy", "running"):
             raise ValueError("health identity or API status differs")
-        if service(host, target, component) != now: raise ValueError("service changed during health verification")
+        if wait_for_service(host, target, component) != now: raise ValueError("service changed during health verification")
         result = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
                   "target_alias": target["target_alias"], "status": "succeeded", "heyvm_sha256": req["heyvm_sha256"],
                   "config_sha256": sha(config) if not daemon else sha(b""), "systemd_drop_in_sha256": sha(drop) if not daemon else sha(b""),
@@ -342,15 +364,35 @@ def verify_existing(target, req, host=None):
     journal_path = pathlib.Path(target["state_dir"]) / (req["operation_id"] + ".json")
     old = json.loads(journal_path.read_bytes())
     operation_hash = sha(json.dumps(req, sort_keys=True, separators=(",", ":")).encode())
-    if old.get("status") != "succeeded" or old.get("request_sha256") != operation_hash:
-        raise ValueError("no matching successful bootstrap journal")
+    if old.get("status") not in ("succeeded", "rolled_back") or old.get("request_sha256") != operation_hash:
+        raise ValueError("no matching terminal bootstrap journal")
     config, drop = exact_files(target); daemon=req.get("component", "heyvm") == "heyvmd"
+    if old["status"] == "rolled_back":
+        expected = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
+                    "target_alias": target["target_alias"], "status": "rolled_back",
+                    "backend_server_id": target["backend_server_id"], "region": target["region"]}
+        if old.get("result") != expected: raise ValueError("saved rollback receipt differs")
+        files = (("executable", target["executable"], MAX_HEYVM),) if daemon else (
+            ("executable", target["executable"], MAX_HEYVM), ("config", target["config_json_path"], MAX_SMALL_BACKUP),
+            ("drop_in", target["systemd_drop_in_path"], MAX_SMALL_BACKUP))
+        for key, path, limit in files:
+            if secure_file(path, limit, allow_symlink=key == "executable") != old["predecessors"][key]:
+                raise ValueError("rollback predecessor file differs")
+        now = wait_for_service(host, target, req.get("component", "heyvm"))
+        if now["disk_sha256"] != old["service"]["disk_sha256"] or now["running_sha256"] != old["service"]["running_sha256"]:
+            raise ValueError("rollback predecessor executable differs")
+        health = wait_for_health(host, target["local_health_url"])
+        if health.get("backendId", health.get("backend_id")) != target["backend_server_id"] or health.get("backendRegion", health.get("backend_region")) != target["region"] or health.get("status") not in ("ok", "healthy", "running"):
+            raise ValueError("rollback health identity differs")
+        if wait_for_service(host, target, req.get("component", "heyvm")) != now:
+            raise ValueError("service changed during rollback verification")
+        return expected
     expected = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
                 "target_alias": target["target_alias"], "status": "succeeded", "heyvm_sha256": req["heyvm_sha256"],
                 "config_sha256": sha(config) if not daemon else sha(b""), "systemd_drop_in_sha256": sha(drop) if not daemon else sha(b""),
                 "backend_server_id": target["backend_server_id"], "region": target["region"]}
     if old.get("result") != expected: raise ValueError("saved receipt differs")
-    now = service(host, target, req.get("component", "heyvm"))
+    now = wait_for_service(host, target, req.get("component", "heyvm"))
     if now["disk_sha256"] != req["heyvm_sha256"] or now["running_sha256"] != req["heyvm_sha256"] or host.proc_exe(now["pid"]) != os.path.realpath(target["executable"]):
         raise ValueError("current executable differs")
     if not daemon and (pathlib.Path(target["config_json_path"]).read_bytes() != config or pathlib.Path(target["systemd_drop_in_path"]).read_bytes() != drop):
@@ -361,7 +403,7 @@ def verify_existing(target, req, host=None):
     health = host.health(target["local_health_url"])
     if health.get("backendId", health.get("backend_id")) != target["backend_server_id"] or health.get("backendRegion", health.get("backend_region")) != target["region"] or health.get("status") not in ("ok", "healthy", "running"):
         raise ValueError("current health identity differs")
-    if service(host, target) != now: raise ValueError("service changed during verification")
+    if wait_for_service(host, target, req.get("component", "heyvm")) != now: raise ValueError("service changed during verification")
     return expected
 
 

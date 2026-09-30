@@ -6,6 +6,7 @@ on:
       - 'pg-fc/**'
       - 'ui/**'
       - '.ci/workflows/pg-fc.yml'
+      - '.ci/workflows/regional-release.yml'
       - '.ci/image/ci/**'
 
 jobs:
@@ -40,6 +41,7 @@ jobs:
         run: |
           set -eu
           python3 -m unittest discover -s deploy -p 'test_sync_traefik_cert.py' -v
+          python3 -m unittest discover -s deploy -p 'test_pooler_rollout.py' -v
           sh -n init.sh
           sh -n physical.sh
           python3 -m py_compile deploy/test_physical_seed.py

@@ -468,6 +468,52 @@ hr {
   text-overflow: ellipsis;
 }
 
+/* The hamburger. Hidden on large screens — there the nav sits inline — and
+   revealed by the responsive block below, where the nav collapses behind it.
+   `aria-expanded` is toggled by the inline script on each page and is the
+   single source of truth for the open/closed state. */
+.topbar-toggle {
+  appearance: none;
+  -webkit-appearance: none;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.topbar-toggle:hover {
+  border-color: var(--border-accent);
+  color: var(--text-primary);
+}
+
+/* Three bars drawn in the current text colour via gradients, so the button
+   picks up the theme the same way every other control does — no second
+   palette and no per-theme overrides. */
+.topbar-toggle .bars {
+  width: 16px;
+  height: 12px;
+  position: relative;
+}
+.topbar-toggle .bars::before,
+.topbar-toggle .bars::after,
+.topbar-toggle .bars span {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: currentColor;
+}
+.topbar-toggle .bars::before { top: 0; }
+.topbar-toggle .bars span { top: 5px; }
+.topbar-toggle .bars::after { bottom: 0; }
+
 /* --------------------------------------------------------------------------
    Theme toggle
    -------------------------------------------------------------------------- */
@@ -843,6 +889,49 @@ textarea::placeholder {
   .topbar { padding: 0 var(--gap-3); gap: var(--gap-3); }
   .topbar-user { display: none; }
   .grid { grid-template-columns: 1fr; }
+
+  /* The nav collapses into a hamburger. The button was hidden on large
+     screens; here it becomes the affordance, sitting between the brand and
+     the right-hand cluster (uptime, pill, theme toggle) which all stay put. */
+  .topbar-toggle { display: inline-flex; }
+
+  /* Collapsed by default: the nav drops out of the flex row and is held in a
+     panel under the bar, shown only when the toggle opens it. `position:
+     absolute` rather than reflowing the bar so opening it does not shove the
+     page content down on every click. */
+  .topbar-nav {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    flex: none;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0;
+    padding: var(--gap-1) 0;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border-color);
+    box-shadow: 0 8px 24px var(--shadow);
+    /* `hidden` is the collapsed state; the toggle removes it. Kept as a class
+       rather than `display: none` so a future no-JS fallback can show the nav
+       by simply not adding the class. */
+    display: none;
+    overflow: visible;
+  }
+  .topbar-nav.open { display: flex; }
+
+  /* Full-width tappable rows, the way a mobile menu reads. */
+  .topbar-nav a {
+    padding: 10px var(--gap-3);
+    border: 0;
+    border-top: 1px solid var(--border-color);
+  }
+  .topbar-nav a:first-child { border-top: 0; }
+  .topbar-nav a[aria-current="page"] {
+    border-color: var(--border-color);
+    border-left: 3px solid var(--accent);
+    padding-left: calc(var(--gap-3) - 3px);
+  }
 }
 
 /* Print exists for one reason: somebody screenshots or PDFs an incident page

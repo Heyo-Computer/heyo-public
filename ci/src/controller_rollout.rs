@@ -155,7 +155,12 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &st
         return Err("managed CI requires a regional platform update; direct app-lb self-replacement is forbidden".into());
     }
     let (deployment, base, _) = target(d)?;
-    let (application, _, _) = application_target(d)?;
+    let application = update_application(d)?;
+    if application.is_none() {
+        let adopted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_controller_rollout WHERE application_id IS NOT NULL AND request->>'deployment'=$1 AND request->>'base_url'=$2)")
+            .bind(deployment).bind(base).fetch_one(d.store.pool()).await.map_err(|e| e.to_string())?;
+        if adopted { return Err("previously adopted CI deployment requires its application lifecycle configuration".into()); }
+    }
     let run = d.store.get_run(&msg.run_id).await.map_err(|e| e.to_string())?.ok_or("missing run")?;
     let repository = d.config.controller_repository.as_deref().ok_or("CI_CONTROLLER_REPOSITORY is not configured")?;
     if !crate::repos::same_repo(repository, &run.repo_url) { return Err("this repository may not replace the CI controller".into()); }
@@ -175,13 +180,18 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &st
     if stored.sink != "artifacts" { return Err("controller update requires the HTTP artifact sink".into()); }
     let digest = stored.digest.clone().ok_or("artifact omitted digest")?;
     let id = format!("ci-controller-{}", hex::encode(Sha256::digest(step.as_bytes())));
-    if let Some(existing) = sqlx::query_scalar::<_, Value>("SELECT request FROM ci_controller_rollout WHERE id=$1")
+    if let Some(existing) = sqlx::query("SELECT request,application_id,phase FROM ci_controller_rollout WHERE id=$1")
         .bind(&id).fetch_optional(d.store.pool()).await.map_err(|e| e.to_string())? {
-        let existing: Request = serde_json::from_value(existing).map_err(|e| e.to_string())?;
+        let saved_application: Option<String> = existing.get("application_id");
+        if saved_application.as_deref() != application
+            || (application.is_none() && existing.get::<String,_>("phase") == "prepared") {
+            return Err("controller rollout approval contract changed on replay".into());
+        }
+        let existing: Request = serde_json::from_value(existing.get("request")).map_err(|e| e.to_string())?;
         if existing.sha != sha || existing.artifact != digest || existing.deployment != deployment || existing.base_url != base {
             return Err("controller rollout request changed on replay".into());
         }
-        accept_application_update(d, &id).await?;
+        if application.is_some() { accept_application_update(d, &id).await?; }
         return Ok(format!("[ci] controller deployment {id} is durably recorded\n"));
     }
     if !(1..=256 * 1024 * 1024).contains(&stored.size_bytes) { return Err("controller artifact exceeds verification budget".into()); }
@@ -212,12 +222,24 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &st
     let inserted = sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) SELECT $1,s.id,r.id,j.id,$3,$4,'running','pending',$5,rel.git_ref FROM ci_step s JOIN ci_job j ON j.id=s.job_id JOIN ci_run r ON r.id=j.run_id JOIN ci_release rel ON rel.run_id=r.id AND rel.status='published' WHERE s.id=$2 AND j.status='running' AND r.status<>'cancelled'")
         .bind(&id).bind(step).bind(deployment).bind(hash).bind(&sha).execute(&mut *tx).await.map_err(|e| e.to_string())?.rows_affected();
     if inserted != 1 { return Err("requesting job is no longer running".into()); }
-    sqlx::query("INSERT INTO ci_controller_rollout(id,request,phase,application_id) VALUES($1,$2,'prepared',$3)")
-        .bind(&id).bind(value).bind(application).execute(&mut *tx).await.map_err(|e| format!("another controller rollout is active, or intent could not be recorded: {e}"))?;
+    sqlx::query("INSERT INTO ci_controller_rollout(id,request,phase,application_id) VALUES($1,$2,$3,$4)")
+        .bind(&id).bind(value).bind(if application.is_some() { "prepared" } else { "pending" }).bind(application)
+        .execute(&mut *tx).await.map_err(|e| format!("another controller rollout is active, or intent could not be recorded: {e}"))?;
     Store::add_service_deployment_event(&mut tx, &id).await.map_err(|e| e.to_string())?;
     tx.commit().await.map_err(|e| e.to_string())?;
-    accept_application_update(d, &id).await?;
+    if application.is_some() { accept_application_update(d, &id).await?; }
     Ok(format!("[ci] controller deployment {id} recorded; run waits for drain, replacement, and public revision verification\n"))
+}
+
+/// A never-adopted app-lb deployment already authorizes its release through
+/// repository, merged revision, artifact and deployment-scoped credentials.
+/// Partial lifecycle configuration is an error, never a fallback to that mode.
+fn update_application(d: &Dispatcher) -> Result<Option<&str>, String> {
+    if d.config.application_id.is_none() && d.config.application_orchestrator_url.is_none()
+        && d.config.application_lifecycle_token.is_none() {
+        return Ok(None);
+    }
+    application_target(d).map(|(application, _, _)| Some(application))
 }
 
 fn application_target(d: &Dispatcher) -> Result<(&str, &str, &str), String> {
@@ -339,7 +361,12 @@ async fn reconcile_operation(d: &Dispatcher, id: &str, token: &str) -> Result<()
     let Some(row) = row else { return Ok(()) };
     let phase: String = row.get("phase");
     let run: String = row.get("run_id");
-    let request: Request = serde_json::from_value(row.get("request")).map_err(|e| e.to_string())?;
+    let recorded: Value = row.get("request");
+    if phase != "prepared" && row.get::<Option<String>,_>("application_id").is_some()
+        && row.get::<Option<String>,_>("activation_hash").as_deref() != Some(etag(&recorded).as_str()) {
+        return Err("adopted CI rollout has no matching durable application activation".into());
+    }
+    let request: Request = serde_json::from_value(recorded).map_err(|e| e.to_string())?;
     let source_boot = request.source_boot.ok_or("legacy CI rollout has no pinned source boot; explicit reconciliation is required")?;
     let deployment = request.deployment.as_str();
     let base = request.base_url.as_str();
@@ -598,6 +625,10 @@ mod tests {
     }
 
     async fn dispatcher(f: &Fixture, base: &str) -> Dispatcher {
+        dispatcher_with_application(f, base, true).await
+    }
+
+    async fn dispatcher_with_application(f: &Fixture, base: &str, adopted: bool) -> Dispatcher {
         unsafe {
             std::env::set_var("CI_HEYO_API_KEY", "local-test-only");
             std::env::set_var("CI_NETWORK", "local-test-only");
@@ -606,9 +637,9 @@ mod tests {
             std::env::set_var("CI_NATS_URL", std::env::var("CI_TEST_NATS_URL").expect("disposable CI_TEST_NATS_URL"));
         }
         let mut config = crate::config::Config::from_env().unwrap();
-        config.application_id = Some("ci".into());
-        config.application_orchestrator_url = Some(base.into());
-        config.application_lifecycle_token = Some("test-lifecycle".into());
+        config.application_id = adopted.then(|| "ci".into());
+        config.application_orchestrator_url = adopted.then(|| base.into());
+        config.application_lifecycle_token = adopted.then(|| "test-lifecycle".into());
         config.controller_deployment = Some("ci-test".into());
         config.controller_repository = Some("https://github.com/example/ci.git".into());
         config.app_lb_url = None; config.app_lb_token = None;
@@ -618,6 +649,7 @@ mod tests {
         config.nats_prefix = format!("rollout{}", uuid::Uuid::new_v4().simple());
         config.artifact_sink = crate::config::ArtifactSinkKind::Disk;
         config.artifact_dir = f._dir.path().join("artifacts");
+        config.artifacts = Some(crate::config::ArtifactsConfig { url:base.into(), token:None, guest_url:None });
         let config = Arc::new(config);
         Dispatcher {
             config: config.clone(), store: f.store.clone(),
@@ -664,11 +696,74 @@ mod tests {
         })).route("/healthz", get(|State(r): State<Remote>| async move {
             let binary = if r.wrong_binary.load(SeqCst) { "wrong-binary" } else { "verified-binary" };
             ([("x-ci-revision", "source"), ("x-ci-binary-sha256", binary)], "ok\n")
+        })).route("/blobs/{digest}", get(|| async {
+            package("source", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  ci\n", false)
         })).with_state(remote.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
         (url, remote, task)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL"]
+    async fn request_supports_unadopted_app_lb_but_preserves_application_approval() {
+        for adopted in [false, true] {
+            let f = fixture().await;
+            let (base, remote, server) = remote().await;
+            let mut d = dispatcher_with_application(&f, &base, adopted).await;
+            let original_config = d.config.clone();
+            for fields in 1..7 {
+                let mut partial = crate::config::Config::from_env().unwrap();
+                partial.application_id = (fields & 1 != 0).then(|| "ci".into());
+                partial.application_orchestrator_url = (fields & 2 != 0).then(|| base.clone());
+                partial.application_lifecycle_token = (fields & 4 != 0).then(|| "test-lifecycle".into());
+                d.config = Arc::new(partial);
+                assert!(update_application(&d).is_err(), "partial lifecycle settings must not authorize direct updates: {fields}");
+            }
+            d.config = original_config;
+            d.artifacts = Arc::new(crate::artifacts::ArtifactsSink::new(d.config.artifacts.clone().unwrap()));
+            {
+                let mut snapshot = remote.snapshot.lock().unwrap();
+                snapshot["spec"]["vm"]["env_vars"]["CI_PUBLIC_URL"] = json!(base);
+                snapshot["spec"]["vm"]["env_vars"]["CI_CONTROLLER_DEPLOYMENT"] = json!("ci-test");
+                snapshot["spec"]["vm"]["mounts"][1]["store"] = json!(base);
+            }
+            sqlx::raw_sql("DELETE FROM ci_controller_rollout; DELETE FROM ci_service_deployment;
+                UPDATE ci_run SET sha='source',repo_url='https://github.com/example/ci.git' WHERE id='run';
+                UPDATE ci_job SET status='running' WHERE id='job';
+                INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES('build','run','build','build','Build','success');
+                INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status)
+                VALUES('run','hash','source','source','refs/heads/main','{}','source',
+                '{\"source_sha\":\"source\",\"release_sha\":\"source\",\"git_ref\":\"refs/heads/main\",\"versions\":{}}','published');")
+                .execute(f.store.pool()).await.unwrap();
+            let bytes = package("source", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  ci\n", false);
+            sqlx::query("INSERT INTO ci_artifact(id,run_id,job_id,name,sink,digest,size_bytes,uri) VALUES('artifact','run','build','ci','artifacts',$1,$2,'test')")
+                .bind(hex::encode(Sha256::digest(&bytes))).bind(bytes.len() as i64).execute(f.store.pool()).await.unwrap();
+            let msg = JobMessage { run_id:"run".into(),job_id:"job".into(),job_key:"deploy".into() };
+            let result = request(&d, &msg, "step", "ci", None).await;
+            let id = format!("ci-controller-{}", hex::encode(Sha256::digest(b"step")));
+            let phase: String = sqlx::query_scalar("SELECT phase FROM ci_controller_rollout WHERE id=$1")
+                .bind(&id).fetch_one(f.store.pool()).await.unwrap();
+            if adopted {
+                assert!(result.unwrap_err().contains("authority refused"));
+                assert_eq!(phase, "prepared", "refused approval must never activate a rollout");
+                let unconfigured = dispatcher_with_application(&f, &base, false).await;
+                assert!(request(&unconfigured, &msg, "step", "ci", None).await.unwrap_err().contains("previously adopted"));
+                sqlx::query("UPDATE ci_controller_rollout SET phase='pending' WHERE id=$1")
+                    .bind(&id).execute(f.store.pool()).await.unwrap();
+                assert!(reconcile(&unconfigured).await.unwrap_err().contains("activation"));
+            } else {
+                result.unwrap();
+                assert_eq!(phase, "pending");
+                request(&d, &msg, "step", "ci", None).await.unwrap();
+                let count: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_controller_rollout")
+                    .fetch_one(f.store.pool()).await.unwrap();
+                assert_eq!(count, 1, "replay must not create a second replacement");
+            }
+            assert_eq!(remote.puts.load(std::sync::atomic::Ordering::SeqCst), 0);
+            server.abort();
+        }
     }
 
     async fn seed_request(f: &Fixture, base: &str, source_boot: uuid::Uuid) {

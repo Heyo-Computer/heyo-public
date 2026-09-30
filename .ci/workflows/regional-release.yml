@@ -81,8 +81,33 @@ jobs:
           workflow: .ci/workflows/orchestrator.yml
           artifact: orchestrator-linux
 
-  controller:
+  poolers:
     needs: [eu1]
+    vm: *release_vm
+    timeout-minutes: 60
+    steps:
+      - uses: ci/checkout-release
+        if: ${{ changed('pg-fc/**', 'ui/**', '.ci/workflows/pg-fc.yml', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
+      - uses: ci/download-artifact
+        if: ${{ changed('pg-fc/**', 'ui/**', '.ci/workflows/pg-fc.yml', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
+        with:
+          workflow: .ci/workflows/pg-fc.yml
+          name: pg-fc
+          path: pg-fc-release.tar.gz
+      - name: Replace poolers in operator-configured order
+        if: ${{ changed('pg-fc/**', 'ui/**', '.ci/workflows/pg-fc.yml', '.ci/image/ci/**', '.ci/workflows/regional-release.yml') }}
+        env:
+          PG_FC_ROLLOUT_TARGETS: ${{ secrets.PG_FC_ROLLOUT_TARGETS }}
+          APP_LB_US3_TOKEN: ${{ secrets.APP_LB_US3_TOKEN }}
+          APP_LB_EU1_TOKEN: ${{ secrets.POOLER_APP_LB_EU1_TOKEN }}
+          PG_FC_RUN_ID: ${{ ci.run_id }}
+        run: |
+          set -eu
+          export PG_FC_REVISION="$(git rev-parse HEAD)"
+          python3 pg-fc/deploy/rollout_poolers.py pg-fc-release.tar.gz
+
+  controller:
+    needs: [poolers]
     vm: *release_vm
     timeout-minutes: 30
     steps:

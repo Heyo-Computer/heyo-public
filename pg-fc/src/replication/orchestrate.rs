@@ -95,6 +95,9 @@ pub async fn enable_primary(
     peer_name: &str,
 ) -> Result<ReplRecord> {
     let _operation = reg.replication_operation(database).await;
+    if reg.physical().reserves_database(database) || reg.physical_sources().get(database).is_some() {
+        bail!("logical replication changes are blocked while physical ownership exists");
+    }
     let rcfg = cfg(reg)?;
 
     // The tenant credential has to be mirrored onto the replica so the same
@@ -291,6 +294,9 @@ pub fn accept_replica(
     reg: &Arc<SchemaRegistry>,
     req: wire::ProvisionReplica,
 ) -> Result<ReplRecord> {
+    if reg.physical().reserves_database(&req.database) || reg.physical_sources().get(&req.database).is_some() {
+        bail!("logical replication changes are blocked while physical ownership exists");
+    }
     let rcfg = cfg(reg)?;
     if req.peer == rcfg.node_name {
         bail!("refusing to replicate from a peer reporting this node's own name");

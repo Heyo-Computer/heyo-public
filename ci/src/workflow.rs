@@ -1675,8 +1675,8 @@ mod repo_workflow {
         let plan = crate::plan::Plan::build(&wf).unwrap();
         crate::submission::validate_release_plan(&plan).unwrap();
         assert_eq!(plan.jobs.iter().map(|j| j.base_id.as_str()).collect::<Vec<_>>(),
-            ["merge", "us3", "eu1", "controller"]);
-        for (i, predecessor) in [(1, "merge"), (2, "us3"), (3, "eu1")] {
+            ["merge", "us3", "eu1", "poolers", "controller"]);
+        for (i, predecessor) in [(1, "merge"), (2, "us3"), (3, "eu1"), (4, "poolers")] {
             assert_eq!(plan.jobs[i].needs, [predecessor]);
             assert!(plan.jobs[i].condition.is_none(), "do not skip a dependency stage");
         }
@@ -1693,7 +1693,13 @@ mod repo_workflow {
             assert_eq!(steps[1].with["mount-path"], "/opt/orchestrator-release",
                 "reuse the registered private release mount instead of adding an unauthenticated mount");
         }
-        assert_eq!(plan.jobs[3].steps.last().unwrap().uses.as_deref(), Some("ci/deploy-controller"));
+        let poolers = &plan.jobs[3].steps;
+        assert_eq!(poolers[0].uses.as_deref(), Some("ci/checkout-release"));
+        assert_eq!(poolers[1].uses.as_deref(), Some("ci/download-artifact"));
+        assert_eq!(poolers[1].with["workflow"], ".ci/workflows/pg-fc.yml");
+        assert_eq!(poolers[1].with["name"], "pg-fc");
+        assert!(poolers[2].run.as_deref().unwrap().contains("python3 pg-fc/deploy/rollout_poolers.py pg-fc-release.tar.gz"));
+        assert_eq!(plan.jobs[4].steps.last().unwrap().uses.as_deref(), Some("ci/deploy-controller"));
 
         // Exercise asymmetric changes: a shared parser affects CI and app-lb,
         // release-mount extraction affects app-lb and its mounted service, while
@@ -1705,27 +1711,37 @@ mod repo_workflow {
             ("ci/src/main.rs", vec!["ci"]),
             ("orchestrator/src/main.rs", vec!["orchestrator-linux"]),
             ("heyosecret-client/src/lib.rs", vec!["orchestrator-linux"]),
-            (".ci/image/ci/Dockerfile", vec!["ci", "orchestrator-linux"]),
+            ("pg-fc/src/main.rs", vec!["pg-fc"]),
+            (".ci/workflows/pg-fc.yml", vec!["pg-fc"]),
+            (".ci/image/ci/Dockerfile", vec!["ci", "orchestrator-linux", "pg-fc"]),
             (".ci/image/apps/Dockerfile", vec!["app-lb"]),
-            (".ci/workflows/regional-release.yml", vec!["app-lb", "ci", "orchestrator-linux"]),
+            (".ci/workflows/regional-release.yml", vec!["app-lb", "ci", "orchestrator-linux", "pg-fc"]),
             ("README.md", vec![]),
         ] {
             let changes = crate::paths::Changes::known(vec![path.into()]);
             let mut ctx = crate::expr::Context::new();
             ctx.set("ci", serde_json::json!({"changes_known":true,"changed_files":[path]}));
+            for step in poolers {
+                assert_eq!(ctx.eval_condition(step.condition.as_deref().unwrap()).unwrap(),
+                    expected.contains(&"pg-fc"), "{path}: pooler steps must select together");
+            }
             for step in plan.jobs.iter().skip(1).flat_map(|j| &j.steps) {
+                if !step.with.contains_key("workflow") {
+                    continue;
+                }
                 let validation_path = &step.with["workflow"];
+                let artifact = step.with.get("artifact").or_else(|| step.with.get("name")).unwrap();
                 let yaml = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(validation_path)).unwrap();
                 let validation = Workflow::parse(validation_path, &yaml).unwrap();
                 let build = crate::plan::Plan::build(&validation).unwrap();
                 crate::submission::validate_validation_plan(&build).unwrap();
                 let selected = ctx.eval_condition(step.condition.as_deref().unwrap()).unwrap();
-                assert_eq!(selected, expected.contains(&step.with["artifact"].as_str()), "{path}: {validation_path}");
+                assert_eq!(selected, expected.contains(&artifact.as_str()), "{path}: {validation_path}");
                 assert_eq!(selected, validation.on_submit.admits("feature", &changes).is_ok(), "{path}: {validation_path}");
                 if selected {
                     assert!(build.jobs.iter().all(|j| j.condition.as_deref().is_none_or(|c| ctx.eval_condition(c).unwrap())));
                     assert!(build.jobs.iter().flat_map(|j| &j.steps).any(|s|
-                        s.uses.as_deref() == Some("ci/upload-artifact") && s.with.get("name") == step.with.get("artifact")));
+                        s.uses.as_deref() == Some("ci/upload-artifact") && s.with.get("name") == Some(artifact)));
                 }
             }
         }

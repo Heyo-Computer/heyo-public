@@ -36,6 +36,10 @@ pub(crate) fn route(reg: &SchemaRegistry, db: &str) -> Result<Route> {
         }
     }
     if let Some(candidate) = reg.physical().get(db) {
+        if candidate.phase == PhysicalPhase::Standby {
+            return Ok(if candidate.candidate_id.as_deref() == bound.as_deref() { Route::Local }
+                else { Route::Unavailable("physical standby binding mismatch") });
+        }
         if candidate.handoff_started() {
             return Ok(if candidate.phase == PhysicalPhase::Activated
                 && candidate.candidate_id.as_deref() == bound.as_deref()

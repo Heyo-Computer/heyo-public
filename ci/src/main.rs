@@ -44,6 +44,7 @@ mod plan;
 mod pool;
 mod release;
 mod release_git;
+mod release_policy;
 mod repos;
 mod runners;
 mod secrets;

@@ -56,9 +56,8 @@
   .wrap { max-width: 1200px; margin: 0 auto; padding: 24px 20px 64px; }
 
   @media (max-width: 720px) {
-    .topbar { flex-wrap: wrap; height: auto; padding: 12px; gap: 8px; }
+    .topbar { flex-wrap: wrap; height: auto; padding: 8px 12px; gap: 8px; }
     .topbar-brand { white-space: normal; overflow-wrap: anywhere; }
-    .topbar-nav { order: 3; flex-basis: 100%; }
     .topbar-right { flex-wrap: wrap; white-space: normal; }
   }
 
@@ -343,7 +342,8 @@ button.cellbtn:hover .tag, button.cellbtn:focus-visible .tag { outline: 1px soli
 <div class="wrap">
 <header class="topbar">
     <a class="topbar-brand" href="/"><span>heyo</span><span class="topbar-app">{{APP_NAME}}</span></a>
-    <nav class="topbar-nav">
+    <button class="topbar-toggle" type="button" aria-expanded="false" aria-controls="topbar-nav" aria-label="Toggle navigation"><span class="bars"><span></span></span></button>
+    <nav class="topbar-nav" id="topbar-nav">
       <a href="/" data-local-nav>Directory</a>
       <a href="/dashboard" aria-current="page">Dashboard</a>
       <a href="/siem" data-local-nav>Security</a>
@@ -536,6 +536,22 @@ document.getElementById("uptime").hidden = !localView;
 // The global topology is the default away from a local view; a local page
 // keeps its own gateway's picture.
 document.getElementById("network-nav").href = localView ? "/network?view=local" : "/network";
+
+// Hamburger menu: collapse the nav on narrow screens. The open/closed state
+// lives on the nav (`.open`) and is mirrored to the button's `aria-expanded`
+// so assistive tech reads it correctly. Clicking a link or escaping closes it.
+(function setupNavToggle() {
+  const btn = document.querySelector(".topbar-toggle");
+  const nav = document.querySelector(".topbar-nav");
+  if (!btn || !nav) return;
+  const close = () => { nav.classList.remove("open"); btn.setAttribute("aria-expanded", "false"); };
+  btn.addEventListener("click", () => {
+    const open = nav.classList.toggle("open");
+    btn.setAttribute("aria-expanded", String(open));
+  });
+  nav.addEventListener("click", (e) => { if (e.target.closest("a")) close(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+})();
 const REFRESH_MS = 2000;
 // Certs, secrets and jobs move on human timescales; see `pollSlow`.
 const SLOW_REFRESH_MS = 10000;

@@ -244,6 +244,16 @@ impl Dispatcher {
             None => req.repository.url.clone(),
         };
 
+        // Policy comes from the CI service's operator configuration, never the
+        // submitted tree. Resolve every target before admitting any run.
+        let release_policy = crate::release_policy::select(self.config.release_policies.as_deref(), &repo_url)
+            .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+        let operator_plan = match &release_policy {
+            Some(policy) => Some(crate::release_policy::prepare(self, &repo_url, policy).await
+                .map_err(|e| DispatchError::Workflow(e.to_string()))?),
+            None => None,
+        };
+
         // A registered workflow object decides the path glob and the id; without
         // one, the installation-wide default applies. Matching is on the
         // *repository*, because `git submit` knows what it is a clone of but not
@@ -340,8 +350,12 @@ impl Dispatcher {
         // not only on a page nobody has open.
         let mut warnings: Vec<String> = Vec::new();
 
-        for source in &sources {
-            let files = crate::trigger::find_workflows(&workspace.root, &source.pattern)?;
+        for (source_index, source) in sources.iter().enumerate() {
+            let mut files = crate::trigger::find_workflows(&workspace.root, &source.pattern)?;
+            if let Some(policy) = &release_policy {
+                files = crate::release_policy::workflows(files, policy, source_index == 0)
+                    .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+            }
             patterns_tried.push(source.pattern.clone());
             if files.is_empty() {
                 continue;
@@ -420,8 +434,11 @@ impl Dispatcher {
                         continue;
                     }
                 }
-                let mut plan = crate::plan::Plan::build(&wf)
-                    .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+                let mut plan = match operator_plan.as_ref().filter(|_| is_release) {
+                    Some(plan) => plan.clone(),
+                    None => crate::plan::Plan::build(&wf)
+                        .map_err(|e| DispatchError::Workflow(e.to_string()))?,
+                };
                 if is_release {
                     crate::submission::validate_release_plan(&plan)
                         .map_err(DispatchError::Workflow)?;
@@ -1403,6 +1420,8 @@ impl Dispatcher {
                 return Ok(JobStatus::Running);
             }
         }
+        let mut preparation_quiescent = false;
+        let result = async {
         tracing::info!(job = %plan.key, runner = %runner, attempt, "acquiring a VM");
 
         // CI owns disposable job machines, not a stopped VM cache. Keep parsing
@@ -1413,7 +1432,17 @@ impl Dispatcher {
         let needs_source = existing_vm.is_none()
             && (plan.vm.build.is_some() || !plan.vm.cache_key_files.is_empty());
         let prepared = if needs_source {
-            Some(self.prepare_source(&runner, &plan, msg, Duration::from_secs(40 * 60)).await?)
+            match self.prepare_source(&runner, &plan, msg, Duration::from_secs(40 * 60)).await {
+                Ok(source) => Some(source),
+                Err(error) => {
+                    // At this first preparation call no image request exists.
+                    // A terminal source failure or unsupported endpoint is
+                    // conclusive; expiry/transport/protocol errors are not.
+                    preparation_quiescent = matches!(&error, DispatchError::Image(
+                        crate::image::ImageError::Source(_) | crate::image::ImageError::Capability));
+                    return Err(error);
+                }
+            }
         } else { None };
 
         // `vm.build` becomes `vm.image` here, building the image on the runner
@@ -1428,11 +1457,27 @@ impl Dispatcher {
         // so a redelivery re-derives the name rather than inheriting one.
         let disk_requirement = runner_disk_requirement(&plan.vm);
         if existing_vm.is_none() && let Some(build) = plan.vm.build.clone() {
-            let image = self
+            let image = match self
                 .ensure_image(&runner, &plan, &build, prepared.as_ref().expect("build requires preparation"), msg)
-                .await?;
+                .await {
+                    Ok(image) => image,
+                    Err(error) => {
+                        // Only the daemon's terminal build response settles
+                        // image work. Source replay failures do not settle it.
+                        preparation_quiescent = matches!(&error, DispatchError::Image(crate::image::ImageError::Build { .. }));
+                        return Err(error);
+                    }
+                };
             plan.vm.image = Some(image);
             plan.vm.build = None;
+        }
+        preparation_quiescent = true;
+
+        // Persist before acquire_vm (including disk reclamation), or opening
+        // an existing VM. Cancellation and pre-VM finalization cannot race past
+        // this boundary; instance drain still allows already-claimed work.
+        if !self.store.begin_job_execution(&msg.job_id, attempt, self.executor.boot_id()).await? {
+            return Err(DispatchError::Cancelled("job ended before VM acquisition".into()));
         }
 
         // Two ways to get a machine, and they share nothing but the handle.
@@ -1556,6 +1601,17 @@ impl Dispatcher {
                 self.executor.boot_id()).await?;
         }
         Ok(status)
+        }.await;
+        // Only the delivery that actually acquired this claim may finalize it.
+        // A dropped outer future retains ownership: it did not reach this point.
+        if let Err(error) = &result {
+            if error.is_tunnel_failure() { self.runners.evict(&runner).await; }
+            if let Some(status) = self.store.finish_job_preparation(&msg.job_id, attempt,
+                self.executor.boot_id(), &error.to_string(), preparation_quiescent).await? {
+                return Ok(status);
+            }
+        }
+        result
     }
 
     /// Reconstruct this run's immutable source on a runner. This owns secret
@@ -2870,6 +2926,13 @@ impl Dispatcher {
 
         match action {
             "ci/merge-release" => {
+                if let Some(policy) = &plan.release_policy {
+                    crate::release_policy::check_targets(self, policy).await
+                        .map_err(|e| DispatchError::StepFailed(e.to_string()))?;
+                    if policy.token_expressions.iter().any(|expression| ctx.substitute(expression).trim().is_empty()) {
+                        return Err(DispatchError::StepFailed("operator release policy has an unresolved credential; merge refused".into()));
+                    }
+                }
                 let manifests: Vec<String> = serde_json::from_str(&required("manifests")?)
                     .map_err(|_| DispatchError::StepFailed("with.manifests must be a JSON array of manifest paths".into()))?;
                 let tags = with("tags").map(|raw| serde_json::from_str(&raw)
@@ -6955,6 +7018,65 @@ jobs:
         assert_eq!(d.store.get_run(&run).await.unwrap().unwrap().status, "failure");
         // A failed run is still unsafe to rerun while independent/cleanup jobs run.
         assert!(d.rerun(&run, true, None).await.err().unwrap().to_string().contains("still active"));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; fake source builder"]
+    async fn failed_preparation_does_not_block_ci_app_drain() {
+        use axum::{Json, Router, http::StatusCode, routing::{get, post}};
+        let terminal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mode = terminal.clone();
+        let unexpected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = unexpected.clone();
+        let app = Router::new()
+            .route("/sources/prepare", post(move || {
+                let failed = mode.load(Ordering::SeqCst);
+                async move { Json(json!({"sourceId":"src-test", "status":if failed {"failed"} else {"preparing"}, "error":"checkout rejected"})) }
+            }))
+            .route("/sources/src-test", get(|| async { StatusCode::NOT_FOUND }))
+            .fallback(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::INTERNAL_SERVER_ERROR }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        unsafe { std::env::set_var("CI_TEST_DAEMON", format!("http://{}", listener.local_addr().unwrap())); }
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        for failed in [false, true] {
+            terminal.store(failed, Ordering::SeqCst);
+            let workspace = tempfile::tempdir().unwrap();
+            let d = test_dispatcher(workspace.path()).await;
+            let yaml = "jobs:\n  build:\n    vm:\n      driver: firecracker\n      build: {dockerfile: Dockerfile}\n    steps: [{run: echo test}]\n";
+            let workflow = crate::workflow::Workflow::parse("prep.yml", yaml).unwrap();
+            let plan = crate::plan::Plan::build(&workflow).unwrap();
+            let run = crate::vm::new_id();
+            let mut tx = d.store.pool().begin().await.unwrap();
+            crate::store::Store::create_run_in(&mut tx, &run, &crate::store::RunRequest {
+                repo_url: "https://github.com/example/ci-test.git".into(), ..Default::default()
+            }, &plan).await.unwrap();
+            crate::store::Store::record_source_in(&mut tx, &run, &serde_json::to_vec(&json!({
+                "baseRevision":"a".repeat(40), "targetTree":"b".repeat(40),
+                "patchBase64":"", "workflows":{"prep.yml":yaml}
+            })).unwrap()).await.unwrap();
+            tx.commit().await.unwrap();
+            let job = d.store.jobs_of(&run).await.unwrap().remove(0);
+            let msg = JobMessage { run_id: run.clone(), job_id: job.id.clone(), job_key: job.job_key.clone() };
+            let status = d.run_claimed(&msg, 1, plan.jobs[0].clone(), "hd-local".into(), None).await.unwrap();
+            assert_eq!(status, JobStatus::Failure);
+            let job = d.store.get_job(&job.id).await.unwrap().unwrap();
+            assert_eq!(job.status, "failure");
+            assert!(job.error.as_deref().unwrap().contains(if failed { "checkout rejected" } else { "prepared source expired" }));
+            assert!(job.sandbox_id.is_none());
+            assert_eq!(d.store.has_host_work(&job.id).await.unwrap(), !failed);
+            let operation = uuid::Uuid::new_v4();
+            d.executor.pause(operation).await.unwrap();
+            d.executor.quiesce(operation).await.unwrap();
+            assert_eq!(unexpected.load(Ordering::SeqCst), 0, "preparation failure must never reach VM APIs");
+            d.store.end_host_work(&job.id, "hd-local", 1).await.unwrap();
+            sqlx::query("DELETE FROM ci_run WHERE id=$1").bind(&run).execute(d.store.pool()).await.unwrap();
+            d.bus.js_delete_streams().await.unwrap();
+        }
+        server.abort();
+        unsafe { std::env::remove_var("CI_TEST_DAEMON"); }
     }
 
     #[tokio::test]

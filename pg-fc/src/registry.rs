@@ -614,6 +614,7 @@ pub struct SchemaRegistry {
     physical: Arc<crate::replication::PhysicalStore>,
     physical_sources: Arc<crate::replication::PhysicalSourceStore>,
     replication_ops: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    binding_ops: StdMutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
     // The knobs `PUT /api/config` may change while the pooler runs. The loops
     // that use them read here on every pass rather than off `cfg`.
     runtime: Arc<crate::runtime_config::RuntimeConfig>,
@@ -668,6 +669,7 @@ impl SchemaRegistry {
             physical,
             physical_sources,
             replication_ops: StdMutex::new(HashMap::new()),
+            binding_ops: StdMutex::new(HashMap::new()),
             repl_status: StdMutex::new(HashMap::new()),
             repl_inactive: StdMutex::new(HashMap::new()),
             runtime,
@@ -709,7 +711,11 @@ impl SchemaRegistry {
         !bound.as_deref().is_some_and(|id| self.physical_sources.has_grant_for_source_vm(database, id))
             && !self.physical_source_fenced(database)
             && self.physical.get(database).is_none_or(|r| {
-                if r.handoff_started() {
+                if r.phase == crate::replication::PhysicalPhase::StandbyBinding {
+                    false
+                } else if r.phase == crate::replication::PhysicalPhase::Standby {
+                    r.candidate_id == bound
+                } else if r.handoff_started() {
                     r.phase == crate::replication::PhysicalPhase::Activated && r.candidate_id == bound
                 } else { r.previous_vm_id == bound }
             })
@@ -729,11 +735,28 @@ impl SchemaRegistry {
     }
 
     pub async fn commit_physical_binding(self: &Arc<Self>, database: &str, expected: &str, candidate: &str) -> Result<()> {
+        let _binding = self.binding_lock(database).write_owned().await;
         let reg = self.clone();
         let (db, old, new) = (database.to_owned(), expected.to_owned(), candidate.to_owned());
         tokio::task::spawn_blocking(move || reg.store.commit_handoff_binding(&db, &old, &new)).await??;
         self.entries.lock().await.remove(database);
         Ok(())
+    }
+
+    fn binding_lock(&self, database: &str) -> Arc<tokio::sync::RwLock<()>> {
+        self.binding_ops.lock().unwrap().entry(database.into())
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(()))).clone()
+    }
+
+    /// Checkout an already-owned physical VM by exact ID.  This deliberately
+    /// bypasses ordinary name-based bring-up and is safe while the caller owns
+    /// `replication_operation`; it cannot publish a stale `pg-{database}` VM.
+    pub async fn checkout_physical_exact(&self, database: &str, candidate: &str) -> Result<ConnGuard> {
+        if self.bound_vm_id(database).as_deref() != Some(candidate) { bail!("exact physical binding changed"); }
+        let cell = self.entries.lock().await.entry(database.to_string()).or_insert_with(|| Arc::new(OnceCell::new())).clone();
+        let entry = cell.get_or_try_init(|| vm::ensure_fenced_vm(&self.cfg, database, candidate)).await?;
+        if entry.sandbox_id() != candidate { bail!("warm entry does not match exact physical binding"); }
+        ConnGuard::acquire(entry.clone(), self.cfg.admit_timeout).await.context("physical standby connection slots exhausted")
     }
 
     pub async fn exec_bound(&self, database: &str, expected_id: &str, command: &str, env: HashMap<String, String>) -> Result<()> {
@@ -852,7 +875,11 @@ impl SchemaRegistry {
             replication: self
                 .replication
                 .get(schema)
-                .filter(|r| r.state.pins())
+                // Failed replication still owns PostgreSQL objects. In
+                // particular, even an invalidated logical slot prevents a
+                // primary from starting with minimal WAL. Releasing the VM
+                // pin must not erase its durable role or downgrade settings.
+                .filter(|r| r.state.pins() || r.state == crate::replication::State::Failed)
                 .map(|r| r.role),
             repl_login,
             // Maintenance bring-ups wait as long as it takes; only a client
@@ -1511,6 +1538,13 @@ impl SchemaRegistry {
     /// The returned guard keeps the VM off the reaper's radar until dropped.
     /// Concurrent callers for the same schema share one bring-up.
     pub async fn checkout(&self, schema: &str) -> Result<ConnGuard> {
+        // A cold checkout can publish its VM binding. Finish that publication
+        // before a replacement CAS, never after it. Independent of the
+        // replication-operation mutex, whose callers also use checkout.
+        let _binding = self.binding_lock(schema).read_owned().await;
+        if self.physical.get(schema).is_some_and(|r| r.phase == crate::replication::PhysicalPhase::StandbyBinding) {
+            bail!("standby binding is in progress; retry after completion");
+        }
         // An outgoing grant/fence takes precedence over the older activation
         // that originally made this same VM a writer.
         if self.physical_source_fenced(schema) {
@@ -1521,6 +1555,10 @@ impl SchemaRegistry {
                 return self.maintenance_client(schema).await.map(|(guard, _)| guard);
             }
             bail!("physical source grant lost its fence; refusing ordinary checkout");
+        }
+        if let Some(rec) = self.physical.get(schema).filter(|r| r.phase == crate::replication::PhysicalPhase::Standby) {
+            let candidate = rec.candidate_id.context("standby lost candidate identity")?;
+            return self.checkout_physical_exact(schema, &candidate).await;
         }
         if let Some(rec) = self.physical.get(schema).filter(|r| r.handoff_started()) {
             if rec.phase != crate::replication::PhysicalPhase::Activated {
@@ -1948,6 +1986,9 @@ impl SchemaRegistry {
             {
                 continue; // the spare pool owns these
             }
+            if self.physical.owns_vm(&info.id) || self.physical_sources.owns_vm(&info.id) {
+                continue; // physical journals own even superseded pg-* VMs
+            }
             // Bound to a live schema, or a SUPERSEDED DUPLICATE: a running
             // `pg-<schema>` VM that is not that schema's current binding (a
             // retrying bring-up created it and moved on; nothing references
@@ -2017,6 +2058,9 @@ impl SchemaRegistry {
         }
         let mut stops = futures::stream::iter(confirmed.into_iter().map(
             |(id, schema, superseded)| async move {
+                if self.physical.owns_vm(&id) || self.physical_sources.owns_vm(&id) {
+                    return false; // ownership may have been persisted after inventory
+                }
                 info!(
                     "untracked-reaper: VM {id} (schema {schema}{}) is running with no warm \
                      entry and no bring-up in flight on two consecutive passes — stopping it \
@@ -6992,6 +7036,42 @@ fn used_pct(used: u64, avail: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_pairings_keep_bringup_settings_without_becoming_live() {
+        use crate::replication::{ReplRecord, Role, State};
+        let dir = std::env::temp_dir().join(format!("pgfc-failed-role-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::from_env().unwrap();
+        cfg.state_file = dir.join("registry.tsv");
+        cfg.dedicated_file = dir.join("dedicated.tsv");
+        cfg.peers_file = dir.join("peers.tsv");
+        cfg.replication_file = dir.join("replication.tsv");
+        let registry = SchemaRegistry::new(cfg).unwrap();
+        for (database, role) in [("publisher", Role::Primary), ("subscriber", Role::Replica)] {
+            registry.replication.create(
+                ReplRecord::new(database, role, "peer", "replpassword12"),
+                &|_| false,
+            ).unwrap();
+            for (state, expected) in [
+                (State::Pending, None),
+                (State::Syncing, Some(role)),
+                (State::Active, Some(role)),
+                (State::Failed, Some(role)),
+                (State::Detached, None),
+                (State::Promoted, None),
+            ] {
+                registry.replication.set_state(database, state, "test transition").unwrap();
+                assert_eq!(registry.bring_up_for(database, None, None).replication, expected);
+                assert_eq!(registry.replication.get(database).unwrap().state, state);
+                if state == State::Failed {
+                    assert!(!registry.replication.is_pinned(database));
+                }
+            }
+        }
+        assert_eq!(registry.bring_up_for("unpaired", None, None).replication, None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn owned_claim_checkout_progresses_while_ordinary_checkout_waits() {
