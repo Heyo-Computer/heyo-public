@@ -109,6 +109,112 @@ peer, follow `pg-fc/README.md`'s cross-host replication configuration and use a
 distinct state directory and the intended host-local heyvm endpoint. The pg-fc
 artifact is private by default; use authenticated artifact-store access.
 
+### Managed pooler replacement
+
+`regional-release.yml` now includes a `poolers` job before the final CI update.
+It downloads `pg-fc` only from the current submission's successful validation,
+checks its `BUILD-INFO` against the merged checkout, and passes a pinned artifact
+digest to app-lb's existing managed host-update API. No SSH, database VM rollout,
+guest image update, replica promotion, or database-state restore is involved.
+The existing release-workflow-change triggers still select app-lb, Orchestrator,
+and CI when the release YAML itself changes; a subsequent pg-fc-only change
+selects only the pooler replacement steps.
+
+This is **stop–replace–start**, not connection-preserving handoff. Existing
+connections disconnect; clients must reconnect and may need to retry aborted
+transactions. An unchanged peer does not make a primary's database interruption
+disappear. The installer preserves the existing systemd/Supervisor definition,
+executable ownership/mode, configuration files, and schema-to-VM bindings.
+It does not call any VM lifecycle API. Normal pooler background activity resumes
+when the service starts; this workflow does not disable or rewrite that policy.
+
+Before enabling this workflow, provision repository-scoped HeyoSecret
+`PG_FC_ROLLOUT_TARGETS` with an ordered JSON target list. The list, not Python
+code, selects region names, count, endpoints, paths and order. For the current
+installation use US3 first, EU1 second. The workflow already delivers the existing
+`APP_LB_US3_TOKEN` and maps `POOLER_APP_LB_EU1_TOKEN` into `APP_LB_EU1_TOKEN`
+for this job. The latter is a delivery alias of the existing namespace-scoped
+host deployment credential, since the ordinary EU release token is restricted
+to named deployments and cannot register maintenance launchers. Additional targets need their credential
+environment reference in the operator release workflow. Never embed tokens or
+database passwords in target JSON or the repository.
+
+Example shape (operator values must replace every example path):
+
+```json
+{
+  "artifact_store": "https://art.example.com",
+  "targets": [{
+    "name": "first-region",
+    "url": "https://admin.first.example.com",
+    "token_env": "APP_LB_US3_TOKEN",
+    "namespace": "default",
+    "env_from": [{
+      "namespace": "default", "secret": "artifact-reader",
+      "key": "token", "as": "ART_API_KEY"
+    }, {
+      "namespace": "default", "secret": "ci-regional",
+      "key": "CI_DATABASE_URL", "as": "CI_DATABASE_URL"
+    }],
+    "pooler": {
+      "manager": "systemd",
+      "service": "pg-fc@first.service",
+      "executable": "/usr/local/bin/pg-vm-pool",
+      "registry": "/var/lib/pg-fc-first/registry.tsv",
+      "update_state": "/var/lib/pg-fc-updates",
+      "port": 6432,
+      "config_files": [
+        "/etc/systemd/system/pg-fc@.service",
+        "/etc/pg-fc/first.env",
+        "/etc/pg-fc/first.secrets.env"
+      ],
+      "sql_url_envs": ["CI_DATABASE_URL"]
+    }
+  }]
+}
+```
+
+Host prerequisites: Python 3, `psql`, permission to stop/start the exact mapped
+service and replace its executable. Use `manager: supervisor` and its exact
+program name for Supervisor. Existing PostgreSQL URLs are delivered through
+app-lb `env_from` references, never through argv or new host credential files.
+The probe forces `hostaddr=127.0.0.1` and the mapped pooler port, retains the URL's
+TLS options, and runs only `SELECT 1` with read-only transactions. Set optional
+`pooler.tls_server_name` to the local pooler's certificate hostname when shared
+database URLs name another region; otherwise the URL hostname is retained. It
+disables psql startup files and password prompts. Supported URL options are
+`sslmode`, `sslrootcert`, `sslcert`, and `sslkey`; unsupported options fail before
+replacement. Include a probe for every database whose connectivity must gate
+the next target. Include all effective unit/drop-in and environment configuration
+files in `config_files`.
+Use a dedicated update state directory consistently for this pooler; it contains
+only executable backups and operation receipts, never database storage.
+
+All targets must pass download, artifact, running-process, registry and SQL
+preflight before the first replacement. Each replacement waits for the old PID
+to disappear, atomically installs the executable, starts only that service, then
+checks the running executable hash, configuration hashes, retained bindings and
+SQL probes. Failed startup/readiness restores the previous executable and
+verifies it, but still fails the release and prevents updating later targets.
+Rollback is binary-only and requires backward-compatible persistent state.
+Do not use this workflow for incompatible registry formats or guest migrations.
+
+The per-pooler filesystem lock prevents overlapping installers; it is not a
+global CI execution lock. Do not run concurrent fleet pooler releases: regional
+ordering is within one job, not a fleet-wide transaction. CI/job cancellation or
+host failure can interrupt the helper; `receipt.json` records its last durable
+phase. An uncertain stop/install is never blindly replayed. Inspect the protected
+receipt and actual process before recovery. A successful repeated operation
+revalidates without restarting. A failed operation requires explicit recovery
+and a new submission; it does not silently reopen a failed CI run.
+
+Launchers are maintenance-only `.invalid` routes with no serving traffic. They
+are retained with their operation identity for reconciliation. app-lb HTTP health
+verification is disabled only for these launchers because the helper performs
+pooler-specific SQL/process checks instead. SQL child output is not logged.
+Provision and verify the operator mapping and secret references before merge; the
+workflow and fixture tests alone are not evidence of a live pooler deployment.
+
 ```sh
 sh .ci/install.sh --list            # what the store has, and what each thing is
 sh .ci/install.sh --dry-run         # fetch and verify, install nothing
