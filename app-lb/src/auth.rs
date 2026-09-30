@@ -2924,6 +2924,23 @@ mod tests {
             assert_eq!(g.public_scope("/elsewhere"), None);
         }
 
+        /// The shipped art-store gate opens `/blobs/` to anonymous callers and
+        /// nothing else. That is safe only because `art serve` itself answers
+        /// an anonymous request for a *public* blob's GET/HEAD and refuses the
+        /// rest (`artifacts/src/http.rs`, `authorize`) — the keyless installer
+        /// (`.ci/install-apps.sh`) depends on this. Tags, manifests and usage
+        /// still need an admin credential at the gate.
+        #[test]
+        fn the_art_store_example_opens_blobs_only() {
+            let spec: serde_json::Value =
+                serde_json::from_str(include_str!("../examples/artifacts-gated.json")).unwrap();
+            let g: AuthGate = serde_json::from_value(spec["auth"].clone()).unwrap();
+            assert_eq!(g.public_scope("/blobs/abc"), Some(PathScope::Public));
+            for p in ["/tags", "/tags/x", "/manifests/x", "/usage"] {
+                assert_eq!(g.public_scope(p), Some(PathScope::Admin), "{p}");
+            }
+        }
+
         /// Longest prefix wins, so a narrow entry can tighten a broad one and
         /// the answer never depends on the order somebody typed them in.
         #[test]
