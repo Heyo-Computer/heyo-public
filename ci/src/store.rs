@@ -1891,6 +1891,34 @@ impl Store {
         Ok(())
     }
 
+    /// Commit a completed command once. A lost COMMIT response is safe to
+    /// retry: the terminal row is the receipt, and its log is not appended twice.
+    pub async fn finish_command(
+        &self, step_id: &str, status: StepStatus, exit_code: i32, text: &str,
+        attempt: i32, boot: uuid::Uuid,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::sql)?;
+        let job = sqlx::query("SELECT j.id,j.attempt,j.executor_boot FROM ci_job j JOIN ci_step s ON s.job_id=j.id WHERE s.id=$1 FOR UPDATE OF j")
+            .bind(step_id).fetch_one(&mut *tx).await.map_err(StoreError::sql)?;
+        if job.get::<i32,_>("attempt") != attempt || job.get::<Option<uuid::Uuid>,_>("executor_boot") != Some(boot) {
+            return Err(StoreError::Sql("completed command no longer owns this job attempt".into()));
+        }
+        let row = sqlx::query("SELECT status,exit_code,finished_at IS NOT NULL AS finished FROM ci_step WHERE id=$1 FOR UPDATE")
+            .bind(step_id).fetch_one(&mut *tx).await.map_err(StoreError::sql)?;
+        if row.get::<bool,_>("finished") {
+            if row.get::<String,_>("status") != status.as_str() || row.get::<Option<i32>,_>("exit_code") != Some(exit_code) {
+                return Err(StoreError::Sql("completed command conflicts with the recorded step result".into()));
+            }
+            return Ok(());
+        }
+        Self::append_log_in(&mut tx, step_id, text).await?;
+        sqlx::query("UPDATE ci_step SET status=$2,exit_code=$3,error=NULL,finished_at=now() WHERE id=$1")
+            .bind(step_id).bind(status.as_str()).bind(exit_code)
+            .execute(&mut *tx).await.map_err(StoreError::sql)?;
+        self.add_step_event(&mut tx, step_id, &job.get::<String,_>("id"), status.as_str(), None).await?;
+        tx.commit().await.map_err(StoreError::sql)
+    }
+
     pub async fn steps_of(&self, job_id: &str) -> Result<Vec<StepRow>, StoreError> {
         let rows = sqlx::query("SELECT * FROM ci_step WHERE job_id = $1 ORDER BY idx")
             .bind(job_id)
@@ -3223,6 +3251,33 @@ jobs:
         Store::append_log_in(&mut tx, sid, "must roll back").await.unwrap();
         tx.rollback().await.unwrap();
         assert_eq!(other.read_log(&steps[0]).await.unwrap().unwrap(), text);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn command_completion_retries_do_not_duplicate_logs_or_change_outcome() {
+        let store = test_store().await;
+        let run = crate::vm::new_id();
+        store.create_run(&run, &RunRequest::default(), &test_plan()).await.unwrap();
+        let jid = job_id(&run, "deploy");
+        let sid = step_id(&jid, 0);
+        let boot = uuid::Uuid::new_v4();
+        sqlx::query("UPDATE ci_job SET status='running',attempt=3,executor_boot=$2 WHERE id=$1")
+            .bind(&jid).bind(boot).execute(store.pool()).await.unwrap();
+        store.create_step(&sid, &jid, 0, "deploy", None).await.unwrap();
+        store.start_step(&sid, &sid).await.unwrap();
+        assert!(store.finish_command(&sid, StepStatus::Failure, 7, "failed once\n", 2, boot).await.is_err());
+        assert!(store.finish_command(&sid, StepStatus::Failure, 7, "failed once\n", 3, uuid::Uuid::new_v4()).await.is_err());
+        assert_eq!(store.steps_of(&jid).await.unwrap()[0].log_bytes, 0);
+        store.finish_command(&sid, StepStatus::Failure, 7, "failed once\n", 3, boot).await.unwrap();
+        // Models replay after the server committed but its reply was lost.
+        store.finish_command(&sid, StepStatus::Failure, 7, "failed once\n", 3, boot).await.unwrap();
+        assert!(store.finish_command(&sid, StepStatus::Success, 0, "wrong\n", 3, boot).await.is_err());
+        let steps = store.steps_of(&jid).await.unwrap();
+        assert_eq!(steps[0].status, "failure");
+        assert_eq!(steps[0].exit_code, Some(7));
+        assert_eq!(steps[0].log_bytes, 12);
+        assert_eq!(store.read_log(&steps[0]).await.unwrap().as_deref(), Some("failed once\n"));
     }
 
     #[tokio::test]

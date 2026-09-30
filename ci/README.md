@@ -950,6 +950,15 @@ chain before scheduling stops; matrix dependencies wait for every cell. An
 explicit `if: always()` can still schedule cleanup, and independent jobs are
 not skipped. A failed run cannot be rerun while those jobs are active.
 
+For completed Linux `run:` commands, CI records the masked log and exit status
+in one transaction. A temporary database outage retries only that transaction
+for up to two minutes (within the existing job deadline), never the command.
+Replaying a committed result does not duplicate its log. If recording still
+fails, the job error explicitly reports a result-recording failure and the
+known command exit code; it does not claim the command itself failed. This
+bounded in-process retry does not add restart recovery or make pooler replacement
+zero-downtime.
+
 Two buttons on a finished run's page, and the routes behind them:
 
 - **Run again** — `POST /runs/{id}/rerun`. Every job, from the top.

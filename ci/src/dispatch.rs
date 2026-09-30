@@ -1539,7 +1539,7 @@ impl Dispatcher {
             vm.ensure_running(BOOT_TIMEOUT).await?;
             self.ensure_sized(&plan, &runner, &vm).await?;
             self.checkout(msg, &plan, &vm).await?;
-            self.run_steps(msg, &plan, &vm).await
+            self.run_steps(msg, &plan, &vm, attempt).await
         }.await;
         // Durable maintenance owns strict VM stop/release and final job status.
         // Do not stop or repool here: another reconciler may already have done
@@ -2632,6 +2632,7 @@ impl Dispatcher {
         msg: &JobMessage,
         plan: &JobPlan,
         vm: &Vm,
+        attempt: i32,
     ) -> Result<Value, DispatchError> {
         let needs = self.store.needs_context(&msg.run_id).await?;
 
@@ -2812,9 +2813,18 @@ impl Dispatcher {
                     // Masked before it is persisted, not when it is rendered: a
                     // secret that reaches disk in plain text has leaked, and
                     // hiding it from one reader does not un-leak it.
-                    self.store
-                        .append_log(&sid, &log_path, &masker.mask(&text))
-                        .await?;
+                    let text = masker.mask(&text);
+                    let ok = out.succeeded();
+                    let status = if ok { StepStatus::Success } else { StepStatus::Failure };
+                    // Retry only the atomic receipt write, never vm.exec. The
+                    // remote command is already complete, even if the pooler
+                    // it replaced briefly disconnected our own database.
+                    retry_command_recording(Duration::from_secs(120), Duration::from_secs(2), || {
+                        self.store.finish_command(&sid, status, out.exit_code, &text,
+                            attempt, self.executor.boot_id())
+                    }).await.map_err(|error| DispatchError::ResultRecording {
+                        step: sid.clone(), exit_code: out.exit_code, error: masker.mask(&error),
+                    })?;
                     if let Some(id) = &step.id {
                         step_outputs.insert(
                             id.clone(),
@@ -2822,19 +2832,6 @@ impl Dispatcher {
                                 if out.succeeded() { "success" } else { "failure" } }),
                         );
                     }
-                    let ok = out.succeeded();
-                    self.store
-                        .finish_step(
-                            &sid,
-                            if ok {
-                                StepStatus::Success
-                            } else {
-                                StepStatus::Failure
-                            },
-                            Some(out.exit_code),
-                            None,
-                        )
-                        .await?;
                     if !ok && !step.continue_on_error {
                         failed = Some(format!(
                             "step {:?} exited {}",
@@ -4858,8 +4855,31 @@ fn or_none(items: &[String]) -> String {
     }
 }
 
+/// The command is outside this retry boundary. Keeping the same completion
+/// payload also makes retry after an ambiguous database COMMIT safe.
+async fn retry_command_recording<F, Fut, E>(budget: Duration, delay: Duration, mut persist: F) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match tokio::time::timeout_at(deadline, persist()).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "command completed; retrying result recording without re-execution");
+                if tokio::time::Instant::now() + delay >= deadline { return Err(error.to_string()); }
+                tokio::time::sleep(delay).await;
+            }
+            Err(_) => return Err("database result recording exceeded its recovery deadline".into()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum DispatchError {
+    ResultRecording { step: String, exit_code: i32, error: String },
     InstanceDraining,
     MaintenancePaused,
     ControllerUnavailable(String),
@@ -5172,6 +5192,8 @@ impl std::fmt::Display for DispatchError {
                 or_none(served)
             ),
             Self::StepFailed(r) => write!(f, "{r}"),
+            Self::ResultRecording { step, exit_code, error } => write!(f,
+                "result recording failed for {step}: command completed with exit code {exit_code}; command was not rerun; {error}"),
             Self::Checkout(r) => write!(f, "checkout failed: {r}"),
             Self::Secrets(r) => write!(f, "{r}"),
             Self::Artifact(r) => write!(f, "{r}"),
@@ -5292,6 +5314,30 @@ mod tests {
     use super::*;
     use crate::workflow::Step;
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn command_recording_retries_until_database_recovers() {
+        let mut writes = 0;
+        retry_command_recording(Duration::from_secs(1), Duration::ZERO, || {
+            writes += 1;
+            let attempt = writes;
+            async move {
+                if attempt < 3 { Err("database unavailable") } else { Ok(()) }
+            }
+        }).await.unwrap();
+        assert_eq!(writes, 3);
+    }
+
+    #[tokio::test]
+    async fn command_recording_timeout_is_not_a_command_failure() {
+        let error = retry_command_recording(Duration::from_millis(5), Duration::ZERO, || {
+            std::future::pending::<Result<(), String>>()
+        }).await.unwrap_err();
+        let message = DispatchError::ResultRecording { step: "deploy.2".into(), exit_code: 0, error }.to_string();
+        assert!(message.contains("result recording failed"));
+        assert!(message.contains("command completed with exit code 0"));
+        assert!(message.contains("command was not rerun"));
+    }
 
     #[test]
     fn source_urls_exclude_local_paths_remote_helpers_and_embedded_secrets() {
