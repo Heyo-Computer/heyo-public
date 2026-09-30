@@ -144,7 +144,13 @@ class Pooler:
     def pid(self):
         if self.config["manager"] == "systemd":
             return int(command([self.ctl, "show", self.config["service"], "--property=MainPID", "--value"]))
-        return int(command([self.ctl, "pid", self.config["service"]]))
+        result = subprocess.run([self.ctl, "pid", self.config["service"]], cwd="/",
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=45)
+        value = result.stdout.decode().strip()
+        # Supervisor uses NOT_RUNNING (7), with PID 0, after a successful stop.
+        require(result.returncode == 0 or (result.returncode == 7 and value == "0"),
+                "could not determine pooler PID")
+        return int(value)
 
     def control(self, action):
         command([self.ctl, action, self.config["service"]])

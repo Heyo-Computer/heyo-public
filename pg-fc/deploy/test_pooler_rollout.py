@@ -135,6 +135,20 @@ class ReplacementTests(unittest.TestCase):
             self.replace()
         self.assertEqual(self.pooler.mapping["ci"], "sb-other")
 
+    def test_supervisor_stopped_pid_is_not_a_command_failure(self):
+        pooler = object.__new__(installer.Pooler)
+        pooler.config = {"manager": "supervisor", "service": "pooler"}
+        pooler.ctl = "/usr/bin/supervisorctl"
+        for code, output, expected in [(0, b"123\n", 123), (7, b"0\n", 0),
+                                       (7, b"123\n", None), (4, b"0\n", None)]:
+            result = installer.subprocess.CompletedProcess([], code, stdout=output)
+            with patch.object(installer.subprocess, "run", return_value=result):
+                if expected is None:
+                    with self.assertRaisesRegex(RuntimeError, "determine pooler PID"):
+                        pooler.pid()
+                else:
+                    self.assertEqual(pooler.pid(), expected)
+
     def test_sql_probe_forces_local_pooler_and_decodes_credentials_without_argv(self):
         with patch.dict(os.environ, {"PGSERVICE": "wrong-service", "PGHOSTADDR": "203.0.113.1"}):
             env = installer.sql_environment("postgresql://reader:encoded%40value@pg.example/db%2Dname?sslmode=verify-full", 6432)
