@@ -263,8 +263,26 @@ jobs:
           pg_ctlcluster 16 main status >/dev/null 2>&1 || pg_ctlcluster -o '-c listen_addresses=127.0.0.1' 16 main start
           runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c "ALTER ROLE postgres PASSWORD 'disposable-test-password'"
           runuser -u postgres -- createdb ci_release_retry
-          nats-server -js -a 127.0.0.1 -p 44222 -sd /tmp/ci-retry-nats >/tmp/ci-retry-nats.log 2>&1 &
-          trap 'kill "$!"' EXIT
+          nats-server -js -a 127.0.0.1 -p 44222 -m 48222 -sd /tmp/ci-retry-nats >/tmp/ci-retry-nats.log 2>&1 &
+          nats_pid=$!
+          trap 'kill "$nats_pid" 2>/dev/null || true' EXIT
+          ready=false
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "$nats_pid" 2>/dev/null; then
+              cat /tmp/ci-retry-nats.log
+              exit 1
+            fi
+            if curl --fail --silent --max-time 1 http://127.0.0.1:48222/healthz >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != true ]; then
+            cat /tmp/ci-retry-nats.log
+            echo "Disposable NATS did not become healthy within 30 seconds" >&2
+            exit 1
+          fi
           export CI_TEST_DATABASE_URL=postgres://postgres:disposable-test-password@127.0.0.1/ci_release_retry
           export CI_TEST_NATS_URL=nats://127.0.0.1:44222
           export CI_NATS_URL="$CI_TEST_NATS_URL"
