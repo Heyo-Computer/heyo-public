@@ -205,6 +205,120 @@ pub struct HostDisk {
     pub avail: u64,
 }
 
+// ---- metrics -------------------------------------------------------------
+
+/// `GET /api/metrics?hours=N` — activity counts and bring-up latency over a
+/// trailing window (default 1h, capped at 24h). In-memory only, like
+/// `/api/health`, so it is cheap enough for another dashboard to poll.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Metrics {
+    /// The trailing window every figure below covers, in hours.
+    pub window_hours: u64,
+    #[serde(default)]
+    pub events: EventCounts,
+    /// Bring-up errors journalled in the window — failed creates and restores.
+    #[serde(default)]
+    pub bringup_errors: usize,
+    /// Every error journalled in the window, bring-up or otherwise.
+    #[serde(default)]
+    pub errors: usize,
+    /// Latency per timing kind (`vm_create`, `restore_s3_image_total`, …).
+    /// Kinds with no sample in the window are left out.
+    #[serde(default)]
+    pub timings: Vec<TimingSummary>,
+}
+
+/// How often each notable pooler event happened in the window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCounts {
+    pub vms_created: u64,
+    pub restores_s3: u64,
+    pub restores_local: u64,
+    pub offloads_done: u64,
+    pub vms_deleted: u64,
+    pub spares_claimed: u64,
+}
+
+/// Nearest-rank percentiles of one timing kind over the window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimingSummary {
+    pub kind: String,
+    pub count: usize,
+    pub p50_ms: u32,
+    pub p95_ms: u32,
+    pub p99_ms: u32,
+    pub max_ms: u32,
+}
+
+// ---- fleet ---------------------------------------------------------------
+
+/// `GET /api/fleet?hours=N` — health and metrics for this instance and every
+/// instance in `PG_VM_POOL_DASHBOARD_FLEET`, fetched live from each one's
+/// `/api/health`, `/api/host` and `/api/metrics`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FleetRollup {
+    /// Unix seconds when this rollup was assembled.
+    pub generated_at: u64,
+    pub window_hours: u64,
+    /// This instance first, then the configured ones in configured order.
+    pub instances: Vec<FleetInstance>,
+    #[serde(default)]
+    pub totals: FleetTotals,
+}
+
+/// One instance as the rollup saw it. The three reads are independent: an
+/// instance older than `/api/metrics` still reports health and host.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FleetInstance {
+    pub name: String,
+    /// The instance's dashboard base URL, credentials stripped. `None` for the
+    /// instance serving the rollup.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// True for the instance serving the rollup (read in-process).
+    #[serde(default)]
+    pub local: bool,
+    /// Whether `/api/health` answered.
+    pub reachable: bool,
+    /// Why a read failed, when one did.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// How long fetching this instance took, in milliseconds.
+    #[serde(default)]
+    pub fetch_ms: u64,
+    #[serde(default)]
+    pub health: Option<Health>,
+    #[serde(default)]
+    pub host: Option<HostInfo>,
+    #[serde(default)]
+    pub metrics: Option<Metrics>,
+}
+
+/// Sums across the reachable instances. Latency percentiles are deliberately
+/// absent: a percentile of percentiles is not a fleet percentile, so they are
+/// reported per instance only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetTotals {
+    pub instances: usize,
+    pub reachable: usize,
+    pub warm_schemas: usize,
+    pub known_schemas: usize,
+    #[serde(default)]
+    pub tiers: TierCounts,
+    #[serde(default)]
+    pub events: EventCounts,
+    #[serde(default)]
+    pub bringup_errors: usize,
+    #[serde(default)]
+    pub errors: usize,
+    #[serde(default)]
+    pub memory_total_bytes: u64,
+    #[serde(default)]
+    pub memory_used_bytes: u64,
+    #[serde(default)]
+    pub cpu_count: u64,
+}
+
 // ---- events and logs ------------------------------------------------------
 
 /// One `GET /api/events` row, newest first.

@@ -24,12 +24,21 @@
 //! restore builds the default-size one and `pg_restore` fills it (see
 //! [`Store::set_disk_gb`]).
 //!
-//! Format: one `schema\tsandbox_id\tlast_active_unix\tstate\tdisk_gb` line per
-//! entry. Older 2-column files (`schema\tsandbox_id`) still parse: the missing
-//! `last_active` defaults to *load time* (so an upgrade doesn't make every
-//! pre-existing schema instantly eligible for eviction), state to `live`, and
-//! `disk_gb` to `0` ("unknown — use the configured default"). Trailing fields
-//! are ignored positionally, so an older binary reads a 5-column file fine.
+//! The sixth and seventh, `bringup_ms` and `bringup_kind`, are diagnostics
+//! only: how long this schema's last client bring-up took and what it was (a
+//! fresh create, a spare claim, a reattach, or one of the restores — see
+//! [`BringupKind`]). Nothing reads them back to make a decision; they are the
+//! per-VM answer to "how long did this one take to come up", which the
+//! aggregate timing charts can't give (see [`Store::set_bringup`]).
+//!
+//! Format: one
+//! `schema\tsandbox_id\tlast_active_unix\tstate\tdisk_gb\tbringup_ms\tbringup_kind`
+//! line per entry. Older 2-column files (`schema\tsandbox_id`) still parse: the
+//! missing `last_active` defaults to *load time* (so an upgrade doesn't make
+//! every pre-existing schema instantly eligible for eviction), state to `live`,
+//! `disk_gb` to `0` ("unknown — use the configured default"), and the bring-up
+//! fields to "never recorded". Trailing fields are ignored positionally, so an
+//! older binary reads a 7-column file fine.
 //! Schema names are validated upstream to contain no control chars (so never a
 //! tab or newline), so this needs no escaping.
 
@@ -98,6 +107,64 @@ impl Tier {
     }
 }
 
+/// What a schema's last client bring-up had to do to get a serving Postgres.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BringupKind {
+    /// A brand-new VM was created for the schema.
+    Create,
+    /// A warm spare was claimed off the pool.
+    Spare,
+    /// The schema's own VM was found (by id or name) and started or reused.
+    Reattach,
+    /// A fresh VM, then `pg_restore` of the schema's S3 dump into it.
+    RestoreS3Dump,
+    /// The schema's S3 disk image was downloaded and booted.
+    RestoreS3Image,
+    /// A fresh VM, then `pg_restore` of the local frozen dump into it.
+    RestoreLocalDump,
+    /// The local compacted image was decompressed and booted.
+    ThawCompacted,
+}
+
+impl BringupKind {
+    /// Stable on-disk token — part of the registry format, never rename.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            BringupKind::Create => "create",
+            BringupKind::Spare => "spare",
+            BringupKind::Reattach => "reattach",
+            BringupKind::RestoreS3Dump => "restore_s3_dump",
+            BringupKind::RestoreS3Image => "restore_s3_image",
+            BringupKind::RestoreLocalDump => "restore_local_dump",
+            BringupKind::ThawCompacted => "thaw_compacted",
+        }
+    }
+
+    /// Unknown tokens (a newer binary's) parse to `None`: it's a diagnostic,
+    /// never worth dropping the row over.
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "create" => Some(BringupKind::Create),
+            "spare" => Some(BringupKind::Spare),
+            "reattach" => Some(BringupKind::Reattach),
+            "restore_s3_dump" => Some(BringupKind::RestoreS3Dump),
+            "restore_s3_image" => Some(BringupKind::RestoreS3Image),
+            "restore_local_dump" => Some(BringupKind::RestoreLocalDump),
+            "thaw_compacted" => Some(BringupKind::ThawCompacted),
+            _ => None,
+        }
+    }
+}
+
+/// How long one bring-up took to reach a serving Postgres, and what it was.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Bringup {
+    pub kind: BringupKind,
+    /// Milliseconds from clearing the admission queue to a serving Postgres —
+    /// the same span as `SchemaEntry`'s `bringup_took`, queue wait excluded.
+    pub took_ms: u64,
+}
+
 /// A durable, owned view of one schema's registry entry.
 #[derive(Clone)]
 pub struct StoreRecord {
@@ -112,6 +179,8 @@ pub struct StoreRecord {
     /// (`PG_VM_POOL_DATA_DISK_GB`) is a starting size, not a promise that the
     /// schema still fits in one.
     pub disk_gb: u32,
+    /// The schema's last client bring-up, `None` when none was recorded.
+    pub bringup: Option<Bringup>,
 }
 
 impl StoreRecord {
@@ -128,6 +197,7 @@ struct Rec {
     last_active: u64,
     tier: Tier,
     disk_gb: u32,
+    bringup: Option<Bringup>,
 }
 
 impl Rec {
@@ -137,6 +207,7 @@ impl Rec {
             last_active: self.last_active,
             tier: self.tier,
             disk_gb: self.disk_gb,
+            bringup: self.bringup,
         }
     }
 }
@@ -257,7 +328,11 @@ impl Store {
                     // the size on the very write that records it. A stale
                     // value only ever over-provisions the next restore, and
                     // the next idle-stop sample corrects it.
-                    let disk_gb = map.get(schema).map(|r| r.disk_gb).unwrap_or(0);
+                    // The bring-up record is carried too, until the caller's
+                    // `set_bringup` replaces it.
+                    let prev = map.get(schema);
+                    let disk_gb = prev.map(|r| r.disk_gb).unwrap_or(0);
+                    let bringup = prev.and_then(|r| r.bringup);
                     map.insert(
                         schema.to_string(),
                         Rec {
@@ -265,6 +340,7 @@ impl Store {
                             last_active: now,
                             tier: Tier::Live,
                             disk_gb,
+                            bringup,
                         },
                     );
                     *self.bound_cache.lock().unwrap() = None;
@@ -350,6 +426,7 @@ impl Store {
                     last_active,
                     tier: Tier::Archived,
                     disk_gb,
+                    bringup: prev.as_ref().and_then(|r| r.bringup),
                 },
             );
             *self.bound_cache.lock().unwrap() = None;
@@ -443,6 +520,26 @@ impl Store {
             return;
         }
         r.disk_gb = disk_gb;
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Record how long `schema`'s latest bring-up took and what kind it was.
+    /// No-op when the schema isn't known or the value is unchanged.
+    ///
+    /// A lazy write, like [`Self::touch`]: it only marks the map dirty, and the
+    /// [`Self::flush_dirty`] loop persists it within [`FLUSH_INTERVAL`]. This
+    /// runs on the cold-checkout path right after [`Self::put`], and a
+    /// diagnostic is not worth a second O(rows) serialize there; losing one to
+    /// a crash costs nothing but the number.
+    pub fn set_bringup(&self, schema: &str, bringup: Bringup) {
+        let mut map = self.map.lock().unwrap();
+        let Some(r) = map.get_mut(schema) else {
+            return;
+        };
+        if r.bringup == Some(bringup) {
+            return;
+        }
+        r.bringup = Some(bringup);
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -549,6 +646,13 @@ fn parse(s: &str, now: u64) -> HashMap<String, Rec> {
             // Absent (pre-upgrade row) or unparseable ⇒ 0 ⇒ "unknown", which
             // every consumer reads as "use the configured default size".
             let disk_gb = f.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+            // Both halves or neither: a duration without its kind can't be
+            // read against anything.
+            let took_ms = f.next().and_then(|v| v.parse::<u64>().ok());
+            let kind = f.next().and_then(BringupKind::parse);
+            let bringup = took_ms
+                .zip(kind)
+                .map(|(took_ms, kind)| Bringup { kind, took_ms });
             Some((
                 schema.to_string(),
                 Rec {
@@ -556,6 +660,7 @@ fn parse(s: &str, now: u64) -> HashMap<String, Rec> {
                     last_active,
                     tier,
                     disk_gb,
+                    bringup,
                 },
             ))
         })
@@ -575,6 +680,14 @@ fn serialize(map: &HashMap<String, Rec>) -> String {
         out.push_str(state);
         out.push('\t');
         out.push_str(&v.disk_gb.to_string());
+        // Omitted rather than written blank when never recorded, so such a
+        // row stays byte-identical to the 5-column format.
+        if let Some(b) = v.bringup {
+            out.push('\t');
+            out.push_str(&b.took_ms.to_string());
+            out.push('\t');
+            out.push_str(b.kind.as_str());
+        }
         out.push('\n');
     }
     out
@@ -616,6 +729,7 @@ mod tests {
                 last_active: 1_700_000_000,
                 tier: Tier::Archived,
                 disk_gb: 8,
+                bringup: None,
             },
         );
         let back = parse(&serialize(&map), 0);
@@ -632,7 +746,13 @@ mod tests {
         let mut blank = HashMap::new();
         blank.insert(
             "wb2".to_string(),
-            Rec { sandbox_id: String::new(), last_active: 0, tier: Tier::Archived, disk_gb: 0 },
+            Rec {
+                sandbox_id: String::new(),
+                last_active: 0,
+                tier: Tier::Archived,
+                disk_gb: 0,
+                bringup: None,
+            },
         );
         assert!(
             parse(&serialize(&blank), 0).is_empty(),
@@ -760,6 +880,93 @@ mod tests {
             0,
             "a pre-upgrade row must read as unknown, which every consumer floors at the default"
         );
+    }
+
+    /// The bring-up columns round-trip, and a row without them serializes to
+    /// exactly the 5-column format an older binary wrote.
+    #[test]
+    fn bringup_columns_round_trip_and_stay_optional() {
+        let mut map = HashMap::new();
+        let bringup = Bringup {
+            kind: BringupKind::RestoreS3Image,
+            took_ms: 4_321,
+        };
+        map.insert(
+            "wb1".to_string(),
+            Rec {
+                sandbox_id: "sb-1".to_string(),
+                last_active: 1_700_000_000,
+                tier: Tier::Live,
+                disk_gb: 4,
+                bringup: Some(bringup),
+            },
+        );
+        let line = serialize(&map);
+        assert_eq!(
+            line,
+            "wb1\tsb-1\t1700000000\tlive\t4\t4321\trestore_s3_image\n"
+        );
+        assert_eq!(parse(&line, 0).get("wb1").unwrap().bringup, Some(bringup));
+
+        map.get_mut("wb1").unwrap().bringup = None;
+        assert_eq!(serialize(&map), "wb1\tsb-1\t1700000000\tlive\t4\n");
+
+        // A kind this binary doesn't know (a newer one's) drops the diagnostic,
+        // never the row.
+        let r = parse("wb1\tsb-1\t1700000000\tlive\t4\t99\tteleport\n", 0);
+        let r = r
+            .get("wb1")
+            .expect("an unknown bring-up kind must not drop the row");
+        assert_eq!(r.tier, Tier::Live);
+        assert_eq!(r.bringup, None);
+
+        for kind in [
+            BringupKind::Create,
+            BringupKind::Spare,
+            BringupKind::Reattach,
+            BringupKind::RestoreS3Dump,
+            BringupKind::RestoreS3Image,
+            BringupKind::RestoreLocalDump,
+            BringupKind::ThawCompacted,
+        ] {
+            assert_eq!(BringupKind::parse(kind.as_str()), Some(kind));
+        }
+    }
+
+    /// `set_bringup` is lazy: it marks the map dirty for the flush loop and
+    /// survives the `put` that rebinds the schema.
+    #[test]
+    fn set_bringup_is_a_debounced_write() {
+        let dir = std::env::temp_dir().join(format!("pgfc-bringup-{}", std::process::id()));
+        let path = dir.join("registry.tsv");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::load(path.clone());
+        store.put("wb1", "sb-1");
+        let bringup = Bringup {
+            kind: BringupKind::Create,
+            took_ms: 1_250,
+        };
+        store.set_bringup("wb1", bringup);
+        assert!(
+            !std::fs::read_to_string(&path).unwrap().contains("1250"),
+            "set_bringup must not write on the checkout path"
+        );
+        store.flush_dirty();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\t1250\tcreate\n")
+        );
+        assert_eq!(store.record("wb1").unwrap().bringup, Some(bringup));
+
+        // Rebinding carries it until the next set_bringup replaces it.
+        store.put("wb1", "sb-2");
+        assert_eq!(store.record("wb1").unwrap().bringup, Some(bringup));
+
+        // Unknown schema: a no-op, not a phantom row.
+        store.set_bringup("nope", bringup);
+        assert!(store.record("nope").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

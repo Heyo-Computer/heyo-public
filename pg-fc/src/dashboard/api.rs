@@ -19,8 +19,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use pg_fc_api::{
-    ActionResult, ApiError, ConfigView, EventEntry, Health, HostDisk, HostInfo, LogTail,
-    ResizeRequest, RuntimeKnobs, SchemaAction, SchemaDetail, SchemaInfo, TierCounts,
+    ActionResult, ApiError, ConfigView, EventCounts, EventEntry, Health, HostDisk, HostInfo,
+    LogTail, Metrics, ResizeRequest, RuntimeKnobs, SchemaAction, SchemaDetail, SchemaInfo,
+    TierCounts, TimingSummary,
 };
 use serde::Deserialize;
 
@@ -66,6 +67,11 @@ fn finished(message: impl Into<String>) -> Response {
 /// Basic auth like everything else, so it describes the pooler rather than
 /// serving as an unauthenticated liveness probe.
 pub async fn health(State(st): State<DashState>) -> Json<Health> {
+    Json(health_view(&st).await)
+}
+
+/// What `/api/health` serves, for in-process callers (the fleet rollup).
+pub(super) async fn health_view(st: &DashState) -> Health {
     let cfg = st.registry.cfg();
     let mut tiers = Vec::new();
     if cfg.compact.is_some() {
@@ -77,7 +83,7 @@ pub async fn health(State(st): State<DashState>) -> Json<Health> {
     if cfg.archive.is_some() {
         tiers.push("archived".into());
     }
-    Json(Health {
+    Health {
         version: env!("CARGO_PKG_VERSION").into(),
         uptime_secs: st.started_at.elapsed().as_secs(),
         listen: cfg.listen_addr.to_string(),
@@ -86,7 +92,80 @@ pub async fn health(State(st): State<DashState>) -> Json<Health> {
         tiers,
         tls: st.registry.tls_enabled(),
         replication: st.registry.replication_cfg().is_some(),
+    }
+}
+
+// ---- metrics ---------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct WindowQuery {
+    /// Trailing window in hours (default 1, clamped to 1..=24).
+    pub hours: Option<u64>,
+}
+
+impl WindowQuery {
+    pub(super) fn hours(&self) -> u64 {
+        self.hours.unwrap_or(1).clamp(1, 24)
+    }
+}
+
+/// `GET /api/metrics` — activity counts, journalled errors and bring-up
+/// latency over a trailing window. In-memory only, like `/api/health`.
+pub async fn metrics(Query(q): Query<WindowQuery>) -> Json<Metrics> {
+    Json(metrics_view(q.hours()))
+}
+
+/// What `/api/metrics` serves, for in-process callers (the fleet rollup).
+pub(super) fn metrics_view(hours: u64) -> Metrics {
+    use crate::events::{Event, Timing};
+    // Whole clock-hour buckets, matching the monitoring charts: the current
+    // (partial) hour plus `hours - 1` before it.
+    let count = |e: Event| -> u64 {
+        crate::events::hourly_counts(e, hours as usize)
+            .iter()
+            .map(|(_, n)| u64::from(*n))
+            .sum()
+    };
+    let cutoff = crate::events::now_unix().saturating_sub(hours * 3600);
+    let recent: Vec<_> = crate::events::journal_recent(crate::events::JOURNAL_CAPACITY)
+        .into_iter()
+        .filter(|e| e.t >= cutoff && e.level == crate::events::Level::Error)
+        .collect();
+    let timings = [
+        Timing::VmCreate,
+        Timing::RestoreS3Image,
+        Timing::RestoreS3Dump,
+        Timing::RestoreLocalImage,
+        Timing::RestoreLocalDump,
+        Timing::RestoreS3Download,
+        Timing::RestoreImageAdopt,
+    ]
+    .into_iter()
+    .filter_map(|t| {
+        crate::events::timing_stats(t, hours).map(|s| TimingSummary {
+            kind: t.as_str().into(),
+            count: s.count,
+            p50_ms: s.p50_ms,
+            p95_ms: s.p95_ms,
+            p99_ms: s.p99_ms,
+            max_ms: s.max_ms,
+        })
     })
+    .collect();
+    Metrics {
+        window_hours: hours,
+        events: EventCounts {
+            vms_created: count(Event::VmCreated),
+            restores_s3: count(Event::RestoreS3),
+            restores_local: count(Event::RestoreLocal),
+            offloads_done: count(Event::OffloadDone),
+            vms_deleted: count(Event::VmDeleted),
+            spares_claimed: count(Event::SpareClaimed),
+        },
+        bringup_errors: recent.iter().filter(|e| e.kind == "bring-up").count(),
+        errors: recent.len(),
+        timings,
+    }
 }
 
 // ---- schemas ---------------------------------------------------------------
@@ -382,7 +461,12 @@ async fn lifecycle(vm: &str, act: Lifecycle, done: &str) -> Response {
 /// `GET /api/host` — what `/monitoring` shows at the top, each part
 /// best-effort: a stale daemon sampler or a `df` hiccup blanks its own fields.
 pub async fn host(State(st): State<DashState>) -> Json<HostInfo> {
-    let (usage, disks) = tokio::join!(model::fetch_host_usage(&st), host::host_disks());
+    Json(host_view(&st).await)
+}
+
+/// What `/api/host` serves, for in-process callers (the fleet rollup).
+pub(super) async fn host_view(st: &DashState) -> HostInfo {
+    let (usage, disks) = tokio::join!(model::fetch_host_usage(st), host::host_disks());
     let usage = usage.unwrap_or_default();
     let mut tiers = TierCounts::default();
     for (_, r) in st.registry.store_records() {
@@ -394,7 +478,7 @@ pub async fn host(State(st): State<DashState>) -> Json<HostInfo> {
         }
     }
     let spares = st.registry.spare_pool_depth();
-    Json(HostInfo {
+    HostInfo {
         cpu_percent: usage.cpu_percent,
         cpu_count: usage.cpu_count,
         memory_total_bytes: usage.memory_total_bytes,
@@ -413,7 +497,7 @@ pub async fn host(State(st): State<DashState>) -> Json<HostInfo> {
         spares_ready: spares.map(|s| s.0),
         spares_target: spares.map(|s| s.1),
         tiers,
-    })
+    }
 }
 
 // ---- events and logs -------------------------------------------------------

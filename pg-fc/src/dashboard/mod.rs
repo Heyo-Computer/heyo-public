@@ -36,6 +36,7 @@ mod archives;
 mod auth;
 mod dedicated;
 mod error;
+mod fleet;
 mod handlers;
 mod history;
 mod host;
@@ -61,6 +62,29 @@ use state::DashState;
 pub async fn serve(cfg: DashboardConfig, registry: Arc<SchemaRegistry>) -> Result<()> {
     let addr = cfg.listen;
     let alert_interval = cfg.alert_interval;
+    if !cfg.fleet.is_empty() {
+        let names: Vec<&str> = cfg.fleet.iter().map(|m| m.name.as_str()).collect();
+        info!(
+            "dashboard fleet rollup: this instance is {:?}, reading {}",
+            cfg.fleet_name,
+            names.join(", ")
+        );
+        // Basic auth over plain HTTP crosses the network in the clear. A
+        // loopback or private-link URL is the operator's call; say so once.
+        for m in cfg.fleet.iter().filter(|m| {
+            m.basic_auth.is_some()
+                && m.base_url.starts_with("http://")
+                && !m.base_url.starts_with("http://127.")
+                && !m.base_url.starts_with("http://localhost")
+        }) {
+            tracing::warn!(
+                "dashboard fleet member {} is plain http ({}): its dashboard credentials \
+                 are sent unencrypted on every /fleet load",
+                m.name,
+                m.base_url
+            );
+        }
+    }
     let alerts = Arc::new(alerts::AlertStore::load(cfg.alerts_file.clone()));
     let state = DashState {
         registry,

@@ -140,7 +140,7 @@ pub enum Timing {
 
 impl Timing {
     /// Stable on-disk token — part of the partition file format, never rename.
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Timing::VmCreate => "vm_create",
             Timing::RestoreS3Dump => "restore_s3_dump_total",
@@ -209,7 +209,7 @@ const RETAIN_HOURS: u64 = 25;
 
 /// Max journal entries held in memory (and shown on the events page's source
 /// buffer). The daily partition files retain more ([`RETAIN_DAYS`]).
-const JOURNAL_CAPACITY: usize = 1_000;
+pub const JOURNAL_CAPACITY: usize = 1_000;
 
 /// Hard cap on in-memory events, independent of age — a runaway create/restore
 /// loop must not grow this without bound. 10k events far exceeds anything a
@@ -706,7 +706,7 @@ fn civil_from_unix(t: u64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-fn now_unix() -> u64 {
+pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

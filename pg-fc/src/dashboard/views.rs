@@ -46,6 +46,7 @@ fn shell_with_head(title: &str, extra_head: Markup, body: Markup) -> Markup {
                         a href="/dedicated" { "dedicated" }
                         a href="/replication" { "replication" }
                         a href="/monitoring" { "monitoring" }
+                        a href="/fleet" { "fleet" }
                         a href="/archives" { "archives" }
                         a href="/events" { "events" }
                         a href="/logs/pooler" { "pooler log" }
@@ -68,6 +69,220 @@ fn banner(b: &Banner) -> Markup {
             div.banner.err { "error: " (e) }
         }
     }
+}
+
+/// The fleet rollup: every configured pooler instance, side by side.
+pub fn fleet_page(st: &DashState, f: &pg_fc_api::FleetRollup) -> Markup {
+    let t = &f.totals;
+    let window = format!("last {}h", f.window_hours);
+    let restores = t.events.restores_s3 + t.events.restores_local;
+    let mem = (t.memory_total_bytes > 0)
+        .then(|| t.memory_used_bytes as f64 / t.memory_total_bytes as f64);
+    // Every timing kind any instance reported, in a stable order, so the
+    // latency table's rows line up across instances.
+    let kinds: Vec<&str> = {
+        let mut k: Vec<&str> = f
+            .instances
+            .iter()
+            .filter_map(|i| i.metrics.as_ref())
+            .flat_map(|m| m.timings.iter().map(|t| t.kind.as_str()))
+            .collect();
+        k.sort_unstable();
+        k.dedup();
+        k
+    };
+    html! {
+        (shell("fleet", html! {
+            h1 { "Fleet" }
+            div.summary {
+                span { "window: " b { (window) } }
+                @for h in [1u64, 6, 24] {
+                    @if h == f.window_hours { b { (h) "h" } }
+                    @else { a href=(format!("/fleet?hours={h}")) { (h) "h" } }
+                }
+                span { "read " (crate::events::fmt_ts(f.generated_at)) " UTC" }
+            }
+            @if st.cfg.fleet.is_empty() {
+                p.note {
+                    "Only this instance is listed. Set " code { "PG_VM_POOL_DASHBOARD_FLEET" }
+                    " to comma-separated " code { "name=url" } " entries for the other pooler "
+                    "dashboards (credentials as " code { "https://user:pass@host" }
+                    ", else this dashboard's own login is used), and "
+                    code { "PG_VM_POOL_DASHBOARD_FLEET_NAME" } " to this instance's name "
+                    "(currently " code { (st.cfg.fleet_name) } ") so the same list can be "
+                    "deployed on every host."
+                }
+            }
+            div.stats {
+                (stat("instances up", &format!("{} / {}", t.reachable, t.instances),
+                    (t.reachable < t.instances).then_some("some unreachable")))
+                (stat("warm schemas", &t.warm_schemas.to_string(), None))
+                (stat("known schemas", &t.known_schemas.to_string(), None))
+                (stat("VMs created", &t.events.vms_created.to_string(), Some(&window)))
+                (stat("restores", &restores.to_string(), Some(&window)))
+                (stat("failed bring-ups", &t.bringup_errors.to_string(), Some(&window)))
+                (stat("errors", &t.errors.to_string(), Some(&window)))
+                @if let Some(m) = mem {
+                    (stat("fleet memory", &frac_pct(m),
+                        Some(&format!("of {}", human_bytes(t.memory_total_bytes)))))
+                }
+            }
+
+            h2 { "Instances" }
+            div.scroll-x {
+                table {
+                    thead { tr {
+                        th { "instance" } th { "status" } th { "version" } th { "uptime" }
+                        th.num { "cpu" } th.num { "memory" } th { "fullest disk" }
+                        th.num { "warm / known" } th { "live · compacted · frozen · archived" }
+                        th.num { "spares" } th.num { "created" } th.num { "restores" }
+                        th.num { "failed" } th.num { "read in" }
+                    } }
+                    tbody {
+                        @for i in &f.instances {
+                            (fleet_row(i))
+                        }
+                    }
+                }
+            }
+
+            h2 { "Bring-up latency (" (window) ")" }
+            @if kinds.is_empty() {
+                p.note { "No instance recorded a create or restore in this window." }
+            } @else {
+                div.scroll-x {
+                    table.restores {
+                        thead { tr {
+                            th { "kind" }
+                            @for i in &f.instances { th.num { (i.name) " p50 / p95 / n" } }
+                        } }
+                        tbody {
+                            @for k in &kinds {
+                                tr {
+                                    td { code { (k) } }
+                                    @for i in &f.instances {
+                                        @match i.metrics.as_ref().and_then(|m| m.timings.iter().find(|t| t.kind == *k)) {
+                                            Some(s) => td.num {
+                                                (human_ms(s.p50_ms as u128)) " / "
+                                                (human_ms(s.p95_ms as u128)) " / " (s.count)
+                                            },
+                                            None => td.num.dim { "—" },
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                p.note {
+                    "Per instance only: a percentile of percentiles is not a fleet percentile. "
+                    "Same spans as the monitoring page — admission wait excluded, successful "
+                    "bring-ups only."
+                }
+            }
+            p.note {
+                "Each instance is read live from its own " code { "/api/health" } ", "
+                code { "/api/host" } " and " code { "/api/metrics" } " on every load (deadline "
+                (format!("{:?}", st.cfg.fleet_timeout)) "); totals cover reachable instances "
+                "only. Degraded means memory or a disk at 90%+, no warm spares ready, or a "
+                "failed bring-up in the window. Error counts come from each instance's "
+                "in-memory journal, which holds its last 1000 entries."
+            }
+        }))
+    }
+}
+
+fn fleet_row(i: &pg_fc_api::FleetInstance) -> Markup {
+    let (state, why) = super::fleet::verdict(i);
+    let badge = match state {
+        "ok" => "s-running",
+        "degraded" => "s-prov",
+        _ => "s-failed",
+    };
+    let h = i.health.as_ref();
+    let host = i.host.as_ref();
+    let m = i.metrics.as_ref();
+    let dash = || html! { span.dim { "—" } };
+    let fullest = host.and_then(|h| {
+        h.disks.iter().filter(|d| d.total > 0).max_by(|a, b| {
+            (a.used as f64 / a.total as f64).total_cmp(&(b.used as f64 / b.total as f64))
+        })
+    });
+    html! {
+        tr {
+            td {
+                @match &i.url {
+                    Some(u) => a href=(u) { (i.name) },
+                    None => b { (i.name) },
+                }
+                @if i.local { span.sub.dim { "this instance" } }
+            }
+            td {
+                span.badge class=(badge) { (state) }
+                @for w in &why { span.sub.dim { (w) } }
+                @if let Some(e) = &i.error { span.sub.dim { (e) } }
+            }
+            td { @match h { Some(h) => (h.version), None => (dash()) } }
+            td { @match h { Some(h) => (human_secs(h.uptime_secs)), None => (dash()) } }
+            td.num {
+                @match host.and_then(|h| h.cpu_percent) {
+                    Some(c) => (format!("{c:.0}%")),
+                    None => (dash()),
+                }
+                @if let Some(n) = host.and_then(|h| h.cpu_count) { span.sub.dim { (n) " cores" } }
+            }
+            td.num {
+                @match host.and_then(|h| h.memory_used_bytes.zip(h.memory_total_bytes)) {
+                    Some((u, t)) if t > 0 => {
+                        (frac_pct(u as f64 / t as f64))
+                        span.sub.dim { "of " (human_bytes(t)) }
+                    },
+                    _ => (dash()),
+                }
+            }
+            td {
+                @match fullest {
+                    Some(d) => {
+                        (frac_pct(d.used as f64 / d.total as f64)) " " code { (d.mount) }
+                        span.sub.dim { (human_bytes(d.avail)) " free" }
+                    },
+                    None => (dash()),
+                }
+            }
+            td.num {
+                @match h { Some(h) => { (h.warm_schemas) " / " (h.known_schemas) }, None => (dash()) }
+            }
+            td {
+                @match host {
+                    Some(h) => {
+                        (h.tiers.live) " · " (h.tiers.compacted) " · " (h.tiers.frozen) " · "
+                        (h.tiers.archived)
+                    },
+                    None => (dash()),
+                }
+            }
+            td.num {
+                @match host.and_then(|h| h.spares_ready.zip(h.spares_target)) {
+                    Some((r, t)) => { (r) " / " (t) },
+                    None => (dash()),
+                }
+            }
+            td.num { @match m { Some(m) => (m.events.vms_created), None => (dash()) } }
+            td.num {
+                @match m {
+                    Some(m) => (m.events.restores_s3 + m.events.restores_local),
+                    None => (dash()),
+                }
+            }
+            td.num { @match m { Some(m) => (m.bringup_errors), None => (dash()) } }
+            td.num { (human_ms(i.fetch_ms as u128)) }
+        }
+    }
+}
+
+/// A 0–1 fraction as a whole percentage.
+fn frac_pct(frac: f64) -> String {
+    format!("{:.0}%", frac * 100.0)
 }
 
 /// The main Databases view: a paged, searchable list of every daemon sandbox.
@@ -2346,6 +2561,43 @@ fn state_class(s: crate::replication::State) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fleet row renders every state, names what is wrong, links to the
+    /// remote dashboard by its credential-free URL, and never needs a field a
+    /// down instance can't supply.
+    #[test]
+    fn fleet_rows_render_up_degraded_and_down() {
+        use pg_fc_api::{FleetInstance, Health, HostDisk, HostInfo};
+        let up = FleetInstance {
+            name: "mia1".into(),
+            url: Some("http://10.0.0.1:34199".into()),
+            reachable: true,
+            health: Some(Health { version: "0.3.0".into(), ..Health::default() }),
+            host: Some(HostInfo {
+                disks: vec![HostDisk {
+                    mount: "/mnt/md1".into(),
+                    total: 100,
+                    used: 97,
+                    avail: 3,
+                    ..HostDisk::default()
+                }],
+                ..HostInfo::default()
+            }),
+            ..FleetInstance::default()
+        };
+        let html = fleet_row(&up).into_string();
+        assert!(html.contains(r#"href="http://10.0.0.1:34199""#), "{html}");
+        assert!(html.contains("degraded") && html.contains("/mnt/md1 97% full"), "{html}");
+
+        let down = FleetInstance {
+            name: "mia2".into(),
+            url: Some("http://10.0.0.2:34199".into()),
+            error: Some("health: connection failed".into()),
+            ..FleetInstance::default()
+        };
+        let html = fleet_row(&down).into_string();
+        assert!(html.contains("s-failed") && html.contains("connection failed"), "{html}");
+    }
     use crate::events::TimingStats;
 
     /// An empty window and a populated one are different statements, and the
@@ -2710,6 +2962,8 @@ td.dim, .dim { color:var(--muted); }
 .s-stopped { background:var(--stop-bg); color:var(--stop-fg); }
 .s-prov { background:var(--prov-bg); color:var(--prov-fg); }
 .s-failed { background:var(--fail-bg); color:var(--fail-fg); }
+.scroll-x { overflow-x:auto; }
+td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
 .s-unknown { background:var(--stop-bg); color:var(--stop-fg); }
 .s-archived { background:var(--sess-bg); color:var(--sess-fg); }
 .badge.active { background:var(--sess-bg); color:var(--sess-fg); }
