@@ -5,7 +5,7 @@ use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::Router;
 
-use super::{api, archives, auth, dedicated, handlers, replication, state::DashState};
+use super::{api, archives, auth, dedicated, fleet, handlers, replication, state::DashState};
 
 pub fn build(state: DashState) -> Router {
     Router::new()
@@ -27,6 +27,11 @@ pub fn build(state: DashState) -> Router {
         .route("/api/schemas/{schema}", get(api::schema))
         .route("/api/schemas/{schema}/{action}", post(api::schema_action))
         .route("/api/host", get(api::host))
+        .route("/api/metrics", get(api::metrics))
+        // The fleet rollup: this instance plus every PG_VM_POOL_DASHBOARD_FLEET
+        // member, read live through the three endpoints above.
+        .route("/api/fleet", get(fleet::api_fleet))
+        .route("/fleet", get(fleet::page))
         .route("/api/events", get(api::events))
         .route("/api/logs/schema/{schema}", get(api::schema_log))
         .route("/api/logs/{which}", get(api::host_log))

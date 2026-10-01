@@ -950,6 +950,142 @@ pub struct DashboardConfig {
     /// How often the background evaluator samples host metrics and fires any
     /// crossed alerts. Env `PG_VM_POOL_DASHBOARD_ALERT_INTERVAL_SECS` (default 60).
     pub alert_interval: std::time::Duration,
+    /// The other pooler dashboards the `/fleet` rollup reads, in display
+    /// order. Empty disables nothing: `/fleet` then shows this instance alone.
+    /// Env `PG_VM_POOL_DASHBOARD_FLEET` — see [`parse_fleet`].
+    pub fleet: Vec<FleetMember>,
+    /// What this instance is called in the rollup, and the name a fleet entry
+    /// must carry to be recognised as this instance and read in-process
+    /// rather than over HTTP — so one fleet list can be shared by every host.
+    /// Env `PG_VM_POOL_DASHBOARD_FLEET_NAME` (default `local`).
+    pub fleet_name: String,
+    /// Per-instance deadline for a rollup's reads. Env
+    /// `PG_VM_POOL_DASHBOARD_FLEET_TIMEOUT_SECS` (default 5).
+    pub fleet_timeout: std::time::Duration,
+}
+
+/// One other pooler dashboard the fleet rollup reads.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FleetMember {
+    pub name: String,
+    /// Dashboard base URL, credentials stripped and no trailing slash.
+    pub base_url: String,
+    /// Basic auth for that dashboard: the URL's own `user:pass@`, else this
+    /// dashboard's credentials (a fleet usually shares one login), else none.
+    pub basic_auth: Option<(String, String)>,
+}
+
+// Hand-written so a `{:?}` in a log line can never print a password.
+impl std::fmt::Debug for FleetMember {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FleetMember")
+            .field("name", &self.name)
+            .field("base_url", &self.base_url)
+            .field(
+                "basic_auth",
+                &self.basic_auth.as_ref().map(|(u, _)| (u, "<redacted>")),
+            )
+            .finish()
+    }
+}
+
+/// Parse `PG_VM_POOL_DASHBOARD_FLEET`: comma-separated `name=url` entries,
+/// e.g. `mia1=http://10.0.0.1:34199,mia3=https://admin:pw@mia3.pool.example`.
+///
+/// Credentials go in the URL's userinfo (percent-encode a `:`/`@` in them);
+/// an entry without them uses `default_auth`, this dashboard's own login. An
+/// entry named `self_name` is this instance and is dropped, so the same list
+/// can be deployed to every host. Names must be unique and URLs http(s).
+pub fn parse_fleet(
+    spec: &str,
+    self_name: &str,
+    default_auth: Option<&(String, String)>,
+) -> anyhow::Result<Vec<FleetMember>> {
+    let mut out: Vec<FleetMember> = Vec::new();
+    for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((name, url)) = entry.split_once('=') else {
+            anyhow::bail!(
+                "PG_VM_POOL_DASHBOARD_FLEET entry {:?} is not name=url",
+                redact_userinfo(entry)
+            );
+        };
+        let name = name.trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            anyhow::bail!(
+                "PG_VM_POOL_DASHBOARD_FLEET name {name:?} must be non-empty letters, digits, \
+                 '-', '_' or '.'"
+            );
+        }
+        let mut url = reqwest::Url::parse(url.trim()).map_err(|e| {
+            anyhow::anyhow!(
+                "PG_VM_POOL_DASHBOARD_FLEET url for {name} ({}) is invalid: {e}",
+                redact_userinfo(url)
+            )
+        })?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            anyhow::bail!("PG_VM_POOL_DASHBOARD_FLEET url for {name} must be http(s)://host…");
+        }
+        let decode = |v: &str| {
+            percent_decode(v).map_err(|e| {
+                anyhow::anyhow!("PG_VM_POOL_DASHBOARD_FLEET credentials for {name}: {e}")
+            })
+        };
+        let own_auth = match (url.username(), url.password()) {
+            ("", None) => None,
+            (u, Some(p)) => Some((decode(u)?, decode(p)?)),
+            (_, None) => anyhow::bail!(
+                "PG_VM_POOL_DASHBOARD_FLEET url for {name} has a user but no password"
+            ),
+        };
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        if name == self_name {
+            continue;
+        }
+        if out.iter().any(|m| m.name == name) {
+            anyhow::bail!("PG_VM_POOL_DASHBOARD_FLEET lists {name} twice");
+        }
+        out.push(FleetMember {
+            name: name.to_string(),
+            base_url: url.as_str().trim_end_matches('/').to_string(),
+            basic_auth: own_auth.or_else(|| default_auth.cloned()),
+        });
+    }
+    Ok(out)
+}
+
+/// `scheme://user:pass@host` → `scheme://***@host`, for error messages.
+fn redact_userinfo(s: &str) -> String {
+    match (s.find("://"), s.rfind('@')) {
+        (Some(i), Some(j)) if j > i => format!("{}***{}", &s[..i + 3], &s[j..]),
+        _ => s.to_string(),
+    }
+}
+
+fn percent_decode(s: &str) -> anyhow::Result<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = s.get(i + 1..i + 3).filter(|h| h.len() == 2);
+            let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) else {
+                anyhow::bail!("bad percent-escape");
+            };
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| anyhow::anyhow!("not UTF-8 once decoded"))
 }
 
 impl Config {
@@ -995,6 +1131,9 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_DASHBOARD_LOG_LINES",
     "PG_VM_POOL_DASHBOARD_ALERTS_FILE",
     "PG_VM_POOL_DASHBOARD_ALERT_INTERVAL_SECS",
+    "PG_VM_POOL_DASHBOARD_FLEET",
+    "PG_VM_POOL_DASHBOARD_FLEET_NAME",
+    "PG_VM_POOL_DASHBOARD_FLEET_TIMEOUT_SECS",
     "PG_VM_POOL_ARCHIVE_AFTER_SECS",
     "PG_VM_POOL_ARCHIVE_SWEEP_SECS",
     "PG_VM_POOL_IMAGE_ARCHIVE",
@@ -1483,6 +1622,23 @@ impl DashboardConfig {
             .map(std::time::Duration::from_secs)
             .unwrap_or_else(|| std::time::Duration::from_secs(60));
 
+        let fleet_name = std::env::var("PG_VM_POOL_DASHBOARD_FLEET_NAME")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "local".to_string());
+        let fleet = parse_fleet(
+            &std::env::var("PG_VM_POOL_DASHBOARD_FLEET").unwrap_or_default(),
+            &fleet_name,
+            basic_auth.as_ref(),
+        )?;
+        let fleet_timeout = std::env::var("PG_VM_POOL_DASHBOARD_FLEET_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(|| std::time::Duration::from_secs(5));
+
         Ok(Some(Self {
             listen,
             basic_auth,
@@ -1491,6 +1647,9 @@ impl DashboardConfig {
             log_lines,
             alerts_file,
             alert_interval,
+            fleet,
+            fleet_name,
+            fleet_timeout,
         }))
     }
 }
@@ -1576,5 +1735,72 @@ pub(crate) fn parse_size_class(v: &str) -> anyhow::Result<SandboxSize> {
         other => anyhow::bail!(
             "invalid PG_VM_POOL_SIZE_CLASS {other:?}: expected one of micro, mini, small, medium, large"
         ),
+    }
+}
+
+#[cfg(test)]
+mod fleet_tests {
+    use super::*;
+
+    #[test]
+    fn parses_entries_strips_credentials_and_skips_self() {
+        let own = ("admin".to_string(), "shared".to_string());
+        let fleet = parse_fleet(
+            " mia1=http://10.0.0.1:34199/ , mia2=http://10.0.0.2:34199,\
+             mia3=https://ops:p%40ss%3Aw@mia3.pool.example",
+            "mia2",
+            Some(&own),
+        )
+        .unwrap();
+        assert_eq!(
+            fleet.len(),
+            2,
+            "mia2 is this instance and is read in-process"
+        );
+        assert_eq!(fleet[0].name, "mia1");
+        assert_eq!(fleet[0].base_url, "http://10.0.0.1:34199");
+        assert_eq!(
+            fleet[0].basic_auth,
+            Some(own.clone()),
+            "no userinfo: our own login"
+        );
+        assert_eq!(fleet[1].base_url, "https://mia3.pool.example");
+        assert_eq!(
+            fleet[1].basic_auth,
+            Some(("ops".to_string(), "p@ss:w".to_string())),
+            "userinfo wins, percent-decoded"
+        );
+        assert!(
+            !format!("{fleet:?}").contains("p@ss"),
+            "Debug must never print a password"
+        );
+    }
+
+    #[test]
+    fn empty_spec_is_an_empty_fleet() {
+        assert!(parse_fleet("", "local", None).unwrap().is_empty());
+        assert!(parse_fleet(" , ", "local", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_bad_entries_without_echoing_passwords() {
+        for bad in [
+            "mia1",
+            "=http://h",
+            "mia 1=http://h",
+            "mia1=ftp://h",
+            "mia1=not a url",
+            "mia1=http://h,mia1=http://g",
+            "mia1=http://user@h",
+        ] {
+            assert!(
+                parse_fleet(bad, "local", None).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        let err = parse_fleet("mia1 https://u:secret@h", "local", None)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("secret"), "{err}");
     }
 }

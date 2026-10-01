@@ -21,7 +21,7 @@ use crate::dedicated::{Credential, Credentials};
 use crate::dumpsrv::DumpServer;
 use crate::reclaim::{POST_STOP_RECLAIM_DELAY, RECLAIM_FIRST_DELAY, Reclaimer};
 use crate::spares::SparePool;
-use crate::store::{Store, StoreRecord, Tier};
+use crate::store::{Bringup, BringupKind, Store, StoreRecord, Tier};
 use crate::vm;
 use crate::vm::RestoreSource;
 
@@ -175,6 +175,10 @@ pub struct SchemaEntry {
     /// This is the price of *not* keeping the VM warm, so it is what the
     /// reaper prices the idle timeout off — see [`Self::idle_budget`].
     bringup_took: Duration,
+    /// What that bring-up was — a create, a spare claim, a reattach or a
+    /// restore. `None` for an entry that didn't come from a client bring-up
+    /// (a fenced handoff reattach), which is never recorded.
+    bringup_kind: Option<BringupKind>,
 }
 
 impl SchemaEntry {
@@ -186,6 +190,7 @@ impl SchemaEntry {
         keepalive: bool,
         slots: usize,
         bringup_took: Duration,
+        bringup_kind: Option<BringupKind>,
     ) -> Self {
         Self {
             sandbox,
@@ -198,7 +203,16 @@ impl SchemaEntry {
             active: AtomicUsize::new(0),
             last_active: StdMutex::new(Instant::now()),
             bringup_took,
+            bringup_kind,
         }
+    }
+
+    /// This entry's own bring-up, as the registry row records it.
+    pub fn bringup(&self) -> Option<Bringup> {
+        self.bringup_kind.map(|kind| Bringup {
+            kind,
+            took_ms: u64::try_from(self.bringup_took.as_millis()).unwrap_or(u64::MAX),
+        })
     }
 
     /// Free client slots right now (0 = the next client will queue).
@@ -1774,6 +1788,12 @@ impl SchemaRegistry {
                     // also clears any `archived` flag (this is a fresh VM id), so
                     // a just-restored schema is durably marked live again.
                     self.store.put(schema, entry.sandbox.sandbox_id());
+                    // Per-VM create/restore time, written lazily by the flush
+                    // loop. Every client that shared this bring-up lands here
+                    // with the same entry; only the first marks it dirty.
+                    if let Some(bringup) = entry.bringup() {
+                        self.store.set_bringup(schema, bringup);
+                    }
                     // The bring-up resolved: the id is durably bound, so the
                     // pending ledger's claim on it is settled.
                     crate::pending::clear(schema).await;
@@ -6311,6 +6331,7 @@ mod archive_tests {
             last_active,
             tier: if archived { Tier::Archived } else { Tier::Live },
             disk_gb: 0,
+            bringup: None,
         }
     }
 
@@ -6378,6 +6399,7 @@ mod archive_tests {
             last_active: NOW - idle,
             tier,
             disk_gb: 0,
+            bringup: None,
         }
     }
 

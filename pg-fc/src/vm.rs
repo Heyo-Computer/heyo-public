@@ -21,6 +21,7 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::registry::{GIB, GrowVerdict, SchemaEntry};
 use crate::s3::S3Config;
+use crate::store::BringupKind;
 
 const VM_PG_PORT: u16 = 5432;
 
@@ -705,6 +706,17 @@ pub async fn ensure_vm(
 
     let resolve_took = std::mem::replace(&mut phase, Instant::now()).elapsed();
     let sandbox_id = sandbox.sandbox_id().to_string();
+    // What this bring-up was, for the registry row's per-VM record. A restore
+    // is named by its source whatever vehicle carried it.
+    let kind = match (restore, provenance) {
+        (Some(RestoreSource::S3(_)), _) => BringupKind::RestoreS3Dump,
+        (Some(RestoreSource::S3Image(_)), _) => BringupKind::RestoreS3Image,
+        (Some(RestoreSource::Local { .. }), _) => BringupKind::RestoreLocalDump,
+        (Some(RestoreSource::LocalImage(_)), _) => BringupKind::ThawCompacted,
+        (None, Provenance::Created) => BringupKind::Create,
+        (None, Provenance::Spare | Provenance::ChilledSpare) => BringupKind::Spare,
+        (None, Provenance::Existing) => BringupKind::Reattach,
+    };
 
     // The rest of the bring-up can still fail (ready-timeout, restore error).
     // When the sandbox is a freshly claimed spare, that failure must release
@@ -795,6 +807,7 @@ pub async fn ensure_vm(
             keepalive,
             slots,
             bringup_started.elapsed(),
+            Some(kind),
         )))
     }
     .await;
@@ -858,7 +871,7 @@ pub async fn ensure_fenced_vm(cfg: &Config, schema: &str, sandbox_id: &str) -> R
     }
     drop(client);
     let slots = client_slot_budget(&pool, &name).await;
-    Ok(Arc::new(SchemaEntry::new(sandbox, target, tunnel, pool, true, slots, Duration::ZERO)))
+    Ok(Arc::new(SchemaEntry::new(sandbox, target, tunnel, pool, true, slots, Duration::ZERO, None)))
 }
 
 /// Validity window for a presigned S3 URL handed to the guest. Generous enough
