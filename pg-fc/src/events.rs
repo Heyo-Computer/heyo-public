@@ -125,17 +125,45 @@ pub enum Timing {
     /// [`Timing::RestoreS3Image`], the gap between them is what the bucket
     /// costs.
     RestoreLocalImage,
-    /// The download alone, S3 to the local `.img.zst`: the phase that answers
-    /// whether a slow image restore is the network or the host. Recorded even
-    /// when the restore that follows it fails — the bytes were still moved,
-    /// and a download that lands before a failed boot is exactly the case
-    /// worth seeing.
+    /// The fetch of an S3 disk image, S3 to a raw `.ext4` on the host: the
+    /// phase that answers whether a slow image restore is the network or the
+    /// host. The download is decompressed as it streams in (parallel ranged
+    /// GETs feeding one `zstd -d`), so this span includes the decompress — the
+    /// two can no longer be told apart, and splitting them would only measure
+    /// whichever one was waiting on the other. Recorded even when the restore
+    /// that follows it fails — the bytes were still moved, and a download that
+    /// lands before a failed boot is exactly the case worth seeing.
     RestoreS3Download,
-    /// Everything an image restore does after the bytes are on the host:
-    /// decompress, `e2fsck`, the disk swap under a booted vehicle, and the
-    /// boot on the real data. Recorded for local and S3 image restores alike,
-    /// so the two are directly comparable.
+    /// Everything an image restore does once the raw image is on the host:
+    /// `e2fsck`, the headroom grow, the disk swap (or daemon adoption), and
+    /// the boot on the real data. Recorded for local and S3 image restores
+    /// alike, so the two are directly comparable. A local thaw's decompress is
+    /// [`Timing::RestoreImageDecompress`], outside this span, for the same
+    /// reason: the S3 path pays its decompress inside the download.
     RestoreImageAdopt,
+    /// A local thaw's `zstd -d` of the compacted image — the counterpart of
+    /// the decompress the S3 path folds into [`Timing::RestoreS3Download`].
+    RestoreImageDecompress,
+    /// The restore-time `e2fsck` (check, plus the repair when the check finds
+    /// anything) — the part of [`Timing::RestoreImageAdopt`] that scales with
+    /// the filesystem rather than with the boot.
+    RestoreImageFsck,
+    /// The boot on the restored image: daemon adoption or the vehicle swap,
+    /// through the VM reporting ready. The rest of
+    /// [`Timing::RestoreImageAdopt`].
+    RestoreImageBoot,
+    /// A dump restore's download inside the guest, S3 (or the local dump
+    /// server) to the guest's scratch file. Only measured when the guest
+    /// downloads before loading; a streamed restore has no separate download
+    /// and reports the whole pipe as [`Timing::RestoreDumpLoad`].
+    RestoreDumpDownload,
+    /// A dump restore's `pg_restore` — or, when the dump is streamed straight
+    /// into it, the download and load together, which overlap by design.
+    RestoreDumpLoad,
+    /// A dump restore's finalize: putting the restore-time durability
+    /// settings back, and the `CHECKPOINT` + `sync` that makes the loaded
+    /// data durable before the database is served.
+    RestoreDumpFinalize,
 }
 
 impl Timing {
@@ -149,6 +177,12 @@ impl Timing {
             Timing::RestoreLocalImage => "restore_local_image_total",
             Timing::RestoreS3Download => "restore_s3_download",
             Timing::RestoreImageAdopt => "restore_image_adopt",
+            Timing::RestoreImageDecompress => "restore_image_decompress",
+            Timing::RestoreImageFsck => "restore_image_fsck",
+            Timing::RestoreImageBoot => "restore_image_boot",
+            Timing::RestoreDumpDownload => "restore_dump_download",
+            Timing::RestoreDumpLoad => "restore_dump_load",
+            Timing::RestoreDumpFinalize => "restore_dump_finalize",
         }
     }
 
@@ -161,6 +195,12 @@ impl Timing {
             "restore_local_image_total" => Some(Timing::RestoreLocalImage),
             "restore_s3_download" => Some(Timing::RestoreS3Download),
             "restore_image_adopt" => Some(Timing::RestoreImageAdopt),
+            "restore_image_decompress" => Some(Timing::RestoreImageDecompress),
+            "restore_image_fsck" => Some(Timing::RestoreImageFsck),
+            "restore_image_boot" => Some(Timing::RestoreImageBoot),
+            "restore_dump_download" => Some(Timing::RestoreDumpDownload),
+            "restore_dump_load" => Some(Timing::RestoreDumpLoad),
+            "restore_dump_finalize" => Some(Timing::RestoreDumpFinalize),
             _ => None,
         }
     }
@@ -813,6 +853,12 @@ mod tests {
             Timing::RestoreLocalImage,
             Timing::RestoreS3Download,
             Timing::RestoreImageAdopt,
+            Timing::RestoreImageDecompress,
+            Timing::RestoreImageFsck,
+            Timing::RestoreImageBoot,
+            Timing::RestoreDumpDownload,
+            Timing::RestoreDumpLoad,
+            Timing::RestoreDumpFinalize,
         ] {
             assert_eq!(Timing::parse(k.as_str()), Some(k), "token {:?}", k.as_str());
         }

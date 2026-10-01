@@ -1175,6 +1175,9 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_MAX_PENDING_BRINGUPS",
     "PG_VM_POOL_ADMISSION_WAIT_SECS",
     "PG_VM_POOL_ARCHIVE_VIA_GUEST",
+    // Read lazily by the restore paths (vm.rs, imgarchive.rs).
+    "PG_VM_POOL_RESTORE_FAST_LOAD",
+    "PG_VM_POOL_RESTORE_GET_CONCURRENCY",
     // Cross-host logical replication (see `crate::replication`).
     "PG_VM_POOL_REPLICATION",
     "PG_VM_POOL_NODE_NAME",
