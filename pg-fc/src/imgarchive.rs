@@ -1572,6 +1572,24 @@ async fn swap_and_boot(
             .context("stopping the fresh VM for the disk swap timed out")?
             .context("stopping the fresh VM for the disk swap")?;
     }
+
+    // Take the disk's reclaim exclusion BEFORE anything below reads or writes
+    // it, and hold it until the VM has the disk open. A reclaim pass runs its
+    // `e2fsck` / `debugfs -w` / discard on a stopped disk under this same lock,
+    // as root — and the fd scan in `wait_disk_released` runs as the pooler's
+    // user, so it cannot see those root-owned processes at all
+    // (`orphans::open_inodes` skips any `/proc/<pid>/fd` it cannot read).
+    // Taken only around `start()`, as it used to be, the permit left the whole
+    // stop → release check → PG_VERSION read → `cp` sequence unprotected: a
+    // pass could be repairing or punching holes in the vehicle disk while the
+    // restored image was copied over it, and the VM then booted on the mix.
+    // The lock is the only check here that actually sees the script.
+    //
+    // Permit before slot, as everywhere (see `vm::bring_up_existing`): this
+    // waits on reclaim without holding a bring-up slot. Holding it across the
+    // copy only ever delays reclaim of THIS disk (or, under the global-gate
+    // fallback, the next pass) — never another VM's boot.
+    let permit = crate::reclaim::boot_permit(sandbox.sandbox_id()).await;
     wait_disk_released(&disk).await?;
 
     // Refuse a cross-major adoption before it overwrites anything. Postgres
@@ -1639,12 +1657,15 @@ async fn swap_and_boot(
     .with_context(|| format!("schema {schema}: adopting the image into {}", disk.display()))?;
 
     let started = {
-        // A reclaim pass must not be mid-fsck on this disk when the VM boots,
-        // and the boot counts against the global bring-up gate like any other.
-        // Permit before slot — see `vm::bring_up_existing`.
-        let _permit = crate::reclaim::boot_permit(sandbox.sandbox_id()).await;
+        // The boot counts against the global bring-up gate like any other. The
+        // reclaim permit taken before the swap is still held, so no pass can
+        // reach this disk between the copy and the VM opening it; it is
+        // released as soon as `start()` returns, after which the script's
+        // in-use checks see the VM holding the disk.
         let _slot = crate::vm::bringup_slot(schema).await;
-        sandbox.start().await
+        let started = sandbox.start().await;
+        drop(permit);
+        started
     };
     started.context("booting the VM on the restored image")?;
     crate::vm::wait_ready(sandbox, cfg.ready_timeout, schema)
@@ -1697,6 +1718,12 @@ async fn download(
 /// the same (device, inode) sweep the orphan sweep trusts; a scan that can
 /// see nothing (no /proc visibility) degrades to reporting "free", so a short
 /// settle-and-recheck follows the first free reading either way.
+///
+/// It only sees processes whose fds the pooler's user can read, i.e. its own
+/// Firecrackers — not root-owned reclaim tools. Callers that are about to
+/// write the disk must therefore already hold the disk's
+/// [`crate::reclaim::boot_permit`]; this check covers the VM, the permit
+/// covers the script.
 ///
 /// This sits in the middle of every image restore — between the vehicle's
 /// stop and the disk swap — so its cadence is client-visible latency, not
