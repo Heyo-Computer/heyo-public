@@ -537,6 +537,12 @@ pub struct RestoreLatency {
     pub local_dump: Option<crate::events::TimingStats>,
     pub s3_download: Option<crate::events::TimingStats>,
     pub image_adopt: Option<crate::events::TimingStats>,
+    pub image_decompress: Option<crate::events::TimingStats>,
+    pub image_fsck: Option<crate::events::TimingStats>,
+    pub image_boot: Option<crate::events::TimingStats>,
+    pub dump_download: Option<crate::events::TimingStats>,
+    pub dump_load: Option<crate::events::TimingStats>,
+    pub dump_finalize: Option<crate::events::TimingStats>,
 }
 
 /// The monitoring view: whole-host CPU/memory/disk saturation plus pooler-fleet
@@ -1658,9 +1664,9 @@ fn restore_latency_table(l: &RestoreLatency) -> Markup {
     }
 }
 
-/// The download/adopt split for image restores, as a sentence — it describes
-/// phases of the image rows above rather than restores of its own, so it
-/// belongs in the note and not as two more table rows.
+/// The phase split for image and dump restores, as sentences — they describe
+/// phases of the rows above rather than restores of their own, so they belong
+/// in the note and not as more table rows.
 fn image_phase_note(l: &RestoreLatency) -> Markup {
     let phase = |what: &str, s: Option<&crate::events::TimingStats>| -> Option<String> {
         let s = s?;
@@ -1672,20 +1678,36 @@ fn image_phase_note(l: &RestoreLatency) -> Markup {
             if s.count == 1 { "" } else { "s" }
         ))
     };
-    let parts: Vec<String> = [
-        phase("S3 download", l.s3_download.as_ref()),
-        phase(
-            "decompress + repair + disk swap + boot",
-            l.image_adopt.as_ref(),
-        ),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if parts.is_empty() {
+    let sentence = |lead: &str, parts: Vec<Option<String>>| -> Option<String> {
+        let parts: Vec<String> = parts.into_iter().flatten().collect();
+        (!parts.is_empty()).then(|| format!("{lead}: {}.", parts.join("; ")))
+    };
+    let image = sentence(
+        "Inside an image restore",
+        vec![
+            phase("S3 download + decompress", l.s3_download.as_ref()),
+            phase("local decompress", l.image_decompress.as_ref()),
+            phase("repair + disk swap + boot", l.image_adopt.as_ref()),
+            phase("of which fsck", l.image_fsck.as_ref()),
+            phase("of which boot", l.image_boot.as_ref()),
+        ],
+    );
+    let dump = sentence(
+        "Inside a dump restore",
+        vec![
+            phase("guest download", l.dump_download.as_ref()),
+            phase(
+                "pg_restore (streamed: download + load)",
+                l.dump_load.as_ref(),
+            ),
+            phase("checkpoint + sync", l.dump_finalize.as_ref()),
+        ],
+    );
+    let text: Vec<String> = [image, dump].into_iter().flatten().collect();
+    if text.is_empty() {
         return html! {};
     }
-    html! { "Inside an image restore: " (parts.join("; ")) "." }
+    html! { (text.join(" ")) }
 }
 
 fn stat(label: &str, value: &str, sub: Option<&str>) -> Markup {
@@ -2712,12 +2734,22 @@ mod tests {
         // 3 samples cannot support a p95, and the table says so; 200 can.
         assert!(html.contains("(thin)"), "a thin window must be marked: {html}");
         // The download phase belongs to the note, not to the rows.
-        assert!(html.contains("S3 download p50"), "{html}");
+        assert!(html.contains("S3 download + decompress p50"), "{html}");
+        // No dump phase was measured: no dump sentence.
+        assert!(!html.contains("Inside a dump restore"), "{html}");
+        let dumped = restore_latency_table(&RestoreLatency {
+            dump_load: Some(stats(4, 2_000, 5_000)),
+            dump_finalize: Some(stats(4, 300, 900)),
+            ..Default::default()
+        })
+        .into_string();
+        assert!(dumped.contains("Inside a dump restore"), "{dumped}");
+        assert!(dumped.contains("checkpoint + sync p50"), "{dumped}");
 
         // Nothing measured at all: the phase sentence is simply absent, and
         // no percentile is invented anywhere.
         let quiet = restore_latency_table(&RestoreLatency::default()).into_string();
-        assert!(!quiet.contains("S3 download p50"), "{quiet}");
+        assert!(!quiet.contains("S3 download"), "{quiet}");
         assert!(!quiet.contains("(thin)"), "{quiet}");
         assert!(
             quiet.contains("S3 disk image"),

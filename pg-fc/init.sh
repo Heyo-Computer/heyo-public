@@ -711,6 +711,14 @@ if [ "$PHYSICAL_ACTIVE" = 1 ]; then
     echo "include = 'pg-fc-physical.conf'" >> "$PGDATA/postgresql.conf"
 fi
 
+# Restore-time settings: the pooler's restore job writes fsync/full_page_writes
+# off here for the load, then removes the file, reloads and checkpoints before
+# the database is served. Last, so it wins over everything above for the
+# duration of a load. On /run — a tmpfs — so a VM that reboots mid-restore
+# always comes back with normal durability; absent, it is a no-op.
+sed -i "\|^include_if_exists = '/run/pg-fc-restore.conf'$|d" "$PGDATA/postgresql.conf"
+echo "include_if_exists = '/run/pg-fc-restore.conf'" >> "$PGDATA/postgresql.conf"
+
 chown postgres:postgres "$PGDATA/postgresql.conf" "$PGDATA/pg_hba.conf" 2>/dev/null || true
 sync
 

@@ -139,6 +139,12 @@ pub(super) fn metrics_view(hours: u64) -> Metrics {
         Timing::RestoreLocalDump,
         Timing::RestoreS3Download,
         Timing::RestoreImageAdopt,
+        Timing::RestoreImageDecompress,
+        Timing::RestoreImageFsck,
+        Timing::RestoreImageBoot,
+        Timing::RestoreDumpDownload,
+        Timing::RestoreDumpLoad,
+        Timing::RestoreDumpFinalize,
     ]
     .into_iter()
     .filter_map(|t| {

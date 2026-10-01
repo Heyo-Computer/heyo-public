@@ -94,6 +94,21 @@ pub async fn monitoring(
             local_dump: crate::events::timing_stats(crate::events::Timing::RestoreLocalDump, 24),
             s3_download: crate::events::timing_stats(crate::events::Timing::RestoreS3Download, 24),
             image_adopt: crate::events::timing_stats(crate::events::Timing::RestoreImageAdopt, 24),
+            image_decompress: crate::events::timing_stats(
+                crate::events::Timing::RestoreImageDecompress,
+                24,
+            ),
+            image_fsck: crate::events::timing_stats(crate::events::Timing::RestoreImageFsck, 24),
+            image_boot: crate::events::timing_stats(crate::events::Timing::RestoreImageBoot, 24),
+            dump_download: crate::events::timing_stats(
+                crate::events::Timing::RestoreDumpDownload,
+                24,
+            ),
+            dump_load: crate::events::timing_stats(crate::events::Timing::RestoreDumpLoad, 24),
+            dump_finalize: crate::events::timing_stats(
+                crate::events::Timing::RestoreDumpFinalize,
+                24,
+            ),
         },
     };
     Ok(views::monitoring_page(

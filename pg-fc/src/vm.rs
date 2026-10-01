@@ -754,12 +754,15 @@ pub async fn ensure_vm(
         // Restore into the freshly-created, empty database before the entry is
         // handed to any client. A failure here must abort the bring-up: serving
         // an empty DB in place of a restored one would look like silent data loss.
+        let mut restore_report = None;
         match restore {
-            Some(RestoreSource::S3(s3)) => restore_from_s3(cfg, &sandbox, schema, s3, up.owner)
-                .await
-                .with_context(|| format!("restoring schema {schema} from S3"))?,
+            Some(RestoreSource::S3(s3)) => {
+                restore_report = restore_from_s3(cfg, &sandbox, schema, s3, up.owner)
+                    .await
+                    .with_context(|| format!("restoring schema {schema} from S3"))?
+            }
             Some(RestoreSource::Local { srv, port }) => {
-                restore_from_local(cfg, &sandbox, schema, srv, *port, up.owner)
+                restore_report = restore_from_local(cfg, &sandbox, schema, srv, *port, up.owner)
                     .await
                     .with_context(|| format!("restoring schema {schema} from the local dump"))?
             }
@@ -785,10 +788,14 @@ pub async fn ensure_vm(
         // the guest boot; `pg-ready` is the wait for the postmaster. The gate
         // waits (admission, bring-up slot, boot gate) also log themselves
         // when they actually queued.
+        let restore_detail = restore_report
+            .as_ref()
+            .map(|r| format!(" [{r}]"))
+            .unwrap_or_default();
         info!(
             "schema {schema}: bring-up phases — admission {admission_took:?}, resolve+boot \
              {resolve_took:?}, pg-ready {pg_ready_took:?}, create-db {create_db_took:?}, \
-             restore {restore_took:?}, slots {bootstrap_took:?}",
+             restore {restore_took:?}{restore_detail}, slots {bootstrap_took:?}",
         );
 
         // Time to a serving Postgres, per restore source — the same span the
@@ -976,6 +983,33 @@ struct DetachedJob {
     /// local dump-and-upload, and one an operator sizes with
     /// `PG_VM_POOL_REPL_SETUP_SECS`.
     deadline: Duration,
+    /// How [`await_detached_job`] spaces its probes: `poll_first` before the
+    /// first one, doubling after each still-running answer up to `poll_max`.
+    /// Per-job because the jobs are waited on by different parties. A restore
+    /// or schema copy is a bring-up with a client parked on it, and a flat
+    /// [`ARCHIVE_POLL_INTERVAL`] rounded every one of those up to the next
+    /// 10s mark — a 2s restore was served at 10s, a 10.1s one at 20s. The
+    /// probe is builtins-only, so a sub-second first look costs the guest
+    /// next to nothing; the doubling keeps a long load from paying for a
+    /// console exec every 250ms.
+    poll_first: Duration,
+    poll_max: Duration,
+    /// A guest file the job leaves a one-line report in before its sentinel
+    /// (the restore's phase timings). Read by the completion probe in the
+    /// same exec as the sentinel, so a report costs no extra console round
+    /// trip.
+    report: Option<&'static str>,
+}
+
+/// Probe spacing for a detached job a client is waiting on. Same shape as
+/// [`READY_POLL_FAST_INTERVAL`]/[`READY_POLL_SLOW_INTERVAL`]: a short job is
+/// seen within a quarter-second, a long one is probed at most every 2s.
+const CLIENT_JOB_POLL_FIRST: Duration = Duration::from_millis(250);
+const CLIENT_JOB_POLL_MAX: Duration = Duration::from_secs(2);
+
+/// The next probe gap after a still-running answer: doubled, capped.
+fn next_poll(cur: Duration, max: Duration) -> Duration {
+    (cur * 2).min(max)
 }
 
 const ARCHIVE_JOB: DetachedJob = DetachedJob {
@@ -984,6 +1018,11 @@ const ARCHIVE_JOB: DetachedJob = DetachedJob {
     done: "/workspace/_archive.done",
     log: "/workspace/_archive.log",
     deadline: ARCHIVE_DEADLINE,
+    // Waited on by `await_archive`, on its own cadence; carried for
+    // completeness. No client waits on a dump.
+    poll_first: ARCHIVE_POLL_INTERVAL,
+    poll_max: ARCHIVE_POLL_INTERVAL,
+    report: None,
 };
 
 const RESTORE_JOB: DetachedJob = DetachedJob {
@@ -992,6 +1031,9 @@ const RESTORE_JOB: DetachedJob = DetachedJob {
     done: "/workspace/_restore.done",
     log: "/workspace/_restore.log",
     deadline: ARCHIVE_DEADLINE,
+    poll_first: CLIENT_JOB_POLL_FIRST,
+    poll_max: CLIENT_JOB_POLL_MAX,
+    report: Some(RESTORE_TIMING_PATH),
 };
 
 /// tmpfs marker recording that the *producer* of the schema-copy pipeline
@@ -1010,6 +1052,9 @@ const SCHEMA_COPY_JOB: DetachedJob = DetachedJob {
     done: "/workspace/_replinit.done",
     log: "/workspace/_replinit.log",
     deadline: Duration::from_secs(3600),
+    poll_first: CLIENT_JOB_POLL_FIRST,
+    poll_max: CLIENT_JOB_POLL_MAX,
+    report: None,
 };
 
 /// Dump `schema`'s database to S3 using the guest's own `pg_dump` + `curl`
@@ -1442,10 +1487,73 @@ fn require_2xx(what: &str) -> String {
     )
 }
 
-/// The restore job body: fetch the archive from S3, load it into the
-/// already-created database, drop the scratch copy. Same `ec`/sentinel
-/// discipline as the dump, so a failed download never looks like a successful
-/// restore of nothing.
+/// Guest file the restore job leaves its phase timings in, as one line:
+/// `mode download_ms load_ms finalize_ms` (`-` for a phase that did not run).
+/// Read back by the completion probe itself ([`DetachedJob::probe_command`]),
+/// so the timings cost no extra exec.
+const RESTORE_TIMING_PATH: &str = "/workspace/_restore.timing";
+
+/// pipefail surrogate for the streamed restore: curl's exit code, when it
+/// failed, so a download that died mid-stream is never mistaken for
+/// `pg_restore`'s own verdict on a truncated archive.
+const RESTORE_CURL_FAIL_MARK: &str = "/workspace/_restore.curl-ec";
+
+/// Where the streamed restore's response headers land (`curl -D`), since the
+/// body goes down the pipe and `-w '%{http_code}'` would land in it too.
+const RESTORE_HEADERS_PATH: &str = "/workspace/_restore.hdr";
+
+/// The restore-time Postgres settings, read through the
+/// `include_if_exists` that `init.sh` keeps last in `postgresql.conf`. On
+/// `/run` — a tmpfs — so a VM that reboots mid-restore comes back with its
+/// normal durability whatever the job managed to do.
+const RESTORE_TUNING_CONF: &str = "/run/pg-fc-restore.conf";
+
+/// Whether restore jobs load with `fsync` and `full_page_writes` off.
+/// `PG_VM_POOL_RESTORE_FAST_LOAD`, default on; `0`/`false`/`no`/`off` turn it
+/// off. Read lazily, the same way the bring-up gates are.
+fn restore_fast_load() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("PG_VM_POOL_RESTORE_FAST_LOAD")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// The restore job body: fetch the archive, load it into the already-created
+/// database, make it durable, and leave its phase timings behind. Same
+/// `ec`/sentinel discipline as the dump, so a failed download never looks like
+/// a successful restore of nothing.
+///
+/// **How it loads.** On a one-vCPU guest — every size class this pooler runs
+/// today — the dump is streamed straight from `curl` into a serial
+/// `pg_restore --single-transaction`: the download and the load overlap
+/// instead of running back to back, the dump never takes a round trip through
+/// the data disk, and with `wal_level=minimal` the COPY into tables created in
+/// that same transaction skips the WAL entirely. `-j` buys nothing on one
+/// core. A guest with more cores keeps the download-then-`pg_restore -j` path,
+/// because parallel restore needs a seekable file. If the stream fails *after*
+/// S3 answered 2xx, the job retries once the classic way: a dump streamed
+/// from `pg_dump` into S3 carries no data offsets in its TOC, and `pg_restore`
+/// refuses some orders on non-seekable input it would accept from a file. The
+/// single transaction rolled the failed stream back, so the retry starts from
+/// the same empty database.
+///
+/// **How it makes the load cheap.** With `fast_load`, the job switches the
+/// cluster to `fsync = off` and `full_page_writes = off` for the load and back
+/// afterwards — then `CHECKPOINT` and `sync` before the sentinel, so a
+/// restore reported done is durable. That is only safe because nothing on
+/// this VM matters until the restore succeeds: a bring-up whose restore fails
+/// kills its VM, and the settings live on a tmpfs, so a reboot drops them.
+/// The guest job owns the reset rather than the pooler, so a pooler restart
+/// mid-restore still puts durability back. `max_wal_size` is deliberately left
+/// alone: with fsync and full-page images off, a checkpoint is cheap anyway,
+/// and init.sh's WAL ceiling is what keeps a big load off ENOSPC.
 ///
 /// `--clean --if-exists` makes the load idempotent: a *previous* restore
 /// attempt that died partway (host outage, kill mid-load) leaves a partially
@@ -1462,24 +1570,165 @@ fn require_2xx(what: &str) -> String {
 /// owned by `postgres`. The owning role is guaranteed to exist before any
 /// restore runs (`ensure_database` creates it first), so here the dump's own
 /// ownership and grants can and must be replayed.
-fn restore_job_body(user: &str, db: &str, resolve: &str, url: &str, keep_ownership: bool) -> String {
+fn restore_job_body(
+    user: &str,
+    db: &str,
+    resolve: &str,
+    url: &str,
+    keep_ownership: bool,
+    fast_load: bool,
+) -> String {
     let done = RESTORE_JOB.done;
     let ownership = if keep_ownership {
         ""
     } else {
         "--no-owner --no-privileges "
     };
+    let restore = format!("pg_restore -h 127.0.0.1 -U {user} --clean --if-exists {ownership}");
+    let psql = format!("psql -h 127.0.0.1 -U {user} -d postgres -qAtX");
+    let tune = if fast_load {
+        format!(
+            "if printf 'fsync = off\\nfull_page_writes = off\\n' > {RESTORE_TUNING_CONF} \
+             && chmod 644 {RESTORE_TUNING_CONF} \
+             && {psql} -c 'select pg_reload_conf()' >/dev/null; then\n\
+             \ttuned=1\n\
+             else\n\
+             \trm -f {RESTORE_TUNING_CONF}\n\
+             \techo 'restore-time tuning unavailable; loading with normal durability' >&2\n\
+             fi\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "ec=0\n\
-         code=$(curl -sS {resolve} -o {RESTORE_PATH} -w '%{{http_code}}' \"{url}\") || ec=$?\n\
+         tuned=0\n\
+         mode=file\n\
+         dl_ms=-\n\
+         load_ms=-\n\
+         fin_ms=-\n\
+         now_ms() {{ t=$(date +%s%3N 2>/dev/null); case \"$t\" in ''|*[!0-9]*) echo 0 ;; *) echo \"$t\" ;; esac; }}\n\
+         rm -f {RESTORE_TIMING_PATH} {RESTORE_CURL_FAIL_MARK} {RESTORE_HEADERS_PATH}\n\
+         {tune}\
+         if [ \"$(nproc)\" -le 1 ]; then\n\
+         \tmode=stream\n\
+         \tt0=$(now_ms)\n\
+         \t{{ curl -sS {resolve} -D {RESTORE_HEADERS_PATH} -o - \"{url}\" \
+         || echo $? > {RESTORE_CURL_FAIL_MARK}; }} \
+         | {restore}--single-transaction -d {db} || ec=$?\n\
+         \tload_ms=$(( $(now_ms) - t0 ))\n\
+         \tcode=$(awk 'toupper($1) ~ /^HTTP\\// {{c=$2}} END {{print c}}' {RESTORE_HEADERS_PATH} 2>/dev/null)\n\
+         \tif [ -f {RESTORE_CURL_FAIL_MARK} ]; then read ec < {RESTORE_CURL_FAIL_MARK}; fi\n\
          {}\
-         if [ \"$ec\" = 0 ]; then\n\
-         \tpg_restore -h 127.0.0.1 -U {user} --clean --if-exists {ownership}-j \"$(nproc)\" -d {db} {RESTORE_PATH} || ec=$?\n\
+         \tcase \"$ec:$code\" in\n\
+         \t0:*) ;;\n\
+         \t*:2??) echo \"streamed restore failed (exit $ec); retrying from a downloaded file\" >&2\n\
+         \t\tmode=file_after_stream; ec=0 ;;\n\
+         \tesac\n\
          fi\n\
-         rm -f {RESTORE_PATH}\n\
+         if [ \"$mode\" != stream ]; then\n\
+         \tt0=$(now_ms)\n\
+         \tcode=$(curl -sS {resolve} -o {RESTORE_PATH} -w '%{{http_code}}' \"{url}\") || ec=$?\n\
+         {}\
+         \tdl_ms=$(( $(now_ms) - t0 ))\n\
+         \tif [ \"$ec\" = 0 ]; then\n\
+         \t\tt0=$(now_ms)\n\
+         \t\t{restore}-j \"$(nproc)\" -d {db} {RESTORE_PATH} || ec=$?\n\
+         \t\tload_ms=$(( $(now_ms) - t0 ))\n\
+         \tfi\n\
+         \trm -f {RESTORE_PATH}\n\
+         fi\n\
+         if [ \"$tuned\" = 1 ]; then\n\
+         \tt0=$(now_ms)\n\
+         \trm -f {RESTORE_TUNING_CONF}\n\
+         \t{psql} -c 'select pg_reload_conf()' >/dev/null || {{ [ \"$ec\" = 0 ] && ec=1; }}\n\
+         \tif [ \"$ec\" = 0 ]; then\n\
+         \t\t{psql} -c CHECKPOINT >/dev/null || ec=$?\n\
+         \t\tsync\n\
+         \tfi\n\
+         \tfin_ms=$(( $(now_ms) - t0 ))\n\
+         fi\n\
+         rm -f {RESTORE_CURL_FAIL_MARK} {RESTORE_HEADERS_PATH}\n\
+         printf '%s %s %s %s\\n' \"$mode\" \"$dl_ms\" \"$load_ms\" \"$fin_ms\" > {RESTORE_TIMING_PATH}\n\
          printf %s \"$ec\" > {done}.tmp && mv {done}.tmp {done}\n",
-        require_2xx("download")
+        indent(&require_2xx("download")),
+        indent(&require_2xx("download")),
     )
+}
+
+/// One more tab in front of every line of a job fragment, for splicing a
+/// top-level fragment like [`require_2xx`] into a branch.
+fn indent(fragment: &str) -> String {
+    fragment.lines().map(|l| format!("\t{l}\n")).collect()
+}
+
+/// What a finished restore job reported about itself: which way it loaded and
+/// how long each phase took. `None` for a phase that did not run (a streamed
+/// load has no separate download; an untuned load has no finalize).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RestoreReport {
+    /// `stream`, `file`, or `file_after_stream` (a stream that failed and was
+    /// retried from a downloaded file).
+    pub(crate) mode: String,
+    pub(crate) download: Option<Duration>,
+    pub(crate) load: Option<Duration>,
+    pub(crate) finalize: Option<Duration>,
+}
+
+impl RestoreReport {
+    /// Parse the job's timing line. `None` when it is missing or garbled — a
+    /// guest image whose job predates the timing file, or a probe that lost
+    /// the race with the write — which costs the sub-phase figures and nothing
+    /// else.
+    fn parse(line: &str) -> Option<Self> {
+        let mut f = line.split_whitespace();
+        let mode = f.next()?.to_string();
+        if !matches!(mode.as_str(), "stream" | "file" | "file_after_stream") {
+            return None;
+        }
+        let mut ms = || -> Option<Option<Duration>> {
+            match f.next()? {
+                "-" => Some(None),
+                v => v
+                    .parse::<u64>()
+                    .ok()
+                    .map(|n| Some(Duration::from_millis(n))),
+            }
+        };
+        Some(Self {
+            download: ms()?,
+            load: ms()?,
+            finalize: ms()?,
+            mode,
+        })
+    }
+
+    fn record(&self) {
+        use crate::events::{Timing, record_timing};
+        for (kind, took) in [
+            (Timing::RestoreDumpDownload, self.download),
+            (Timing::RestoreDumpLoad, self.load),
+            (Timing::RestoreDumpFinalize, self.finalize),
+        ] {
+            if let Some(took) = took {
+                record_timing(kind, took);
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for RestoreReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let d = |v: Option<Duration>| v.map_or_else(|| "-".to_string(), |d| format!("{d:?}"));
+        write!(
+            f,
+            "{} (download {}, load {}, finalize {})",
+            self.mode,
+            d(self.download),
+            d(self.load),
+            d(self.finalize)
+        )
+    }
 }
 
 impl DetachedJob {
@@ -1548,16 +1797,25 @@ impl DetachedJob {
     /// it competes for the serial console with a `pg_dump`/`pg_restore`
     /// saturating the VM: `[`, `printf` and `read` are shell builtins, so this
     /// forks nothing.
+    ///
+    /// With a [`Self::report`] file, a finished job's reply carries it on an
+    /// `R` line ahead of the `D` line — still builtins only.
     fn probe_command(&self) -> String {
         let done = self.done;
+        let report = match self.report {
+            Some(path) => format!(
+                "r=; {{ read r < {path}; }} 2>/dev/null; printf '{PROBE_TAG}R%s\\n' \"$r\"; "
+            ),
+            None => String::new(),
+        };
         format!(
             "if [ -f {done} ]; then read c < {done}; \
-             printf '{PROBE_TAG}D%s\\n' \"$c\"; \
+             {report}printf '{PROBE_TAG}D%s\\n' \"$c\"; \
              else printf '{PROBE_TAG}P\\n'; fi"
         )
     }
 
-    async fn probe(&self, cfg: &Config, sandbox: &Sandbox) -> Result<JobState> {
+    async fn probe(&self, cfg: &Config, sandbox: &Sandbox) -> Result<(JobState, Option<String>)> {
         let what = self.what;
         let res = exec_guest(
             cfg,
@@ -1567,7 +1825,7 @@ impl DetachedJob {
             &format!("probing {what} job"),
         )
         .await?;
-        Ok(parse_probe(&res.stdout))
+        Ok((parse_probe(&res.stdout), parse_probe_report(&res.stdout)))
     }
 
     /// Best-effort tail of the job's guest-side log, so a failure (bad
@@ -1668,7 +1926,11 @@ async fn await_archive(
         // 2. Ask the guest, unless it has stopped answering — see
         //    `ARCHIVE_MAX_PROBE_FAILURES`. Never fatal on its own.
         if !probes_muted {
-            match ARCHIVE_JOB.probe(cfg, sandbox).await {
+            match ARCHIVE_JOB
+                .probe(cfg, sandbox)
+                .await
+                .map(|(state, _)| state)
+            {
                 Ok(JobState::Failed(code)) => {
                     let log = ARCHIVE_JOB.log_tail(cfg, sandbox).await;
                     bail!(
@@ -1811,7 +2073,11 @@ async fn await_server_upload(
         }
         // Guest sentinel: turns a failed dump into a prompt, explained error.
         if !probes_muted {
-            match ARCHIVE_JOB.probe(cfg, sandbox).await {
+            match ARCHIVE_JOB
+                .probe(cfg, sandbox)
+                .await
+                .map(|(state, _)| state)
+            {
                 Ok(JobState::Failed(code)) => {
                     let log = ARCHIVE_JOB.log_tail(cfg, sandbox).await;
                     bail!(
@@ -1863,7 +2129,7 @@ pub async fn restore_from_local(
     srv: &crate::dumpsrv::DumpServer,
     port: u16,
     owner: Option<&crate::dedicated::Credential>,
-) -> Result<()> {
+) -> Result<Option<RestoreReport>> {
     let path = srv.dump_path(schema);
     match crate::dumpsrv::dump_size(&path) {
         None => bail!(
@@ -1885,12 +2151,27 @@ pub async fn restore_from_local(
     let body = format!(
         "{}{}",
         gw_prelude(RESTORE_JOB.done),
-        restore_job_body(&user, &db, "", &url, owner.is_some())
+        restore_job_body(&user, &db, "", &url, owner.is_some(), restore_fast_load())
     );
     RESTORE_JOB.launch(cfg, sandbox, &body, RESTORE_PATH).await?;
-    await_detached_job(cfg, sandbox, schema, RESTORE_JOB).await?;
+    let report = await_detached_job(cfg, sandbox, schema, RESTORE_JOB).await?;
     crate::events::record(crate::events::Event::RestoreLocal);
-    Ok(())
+    Ok(finish_restore_report(schema, report))
+}
+
+/// Record a finished restore job's phase timings and hand the report up for
+/// the bring-up's phase line. A missing or unreadable report is logged once
+/// and otherwise ignored — the restore itself succeeded.
+fn finish_restore_report(schema: &str, line: Option<String>) -> Option<RestoreReport> {
+    let report = line.as_deref().and_then(RestoreReport::parse);
+    match &report {
+        Some(r) => r.record(),
+        None => warn!(
+            "schema {schema}: the restore job left no readable timing report ({line:?}) — \
+             its phase timings are not recorded"
+        ),
+    }
+    report
 }
 
 /// What the guest says about a detached job.
@@ -1930,6 +2211,18 @@ fn parse_probe(stdout: &str) -> JobState {
     }
 }
 
+/// The `R` line of a probe reply ([`DetachedJob::report`]), if any. Last
+/// match wins, for the same stale-framing reason as [`parse_probe`]; an empty
+/// report (the file was missing) is `None`.
+fn parse_probe_report(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .filter_map(|l| l.trim().rsplit_once(PROBE_TAG).map(|(_, r)| r))
+        .rfind(|r| r.starts_with('R'))
+        .map(|r| r[1..].trim().to_string())
+        .filter(|r| !r.is_empty())
+}
+
 /// Restore `schema`'s database from S3 into the (already-created, empty) target
 /// database, using the guest's `curl` + `pg_restore` against a presigned GET.
 ///
@@ -1952,7 +2245,7 @@ async fn restore_from_s3(
     schema: &str,
     s3: &S3Config,
     owner: Option<&crate::dedicated::Credential>,
-) -> Result<()> {
+) -> Result<Option<RestoreReport>> {
     let key = s3.object_key(schema);
 
     // Pre-flight: is there actually a restorable archive at the key? Feeding
@@ -1997,13 +2290,20 @@ async fn restore_from_s3(
         .launch(
             cfg,
             sandbox,
-            &restore_job_body(&user, &db, &resolve, &url, owner.is_some()),
+            &restore_job_body(
+                &user,
+                &db,
+                &resolve,
+                &url,
+                owner.is_some(),
+                restore_fast_load(),
+            ),
             RESTORE_PATH,
         )
         .await?;
-    await_detached_job(cfg, sandbox, schema, RESTORE_JOB).await?;
+    let report = await_detached_job(cfg, sandbox, schema, RESTORE_JOB).await?;
     crate::events::record(crate::events::Event::RestoreS3);
-    Ok(())
+    Ok(finish_restore_report(schema, report))
 }
 
 /// Wait for a detached job whose only completion signal is its own sentinel.
@@ -2012,27 +2312,31 @@ async fn restore_from_s3(
 /// but not indefinitely: with nothing else to ask, a channel that never comes
 /// back means we can never confirm the job, and reporting failure is the honest
 /// answer. Bounded by the job's own `deadline` either way.
+///
+/// Returns the job's [`DetachedJob::report`] line when it left one.
 async fn await_detached_job(
     cfg: &Config,
     sandbox: &Sandbox,
     schema: &str,
     job: DetachedJob,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let what = job.what;
     let deadline = Instant::now() + job.deadline;
     let mut probe_failures: u32 = 0;
+    let mut poll = job.poll_first;
     loop {
-        sleep(ARCHIVE_POLL_INTERVAL).await;
+        sleep(poll).await;
+        poll = next_poll(poll, job.poll_max);
         match job.probe(cfg, sandbox).await {
-            Ok(JobState::Succeeded) => return Ok(()),
-            Ok(JobState::Failed(code)) => {
+            Ok((JobState::Succeeded, report)) => return Ok(report),
+            Ok((JobState::Failed(code), _)) => {
                 let log = job.log_tail(cfg, sandbox).await;
                 bail!(
                     "detached {what} job for schema {schema} failed (exit {code}): {}",
                     truncate(log.trim(), 800)
                 );
             }
-            Ok(JobState::Running) => probe_failures = 0,
+            Ok((JobState::Running, _)) => probe_failures = 0,
             Err(e) => {
                 probe_failures += 1;
                 warn!(
@@ -3779,7 +4083,7 @@ mod tests {
             ),
             (
                 RESTORE_JOB,
-                restore_job_body(&user, &db, &resolve, url, false),
+                restore_job_body(&user, &db, &resolve, url, false, true),
                 RESTORE_PATH,
                 "_restore.job.sh",
             ),
@@ -4582,12 +4886,354 @@ mod tests {
     /// reconnect to its own database and get "permission denied" on all of it —
     /// data that looks lost. Pin that the flags are dropped exactly for the
     /// dedicated case and kept for every other schema.
+    /// A restore job a client is waiting on is probed early and then backs
+    /// off — never the flat 10s that rounded every restore up to the next
+    /// 10s mark.
+    #[test]
+    fn client_jobs_poll_fast_then_back_off() {
+        for job in [RESTORE_JOB, SCHEMA_COPY_JOB] {
+            let mut gaps = vec![job.poll_first];
+            for _ in 0..6 {
+                gaps.push(next_poll(*gaps.last().unwrap(), job.poll_max));
+            }
+            let ms: Vec<u128> = gaps.iter().map(|d| d.as_millis()).collect();
+            assert_eq!(ms, [250, 500, 1000, 2000, 2000, 2000, 2000], "{}", job.what);
+        }
+        // The dump keeps its slow cadence: no client waits on it.
+        assert_eq!(ARCHIVE_JOB.poll_first, ARCHIVE_POLL_INTERVAL);
+        assert_eq!(
+            next_poll(ARCHIVE_JOB.poll_first, ARCHIVE_JOB.poll_max),
+            ARCHIVE_POLL_INTERVAL
+        );
+    }
+
+    /// The restore probe carries the job's timing line in the same exec as the
+    /// sentinel, still without forking anything.
+    #[test]
+    fn restore_probe_reads_the_report_with_builtins_only() {
+        let dir = std::env::temp_dir().join(format!("pgfc-probe-report-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("empty-path")).unwrap();
+        let root = format!("{}/", dir.display());
+        let cmd = RESTORE_JOB.probe_command().replace("/workspace/", &root);
+        let run = || {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&cmd)
+                .env("PATH", dir.join("empty-path"))
+                .output()
+                .unwrap();
+            assert!(
+                out.stderr.is_empty(),
+                "probe must not shell out: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let done = dir.join("_restore.done");
+        let timing = dir.join("_restore.timing");
+
+        assert!(matches!(parse_probe(&run()), JobState::Running));
+        assert_eq!(parse_probe_report(&run()), None);
+        // Done, but from a job that left no report: still a success, no report.
+        std::fs::write(&done, "0").unwrap();
+        let out = run();
+        assert!(matches!(parse_probe(&out), JobState::Succeeded), "{out}");
+        assert_eq!(parse_probe_report(&out), None);
+        // Done with a report.
+        std::fs::write(&timing, "stream - 4321 87\n").unwrap();
+        let out = run();
+        assert!(matches!(parse_probe(&out), JobState::Succeeded), "{out}");
+        let report = RestoreReport::parse(&parse_probe_report(&out).unwrap()).unwrap();
+        assert_eq!(
+            report,
+            RestoreReport {
+                mode: "stream".into(),
+                download: None,
+                load: Some(Duration::from_millis(4321)),
+                finalize: Some(Duration::from_millis(87)),
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_report_rejects_garbage() {
+        for bad in [
+            "",
+            "stream",
+            "stream 1 2",
+            "turbo 1 2 3",
+            "file x 2 3",
+            "file 1 2 -3",
+        ] {
+            assert_eq!(RestoreReport::parse(bad), None, "{bad:?}");
+        }
+        let r = RestoreReport::parse("file_after_stream 10 20 -").unwrap();
+        assert_eq!(r.download, Some(Duration::from_millis(10)));
+        assert_eq!(r.finalize, None);
+    }
+
+    /// What one run of the real restore job body did, under stubs.
+    struct RestoreRun {
+        sentinel: String,
+        timing: String,
+        /// One line per stubbed command invocation: `<cmd> <args…>`.
+        calls: Vec<String>,
+        /// Whether `pg_restore` saw the restore-time tuning in place.
+        tuned_during_load: bool,
+        /// Whether the tuning file was left behind.
+        tuning_left: bool,
+    }
+
+    /// Run the real restore job body under a real `sh`. Every command it
+    /// calls is a stub steered by `env`:
+    /// `NPROC`; `CURL_CODE` (HTTP status), `CURL_EXIT`; `PGR_STREAM_EXIT` /
+    /// `PGR_FILE_EXIT` (pg_restore reading stdin / a file);
+    /// `PSQL_CHECKPOINT_EXIT`.
+    fn run_restore_job(tag: &str, fast_load: bool, env: &[(&str, &str)]) -> RestoreRun {
+        let dir =
+            std::env::temp_dir().join(format!("pgfc-restorejob-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let root = format!("{}/", dir.display());
+        let conf = format!("{root}run-pg-fc-restore.conf");
+        let body = restore_job_body(
+            &shell_squote("postgres"),
+            &shell_squote("s"),
+            "",
+            "https://x/y?X-Amz-Signature=ab&c=d",
+            false,
+            fast_load,
+        )
+        .replace(RESTORE_TUNING_CONF, &conf)
+        .replace("/workspace/", &root);
+        let log = format!("{root}calls");
+        let stubs = [
+            ("nproc", "#!/bin/sh\necho \"${NPROC:-1}\"\n".to_string()),
+            (
+                "curl",
+                format!(
+                    "#!/bin/sh\necho \"curl $*\" >> {log}\n\
+                     hdr=; out=; w=\n\
+                     while [ $# -gt 0 ]; do case \"$1\" in\n\
+                     -D) hdr=$2; shift ;; -o) out=$2; shift ;; -w) w=1 ;; esac; shift; done\n\
+                     [ -n \"$hdr\" ] && printf 'HTTP/1.1 %s OK\\r\\n\\r\\n' \"${{CURL_CODE:-200}}\" > \"$hdr\"\n\
+                     if [ \"$out\" = - ]; then printf PGDMP; elif [ -n \"$out\" ]; then printf PGDMP > \"$out\"; fi\n\
+                     [ -n \"$w\" ] && printf %s \"${{CURL_CODE:-200}}\"\n\
+                     exit \"${{CURL_EXIT:-0}}\"\n"
+                ),
+            ),
+            (
+                "pg_restore",
+                format!(
+                    "#!/bin/sh\necho \"pg_restore $*\" >> {log}\n\
+                     grep -q 'fsync = off' {conf} 2>/dev/null && touch {root}tuned\n\
+                     case \"$*\" in\n\
+                     *--single-transaction*) cat > /dev/null; exit \"${{PGR_STREAM_EXIT:-0}}\" ;;\n\
+                     *) exit \"${{PGR_FILE_EXIT:-0}}\" ;;\n\
+                     esac\n"
+                ),
+            ),
+            (
+                "psql",
+                format!(
+                    "#!/bin/sh\necho \"psql $*\" >> {log}\n\
+                     case \"$*\" in *CHECKPOINT*) exit \"${{PSQL_CHECKPOINT_EXIT:-0}}\" ;; esac\n\
+                     exit 0\n"
+                ),
+            ),
+            ("sync", "#!/bin/sh\nexit 0\n".to_string()),
+        ];
+        for (cmd, script) in stubs {
+            let p = dir.join("bin").join(cmd);
+            std::fs::write(&p, script).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(&body)
+            .env("PATH", format!("{}/bin:/usr/bin:/bin", dir.display()));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "job body itself must not error: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        let run = RestoreRun {
+            sentinel: read("_restore.done"),
+            timing: read("_restore.timing").trim().to_string(),
+            calls: read("calls").lines().map(str::to_string).collect(),
+            tuned_during_load: dir.join("tuned").exists(),
+            tuning_left: std::path::Path::new(&conf).exists(),
+        };
+        // Scratch never outlives the job, whatever happened.
+        for scratch in ["_restore.dump", "_restore.curl-ec", "_restore.hdr"] {
+            assert!(!dir.join(scratch).exists(), "{tag}: {scratch} left behind");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        run
+    }
+
+    fn restores(run: &RestoreRun) -> Vec<&String> {
+        run.calls
+            .iter()
+            .filter(|c| c.starts_with("pg_restore"))
+            .collect()
+    }
+
+    #[test]
+    fn a_one_core_guest_streams_the_dump_into_one_transaction() {
+        let run = run_restore_job("stream", true, &[("NPROC", "1")]);
+        assert_eq!(run.sentinel, "0");
+        let r = RestoreReport::parse(&run.timing).unwrap();
+        assert_eq!(r.mode, "stream");
+        assert_eq!(r.download, None, "a streamed load has no separate download");
+        assert!(r.load.is_some() && r.finalize.is_some(), "{}", run.timing);
+        let pgr = restores(&run);
+        assert_eq!(pgr.len(), 1, "{:?}", run.calls);
+        assert!(
+            pgr[0].contains("--single-transaction") && !pgr[0].contains(" -j "),
+            "{}",
+            pgr[0]
+        );
+        assert!(
+            pgr[0].contains("--clean --if-exists --no-owner --no-privileges"),
+            "{}",
+            pgr[0]
+        );
+        assert!(
+            run.calls
+                .iter()
+                .any(|c| c.starts_with("curl") && c.contains("-o -"))
+        );
+        // Tuned for the load, durable before the sentinel, nothing left behind.
+        assert!(run.tuned_during_load);
+        assert!(!run.tuning_left);
+        let psql: Vec<_> = run.calls.iter().filter(|c| c.starts_with("psql")).collect();
+        assert_eq!(psql.len(), 3, "reload, reload, checkpoint: {psql:?}");
+        assert!(psql[2].contains("CHECKPOINT"), "{psql:?}");
+    }
+
+    #[test]
+    fn a_multi_core_guest_keeps_the_parallel_file_restore() {
+        let run = run_restore_job("file", true, &[("NPROC", "4")]);
+        assert_eq!(run.sentinel, "0");
+        let r = RestoreReport::parse(&run.timing).unwrap();
+        assert_eq!(r.mode, "file");
+        assert!(r.download.is_some() && r.load.is_some());
+        let pgr = restores(&run);
+        assert_eq!(pgr.len(), 1);
+        assert!(
+            pgr[0].contains("-j 4") && !pgr[0].contains("--single-transaction"),
+            "{}",
+            pgr[0]
+        );
+        assert!(run.tuned_during_load && !run.tuning_left);
+    }
+
+    /// A stream S3 answered 2xx but `pg_restore` refused (the non-seekable
+    /// input case) is retried once from a downloaded file.
+    #[test]
+    fn a_failed_stream_falls_back_to_a_file_restore() {
+        let run = run_restore_job("fallback", true, &[("PGR_STREAM_EXIT", "1")]);
+        assert_eq!(run.sentinel, "0", "{:?}", run.calls);
+        assert!(
+            run.timing.starts_with("file_after_stream "),
+            "{}",
+            run.timing
+        );
+        let pgr = restores(&run);
+        assert_eq!(pgr.len(), 2, "{:?}", run.calls);
+        assert!(pgr[1].contains("-j 1"), "{}", pgr[1]);
+        assert!(!run.tuning_left);
+
+        // Both attempts failing is a failed restore, and still untuned after.
+        let run = run_restore_job(
+            "fallback-fails",
+            true,
+            &[("PGR_STREAM_EXIT", "1"), ("PGR_FILE_EXIT", "1")],
+        );
+        assert_ne!(run.sentinel, "0");
+        assert!(!run.tuning_left);
+        assert!(
+            !run.calls.iter().any(|c| c.contains("CHECKPOINT")),
+            "a failed restore is never checkpointed as if served: {:?}",
+            run.calls
+        );
+    }
+
+    /// curl dying mid-stream must decide the attempt even when `pg_restore`
+    /// happens to accept what arrived — POSIX sh has no pipefail.
+    #[test]
+    fn a_download_that_dies_mid_stream_is_not_a_restore() {
+        // The file retry succeeds once the network does... here it never
+        // does, so the restore fails.
+        let run = run_restore_job("curl-dies", true, &[("CURL_EXIT", "56")]);
+        assert_ne!(run.sentinel, "0", "{:?}", run.calls);
+        assert_eq!(
+            restores(&run).len(),
+            1,
+            "the file retry never loads a failed download"
+        );
+    }
+
+    /// A redirect or rejection is a failed restore with no retry: the second
+    /// GET would get the same answer.
+    #[test]
+    fn a_rejected_stream_is_not_retried() {
+        for code in ["301", "403"] {
+            let run = run_restore_job(
+                &format!("rejected-{code}"),
+                true,
+                &[("CURL_CODE", code), ("PGR_STREAM_EXIT", "1")],
+            );
+            assert_ne!(run.sentinel, "0", "HTTP {code}");
+            assert_eq!(restores(&run).len(), 1, "HTTP {code}: {:?}", run.calls);
+            assert!(run.timing.starts_with("stream "), "{}", run.timing);
+        }
+        // Even when pg_restore "succeeds" on the error body, the status wins.
+        let run = run_restore_job("rejected-200-restore", true, &[("CURL_CODE", "301")]);
+        assert_ne!(run.sentinel, "0");
+    }
+
+    #[test]
+    fn a_failed_checkpoint_is_a_failed_restore() {
+        let run = run_restore_job("checkpoint", true, &[("PSQL_CHECKPOINT_EXIT", "2")]);
+        assert_eq!(run.sentinel, "2");
+        assert!(!run.tuning_left);
+    }
+
+    #[test]
+    fn fast_load_off_leaves_durability_alone() {
+        let run = run_restore_job("untuned", false, &[]);
+        assert_eq!(run.sentinel, "0");
+        assert!(!run.tuned_during_load);
+        assert!(
+            !run.calls.iter().any(|c| c.starts_with("psql")),
+            "{:?}",
+            run.calls
+        );
+        assert!(
+            run.timing.ends_with(" -"),
+            "no finalize phase: {}",
+            run.timing
+        );
+    }
+
     #[test]
     fn restore_keeps_ownership_only_for_a_dedicated_database() {
-        let shared = restore_job_body("postgres", "tenant1", "", "http://x/y", false);
+        let shared = restore_job_body("postgres", "tenant1", "", "http://x/y", false, true);
         assert!(shared.contains("--no-owner --no-privileges"), "{shared}");
 
-        let dedicated = restore_job_body("postgres", "beta", "", "http://x/y", true);
+        let dedicated = restore_job_body("postgres", "beta", "", "http://x/y", true, true);
         assert!(!dedicated.contains("--no-owner"), "{dedicated}");
         assert!(!dedicated.contains("--no-privileges"), "{dedicated}");
         // Everything else about the invocation is unchanged — notably the
@@ -4750,7 +5396,9 @@ pub(crate) async fn copy_schema_from_primary(
         Some(env),
     )
     .await?;
-    await_detached_job(cfg, sandbox, schema, job).await
+    await_detached_job(cfg, sandbox, schema, job)
+        .await
+        .map(|_| ())
 }
 
 /// The durable per-VM replication marker `init.sh` reads to decide this

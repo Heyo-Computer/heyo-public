@@ -993,8 +993,8 @@ pub(crate) async fn materialize_from_image(
     let http = reqwest::Client::builder()
         .build()
         .context("building HTTP client for the image download")?;
-    let expect_len = match s3.head_object(&http, &key, HEAD_TIMEOUT).await? {
-        Some(id) if id.content_length >= MIN_IMAGE_BYTES => id.content_length,
+    let object = match s3.head_object(&http, &key, HEAD_TIMEOUT).await? {
+        Some(id) if id.content_length >= MIN_IMAGE_BYTES => id,
         Some(id) => bail!(
             "schema {schema}: the image at s3://{}/{key} is only {} bytes — it is not a \
              filesystem image and cannot be restored",
@@ -1015,16 +1015,17 @@ pub(crate) async fn materialize_from_image(
     tokio::fs::create_dir_all(&scratch)
         .await
         .with_context(|| format!("creating restore scratch dir {}", scratch.display()))?;
-    let zst = scratch.join(format!("{schema}.img.zst"));
+    let expect_len = object.content_length;
     let raw = scratch.join(format!("{schema}.ext4"));
 
     // Mirror of the archive side's spool precheck: a restore transiently
-    // holds the compressed download, the decompressed raw image, AND the
-    // in-place copy onto the new VM's disk — all on the run-dir filesystem.
-    // The raw/copy sizes aren't knowable before the decompress (sparse), so
-    // this gates only the download; `swap_and_boot`'s copy is gated exactly,
-    // below. Refusing here beats driving the VM filesystem to 0% mid-restore,
-    // which is precisely the incident emergency-drain.sh exists for.
+    // holds the decompressed raw image AND the in-place copy onto the new VM's
+    // disk — both on the run-dir filesystem. (The compressed download is
+    // decompressed as it streams in and never lands.) The raw/copy sizes
+    // aren't knowable before the decompress (sparse), so this is only a sanity
+    // floor; `swap_and_boot`'s copy is gated exactly, below. Refusing here
+    // beats driving the VM filesystem to 0% mid-restore, which is precisely
+    // the incident emergency-drain.sh exists for.
     if let Some(free) = free_bytes(&scratch).await
         && free < expect_len * 2
     {
@@ -1038,10 +1039,18 @@ pub(crate) async fn materialize_from_image(
     }
 
     let res = materialize_inner(
-        cfg, schema, s3, &key, &http, expect_len, &zst, &raw, spares, pinned,
+        cfg,
+        schema,
+        s3,
+        &key,
+        &http,
+        expect_len,
+        &object.etag,
+        &raw,
+        spares,
+        pinned,
     )
     .await;
-    let _ = tokio::fs::remove_file(&zst).await;
     let _ = tokio::fs::remove_file(&raw).await;
     res
 }
@@ -1101,7 +1110,16 @@ pub(crate) async fn materialize_from_local_image(
             crate::orphans::human_iec(len),
         );
     }
-    let res = adopt_zst_image(cfg, schema, src, &raw, spares, pinned).await;
+    let res = async {
+        let started = std::time::Instant::now();
+        decompress(src, &raw).await?;
+        crate::events::record_timing(
+            crate::events::Timing::RestoreImageDecompress,
+            started.elapsed(),
+        );
+        adopt_raw_image(cfg, schema, &raw, spares, pinned).await
+    }
+    .await;
     let _ = tokio::fs::remove_file(&raw).await;
     res
 }
@@ -1114,7 +1132,7 @@ async fn materialize_inner(
     key: &str,
     http: &reqwest::Client,
     expect_len: u64,
-    zst: &Path,
+    etag: &str,
     raw: &Path,
     spares: crate::vm::Spares<'_>,
     // Whether this schema's VM must never be idle-stopped (a keepalive schema,
@@ -1124,7 +1142,7 @@ async fn materialize_inner(
     pinned: bool,
 ) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     let started = std::time::Instant::now();
-    let downloaded = download(s3, http, key, expect_len, zst).await;
+    let downloaded = download_decompress(s3, http, key, expect_len, etag, raw).await;
     // Recorded before the `?`: a download that lands and is then wasted by a
     // failed adoption still moved the bytes, and that is exactly the restore
     // worth seeing in the network figures.
@@ -1132,28 +1150,27 @@ async fn materialize_inner(
         crate::events::record_timing(crate::events::Timing::RestoreS3Download, started.elapsed());
     }
     downloaded?;
-    adopt_zst_image(cfg, schema, zst, raw, spares, pinned).await
+    adopt_raw_image(cfg, schema, raw, spares, pinned).await
 }
 
-/// The shared tail of every image restore: decompress `zst` into `raw`,
-/// verify it is ext4, then run the readopt maneuver (a booted VM, disk swap,
-/// boot on the real data). Deletes nothing — each caller owns its files'
-/// lifecycles.
+/// The shared tail of every image restore, once the raw image is on the
+/// host: verify it is ext4, check and repair it, then run the readopt maneuver
+/// (a booted VM, disk swap, boot on the real data). Deletes nothing — each
+/// caller owns its files' lifecycles.
 ///
 /// Returns the VM together with where it came from, because the two origins
 /// must be *disposed of* differently on failure — see the dispatch below and
 /// [`crate::vm::claim_restore_vehicle`].
-async fn adopt_zst_image(
+async fn adopt_raw_image(
     cfg: &Config,
     schema: &str,
-    zst: &Path,
     raw: &Path,
     spares: crate::vm::Spares<'_>,
     // Whether this schema's VM must never be idle-stopped — see the callers.
     pinned: bool,
 ) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     let started = std::time::Instant::now();
-    let adopted = adopt_zst_image_inner(cfg, schema, zst, raw, spares, pinned).await;
+    let adopted = adopt_raw_image_inner(cfg, schema, raw, spares, pinned).await;
     // Success only: a failed adoption is bounded by whichever step gave up,
     // not by what the work costs — the same reason `VmCreate` counts only
     // creates that finished.
@@ -1163,23 +1180,17 @@ async fn adopt_zst_image(
     adopted
 }
 
-async fn adopt_zst_image_inner(
+async fn adopt_raw_image_inner(
     cfg: &Config,
     schema: &str,
-    zst: &Path,
     raw: &Path,
     spares: crate::vm::Spares<'_>,
     pinned: bool,
 ) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
-    run_ok(
-        Command::new("zstd").args(["-q", "-d", "-f", "--sparse", "-o"]).arg(raw).arg(zst),
-        "decompressing the disk image (is zstd installed?)",
-        ZSTD_TIMEOUT,
-    )
-    .await?;
     check_ext4_magic(raw)
         .await
         .with_context(|| format!("schema {schema}: downloaded image is not an ext4 filesystem"))?;
+    let fsck_started = std::time::Instant::now();
     // Check, then repair if needed. A dirty journal is expected — the
     // archive-time stop is an unclean power-off — and on its own the guest
     // would replay it at boot. But findings here also cover real corruption
@@ -1235,8 +1246,32 @@ async fn adopt_zst_image_inner(
             health.summary()
         );
     }
+    crate::events::record_timing(
+        crate::events::Timing::RestoreImageFsck,
+        fsck_started.elapsed(),
+    );
     ensure_restore_headroom(cfg, schema, raw).await?;
 
+    let boot_started = std::time::Instant::now();
+    let booted = boot_on_image(cfg, schema, raw, spares, pinned).await;
+    if booted.is_ok() {
+        crate::events::record_timing(
+            crate::events::Timing::RestoreImageBoot,
+            boot_started.elapsed(),
+        );
+    }
+    booted
+}
+
+/// Boot a VM on a verified, repaired raw image: daemon adoption where the
+/// daemon supports it, the vehicle swap otherwise.
+async fn boot_on_image(
+    cfg: &Config,
+    schema: &str,
+    raw: &Path,
+    spares: crate::vm::Spares<'_>,
+    pinned: bool,
+) -> Result<(heyo_sdk::Sandbox, crate::vm::Provenance)> {
     // Fast path: hand the verified image to the daemon and let it build the VM
     // around it. No vehicle to borrow, so no stop, no wait for Firecracker to
     // release the disk, and no copy — the daemon renames the file into the new
@@ -1674,44 +1709,241 @@ async fn swap_and_boot(
     Ok(())
 }
 
-/// Stream the object to `dest` and require exactly the HEAD-reported length —
-/// a short body (dropped connection) must fail here, not at the ext4 check.
-async fn download(
+/// Size of one ranged GET in an image download. Small enough that
+/// [`restore_get_concurrency`] parts in flight stay a modest slice of pooler
+/// memory per restore (8 × 8MiB), large enough that per-request overhead is
+/// noise against the transfer.
+const DOWNLOAD_PART_SIZE: u64 = 8 * 1024 * 1024;
+
+/// Attempts per ranged GET. A part that fails transiently (a reset
+/// connection, a short body) is refetched rather than failing a restore that
+/// is otherwise most of the way there.
+const DOWNLOAD_PART_ATTEMPTS: u32 = 3;
+
+/// Wall-clock bound on one ranged GET attempt.
+const DOWNLOAD_PART_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How many ranged GETs an image download keeps in flight.
+/// `PG_VM_POOL_RESTORE_GET_CONCURRENCY` (1–32), default 8. One S3 connection
+/// tops out well below what a pooler host can take in, so the download is
+/// split; `1` restores the single-stream behaviour. Read lazily, the same way
+/// [`zstd_threads`] is.
+fn restore_get_concurrency() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("PG_VM_POOL_RESTORE_GET_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 32))
+            .unwrap_or(8)
+    })
+}
+
+/// The `[start, end]` (inclusive, as HTTP `Range` wants them) byte ranges
+/// that cover an object of `len` bytes in `part`-sized pieces.
+fn byte_ranges(len: u64, part: u64) -> Vec<(u64, u64)> {
+    (0..len.div_ceil(part))
+        .map(|i| (i * part, ((i + 1) * part).min(len) - 1))
+        .collect()
+}
+
+/// Fetch an S3 disk image and decompress it as it arrives: parallel ranged
+/// GETs, reassembled in order, piped into one `zstd -d --sparse` writing
+/// `raw`. The compressed object never lands on disk, and the decompress runs
+/// alongside the download instead of after it.
+///
+/// Every part carries `If-Match` with the ETag the caller's HEAD saw, so an
+/// object re-archived mid-download fails the restore (412) instead of
+/// splicing two archives into one image. zstd's frame checksum and the ext4
+/// magic check that follows cover the bytes themselves.
+async fn download_decompress(
     s3: &S3Config,
     http: &reqwest::Client,
     key: &str,
     expect_len: u64,
-    dest: &Path,
+    etag: &str,
+    raw: &Path,
 ) -> Result<()> {
+    download_decompress_with(
+        s3,
+        http,
+        key,
+        expect_len,
+        etag,
+        raw,
+        DOWNLOAD_PART_SIZE,
+        restore_get_concurrency(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_decompress_with(
+    s3: &S3Config,
+    http: &reqwest::Client,
+    key: &str,
+    expect_len: u64,
+    etag: &str,
+    raw: &Path,
+    part_size: u64,
+    concurrency: usize,
+) -> Result<()> {
+    use futures::{StreamExt, TryStreamExt};
     use tokio::io::AsyncWriteExt;
+
     let url = s3.presign_get(key, PRESIGN_TTL);
-    let mut resp = http
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET s3://{}/{key}", s3.bucket))?;
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "GET s3://{}/{key} returned {}",
-        s3.bucket,
-        resp.status()
-    );
-    let mut f = tokio::fs::File::create(dest)
-        .await
-        .with_context(|| format!("creating {}", dest.display()))?;
-    let mut written = 0u64;
-    while let Some(chunk) = resp.chunk().await.context("reading the image download")? {
-        f.write_all(&chunk).await.context("writing the image download")?;
-        written += chunk.len() as u64;
+    let mut zstd = Command::new("zstd")
+        .args(["-q", "-d", "-f", "--sparse", "-o"])
+        .arg(raw)
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawning zstd to decompress the image download (is zstd installed?)")?;
+    let mut stdin = zstd.stdin.take().context("zstd stdin")?;
+
+    let pump = async {
+        let mut parts = futures::stream::iter(byte_ranges(expect_len, part_size))
+            .map(|(start, end)| fetch_range(s3, http, &url, key, start, end, etag))
+            .buffered(concurrency);
+        let mut written = 0u64;
+        while let Some(part) = parts.try_next().await? {
+            stdin
+                .write_all(&part)
+                .await
+                .context("feeding the image download to zstd")?;
+            written += part.len() as u64;
+        }
+        stdin.shutdown().await.context("closing zstd's input")?;
+        drop(stdin);
+        anyhow::ensure!(
+            written == expect_len,
+            "downloaded {written} bytes of s3://{}/{key} but the object is {expect_len} — \
+             truncated transfer",
+            s3.bucket
+        );
+        Ok::<_, anyhow::Error>(())
+    };
+    let pumped = match tokio::time::timeout(ZSTD_TIMEOUT, pump).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!(
+            "the image download did not finish within {ZSTD_TIMEOUT:?}"
+        )),
+    };
+    if let Err(e) = pumped {
+        // zstd may be the reason (a corrupt frame closes its stdin under us);
+        // its own words are the better error when it has any.
+        let _ = zstd.start_kill();
+        let out = tokio::time::timeout(Duration::from_secs(10), zstd.wait_with_output()).await;
+        let why = match out {
+            Ok(Ok(o)) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            _ => String::new(),
+        };
+        let _ = tokio::fs::remove_file(raw).await;
+        return Err(if why.is_empty() {
+            e
+        } else {
+            e.context(format!("zstd: {why}"))
+        });
     }
-    f.flush().await.context("flushing the image download")?;
-    anyhow::ensure!(
-        written == expect_len,
-        "downloaded {written} bytes of s3://{}/{key} but the object is {expect_len} — \
-         truncated transfer",
-        s3.bucket
-    );
+    let out = tokio::time::timeout(ZSTD_TIMEOUT, zstd.wait_with_output())
+        .await
+        .context("zstd did not finish decompressing the image")?
+        .context("waiting for zstd")?;
+    if !out.status.success() {
+        let _ = tokio::fs::remove_file(raw).await;
+        bail!(
+            "decompressing the image download failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
     Ok(())
+}
+
+/// One ranged GET, retried on transient failure. A 412 (the object changed
+/// since the HEAD), 403 or 404 is permanent and fails at once.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_range(
+    s3: &S3Config,
+    http: &reqwest::Client,
+    url: &str,
+    key: &str,
+    start: u64,
+    end: u64,
+    etag: &str,
+) -> Result<Vec<u8>> {
+    let want = end - start + 1;
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 1..=DOWNLOAD_PART_ATTEMPTS {
+        let mut req = http
+            .get(url)
+            .timeout(DOWNLOAD_PART_TIMEOUT)
+            .header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
+        if !etag.is_empty() {
+            req = req.header(reqwest::header::IF_MATCH, etag);
+        }
+        let what = || format!("GET s3://{}/{key} bytes {start}-{end}", s3.bucket);
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if matches!(status.as_u16(), 403 | 404 | 412) {
+                    bail!(
+                        "{} returned {status}{}",
+                        what(),
+                        if status.as_u16() == 412 {
+                            " — the archive was replaced while it was being restored"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                // 206 for a range; a 200 is only acceptable when it is the
+                // whole object (a store that ignores Range on a one-part read).
+                let whole = start == 0 && status == reqwest::StatusCode::OK;
+                if status != reqwest::StatusCode::PARTIAL_CONTENT && !whole {
+                    last = Some(anyhow::anyhow!("{} returned {status}", what()));
+                } else {
+                    match resp.bytes().await {
+                        Ok(b) if b.len() as u64 == want => return Ok(b.to_vec()),
+                        Ok(b) => {
+                            last = Some(anyhow::anyhow!(
+                                "{} returned {} bytes, expected {want}",
+                                what(),
+                                b.len()
+                            ))
+                        }
+                        Err(e) => last = Some(anyhow::Error::from(e).context(what())),
+                    }
+                }
+            }
+            Err(e) => last = Some(anyhow::Error::from(e).context(what())),
+        }
+        if attempt < DOWNLOAD_PART_ATTEMPTS {
+            warn!(
+                "{} failed (attempt {attempt}/{DOWNLOAD_PART_ATTEMPTS}), retrying: {:#}",
+                what(),
+                last.as_ref().expect("set on every failed attempt")
+            );
+            tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
+        }
+    }
+    Err(last.expect("at least one attempt ran"))
+}
+
+/// Decompress a local compacted image into `raw`.
+async fn decompress(zst: &Path, raw: &Path) -> Result<()> {
+    run_ok(
+        Command::new("zstd")
+            .args(["-q", "-d", "-f", "--sparse", "-o"])
+            .arg(raw)
+            .arg(zst),
+        "decompressing the disk image (is zstd installed?)",
+        ZSTD_TIMEOUT,
+    )
+    .await
 }
 
 /// Wait until nothing on the host holds the disk file open. The fd scan is
@@ -2554,6 +2786,233 @@ Block size:               4096
         assert!(compact_via_tmp("b", &bogus, &tmp2, &dest2, None).await.is_err());
         assert!(!dest2.exists(), "unverified image must not land");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ranged-GET S3 stand-in for the image download: serves one object,
+    /// honours `Range` and `If-Match`, and can be told to replace the object
+    /// (new ETag) after some number of GETs, or to short one range once.
+    struct GetStub {
+        data: Vec<u8>,
+        etag: String,
+        gets: usize,
+        replace_after: Option<usize>,
+        short_once: Option<u64>,
+        ranges_seen: Vec<String>,
+    }
+
+    async fn spawn_get_stub(state: Arc<Mutex<GetStub>>) -> String {
+        use axum::extract::State;
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route(
+                "/{*path}",
+                get(
+                    |State(st): State<Arc<Mutex<GetStub>>>, headers: axum::http::HeaderMap| async move {
+                        let mut st = st.lock().unwrap();
+                        st.gets += 1;
+                        if st.replace_after.is_some_and(|n| st.gets > n) {
+                            st.etag = "\"replaced\"".into();
+                        }
+                        let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
+                        if let Some(m) = h("if-match")
+                            && m != st.etag
+                        {
+                            return axum::http::Response::builder()
+                                .status(412)
+                                .body(axum::body::Body::empty())
+                                .unwrap();
+                        }
+                        let range = h("range").expect("every image GET is ranged");
+                        st.ranges_seen.push(range.clone());
+                        let (a, b) = range
+                            .strip_prefix("bytes=")
+                            .and_then(|r| r.split_once('-'))
+                            .map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()))
+                            .unwrap();
+                        let mut body = st.data[a..=b.min(st.data.len() - 1)].to_vec();
+                        if st.short_once == Some(a as u64) {
+                            st.short_once = None;
+                            body.truncate(body.len() / 2);
+                        }
+                        axum::http::Response::builder()
+                            .status(206)
+                            .body(axum::body::Body::from(body))
+                            .unwrap()
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn byte_ranges_tile_the_object_exactly() {
+        assert_eq!(byte_ranges(10, 4), vec![(0, 3), (4, 7), (8, 9)]);
+        assert_eq!(byte_ranges(8, 4), vec![(0, 3), (4, 7)]);
+        assert_eq!(byte_ranges(1, 4), vec![(0, 0)]);
+        assert!(byte_ranges(0, 4).is_empty());
+    }
+
+    /// Compress a small sparse "disk" with the real zstd and return
+    /// (original, compressed), or `None` when zstd isn't installed.
+    async fn compressed_fixture(tag: &str) -> Option<(Vec<u8>, Vec<u8>, PathBuf)> {
+        if run(
+            Command::new("zstd").arg("--version"),
+            Duration::from_secs(10),
+        )
+        .await
+        .is_err()
+        {
+            eprintln!("skipping: zstd not installed");
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!("imgarchive-dl-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Incompressible-ish bytes with a long zero run in the middle, so the
+        // compressed object spans many small parts and the output has a hole.
+        let mut original: Vec<u8> = (0..200_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        original.extend(std::iter::repeat_n(0u8, 300_000));
+        original.extend((0..100_000u32).map(|i| (i.wrapping_mul(40_503) >> 7) as u8));
+        let src = dir.join("disk");
+        std::fs::write(&src, &original).unwrap();
+        let zst = dir.join("disk.zst");
+        run_ok(
+            Command::new("zstd")
+                .args(["-q", "-f", "-3", "-o"])
+                .arg(&zst)
+                .arg(&src),
+            "compress fixture",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        Some((original, std::fs::read(&zst).unwrap(), dir))
+    }
+
+    #[tokio::test]
+    async fn a_parallel_ranged_download_decompresses_to_the_original() {
+        let Some((original, compressed, dir)) = compressed_fixture("ok").await else {
+            return;
+        };
+        let len = compressed.len() as u64;
+        let state = Arc::new(Mutex::new(GetStub {
+            data: compressed,
+            etag: "\"v1\"".into(),
+            gets: 0,
+            replace_after: None,
+            short_once: Some(4096),
+            ranges_seen: Vec::new(),
+        }));
+        let s3 = stub_s3(spawn_get_stub(state.clone()).await);
+        let raw = dir.join("restored.ext4");
+        download_decompress_with(
+            &s3,
+            &reqwest::Client::new(),
+            "pg-vm-pool/s.img.zst",
+            len,
+            "\"v1\"",
+            &raw,
+            4096,
+            4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&raw).unwrap(), original);
+        let st = state.lock().unwrap();
+        let parts = len.div_ceil(4096) as usize;
+        assert!(
+            parts > 4,
+            "the fixture must span more parts than are in flight"
+        );
+        // Every part once, plus the one retry of the shorted part.
+        assert_eq!(st.ranges_seen.len(), parts + 1, "{:?}", st.ranges_seen);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An archive replaced mid-restore fails the download instead of
+    /// stitching two objects into one image.
+    #[tokio::test]
+    async fn an_archive_replaced_mid_download_fails_cleanly() {
+        let Some((_, compressed, dir)) = compressed_fixture("412").await else {
+            return;
+        };
+        let len = compressed.len() as u64;
+        let state = Arc::new(Mutex::new(GetStub {
+            data: compressed,
+            etag: "\"v1\"".into(),
+            gets: 0,
+            replace_after: Some(3),
+            short_once: None,
+            ranges_seen: Vec::new(),
+        }));
+        let s3 = stub_s3(spawn_get_stub(state.clone()).await);
+        let raw = dir.join("restored.ext4");
+        let err = download_decompress_with(
+            &s3,
+            &reqwest::Client::new(),
+            "pg-vm-pool/s.img.zst",
+            len,
+            "\"v1\"",
+            &raw,
+            4096,
+            2,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("replaced while it was being restored"),
+            "{err:#}"
+        );
+        assert!(
+            !raw.exists(),
+            "a failed download leaves no half-written image"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bytes that are not a zstd stream fail with zstd's own diagnosis.
+    #[tokio::test]
+    async fn a_corrupt_download_fails_in_zstd() {
+        let Some((_, mut compressed, dir)) = compressed_fixture("corrupt").await else {
+            return;
+        };
+        for b in compressed.iter_mut().skip(100).take(2000) {
+            *b ^= 0x5a;
+        }
+        let len = compressed.len() as u64;
+        let state = Arc::new(Mutex::new(GetStub {
+            data: compressed,
+            etag: "\"v1\"".into(),
+            gets: 0,
+            replace_after: None,
+            short_once: None,
+            ranges_seen: Vec::new(),
+        }));
+        let s3 = stub_s3(spawn_get_stub(state).await);
+        let raw = dir.join("restored.ext4");
+        let res = download_decompress_with(
+            &s3,
+            &reqwest::Client::new(),
+            "pg-vm-pool/s.img.zst",
+            len,
+            "\"v1\"",
+            &raw,
+            4096,
+            4,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "corrupt bytes must not decompress into an image"
+        );
+        assert!(!raw.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
