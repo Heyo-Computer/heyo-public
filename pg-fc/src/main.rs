@@ -249,11 +249,15 @@ async fn handle_conn(
             anyhow::bail!("refused {}@{}: {reason}", info.user, info.database);
         }
     };
+    // The bytes replayed upstream: the client's own StartupMessage plus the
+    // pooler's session defaults. Built before writer routing so a session
+    // forwarded to a peer carries the same defaults as a local one.
+    let startup_raw = client_startup(&registry, &info);
     if writer_routing::is_routable_tenant(&registry, &info, &schema) {
         match writer_routing::route(&registry, &schema)? {
             writer_routing::Route::Local => {}
             writer_routing::Route::Peer { peer, claim } => {
-                return writer_routing::forward(client, &info.raw, peer, claim).await;
+                return writer_routing::forward(client, &startup_raw, peer, claim).await;
             }
             writer_routing::Route::Unavailable(reason) => {
                 auth::send_fatal(&mut client, auth::SQLSTATE_INSUFFICIENT_PRIVILEGE, reason).await?;
@@ -302,7 +306,58 @@ async fn handle_conn(
             return Err(e);
         }
     };
-    proxy::splice(client, guard.entry(), &info.raw).await
+    proxy::splice(client, guard.entry(), &startup_raw).await
+}
+
+/// The StartupMessage to replay to the guest for this client: verbatim, plus
+/// the session-default `statement_timeout` (see
+/// [`config::Config::client_statement_timeout`]) for ordinary client sessions.
+///
+/// Why here and not in the guest's `postgresql.conf`: clients and the pooler
+/// log in as the same role (`PG_VM_POOL_USER`, `postgres` by default), so
+/// neither the server config nor `ALTER ROLE … SET` can tell them apart, and a
+/// cluster-wide default would cap every maintenance path (CREATE DATABASE,
+/// CHECKPOINT before a stop, restores, `pg_dump` for freeze/archive, schema
+/// copy, subscription setup) unless each remembered to opt out. Only client
+/// sessions pass through this function, so nothing internal can inherit it,
+/// and it takes effect on every VM at the next connection rather than the next
+/// boot.
+///
+/// Replication sessions are left alone: a subscription's initial table sync
+/// is a long `COPY` on a `replication=database` connection, and a replication
+/// login's other sessions (the replica's schema-copy `pg_dump`) belong to the
+/// pooler's own machinery. Best-effort: a packet that cannot be rewritten is
+/// replayed as-is rather than refused.
+fn client_startup<'a>(
+    registry: &SchemaRegistry,
+    info: &'a startup::StartupInfo,
+) -> std::borrow::Cow<'a, [u8]> {
+    let Some(timeout) = registry.cfg().client_statement_timeout else {
+        return info.raw.as_slice().into();
+    };
+    if info.replication_requested
+        || registry.replication().by_repl_role(&info.user).is_some()
+        || registry
+            .physical_sources()
+            .by_repl_role(&info.user)
+            .is_some()
+    {
+        return info.raw.as_slice().into();
+    }
+    let setting = format!(
+        "statement_timeout={}",
+        timeout.as_millis().min(i32::MAX as u128)
+    );
+    match startup::with_default_option(&info.raw, &setting) {
+        Ok(raw) => raw.into(),
+        Err(e) => {
+            warn!(
+                "replaying {}@{}'s startup without session defaults: {e:#}",
+                info.user, info.database
+            );
+            info.raw.as_slice().into()
+        }
+    }
 }
 
 /// Raise this process's open-files soft limit to its hard limit.

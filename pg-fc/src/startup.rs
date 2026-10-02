@@ -174,6 +174,79 @@ pub(crate) fn parse_forwarded(raw: &[u8]) -> Result<StartupInfo> {
     parse_startup_message(&len, body)
 }
 
+/// Return the v3 StartupMessage `raw` with `-c {setting}` prepended to its
+/// `options` parameter, adding the parameter when the client sent none.
+///
+/// This is how the pooler gives client sessions a default without touching
+/// the guest's config (which its own maintenance connections share). The
+/// precedence is the client's: Postgres applies `options` left to right, so a
+/// `-c` the client put there itself overrides ours, and it applies ordinary
+/// startup parameters (e.g. a bare `statement_timeout`) after `options`, so
+/// those override it too. The rest of the packet is copied byte for byte, in
+/// order. `setting` must be a single `name=value` token: `options` is split on
+/// whitespace and backslash is its escape character.
+pub(crate) fn with_default_option(raw: &[u8], setting: &str) -> Result<Vec<u8>> {
+    if setting.is_empty()
+        || setting
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b == b'\\' || b == 0)
+    {
+        bail!("default option must be one unescaped token");
+    }
+    if raw.len() < 9 || i32::from_be_bytes(raw[..4].try_into().unwrap()) as usize != raw.len() {
+        bail!("startup packet framing mismatch");
+    }
+    if i32::from_be_bytes(raw[4..8].try_into().unwrap()) != PROTOCOL_V3 {
+        bail!("not a PostgreSQL v3 startup packet");
+    }
+    let ours = format!("-c {setting}");
+    let mut out = Vec::with_capacity(raw.len() + ours.len() + 16);
+    out.extend_from_slice(&[0; 4]); // the length, patched below
+    out.extend_from_slice(&raw[4..8]);
+    let mut params = &raw[8..];
+    let mut merged = false;
+    loop {
+        let end = params
+            .iter()
+            .position(|b| *b == 0)
+            .context("unterminated startup key")?;
+        let key = &params[..end];
+        params = &params[end + 1..];
+        if key.is_empty() {
+            break; // the list terminator
+        }
+        let end = params
+            .iter()
+            .position(|b| *b == 0)
+            .context("unterminated startup value")?;
+        let value = &params[..end];
+        params = &params[end + 1..];
+        out.extend_from_slice(key);
+        out.push(0);
+        if key == b"options" && !merged {
+            out.extend_from_slice(ours.as_bytes());
+            if !value.is_empty() {
+                out.push(b' ');
+            }
+            merged = true;
+        }
+        out.extend_from_slice(value);
+        out.push(0);
+    }
+    if !params.is_empty() {
+        bail!("trailing bytes after startup parameters");
+    }
+    if !merged {
+        out.extend_from_slice(b"options\0");
+        out.extend_from_slice(ours.as_bytes());
+        out.push(0);
+    }
+    out.push(0);
+    let len = i32::try_from(out.len()).context("startup packet too large")?;
+    out[..4].copy_from_slice(&len.to_be_bytes());
+    Ok(out)
+}
+
 /// Parameters are a flat `key\0value\0...\0` list terminated by an extra `\0`.
 fn parse_params(bytes: &[u8]) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -229,6 +302,71 @@ mod tests {
         assert!(parse_forwarded(&trailing).is_err());
         let mut wrong = raw; wrong[4..8].copy_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
         assert!(parse_forwarded(&wrong).is_err());
+    }
+
+    fn startup(params: &[u8]) -> Vec<u8> {
+        let mut raw = ((8 + params.len()) as i32).to_be_bytes().to_vec();
+        raw.extend_from_slice(&PROTOCOL_V3.to_be_bytes());
+        raw.extend_from_slice(params);
+        raw
+    }
+
+    #[test]
+    fn default_option_is_added_when_the_client_sent_no_options() {
+        let raw = startup(b"user\0alice\0database\0acme\0\0");
+        let out = with_default_option(&raw, "statement_timeout=120000").unwrap();
+        assert_eq!(
+            out,
+            startup(b"user\0alice\0database\0acme\0options\0-c statement_timeout=120000\0\0")
+        );
+        // Still a well-formed, unambiguous startup the rest of the pipeline accepts.
+        let info = parse_forwarded(&out).unwrap();
+        assert_eq!(
+            (info.user.as_str(), info.database.as_str()),
+            ("alice", "acme")
+        );
+        assert_eq!(
+            parse_params(&out[8..])["options"],
+            "-c statement_timeout=120000"
+        );
+    }
+
+    #[test]
+    fn default_option_goes_ahead_of_the_clients_own_options() {
+        // Prepended, so a client's own `-c statement_timeout` (later wins) and
+        // a bare startup parameter (applied after options) both still win.
+        let raw = startup(
+            b"user\0alice\0options\0-c statement_timeout=0 -c search_path=x\0statement_timeout\05s\0\0",
+        );
+        let out = with_default_option(&raw, "statement_timeout=120000").unwrap();
+        assert_eq!(
+            out,
+            startup(
+                b"user\0alice\0options\0-c statement_timeout=120000 -c statement_timeout=0 \
+                  -c search_path=x\0statement_timeout\05s\0\0"
+            )
+        );
+        let empty = startup(b"user\0alice\0options\0\0\0");
+        assert_eq!(
+            with_default_option(&empty, "statement_timeout=1").unwrap(),
+            startup(b"user\0alice\0options\0-c statement_timeout=1\0\0")
+        );
+    }
+
+    #[test]
+    fn default_option_rejects_bad_packets_and_unsafe_settings() {
+        let raw = startup(b"user\0alice\0\0");
+        for bad in ["", "a b", "a\\b"] {
+            assert!(with_default_option(&raw, bad).is_err(), "{bad:?}");
+        }
+        let mut wrong_len = raw.clone();
+        wrong_len.push(0);
+        assert!(with_default_option(&wrong_len, "x=1").is_err());
+        assert!(with_default_option(&startup(b"user\0alice\0"), "x=1").is_err());
+        assert!(with_default_option(&startup(b"user\0alice\0\0junk"), "x=1").is_err());
+        let mut ssl = raw;
+        ssl[4..8].copy_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+        assert!(with_default_option(&ssl, "x=1").is_err());
     }
 
     #[test]
