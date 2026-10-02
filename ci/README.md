@@ -1789,7 +1789,9 @@ deployments with `needs`; a failed regional job then prevents the next one.
 
 Validation workflows in a coordinated submission cannot contain merge or deploy
 actions. `--only`, explicit workflow selections, and individual reruns are
-validation-only and cannot publish or deploy. The submit client computes changed
+validation-only and cannot publish or deploy: the `on: release` workflow is not
+planned for them at all, so its jobs' placement (a host pinned in a network this
+instance does not serve, say) cannot refuse the submit. The submit client computes changed
 paths across the full trunk-to-feature diff, including earlier feature commits.
 For a failed deployment of an already-merged revision, reconcile its remote
 operation first, then use a full `git submit --submit-empty --ref <revision>`.

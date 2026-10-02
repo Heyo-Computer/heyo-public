@@ -248,7 +248,15 @@ impl Dispatcher {
         // submitted tree. Resolve every target before admitting any run.
         let release_policy = crate::release_policy::select(self.config.release_policies.as_deref(), &repo_url)
             .map_err(|e| DispatchError::Workflow(e.to_string()))?;
-        let operator_plan = match &release_policy {
+        // A partial submit (`--only`, a named workflow object, a rerun) never
+        // authorizes merge or deployment, so its release workflow is not planned
+        // at all. Planning it only to discard it meant its placement still had
+        // to resolve: a release job pinned to a network this instance does not
+        // serve refused `git submit --only <build>` outright.
+        let partial = req.only.iter().any(|s| !s.trim().is_empty())
+            || req.workflow_id.is_some()
+            || req.rerun.is_some();
+        let operator_plan = match release_policy.as_ref().filter(|_| !partial) {
             Some(policy) => Some(crate::release_policy::prepare(self, &repo_url, policy).await
                 .map_err(|e| DispatchError::Workflow(e.to_string()))?),
             None => None,
@@ -327,6 +335,7 @@ impl Dispatcher {
         let mut run_ids = Vec::new();
         let mut planned = Vec::new();
         let mut release_run_id = None;
+        let mut release_skipped = false;
         let mut patterns_tried = Vec::new();
         // `--only` bookkeeping: which selectors found a workflow file at all.
         // Checked across every source, after the loop — a selector that matched
@@ -375,6 +384,10 @@ impl Dispatcher {
                     return Err(DispatchError::Workflow(format!(
                         "{path}: release must be a coordinator-only trigger"
                     )));
+                }
+                if is_release && partial {
+                    release_skipped = true;
+                    continue;
                 }
                 // `--only`: the submit names the workflow files it wants, and
                 // every other file is left alone — not "declined", not warned
@@ -550,7 +563,9 @@ impl Dispatcher {
                 patterns_tried.join(", "),
             )));
         }
-        if release_run_id.is_some() {
+        // A repository with a release workflow keeps publication there, whether
+        // or not this submit planned it.
+        if release_run_id.is_some() || release_skipped {
             for (id, _, plan) in &planned {
                 if Some(id) != release_run_id.as_ref() {
                     crate::submission::validate_validation_plan(plan)
@@ -558,12 +573,10 @@ impl Dispatcher {
                 }
             }
             // Partial runs and diagnostic reruns can never authorize publication.
-            if !only.is_empty() || req.workflow_id.is_some() || req.rerun.is_some()
-                || planned.len() == 1
-            {
-                let id = release_run_id.take().unwrap();
-                planned.retain(|(run, _, _)| run != &id);
-                run_ids.retain(|run| run != &id);
+            if release_skipped || planned.len() == 1 {
+                let id = release_run_id.take();
+                planned.retain(|(run, _, _)| Some(run) != id.as_ref());
+                run_ids.retain(|run| Some(run) != id.as_ref());
                 warnings.push("validation only: partial, rerun, or empty submissions do not authorize merge/deployment".into());
             }
         }
@@ -582,7 +595,7 @@ impl Dispatcher {
         for (id, request, plan) in &planned {
             Store::create_run_in(&mut tx, id, request, plan).await?;
             Store::record_source_in(&mut tx, id, &source_bytes).await?;
-            if !only.is_empty() || req.workflow_id.is_some() || req.rerun.is_some() {
+            if partial {
                 sqlx::query("UPDATE ci_run SET validation_only=true WHERE id=$1")
                     .bind(id).execute(&mut *tx).await
                     .map_err(|e| DispatchError::Workflow(format!("record partial submission: {e}")))?;
@@ -6948,6 +6961,37 @@ jobs:
         assert!(d.retry_published_release(retry, None).await.err().unwrap().to_string().contains("confirmed published"));
         assert!(crate::submission::authorize_publication(&d.store, &validation_run).await.is_err(),
             "reusing validation membership must not relax validation-only publication restrictions");
+    }
+
+    /// `--only` runs the named workflow and nothing else. The release workflow
+    /// is not planned, so a release job pinned somewhere this instance does not
+    /// serve cannot refuse the submit, and no submission is recorded.
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL; no VM execution"]
+    async fn only_submit_does_not_plan_the_release_workflow() {
+        unsafe { std::env::set_var("CI_NATIVE_RUNNER_SECRET", "test-only-skips-release"); }
+        let disk = tempfile::tempdir().unwrap();
+        let d = test_dispatcher(disk.path()).await;
+        let release = "on: release\njobs:\n  merge:\n    steps: [{uses: ci/merge-release, with: {manifests: '[]'}}]\n  host:\n    needs: [merge]\n    uses: not-served/some-host\n    steps: [{run: echo host}]\n";
+        let source = serde_json::to_vec(&json!({
+            "baseRevision": "a".repeat(40), "targetTree": "b".repeat(40), "patchBase64": "AAEC",
+            "workflows": {
+                ".ci/workflows/demo.yml": "name: demo\non:\n  submit:\n    paths: ['.ci/manual-only']\njobs:\n  build:\n    runs-on: [macos-intel]\n    steps: [{run: echo demo}]\n",
+                ".ci/workflows/release.yml": release,
+            }
+        })).unwrap();
+        let mut req: crate::trigger::SubmitRequest = serde_json::from_value(json!({
+            "repository": {"url": "https://example.test/only.git", "name": "only"},
+            "ref": "refs/heads/main", "after": "a".repeat(40),
+            "source": {"format": "git-patch", "contentBase64": ""},
+            "only": ["demo"]
+        })).unwrap();
+        req.source.bytes = Some(source);
+        let accepted = d.submit(&req, None, None).await.unwrap();
+        assert_eq!(accepted.run_ids.len(), 1);
+        assert!(accepted.submission.is_none());
+        assert_eq!(d.store.get_run(&accepted.run_ids[0]).await.unwrap().unwrap().workflow_path, ".ci/workflows/demo.yml");
+        assert!(accepted.warnings.iter().any(|w| w.starts_with("validation only")), "{:?}", accepted.warnings);
     }
 
     #[tokio::test]
