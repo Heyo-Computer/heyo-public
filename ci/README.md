@@ -200,21 +200,23 @@ captured trunk must still match at publication; a moved trunk requires revalidat
 CI runtime changes also require `ci/deploy-controller`. It prepares a durable
 release intent. A never-adopted app-lb deployment with all three application
 lifecycle settings absent starts its scoped rollout directly, after the existing
-repository, merged-release, artifact and deployment checks. An adopted deployment
-obtains acceptance from Orchestrator's shared application update API; only its
-authenticated activation advances that prepared intent. Partial configuration is
+repository, merged-release, artifact and deployment checks. An adopted application
+records one release receipt and requests a regional update from Orchestrator.
+Orchestrator freezes its configured regions and order, prepares every target,
+and activates one at a time. Partial configuration is
 an error, and removing configuration cannot bypass a recorded adoption. CI then
 closes new submissions (HTTP 503) and lets existing jobs finish before
 replacing the controller. The requesting job finishes first; the **run remains
-running** until the replacement resumes reconciliation and its public health
-endpoint identifies the expected revision and executable SHA256. Documentation
+running** until every configured target identifies the expected revision and
+executable SHA256, reopens admissions, and completes the platform health bake. Documentation
 and workflow-only changes need no controller replacement unless the release
 workflow explicitly selects one. A passing validation run is not deployment
 completion; inspect the coordinated release run.
 
-Self-deployment is opt-in and currently supports **one Firecracker controller
-with a persistent workspace**, not active-active controllers or regional DB
-writer handoff. Configure the following through the service's HeyoSecret-backed
+Regional self-deployment is opt-in and supports **one retained-workspace
+Firecracker CI app per region**. Both regions remain active normally and share
+authoritative CI state. This does not implement database writer handoff.
+Configure the following through the service's HeyoSecret-backed
 configuration before enabling the workflow:
 
 - `CI_CONTROLLER_DEPLOYMENT`: the app-lb deployment ID of this controller.
@@ -241,6 +243,29 @@ activation reject changed replays. A prepared intent permits normal work and
 cannot mutate app-lb without activation. Cancellation and the existing drain
 deadline still apply. In-flight updates from an older binary retain their phase
 and finish without creating a second operation.
+
+Regional preparation uses `POST /api/lifecycle/updates/{id}/prepare` with
+`{parentOperationId,operationId,applicationId}`. The addressed CI app derives the
+release and artifact from its durable parent receipt and pins its own boot and
+deployment; the caller cannot supply arbitrary executable bytes or VM identity.
+Preparation does not close admissions. The drain deadline begins on activation,
+not while waiting for an earlier region. The release job exits before preparation.
+One generic receipt per real step remains intact; child completion cannot finish
+the run before the regional parent completes its final bake.
+
+Before enabling regional releases, install the protocol in every CI app and
+Orchestrator, configure/adopt all regional bindings at the shared application
+authority, and expose the authenticated lifecycle machine paths. Mixed old/new
+instances must not be enabled as a regional target set. Existing singleton
+updates remain supported for this initial installation. There is no fallback
+from a refused regional request to a single-region replacement.
+
+Cancellation stops new activations and settles prepared children through
+`POST /api/lifecycle/updates/{id}/cancel`. Already-submitted replacements remain
+under observation until their outcomes are known; transport errors never mean
+successful rollback. An unresolved replacement blocks advancement, not CI job
+execution in the healthy peer. This retained-workspace protocol does not invent
+a second candidate VM or perform database rollback.
 
 The deployment must have min/max replicas of one, no warm pool, and exactly one
 read-only `/opt/ci-release` artifact mount with `strip_components: 1`, using the
@@ -1554,8 +1579,8 @@ opening admissions. A lost response is reconciled, never treated as success.
 Configured application authority and persisted adopted operations retain their
 authenticated acceptance requirement. All three lifecycle settings must either
 be absent on a never-adopted deployment or form a complete valid configuration.
-This correction does not install itself into an older binary that unconditionally
-requires those settings, or implement a two-region release coordinator.
+This protocol does not install itself into older binaries. Orchestrator's regional
+application update API owns release sequencing; CI observes its durable result.
 Historical rollouts without a pinned source boot remain inspectable
 and require explicit reconciliation; they are not silently adopted or completed.
 An original process lost before submitting its update likewise requires explicit

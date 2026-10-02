@@ -227,6 +227,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(handlers::application_update::create),
         )
         .route(
+            "/orchestration/services/{service_id}/updates/{operation_id}",
+            get(handlers::application_update::get),
+        )
+        .route(
+            "/orchestration/services/{service_id}/updates/{operation_id}/cancel",
+            post(handlers::application_update::cancel),
+        )
+        .route(
             "/orchestration/services/{service_id}/managed-updates",
             post(handlers::managed_update::create),
         )

@@ -1,6 +1,6 @@
 //! Deferred self-deployment. The requesting job finishes before replacement;
 //! the replacement controller reconciles the same durable operation at startup.
-use crate::{artifacts::StoredArtifact, bus::JobMessage, dispatch::Dispatcher, store::Store};
+use crate::{artifacts::{ArtifactSink, StoredArtifact}, bus::JobMessage, dispatch::Dispatcher, store::Store};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -23,6 +23,39 @@ struct Request {
     source_boot: Option<uuid::Uuid>,
 }
 
+/// Durable identities needed to validate and record a controller replacement.
+/// The artifact digest and release revision are deliberately not inputs: they
+/// are derived again from the run, published release, artifact row and bytes.
+pub struct PreparationInputs<'a> {
+    pub store: &'a Store,
+    pub artifacts: &'a dyn ArtifactSink,
+    pub run_id: &'a str,
+    pub step_id: &'a str,
+    pub artifact_name: &'a str,
+    pub workflow: Option<&'a str>,
+    pub controller_repository: Option<&'a str>,
+    pub artifact_store_url: Option<&'a str>,
+    pub target: PreparationTarget<'a>,
+    pub application_id: Option<&'a str>,
+    pub parent_operation_id: Option<&'a str>,
+}
+
+/// A caller-attested target boot and the deployment authority used to verify
+/// it. `prepare` still reads the authority's live snapshot and pins its ETags
+/// and VM identity; attestation cannot substitute caller-provided digests.
+pub struct PreparationTarget<'a> {
+    pub deployment: &'a str,
+    pub base_url: &'a str,
+    pub token: &'a str,
+    pub public_url: &'a str,
+    pub source_boot: uuid::Uuid,
+}
+
+pub struct PreparedRollout {
+    pub id: String,
+    pub already_recorded: bool,
+}
+
 pub fn binary_sha256() -> Option<&'static str> {
     static HASH: LazyLock<Option<String>> = LazyLock::new(|| {
         let mut file = std::fs::File::open(std::env::current_exe().ok()?).ok()?;
@@ -40,7 +73,7 @@ fn etag(spec: &Value) -> String {
     format!("\"{}\"", hex::encode(Sha256::digest(serde_json::to_vec(&spec).expect("JSON serializes"))))
 }
 
-fn artifact_identity(bytes: &[u8], sha: &str) -> Result<String, String> {
+pub(crate) fn artifact_identity(bytes: &[u8], sha: &str) -> Result<String, String> {
     let mut revision = None;
     let mut binary = None;
     let mut checksums = None;
@@ -121,7 +154,7 @@ fn success_message(request: &Request) -> String {
     )
 }
 
-fn target(d: &Dispatcher) -> Result<(&str, &str, &str), String> {
+pub(crate) fn target(d: &Dispatcher) -> Result<(&str, &str, &str), String> {
     let id = d.config.controller_deployment.as_deref().ok_or("CI_CONTROLLER_DEPLOYMENT is not configured")?;
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return Err("invalid CI_CONTROLLER_DEPLOYMENT".into());
@@ -131,11 +164,6 @@ fn target(d: &Dispatcher) -> Result<(&str, &str, &str), String> {
     crate::cd::app_lb_endpoint(&d.config.public_url)?;
     let token = d.config.controller_app_lb_token.as_deref().filter(|s| !s.is_empty()).ok_or("CI_CONTROLLER_APP_LB_TOKEN is not configured")?;
     Ok((id, base.trim_end_matches('/'), token))
-}
-
-async fn snapshot(d: &Dispatcher) -> Result<Value, String> {
-    let (id, base, token) = target(d)?;
-    snapshot_at(base, id, token).await
 }
 
 async fn snapshot_at(base: &str, id: &str, token: &str) -> Result<Value, String> {
@@ -154,81 +182,123 @@ pub async fn request(d: &Dispatcher, msg: &JobMessage, step: &str, artifact: &st
     if d.config.managed_deployment.is_some() {
         return Err("managed CI requires a regional platform update; direct app-lb self-replacement is forbidden".into());
     }
-    let (deployment, base, _) = target(d)?;
+    let (deployment, base, token) = target(d)?;
     let application = update_application(d)?;
-    if application.is_none() {
+    if application.is_some() {
+        return crate::regional_update::request(d, msg, step, artifact, workflow).await;
+    }
+    let prepared = prepare(PreparationInputs {
+        store: &d.store, artifacts: d.artifacts.as_ref(), run_id: &msg.run_id, step_id: step,
+        artifact_name: artifact, workflow, controller_repository: d.config.controller_repository.as_deref(),
+        artifact_store_url: d.config.artifacts.as_ref().map(|a| a.url.as_str()), application_id: application,
+        parent_operation_id: None,
+        target: PreparationTarget { deployment, base_url: base, token,
+            public_url: &d.config.public_url, source_boot: d.executor.boot_id() },
+    }).await?;
+    if prepared.already_recorded {
+        Ok(format!("[ci] controller deployment {} is durably recorded\n", prepared.id))
+    } else {
+        Ok(format!("[ci] controller deployment {} recorded; run waits for drain, replacement, and public revision verification\n", prepared.id))
+    }
+}
+
+/// Validate the published release and artifact against durable CI state, pin
+/// a live target snapshot, and atomically record the legacy rollout rows.
+/// This is independent of `Dispatcher` so compatibility entry points can use
+/// the exact same authorization and persistence path.
+pub async fn prepare(input: PreparationInputs<'_>) -> Result<PreparedRollout, String> {
+    let target = &input.target;
+    if target.deployment.is_empty() || !target.deployment.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("invalid CI_CONTROLLER_DEPLOYMENT".into());
+    }
+    crate::cd::app_lb_endpoint(target.base_url)?;
+    crate::cd::app_lb_endpoint(target.public_url)?;
+    if target.token.is_empty() { return Err("CI_CONTROLLER_APP_LB_TOKEN is not configured".into()); }
+    let base = target.base_url.trim_end_matches('/');
+    if input.application_id.is_none() {
         let adopted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_controller_rollout WHERE application_id IS NOT NULL AND request->>'deployment'=$1 AND request->>'base_url'=$2)")
-            .bind(deployment).bind(base).fetch_one(d.store.pool()).await.map_err(|e| e.to_string())?;
+            .bind(target.deployment).bind(base).fetch_one(input.store.pool()).await.map_err(|e| e.to_string())?;
         if adopted { return Err("previously adopted CI deployment requires its application lifecycle configuration".into()); }
     }
-    let run = d.store.get_run(&msg.run_id).await.map_err(|e| e.to_string())?.ok_or("missing run")?;
-    let repository = d.config.controller_repository.as_deref().ok_or("CI_CONTROLLER_REPOSITORY is not configured")?;
-    if !crate::repos::same_repo(repository, &run.repo_url) { return Err("this repository may not replace the CI controller".into()); }
-    let release = crate::release::get(&d.store, &msg.run_id).await?
-        .filter(|r| r.status == "published").ok_or("controller deployment requires a confirmed merged release")?;
-    let sha = release.prepared.release_sha;
-    if sha != run.sha { return Err("build must match the exact merged revision; version-bump releases must rebuild first".into()); }
-    let stored = if let Some(workflow) = workflow {
-        crate::submission::artifact(&d.store, &msg.run_id, workflow, artifact, None).await?
-    } else {
-        let row = sqlx::query("SELECT a.* FROM ci_artifact a JOIN ci_job j ON j.id=a.job_id WHERE a.run_id=$1 AND a.name=$2 AND a.sink='artifacts' AND j.status='success' ORDER BY a.created_at DESC LIMIT 1")
-            .bind(&msg.run_id).bind(artifact).fetch_optional(d.store.pool()).await.map_err(|e| e.to_string())?.ok_or("no successfully built controller artifact")?;
-        StoredArtifact { sink: "artifacts", digest: row.get("digest"),
-            size_bytes: row.get::<i64,_>("size_bytes").try_into().map_err(|_| "invalid artifact size")?,
-            uri: row.get("uri"), public_url: None }
-    };
-    if stored.sink != "artifacts" { return Err("controller update requires the HTTP artifact sink".into()); }
+    let (sha, stored) = published_artifact(input.store, input.run_id, input.controller_repository,
+        input.artifact_name, input.workflow).await?;
     let digest = stored.digest.clone().ok_or("artifact omitted digest")?;
-    let id = format!("ci-controller-{}", hex::encode(Sha256::digest(step.as_bytes())));
-    if let Some(existing) = sqlx::query("SELECT request,application_id,phase FROM ci_controller_rollout WHERE id=$1")
-        .bind(&id).fetch_optional(d.store.pool()).await.map_err(|e| e.to_string())? {
+    let id = match input.parent_operation_id {
+        Some(parent) => crate::regional_update::child_id(parent, base, target.deployment),
+        None => format!("ci-controller-{}", hex::encode(Sha256::digest(input.step_id.as_bytes()))),
+    };
+    if let Some(existing) = sqlx::query("SELECT c.request,c.application_id,c.phase,s.run_id FROM ci_controller_rollout c JOIN ci_service_deployment s ON s.id=COALESCE(c.deployment_record_id,c.id) WHERE c.id=$1")
+        .bind(&id).fetch_optional(input.store.pool()).await.map_err(|e| e.to_string())? {
         let saved_application: Option<String> = existing.get("application_id");
-        if saved_application.as_deref() != application
-            || (application.is_none() && existing.get::<String,_>("phase") == "prepared") {
+        if existing.get::<String,_>("run_id") != input.run_id || saved_application.as_deref() != input.application_id
+            || (input.application_id.is_none() && existing.get::<String,_>("phase") == "prepared") {
             return Err("controller rollout approval contract changed on replay".into());
         }
         let existing: Request = serde_json::from_value(existing.get("request")).map_err(|e| e.to_string())?;
-        if existing.sha != sha || existing.artifact != digest || existing.deployment != deployment || existing.base_url != base {
+        if existing.sha != sha || existing.artifact != digest || existing.deployment != target.deployment || existing.base_url != base
+            || existing.public_url.trim_end_matches('/') != target.public_url.trim_end_matches('/') {
             return Err("controller rollout request changed on replay".into());
         }
-        if application.is_some() { accept_application_update(d, &id).await?; }
-        return Ok(format!("[ci] controller deployment {id} is durably recorded\n"));
+        return Ok(PreparedRollout { id, already_recorded: true });
     }
     if !(1..=256 * 1024 * 1024).contains(&stored.size_bytes) { return Err("controller artifact exceeds verification budget".into()); }
-    let bytes = d.artifacts.get(&stored).await.map_err(|e| e.to_string())?;
+    let bytes = input.artifacts.get(&stored).await.map_err(|e| e.to_string())?;
     if hex::encode(Sha256::digest(&bytes)) != digest { return Err("controller artifact digest mismatch".into()); }
     let binary_sha256 = artifact_identity(&bytes, &sha)?;
-    let current = snapshot(d).await?;
+    let current = snapshot_at(base, target.deployment, target.token).await?;
     let spec = &current["spec"];
-    if spec["vm"]["env_vars"]["CI_PUBLIC_URL"].as_str().map(|s| s.trim_end_matches('/')) != Some(d.config.public_url.trim_end_matches('/'))
-        || spec["vm"]["env_vars"]["CI_CONTROLLER_DEPLOYMENT"] != deployment {
+    if spec["vm"]["env_vars"]["CI_PUBLIC_URL"].as_str().map(|s| s.trim_end_matches('/')) != Some(target.public_url.trim_end_matches('/'))
+        || spec["vm"]["env_vars"]["CI_CONTROLLER_DEPLOYMENT"] != target.deployment {
         return Err("registered deployment is not this controller".into());
     }
-    let artifacts = d.config.artifacts.as_ref().ok_or("controller update requires the HTTP artifact sink")?;
+    let artifact_store_url = input.artifact_store_url.ok_or("controller update requires the HTTP artifact sink")?;
     let mount = spec["vm"]["mounts"].as_array().and_then(|m| m.iter().find(|m| m["path"] == "/opt/ci-release"))
         .ok_or("missing controller release mount")?;
-    if mount["store"].as_str().map(|s| s.trim_end_matches('/')) != Some(artifacts.url.trim_end_matches('/')) {
+    if mount["store"].as_str().map(|s| s.trim_end_matches('/')) != Some(artifact_store_url.trim_end_matches('/')) {
         return Err("controller mount uses a different artifact store".into());
     }
     let vms = current["vms"].as_array().ok_or("missing controller VM inventory")?;
     if vms.len() != 1 || vms[0]["healthy"] != true || vms[0]["draining"] != false { return Err("controller must have exactly one healthy, non-draining VM".into()); }
     let wanted = desired_spec(spec.clone(), &digest, &sha)?;
-    let request = Request { deployment: deployment.into(), base_url: base.into(), public_url: d.config.public_url.clone(),
+    let request = Request { deployment: target.deployment.into(), base_url: base.into(), public_url: target.public_url.into(),
         artifact: digest, sha: sha.clone(), binary_sha256, previous_vm: vms[0]["sandbox_id"].as_str().ok_or("missing VM identity")?.into(),
-        previous_etag: etag(spec), desired_etag: etag(&wanted), source_boot: Some(d.executor.boot_id()) };
+        previous_etag: etag(spec), desired_etag: etag(&wanted), source_boot: Some(target.source_boot) };
     let value = serde_json::to_value(&request).map_err(|e| e.to_string())?;
     let hash = etag(&value);
-    let mut tx = d.store.pool().begin().await.map_err(|e| e.to_string())?;
-    let inserted = sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) SELECT $1,s.id,r.id,j.id,$3,$4,'running','pending',$5,rel.git_ref FROM ci_step s JOIN ci_job j ON j.id=s.job_id JOIN ci_run r ON r.id=j.run_id JOIN ci_release rel ON rel.run_id=r.id AND rel.status='published' WHERE s.id=$2 AND j.status='running' AND r.status<>'cancelled'")
-        .bind(&id).bind(step).bind(deployment).bind(hash).bind(&sha).execute(&mut *tx).await.map_err(|e| e.to_string())?.rows_affected();
+    let mut tx = input.store.pool().begin().await.map_err(|e| e.to_string())?;
+    if let Some(parent) = input.parent_operation_id {
+        let row = sqlx::query("SELECT u.request,u.application_id,u.result,s.run_id,s.step_id,j.status AS job_status,r.status AS run_status FROM ci_regional_update u JOIN ci_service_deployment s ON s.id=u.id JOIN ci_job j ON j.id=s.job_id JOIN ci_run r ON r.id=s.run_id WHERE u.id=$1 AND u.attempted FOR UPDATE OF u")
+            .bind(parent).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?.ok_or("regional parent is not submitted")?;
+        let command: Value = row.get("request");
+        let cancelled: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_regional_cancelled_child WHERE id=$1)")
+            .bind(&id).fetch_one(&mut *tx).await.map_err(|e|e.to_string())?;
+        if cancelled || row.get::<Option<String>,_>("result").is_some() || row.get::<String,_>("run_id") != input.run_id
+            || row.get::<String,_>("step_id") != input.step_id || row.get::<String,_>("job_status") != "success"
+            || matches!(row.get::<String,_>("run_status").as_str(), "failure" | "cancelled")
+            || Some(row.get::<String,_>("application_id").as_str()) != input.application_id
+            || command["release"]["targetRevision"] != request.sha
+            || command["release"]["artifactDigest"] != request.artifact
+            || command["release"]["binarySha256"] != request.binary_sha256 {
+            return Err("regional preparation does not match its eligible parent".into());
+        }
+        sqlx::query("INSERT INTO ci_controller_rollout(id,deployment_record_id,request,phase,application_id) VALUES($1,$2,$3,'prepared',$4) ON CONFLICT(id) DO NOTHING")
+            .bind(&id).bind(parent).bind(&value).bind(input.application_id).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+        let saved: Value = sqlx::query_scalar("SELECT request FROM ci_controller_rollout WHERE id=$1")
+            .bind(&id).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
+        if saved != value { return Err("regional preparation changed on replay".into()); }
+        tx.commit().await.map_err(|e| e.to_string())?;
+        return Ok(PreparedRollout { id, already_recorded: false });
+    }
+    let inserted = sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) SELECT $1,s.id,r.id,j.id,$3,$4,'running','pending',$5,rel.git_ref FROM ci_step s JOIN ci_job j ON j.id=s.job_id JOIN ci_run r ON r.id=j.run_id JOIN ci_release rel ON rel.run_id=r.id AND rel.status='published' WHERE s.id=$2 AND r.id=$6 AND j.status='running' AND r.status<>'cancelled'")
+        .bind(&id).bind(input.step_id).bind(target.deployment).bind(hash).bind(&sha).bind(input.run_id)
+        .execute(&mut *tx).await.map_err(|e| e.to_string())?.rows_affected();
     if inserted != 1 { return Err("requesting job is no longer running".into()); }
     sqlx::query("INSERT INTO ci_controller_rollout(id,request,phase,application_id) VALUES($1,$2,$3,$4)")
-        .bind(&id).bind(value).bind(if application.is_some() { "prepared" } else { "pending" }).bind(application)
+        .bind(&id).bind(value).bind(if input.application_id.is_some() { "prepared" } else { "pending" }).bind(input.application_id)
         .execute(&mut *tx).await.map_err(|e| format!("another controller rollout is active, or intent could not be recorded: {e}"))?;
     Store::add_service_deployment_event(&mut tx, &id).await.map_err(|e| e.to_string())?;
     tx.commit().await.map_err(|e| e.to_string())?;
-    if application.is_some() { accept_application_update(d, &id).await?; }
-    Ok(format!("[ci] controller deployment {id} recorded; run waits for drain, replacement, and public revision verification\n"))
+    Ok(PreparedRollout { id, already_recorded: false })
 }
 
 /// A never-adopted app-lb deployment already authorizes its release through
@@ -242,7 +312,7 @@ fn update_application(d: &Dispatcher) -> Result<Option<&str>, String> {
     application_target(d).map(|(application, _, _)| Some(application))
 }
 
-fn application_target(d: &Dispatcher) -> Result<(&str, &str, &str), String> {
+pub(crate) fn application_target(d: &Dispatcher) -> Result<(&str, &str, &str), String> {
     let application = d.config.application_id.as_deref().filter(|id| !id.is_empty()
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b)))
         .ok_or("CI_APPLICATION_ID must be configured")?;
@@ -253,36 +323,67 @@ fn application_target(d: &Dispatcher) -> Result<(&str, &str, &str), String> {
     Ok((application, base, token))
 }
 
-async fn accept_application_update(d: &Dispatcher, id: &str) -> Result<(), String> {
-    let (application, base, token) = application_target(d)?;
-    let intent = application_status(d, id).await?;
-    let response = client()?.post(format!("{base}/orchestration/services/{application}/updates"))
-        .bearer_auth(token).json(&json!({"operationId":id,"intentHash":intent["intentHash"]}))
-        .send().await.map_err(|_| "application update acceptance is unknown; replay the same release step")?;
-    if !response.status().is_success() { return Err("application authority refused the update; controller unchanged".into()); }
-    let receipt: Value = response.json().await.map_err(|_| "invalid application update receipt")?;
-    if receipt["operationId"] != id || receipt["intentHash"] != intent["intentHash"] {
-        return Err("application authority returned a different update receipt".into());
-    }
-    Ok(())
+pub(crate) async fn published_artifact(store: &Store, run_id: &str, repository: Option<&str>,
+    artifact: &str, workflow: Option<&str>) -> Result<(String, StoredArtifact), String> {
+    let run = store.get_run(run_id).await.map_err(|e| e.to_string())?.ok_or("missing run")?;
+    let repository = repository.ok_or("CI_CONTROLLER_REPOSITORY is not configured")?;
+    if !crate::repos::same_repo(repository, &run.repo_url) { return Err("this repository may not replace the CI app".into()); }
+    let release = crate::release::get(store, run_id).await?
+        .filter(|r| r.status == "published").ok_or("CI update requires a confirmed merged release")?;
+    let sha = release.prepared.release_sha;
+    if sha != run.sha { return Err("build must match the exact merged revision; version-bump releases must rebuild first".into()); }
+    let stored = if let Some(workflow) = workflow {
+        crate::submission::artifact(store, run_id, workflow, artifact, None).await?
+    } else {
+        let row = sqlx::query("SELECT a.* FROM ci_artifact a JOIN ci_job j ON j.id=a.job_id WHERE a.run_id=$1 AND a.name=$2 AND a.sink='artifacts' AND j.status='success' ORDER BY a.created_at DESC LIMIT 1")
+            .bind(run_id).bind(artifact).fetch_optional(store.pool()).await.map_err(|e| e.to_string())?.ok_or("no successfully built CI artifact")?;
+        StoredArtifact { sink: "artifacts", digest: row.get("digest"),
+            size_bytes: row.get::<i64,_>("size_bytes").try_into().map_err(|_| "invalid artifact size")?,
+            uri: row.get("uri"), public_url: None }
+    };
+    if stored.sink != "artifacts" { return Err("CI update requires the HTTP artifact sink".into()); }
+    Ok((sha, stored))
 }
 
 pub async fn application_status(d: &Dispatcher, id: &str) -> Result<Value, String> {
-    let row = sqlx::query("SELECT c.request,c.application_id,c.phase,s.run_id,s.status,s.message FROM ci_controller_rollout c JOIN ci_service_deployment s ON s.id=c.id WHERE c.id=$1")
+    let row = sqlx::query("SELECT c.request,c.application_id,c.phase,s.run_id,CASE WHEN c.deployment_record_id IS NULL THEN s.status ELSE COALESCE(c.result,'running') END AS status,COALESCE(c.message,s.message) AS message FROM ci_controller_rollout c JOIN ci_service_deployment s ON s.id=COALESCE(c.deployment_record_id,c.id) WHERE c.id=$1")
         .bind(id).fetch_optional(d.store.pool()).await.map_err(|e| e.to_string())?.ok_or("unknown controller update")?;
     let request: Value = row.get("request");
+    let status: String = row.get("status");
+    let phase: String = row.get("phase");
+    let mut result = Value::Null;
+    if status == "passed" && phase == "complete" {
+        let (deployment, base, token) = target(d)?;
+        if request["deployment"] != deployment || request["base_url"] != base {
+            return Err("completed update must be observed through its target instance".into());
+        }
+        let current = snapshot_at(base, deployment, token).await?;
+        let vms = current["vms"].as_array().ok_or("missing replacement VM inventory")?;
+        if vms.len() != 1 || vms[0]["healthy"] != true || vms[0]["draining"] != false
+            || current["workspace"]["phase"] != "idle" || current["workspace"]["push_pending"] != false {
+            return Err("replacement workspace is not ready".into());
+        }
+        let runtime = vms[0]["sandbox_id"].as_str().ok_or("missing replacement VM identity")?;
+        let admission = d.executor.status().await?;
+        result = json!({"applicationRevision":d.config.expected_sha,"binarySha256":binary_sha256(),
+            "runtimeSandboxId":runtime,"admissionsOpen":admission["admissionClosed"] == false});
+        if result["applicationRevision"] != request["sha"] || result["binarySha256"] != request["binary_sha256"] {
+            return Err("serving executable differs from the completed update".into());
+        }
+    }
     Ok(json!({"operationId":id,"applicationId":row.get::<Option<String>,_>("application_id"),
         "intentHash":etag(&request),"deploymentId":request["deployment"],"authority":request["base_url"],
-        "targetRevision":request["sha"],"artifactDigest":request["artifact"],
-        "runId":row.get::<String,_>("run_id"),"status":row.get::<String,_>("status"),
-        "phase":row.get::<String,_>("phase"),"message":row.get::<Option<String>,_>("message")}))
+        "targetRevision":request["sha"],"artifactDigest":request["artifact"],"binarySha256":request["binary_sha256"],
+        "runId":row.get::<String,_>("run_id"),"status":status,
+        "phase":phase,"message":row.get::<Option<String>,_>("message"),"result":result}))
 }
 
 pub async fn activate_application_update(d: &Dispatcher, id: &str, hash: &str) -> Result<(), String> {
     let (application, _, _) = application_target(d)?;
+    let _permit = d.executor.effect_permit_for(Some(id)).await?;
     let mut tx = d.store.pool().begin().await.map_err(|e| e.to_string())?;
     // Use the same run-before-operation lock order as cancellation/submission.
-    let run: String = sqlx::query_scalar("SELECT run_id FROM ci_service_deployment WHERE id=$1")
+    let run: String = sqlx::query_scalar("SELECT s.run_id FROM ci_service_deployment s JOIN ci_controller_rollout c ON s.id=COALESCE(c.deployment_record_id,c.id) WHERE c.id=$1")
         .bind(id).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
     let run_status: String = sqlx::query_scalar("SELECT status FROM ci_run WHERE id=$1 FOR UPDATE")
         .bind(run).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
@@ -297,7 +398,7 @@ pub async fn activate_application_update(d: &Dispatcher, id: &str, hash: &str) -
     if row.get::<String,_>("phase") != "prepared" || matches!(run_status.as_str(), "cancelled" | "failure") {
         return Err("application update is no longer eligible for activation".into());
     }
-    sqlx::query("UPDATE ci_controller_rollout SET phase='pending',activation_hash=$2,updated_at=now() WHERE id=$1")
+    sqlx::query("UPDATE ci_controller_rollout SET phase='pending',activation_hash=$2,activated_at=now(),updated_at=now() WHERE id=$1")
         .bind(id).bind(hash).execute(&mut *tx).await.map_err(|e| e.to_string())?;
     tx.commit().await.map_err(|e| e.to_string())
 }
@@ -306,11 +407,11 @@ async fn finish(d: &Dispatcher, id: &str, run: &str, passed: bool, message: &str
     let mut tx = d.store.pool().begin().await.map_err(|e| e.to_string())?;
     sqlx::query("SELECT id FROM ci_run WHERE id=$1 FOR UPDATE")
         .bind(run).execute(&mut *tx).await.map_err(|e| e.to_string())?;
-    sqlx::query("UPDATE ci_service_deployment SET status=$2,phase='complete',message=$3,updated_at=now() WHERE id=$1")
+    sqlx::query("UPDATE ci_service_deployment SET status=$2,phase='complete',message=$3,updated_at=now() WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM ci_regional_update WHERE id=$1)")
         .bind(id).bind(if passed { "passed" } else { "failed" }).bind(message).execute(&mut *tx).await.map_err(|e| e.to_string())?;
-    sqlx::query("UPDATE ci_controller_rollout SET phase='complete',updated_at=now() WHERE id=$1")
-        .bind(id).execute(&mut *tx).await.map_err(|e| e.to_string())?;
-    Store::add_service_deployment_event(&mut tx, id).await.map_err(|e| e.to_string())?;
+    let parent: Option<String> = sqlx::query_scalar("UPDATE ci_controller_rollout SET phase='complete',result=$2,message=$3,updated_at=now() WHERE id=$1 RETURNING deployment_record_id")
+        .bind(id).bind(if passed { "passed" } else { "failed" }).bind(message).fetch_one(&mut *tx).await.map_err(|e| e.to_string())?;
+    if parent.is_none() { Store::add_service_deployment_event(&mut tx, id).await.map_err(|e| e.to_string())?; }
     Store::roll_up_run_in(&mut tx, run).await.map_err(|e| e.to_string())?;
     // Reopen only boots paused by this exact rollout. A retired predecessor
     // stays retired; neither another region nor operator maintenance is changed.
@@ -356,7 +457,7 @@ async fn reconcile(d: &Dispatcher) -> Result<(), String> {
 }
 
 async fn reconcile_operation(d: &Dispatcher, id: &str, token: &str) -> Result<(), String> {
-    let row = sqlx::query("SELECT c.*,s.run_id,r.status AS run_status FROM ci_controller_rollout c JOIN ci_service_deployment s ON s.id=c.id JOIN ci_run r ON r.id=s.run_id WHERE c.id=$1 AND c.phase<>'complete'")
+    let row = sqlx::query("SELECT c.*,s.run_id,r.status AS run_status FROM ci_controller_rollout c JOIN ci_service_deployment s ON s.id=COALESCE(c.deployment_record_id,c.id) JOIN ci_run r ON r.id=s.run_id WHERE c.id=$1 AND c.phase<>'complete'")
         .bind(&id).fetch_optional(d.store.pool()).await.map_err(|e| e.to_string())?;
     let Some(row) = row else { return Ok(()) };
     let phase: String = row.get("phase");
@@ -374,8 +475,8 @@ async fn reconcile_operation(d: &Dispatcher, id: &str, token: &str) -> Result<()
     if !attempted && matches!(row.get::<String,_>("run_status").as_str(), "cancelled" | "failure") {
         return finish(d, &id, &run, false, "Release cancelled or failed before deployment; controller unchanged.").await;
     }
-    let created: chrono::DateTime<chrono::Utc> = row.get("created_at");
-    if !attempted && (chrono::Utc::now() - created).to_std().unwrap_or_default() > d.config.max_job_duration {
+    let created: chrono::DateTime<chrono::Utc> = row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("activated_at").unwrap_or_else(||row.get("created_at"));
+    if phase != "prepared" && !attempted && (chrono::Utc::now() - created).to_std().unwrap_or_default() > d.config.max_job_duration {
         return finish(d, &id, &run, false, "Controller drain exceeded CI_MAX_JOB_SECONDS; no update submitted and submissions reopened.").await;
     }
     match phase.as_str() {
@@ -741,20 +842,41 @@ mod tests {
             sqlx::query("INSERT INTO ci_artifact(id,run_id,job_id,name,sink,digest,size_bytes,uri) VALUES('artifact','run','build','ci','artifacts',$1,$2,'test')")
                 .bind(hex::encode(Sha256::digest(&bytes))).bind(bytes.len() as i64).execute(f.store.pool()).await.unwrap();
             let msg = JobMessage { run_id:"run".into(),job_id:"job".into(),job_key:"deploy".into() };
+            // A real running step belonging to another release is not provenance
+            // for the run whose repository and artifact were just verified.
+            sqlx::raw_sql("INSERT INTO ci_run(id,workflow_id,workflow_path,status) VALUES('other-run','tests','ci.yml','running');
+                INSERT INTO ci_job(id,run_id,job_key,base_id,display,status) VALUES('other-job','other-run','deploy','deploy','Deploy','running');
+                INSERT INTO ci_step(id,job_id,idx,name,uses,status) VALUES('other-step','other-job',0,'Request','ci/deploy-controller','running');
+                INSERT INTO ci_release(run_id,request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status)
+                SELECT 'other-run',request_hash,source_sha,base_sha,git_ref,versions,candidate_sha,prepared,status FROM ci_release WHERE run_id='run';")
+                .execute(f.store.pool()).await.unwrap();
+            assert!(request(&d, &msg, "other-step", "ci", None).await.unwrap_err().contains("no longer running"));
+            let recorded: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_controller_rollout")
+                .fetch_one(f.store.pool()).await.unwrap();
+            assert_eq!(recorded, 0, "cross-run preparation must not record or activate an update");
             let result = request(&d, &msg, "step", "ci", None).await;
-            let id = format!("ci-controller-{}", hex::encode(Sha256::digest(b"step")));
-            let phase: String = sqlx::query_scalar("SELECT phase FROM ci_controller_rollout WHERE id=$1")
-                .bind(&id).fetch_one(f.store.pool()).await.unwrap();
+            result.unwrap();
             if adopted {
-                assert!(result.unwrap_err().contains("authority refused"));
-                assert_eq!(phase, "prepared", "refused approval must never activate a rollout");
+                let parent = format!("ci-regional-{:x}", Sha256::digest(b"step"));
+                let id = crate::regional_update::child_id(&parent,&base,"ci-test");
+                let request = crate::regional_update::Preparation { parent_operation_id:parent.clone(),operation_id:id.clone(),application_id:"ci".into() };
+                assert!(crate::regional_update::prepare(&d,&id,&request).await.is_err(), "unsubmitted parent cannot prepare");
+                sqlx::query("UPDATE ci_regional_update SET attempted=TRUE WHERE id=$1").bind(&parent).execute(f.store.pool()).await.unwrap();
+                assert!(crate::regional_update::prepare(&d,&id,&request).await.is_err(), "source job must finish before preparing");
+                sqlx::query("UPDATE ci_job SET status='success' WHERE id='job'").execute(f.store.pool()).await.unwrap();
+                assert_eq!(f.store.roll_up_run("run").await.unwrap(),RunStatus::Running,"parent waits before children exist");
+                let intent = crate::regional_update::prepare(&d,&id,&request).await.unwrap();
+                assert_eq!(intent["phase"],"prepared");
+                assert_eq!(crate::regional_update::prepare(&d,&id,&request).await.unwrap(),intent,"preparation is idempotent");
                 let unconfigured = dispatcher_with_application(&f, &base, false).await;
-                assert!(request(&unconfigured, &msg, "step", "ci", None).await.unwrap_err().contains("previously adopted"));
-                sqlx::query("UPDATE ci_controller_rollout SET phase='pending' WHERE id=$1")
-                    .bind(&id).execute(f.store.pool()).await.unwrap();
-                assert!(reconcile(&unconfigured).await.unwrap_err().contains("activation"));
+                assert!(super::request(&unconfigured, &msg, "step", "ci", None).await.unwrap_err().contains("previously adopted"));
+                crate::regional_update::cancel_child(&d,&id,&parent).await.unwrap();
+                assert!(activate_application_update(&d,&id,intent["intentHash"].as_str().unwrap()).await.is_err());
+                assert_eq!(f.store.roll_up_run("run").await.unwrap(),RunStatus::Running,"child cannot finish aggregate receipt");
             } else {
-                result.unwrap();
+                let id = format!("ci-controller-{}", hex::encode(Sha256::digest(b"step")));
+                let phase: String = sqlx::query_scalar("SELECT phase FROM ci_controller_rollout WHERE id=$1")
+                    .bind(&id).fetch_one(f.store.pool()).await.unwrap();
                 assert_eq!(phase, "pending");
                 request(&d, &msg, "step", "ci", None).await.unwrap();
                 let count: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_controller_rollout")
@@ -878,6 +1000,27 @@ mod tests {
             .bind(json!({"base_url":"https://us.test","deployment":"ci"})).execute(f.store.pool()).await.is_err());
         sqlx::query("INSERT INTO ci_controller_rollout(id,request) VALUES('peer',$1)")
             .bind(json!({"base_url":"https://eu.test","deployment":"ci"})).execute(f.store.pool()).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs disposable CI_TEST_DATABASE_URL and CI_TEST_NATS_URL"]
+    async fn regional_children_share_one_receipt_and_cannot_complete_the_run() {
+        let f=fixture().await;
+        let d=dispatcher(&f,"http://127.0.0.1:1").await;
+        sqlx::raw_sql("DELETE FROM ci_controller_rollout;
+            INSERT INTO ci_regional_update(id,application_id,authority,request,artifact_name) VALUES('op','ci','http://127.0.0.1:1','{}','ci');
+            INSERT INTO ci_controller_rollout(id,deployment_record_id,request,phase,application_id) VALUES
+            ('first','op','{\"base_url\":\"https://west.test\",\"deployment\":\"ci\"}','prepared','ci'),
+            ('second','op','{\"base_url\":\"https://east.test\",\"deployment\":\"ci\"}','prepared','ci');")
+            .execute(f.store.pool()).await.unwrap();
+        f.store.migrate().await.unwrap(); // startup replay preserves the new relationship
+        finish(&d,"first","run",true,"first done").await.unwrap();
+        assert_eq!(f.store.roll_up_run("run").await.unwrap(),RunStatus::Running);
+        finish(&d,"second","run",true,"second done").await.unwrap();
+        assert_eq!(f.store.roll_up_run("run").await.unwrap(),RunStatus::Running,"final bake belongs to parent");
+        assert_eq!(f.store.service_deployments_of("run").await.unwrap().len(),1);
+        sqlx::query("UPDATE ci_service_deployment SET status='passed' WHERE id='op'").execute(f.store.pool()).await.unwrap();
+        assert_eq!(f.store.roll_up_run("run").await.unwrap(),RunStatus::Success);
     }
 
     #[tokio::test]

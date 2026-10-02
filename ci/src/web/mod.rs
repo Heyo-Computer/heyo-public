@@ -141,6 +141,8 @@ pub fn router(
         .route("/api/lifecycle", get(application_lifecycle))
         .route("/api/lifecycle/retirements/{id}", get(retirement_status).post(retire_application))
         .route("/api/lifecycle/updates/{id}", get(application_update_status).post(activate_application_update))
+        .route("/api/lifecycle/updates/{id}/prepare", post(prepare_regional_update))
+        .route("/api/lifecycle/updates/{id}/cancel", post(cancel_regional_child))
         .route(
             "/api/submit",
             post(submit).layer(DefaultBodyLimit::max(submit_limit)),
@@ -247,8 +249,41 @@ async fn application_lifecycle(State(state): State<AppState>, headers: HeaderMap
         || state.config.controller_deployment.is_none() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "application lifecycle is not configured");
     }
+    let admission = match state.dispatcher.executor.status().await {
+        Ok(status) => status,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE,"CI admissions unavailable"),
+    };
     Json(serde_json::json!({"applicationId":state.config.application_id,
-        "deploymentId":state.config.controller_deployment,"capabilities":["release-update"]})).into_response()
+        "deploymentId":state.config.controller_deployment,"authority":state.config.controller_app_lb_url,
+        "bootId":state.dispatcher.executor.boot_id(),"revision":state.config.expected_sha,
+        "binarySha256":crate::controller_rollout::binary_sha256(),"admissionsOpen":admission["admissionClosed"] == false,
+        "capabilities":["release-update","regional-release-update-v1"]})).into_response()
+}
+
+async fn prepare_regional_update(State(state):State<AppState>,Path(id):Path<String>,headers:HeaderMap,
+    Json(request):Json<crate::regional_update::Preparation>) -> axum::response::Response {
+    if let Err(response)=application_lifecycle_auth(&state,&headers) { return response; }
+    match crate::regional_update::prepare(&state.dispatcher,&id,&request).await {
+        Ok(value)=>(StatusCode::ACCEPTED,Json(value)).into_response(),
+        Err(error)=>{ tracing::warn!(%error,%id,"regional preparation refused"); error_response_regional() }
+    }
+}
+
+fn error_response_regional() -> axum::response::Response {
+    error(StatusCode::CONFLICT,"regional lifecycle request unresolved; see CI logs")
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct RegionalCancellation { parent_operation_id:String }
+
+async fn cancel_regional_child(State(state):State<AppState>,Path(id):Path<String>,headers:HeaderMap,
+    Json(request):Json<RegionalCancellation>) -> axum::response::Response {
+    if let Err(response)=application_lifecycle_auth(&state,&headers) { return response; }
+    match crate::regional_update::cancel_child(&state.dispatcher,&id,&request.parent_operation_id).await {
+        Ok(value)=>Json(value).into_response(),
+        Err(error)=>{ tracing::warn!(%error,%id,"regional cancellation unresolved"); error_response_regional() }
+    }
 }
 
 #[derive(serde::Deserialize)]

@@ -118,6 +118,10 @@ pub struct Config {
     #[serde(default)]
     pub external_service_bindings: Vec<ExternalServiceBinding>,
 
+    /// Continuous healthy observation required between regional activations.
+    #[serde(default = "default_regional_application_bake_seconds")]
+    pub regional_application_bake_seconds: u32,
+
     #[serde(default)]
     pub nats: NatsConfig,
 }
@@ -404,6 +408,7 @@ impl Config {
             .set_default("traefik_dynamic_config_dir", "")?
             .set_default("service_state_dir", default_service_state_dir())?
             .set_default("discovery_routed_services", "")?
+            .set_default("regional_application_bake_seconds", default_regional_application_bake_seconds() as i64)?
             .set_default("nats.enabled", false)?
             .set_default("nats.url", default_nats_url())?;
 
@@ -573,7 +578,8 @@ impl Config {
                 .context("invalid ORCHESTRATOR_EXTERNAL_SERVICE_BINDINGS_JSON")?
         };
         let mut identities = std::collections::HashSet::new();
-        let mut services = std::collections::HashSet::new();
+        let mut service_regions = std::collections::HashSet::new();
+        let mut service_deployments = std::collections::HashSet::new();
         for binding in &mut bindings {
             for value in [&mut binding.authority, &mut binding.health_origin] {
                 let url = reqwest::Url::parse(value)?;
@@ -582,7 +588,12 @@ impl Config {
                     && url.username().is_empty() && url.password().is_none(), "external service URLs must be credential-free origins");
                 *value = url.to_string();
             }
-            anyhow::ensure!(services.insert(binding.service_id.clone()), "duplicate external service ID");
+            anyhow::ensure!(!binding.service_id.trim().is_empty() && !binding.region.trim().is_empty(),
+                "external service and region must be nonempty");
+            anyhow::ensure!(service_regions.insert((binding.service_id.clone(), binding.region.clone())),
+                "duplicate external service region");
+            anyhow::ensure!(service_deployments.insert((binding.service_id.clone(), binding.deployment_id.clone())),
+                "duplicate external service deployment");
             anyhow::ensure!(identities.insert((binding.authority.clone(), binding.namespace.clone(), binding.deployment_id.clone())),
                 "duplicate external service authority/namespace/deployment binding");
         }
@@ -601,6 +612,8 @@ impl Config {
         dirs::home_dir().map(|home| home.join(".heyo/orchestrator/orchestrator.toml"))
     }
 }
+
+fn default_regional_application_bake_seconds() -> u32 { 30 }
 
 #[cfg(test)]
 mod observer_config_tests {

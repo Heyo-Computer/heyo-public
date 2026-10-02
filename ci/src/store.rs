@@ -1251,7 +1251,7 @@ impl Store {
             status = RunStatus::Cancelled;
         } else if matches!(status, RunStatus::Success) {
             let deployments: Vec<String> = sqlx::query_scalar(
-                "SELECT s.status FROM ci_service_deployment s JOIN ci_controller_rollout c ON c.id=s.id WHERE s.run_id=$1 UNION ALL SELECT COALESCE(result,'running') FROM ci_managed_update WHERE run_id=$1",
+                "SELECT s.status FROM ci_service_deployment s WHERE s.run_id=$1 AND (EXISTS(SELECT 1 FROM ci_controller_rollout c WHERE COALESCE(c.deployment_record_id,c.id)=s.id) OR EXISTS(SELECT 1 FROM ci_regional_update u WHERE u.id=s.id)) UNION ALL SELECT COALESCE(result,'running') FROM ci_managed_update WHERE run_id=$1",
             ).bind(run_id).fetch_all(&mut **tx).await.map_err(StoreError::sql)?;
             if deployments.iter().any(|s| s == "failed") {
                 status = RunStatus::Failure;

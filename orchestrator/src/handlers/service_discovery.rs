@@ -72,11 +72,12 @@ pub async fn list_services(
 pub(super) async fn read_inventory(db: &sea_orm::DatabaseConnection, after: Option<&str>) -> Result<serde_json::Value> {
     let tx = db.begin_with_config(Some(IsolationLevel::RepeatableRead), Some(AccessMode::ReadOnly)).await?;
     let rows = tx.query_all(Statement::from_sql_and_values(DbBackend::Postgres,
-        "SELECT ids.service_id,s.desired_replicas,s.replica_regions,e.deployment_id AS external_deployment_id,
-                e.region AS external_region,e.observed_at AS external_observed_at,e.lifecycle_owner,e.capabilities
+        "SELECT ids.service_id,s.desired_replicas,s.replica_regions,
+                (SELECT jsonb_agg(jsonb_build_object('deploymentId',e.deployment_id,'region',e.region,
+                    'observedAt',e.observed_at,'lifecycleOwner',e.lifecycle_owner,'capabilities',e.capabilities)
+                    ORDER BY e.region) FROM external_service_bindings e WHERE e.service_id=ids.service_id) AS external_bindings
          FROM (SELECT service_id FROM service_discovery_sets UNION SELECT service_id FROM service_deployment_states UNION SELECT service_id FROM external_service_bindings) ids
          LEFT JOIN service_deployment_states s USING(service_id)
-         LEFT JOIN external_service_bindings e USING(service_id)
          WHERE ($1::text IS NULL OR ids.service_id > $1) ORDER BY ids.service_id LIMIT 101",
         [after.map(str::to_owned).into()])).await?;
     let mut services = Vec::new();
@@ -90,11 +91,10 @@ pub(super) async fn read_inventory(db: &sea_orm::DatabaseConnection, after: Opti
             "operationId":r.try_get::<String>("","operation_id")?,"status":r.try_get::<String>("","status")?,
             "phase":r.try_get::<String>("","phase")?,"targetRevision":r.try_get::<String>("","target_revision")?
         })) }).transpose()?;
-        let external = row.try_get::<Option<String>>("","external_deployment_id")?.map(|deployment| -> Result<Value> { Ok(json!({
-            "externallyManaged":false,"lifecycleOwner":row.try_get::<String>("","lifecycle_owner")?,
-            "deploymentId":deployment,"region":row.try_get::<String>("","external_region")?,
-            "observedAt":row.try_get::<DateTime<Utc>>("","external_observed_at")?,
-            "capabilities":row.try_get::<Value>("","capabilities")?})) }).transpose()?;
+        let external_bindings: Option<Value> = row.try_get("","external_bindings")?;
+        let external = external_bindings.as_ref().and_then(Value::as_array).filter(|v|v.len()==1).map(|v| {
+            let mut singleton=v[0].clone(); singleton["externallyManaged"]=json!(false); singleton
+        });
         let update = tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
             "SELECT operation_id,status,intent,observation,observed_at,error FROM application_updates WHERE service_id=$1 ORDER BY created_at DESC,operation_id DESC LIMIT 1",[id.clone().into()])).await?
             .map(|r| -> Result<Value> {
@@ -110,7 +110,8 @@ pub(super) async fn read_inventory(db: &sea_orm::DatabaseConnection, after: Opti
             "desiredReplicas":row.try_get::<Option<i32>>("","desired_replicas")?,
             "replicaRegions":row.try_get::<Option<serde_json::Value>>("","replica_regions")?,
             "discoveryVersion":snapshot.as_ref().map(|s|s.version),
-            "endpoints":snapshot.as_ref().map(|s| &s.endpoints), "rollout":rollout,"external":external,"update":update}));
+            "endpoints":snapshot.as_ref().map(|s| &s.endpoints), "rollout":rollout,"external":external,
+            "externalBindings":external_bindings,"update":update}));
     }
     let next = if rows.len() > 100 { services.last().map(|s| s["serviceId"].clone()) } else { None };
     tx.commit().await?;

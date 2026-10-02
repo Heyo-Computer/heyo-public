@@ -160,7 +160,9 @@ In CICD's environment, point `CICD_ORCHESTRATOR_URL` at this service (e.g. `http
 - `POST /orchestration/services/archives/presign` (and `/finalize`) — authenticated direct upload for large Heyo-managed service archives; pass the finalized `archiveId` to the service deployment request.
 - `POST /orchestration/services/deployments` — deploy a Heyo-managed service using the snake_case app-lb-style service format described below. **Breaking change:** old flat camelCase requests are rejected, not converted or accepted through aliases.
 - `POST /orchestration/services/adoptions` — internal-key authenticated adoption of an existing application. The request pins `{serviceId,deploymentId,sourceRolloutRevision,artifactDigest,applicationRevision,binarySha256,runtimeSandboxId,runtimePort}`. Registration verifies the app-lb spec ETag, retained workspace, singleton VM, immutable artifact, public health identity and authenticated application lifecycle capability. It creates the shared app identity without replacing the running VM.
-- `POST /orchestration/services/{service_id}/updates` — accepts `{operationId,intentHash}` using the application's scoped lifecycle credential. The referenced CI release intent must already be prepared and match the adopted runtime authority. Acceptance is durable and idempotent; a restartable dispatcher activates that exact intent and reconciles its outcome. Progress appears in shared inventory under `update`. The read-only fleet credential cannot initiate updates.
+- `POST /orchestration/services/{service_id}/updates` — preserves the singleton `{operationId,intentHash}` contract and accepts a durable regional command `{apiVersion:"regional-v1",operationId,release:{runId,targetRevision,artifactDigest,binarySha256}}`. The caller cannot choose targets or bake time. Acceptance transactionally freezes configured binding order, identities, and adoption evidence before external work. The restartable dispatcher prepares every child before activation, then checks the healthy peer and activates/bakes one region at a time. Regional bake duration is `regional_application_bake_seconds` (default 30).
+- `GET /orchestration/services/{service_id}/updates/{operation_id}` — returns the regional parent and ordered per-target lifecycle observations, bake timestamps, and errors. This uses the same application-scoped lifecycle credential as creation.
+- `POST /orchestration/services/{service_id}/updates/{operation_id}/cancel` — durably requests orderly stop. Unactivated children are cancelled through CI; an activated child remains outcome-unknown until its ordinary lifecycle result settles.
 - `GET /orchestration/services?after=<service_id>` — internal-key authenticated shared inventory for regional control-plane views. Returns up to 100 services and `nextCursor`, including desired replicas/regions, recorded discovery membership, and latest regional rollout phase. Each page uses one read-only repeatable-read transaction. Missing discovery is `null`; database failure returns 503, never a local-file fallback. Deployment metadata and credentials are excluded.
 - `GET  /orchestration/services/{service_id}/discovery` — authenticated, versioned endpoint membership for app-lb, including each endpoint's region when known. Rolling deploys publish and health-gate one candidate, drain one old replica, and repeat. A failed candidate leaves the remaining healthy set serving. `retirePrevious=false` only adds capacity up to `desiredReplicas`.
 - `POST /internal/deployments/lifecycle` — callback from the backend reporting deploy state transitions.
@@ -177,7 +179,7 @@ file value, including an empty list, wins. Each binding supplies `service_id`,
 Both credential fields are HeyoSecret references, not values.
 The caller cannot choose a remote authority or supply its credential.
 
-Register canonical service `ci` against the retained `ci-eu1` deployment only
+Register each configured canonical service binding against its retained regional deployment
 after reading its current app-lb spec and public `/healthz` identity. Do not use
 the legacy private `cicd` definition, invent a Cloud archive ID from a workspace
 digest, or replay a captured VM identity after a controller update. Registration
@@ -185,8 +187,12 @@ requires a new service identity with no Cloud-managed state or operation history
 It creates no VM and does not change the current app-lb routes, workspace,
 database, NATS consumers, artifacts, warm pool, or runner records.
 
-Once adopted, CI prepares an immutable release intent, then obtains durable
-acceptance from Orchestrator before it may close admissions or replace itself.
+Once adopted, CI submits the immutable release receipt to Orchestrator. Orchestrator
+freezes the configured regions first, then calls each region's idempotent
+`POST /api/lifecycle/updates/{child}/prepare`; preparation must not drain.
+The child ID is exactly `ci-region-` plus lowercase SHA-256 hex of the compact JSON
+array `[parentOperationId, authority-with-trailing-slashes-trimmed, deploymentId]`.
+CI loads the durable shared parent and derives the release and its own deployment.
 Never-adopted app-lb CI with all application lifecycle settings absent retains
 its direct, release-authorized self-update path; partial configuration is rejected,
 and removing configuration cannot bypass a previously recorded adopted update.
@@ -202,6 +208,18 @@ successful. Job logs and release history remain in CI. This path does not provid
 active-active CI, regional failover, automatic rollback, or recovery independent
 of a controller that cannot boot. Registration attestation is historical evidence,
 not continuous runtime health.
+
+Regional lifecycle identity must advertise `regional-release-update-v1`, open
+admissions, and report application, deployment, authority, boot, revision, and binary.
+Configuration drift from the frozen ordered bindings blocks reconciliation.
+
+For regional baking, a passed child lifecycle status must include
+`result: {applicationRevision,binarySha256,runtimeSandboxId,admissionsOpen}`. Orchestrator
+requires `applicationRevision` to equal the parent target revision, then compares all three
+identities with the live `/healthz` headers and app-lb singleton VM on every bake sample.
+`admissionsOpen` must be `true`; app-lb must also report an idle workspace and a healthy,
+non-draining singleton. CI must derive this result from the completed rollout and current
+executor admission state rather than echoing the prepared intent.
 
 Install the lifecycle-capable CI and Orchestrator versions before adoption, and
 configure CI's `CI_APPLICATION_ID`, `CI_APPLICATION_ORCHESTRATOR_URL`, and
