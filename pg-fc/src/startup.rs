@@ -6,13 +6,16 @@
 //! Physical replication ignores the database and routes by authenticated role.
 //! The raw startup bytes are kept so the proxy can
 //! replay them verbatim to the VM (always plaintext upstream — TLS terminates
-//! here), leaving the rest of the session a pure byte splice.
+//! here), leaving the rest of the session a pure byte splice. A
+//! `CancelRequest` is recognized in the StartupMessage's place and handed
+//! back for [`crate::cancel`] to route.
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::cancel::{CANCEL_REQUEST_CODE, CancelKey};
 use crate::tls::TlsReloader;
 
 // Magic protocol "version" codes that aren't real StartupMessages.
@@ -45,17 +48,32 @@ pub struct StartupInfo {
     pub raw: Vec<u8>,
 }
 
+/// What a new client connection turned out to be.
+pub enum Startup {
+    /// A session: the (possibly TLS-upgraded) stream plus its StartupMessage.
+    Session(ClientStream, StartupInfo),
+    /// A `CancelRequest` for some other connection's running query. Nothing
+    /// else follows on this connection; see [`crate::cancel`].
+    Cancel(CancelKey),
+}
+
+/// The post-preamble request, before the caller wraps it with its stream.
+enum Request {
+    Startup(StartupInfo),
+    Cancel(CancelKey),
+}
+
 /// Read the client's startup handshake and return the (possibly TLS-upgraded)
-/// stream plus the resolved schema and the StartupMessage to forward to the VM.
+/// stream plus the resolved schema and the StartupMessage to forward to the VM
+/// — or, for a cancel connection, the key it carries.
 ///
 /// SSLRequest handling: with `tls` configured we reply `S` and run the rustls
 /// handshake, then read the real StartupMessage over TLS; without it we reply
 /// `N` and libpq proceeds in plaintext (sslmode=prefer) or aborts
-/// (sslmode=require). GSS encryption is always declined.
-pub async fn read_startup(
-    mut client: TcpStream,
-    tls: Option<&TlsReloader>,
-) -> Result<(ClientStream, StartupInfo)> {
+/// (sslmode=require). GSS encryption is always declined. A `CancelRequest`
+/// is accepted in place of the StartupMessage at any of those points: libpq
+/// sends cancels in plaintext by default, but may negotiate SSL first.
+pub async fn read_startup(mut client: TcpStream, tls: Option<&TlsReloader>) -> Result<Startup> {
     loop {
         let (code, len_buf, body) = read_message(&mut client).await?;
         match code {
@@ -67,8 +85,10 @@ pub async fn read_startup(
                     .accept(client)
                     .await
                     .context("TLS handshake with client")?;
-                let info = read_startup_plain(&mut tls_stream).await?;
-                return Ok((Box::new(tls_stream), info));
+                return Ok(match read_startup_plain(&mut tls_stream).await? {
+                    Request::Startup(info) => Startup::Session(Box::new(tls_stream), info),
+                    Request::Cancel(key) => Startup::Cancel(key),
+                });
             }
             SSL_REQUEST_CODE | GSS_ENC_REQUEST_CODE => {
                 // Decline encryption; libpq then sends a plain StartupMessage.
@@ -76,9 +96,12 @@ pub async fn read_startup(
                 client.flush().await?;
                 continue;
             }
+            CANCEL_REQUEST_CODE => {
+                return Ok(Startup::Cancel(CancelKey::from_request_body(&body)?));
+            }
             PROTOCOL_V3 => {
                 let info = parse_startup_message(&len_buf, &body)?;
-                return Ok((Box::new(client), info));
+                return Ok(Startup::Session(Box::new(client), info));
             }
             other => bail!("unsupported startup protocol code: {other}"),
         }
@@ -87,7 +110,7 @@ pub async fn read_startup(
 
 /// The post-preamble loop, generic so it runs over the TLS stream too (where a
 /// repeated SSLRequest or a GSS request still gets `N` — no double upgrade).
-async fn read_startup_plain<S>(stream: &mut S) -> Result<StartupInfo>
+async fn read_startup_plain<S>(stream: &mut S) -> Result<Request>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -99,11 +122,18 @@ where
                 stream.flush().await?;
                 continue;
             }
-            PROTOCOL_V3 => return parse_startup_message(&len_buf, &body),
+            CANCEL_REQUEST_CODE => {
+                return Ok(Request::Cancel(CancelKey::from_request_body(&body)?));
+            }
+            PROTOCOL_V3 => return parse_startup_message(&len_buf, &body).map(Request::Startup),
             other => bail!("unsupported startup protocol code: {other}"),
         }
     }
 }
+
+/// Postgres' own cap on a startup-phase packet (`MAX_STARTUP_PACKET_LENGTH`);
+/// anything longer is refused before its body is allocated.
+const MAX_STARTUP_PACKET_LEN: i32 = 10_000;
 
 /// One length-prefixed startup-phase message: (code, length prefix, body).
 async fn read_message<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(i32, [u8; 4], Vec<u8>)> {
@@ -112,6 +142,9 @@ async fn read_message<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(i32, [u8;
     let len = i32::from_be_bytes(len_buf);
     if len < 8 {
         bail!("startup message length too small: {len}");
+    }
+    if len > MAX_STARTUP_PACKET_LEN {
+        bail!("startup message length too large: {len}");
     }
     let body_len = (len - 4) as usize;
     let mut body = vec![0u8; body_len];
@@ -174,6 +207,79 @@ pub(crate) fn parse_forwarded(raw: &[u8]) -> Result<StartupInfo> {
     parse_startup_message(&len, body)
 }
 
+/// Return the v3 StartupMessage `raw` with `-c {setting}` prepended to its
+/// `options` parameter, adding the parameter when the client sent none.
+///
+/// This is how the pooler gives client sessions a default without touching
+/// the guest's config (which its own maintenance connections share). The
+/// precedence is the client's: Postgres applies `options` left to right, so a
+/// `-c` the client put there itself overrides ours, and it applies ordinary
+/// startup parameters (e.g. a bare `statement_timeout`) after `options`, so
+/// those override it too. The rest of the packet is copied byte for byte, in
+/// order. `setting` must be a single `name=value` token: `options` is split on
+/// whitespace and backslash is its escape character.
+pub(crate) fn with_default_option(raw: &[u8], setting: &str) -> Result<Vec<u8>> {
+    if setting.is_empty()
+        || setting
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b == b'\\' || b == 0)
+    {
+        bail!("default option must be one unescaped token");
+    }
+    if raw.len() < 9 || i32::from_be_bytes(raw[..4].try_into().unwrap()) as usize != raw.len() {
+        bail!("startup packet framing mismatch");
+    }
+    if i32::from_be_bytes(raw[4..8].try_into().unwrap()) != PROTOCOL_V3 {
+        bail!("not a PostgreSQL v3 startup packet");
+    }
+    let ours = format!("-c {setting}");
+    let mut out = Vec::with_capacity(raw.len() + ours.len() + 16);
+    out.extend_from_slice(&[0; 4]); // the length, patched below
+    out.extend_from_slice(&raw[4..8]);
+    let mut params = &raw[8..];
+    let mut merged = false;
+    loop {
+        let end = params
+            .iter()
+            .position(|b| *b == 0)
+            .context("unterminated startup key")?;
+        let key = &params[..end];
+        params = &params[end + 1..];
+        if key.is_empty() {
+            break; // the list terminator
+        }
+        let end = params
+            .iter()
+            .position(|b| *b == 0)
+            .context("unterminated startup value")?;
+        let value = &params[..end];
+        params = &params[end + 1..];
+        out.extend_from_slice(key);
+        out.push(0);
+        if key == b"options" && !merged {
+            out.extend_from_slice(ours.as_bytes());
+            if !value.is_empty() {
+                out.push(b' ');
+            }
+            merged = true;
+        }
+        out.extend_from_slice(value);
+        out.push(0);
+    }
+    if !params.is_empty() {
+        bail!("trailing bytes after startup parameters");
+    }
+    if !merged {
+        out.extend_from_slice(b"options\0");
+        out.extend_from_slice(ours.as_bytes());
+        out.push(0);
+    }
+    out.push(0);
+    let len = i32::try_from(out.len()).context("startup packet too large")?;
+    out[..4].copy_from_slice(&len.to_be_bytes());
+    Ok(out)
+}
+
 /// Parameters are a flat `key\0value\0...\0` list terminated by an extra `\0`.
 fn parse_params(bytes: &[u8]) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -229,6 +335,143 @@ mod tests {
         assert!(parse_forwarded(&trailing).is_err());
         let mut wrong = raw; wrong[4..8].copy_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
         assert!(parse_forwarded(&wrong).is_err());
+    }
+
+    fn startup(params: &[u8]) -> Vec<u8> {
+        let mut raw = ((8 + params.len()) as i32).to_be_bytes().to_vec();
+        raw.extend_from_slice(&PROTOCOL_V3.to_be_bytes());
+        raw.extend_from_slice(params);
+        raw
+    }
+
+    #[test]
+    fn default_option_is_added_when_the_client_sent_no_options() {
+        let raw = startup(b"user\0alice\0database\0acme\0\0");
+        let out = with_default_option(&raw, "statement_timeout=120000").unwrap();
+        assert_eq!(
+            out,
+            startup(b"user\0alice\0database\0acme\0options\0-c statement_timeout=120000\0\0")
+        );
+        // Still a well-formed, unambiguous startup the rest of the pipeline accepts.
+        let info = parse_forwarded(&out).unwrap();
+        assert_eq!(
+            (info.user.as_str(), info.database.as_str()),
+            ("alice", "acme")
+        );
+        assert_eq!(
+            parse_params(&out[8..])["options"],
+            "-c statement_timeout=120000"
+        );
+    }
+
+    #[test]
+    fn default_option_goes_ahead_of_the_clients_own_options() {
+        // Prepended, so a client's own `-c statement_timeout` (later wins) and
+        // a bare startup parameter (applied after options) both still win.
+        let raw = startup(
+            b"user\0alice\0options\0-c statement_timeout=0 -c search_path=x\0statement_timeout\05s\0\0",
+        );
+        let out = with_default_option(&raw, "statement_timeout=120000").unwrap();
+        assert_eq!(
+            out,
+            startup(
+                b"user\0alice\0options\0-c statement_timeout=120000 -c statement_timeout=0 \
+                  -c search_path=x\0statement_timeout\05s\0\0"
+            )
+        );
+        let empty = startup(b"user\0alice\0options\0\0\0");
+        assert_eq!(
+            with_default_option(&empty, "statement_timeout=1").unwrap(),
+            startup(b"user\0alice\0options\0-c statement_timeout=1\0\0")
+        );
+    }
+
+    #[test]
+    fn default_option_rejects_bad_packets_and_unsafe_settings() {
+        let raw = startup(b"user\0alice\0\0");
+        for bad in ["", "a b", "a\\b"] {
+            assert!(with_default_option(&raw, bad).is_err(), "{bad:?}");
+        }
+        let mut wrong_len = raw.clone();
+        wrong_len.push(0);
+        assert!(with_default_option(&wrong_len, "x=1").is_err());
+        assert!(with_default_option(&startup(b"user\0alice\0"), "x=1").is_err());
+        assert!(with_default_option(&startup(b"user\0alice\0\0junk"), "x=1").is_err());
+        let mut ssl = raw;
+        ssl[4..8].copy_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+        assert!(with_default_option(&ssl, "x=1").is_err());
+    }
+
+    fn cancel_request(pid: i32, secret: u32) -> Vec<u8> {
+        let mut p = 16i32.to_be_bytes().to_vec();
+        p.extend_from_slice(&CANCEL_REQUEST_CODE.to_be_bytes());
+        p.extend_from_slice(&pid.to_be_bytes());
+        p.extend_from_slice(&secret.to_be_bytes());
+        p
+    }
+
+    /// Run `read_startup` (no TLS configured) against a client that sends
+    /// `sent`, returning the cancel key it parsed (None for a session) and the
+    /// bytes the pooler answered.
+    async fn read_startup_from(sent: Vec<u8>) -> (Result<Option<CancelKey>>, Vec<u8>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut sock = TcpStream::connect(addr).await.unwrap();
+            sock.write_all(&sent).await.unwrap();
+            sock.shutdown().await.unwrap();
+            let mut answered = Vec::new();
+            sock.read_to_end(&mut answered).await.unwrap();
+            answered
+        });
+        let (sock, _) = listener.accept().await.unwrap();
+        // Mapping drops the session stream (if any), closing the connection.
+        let parsed = read_startup(sock, None).await.map(|s| match s {
+            Startup::Session(..) => None,
+            Startup::Cancel(key) => Some(key),
+        });
+        (parsed, client.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn cancel_request_is_recognized_in_plaintext() {
+        let (parsed, answered) = read_startup_from(cancel_request(4242, 0xDEAD_BEEF)).await;
+        let key = parsed.unwrap().expect("a cancel");
+        assert_eq!(key.pid(), 4242);
+        assert_eq!(key.request_packet(), cancel_request(4242, 0xDEAD_BEEF));
+        assert!(answered.is_empty(), "a cancel gets no reply");
+    }
+
+    #[tokio::test]
+    async fn cancel_request_is_recognized_after_a_declined_ssl_request() {
+        let mut sent = 8i32.to_be_bytes().to_vec();
+        sent.extend_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+        sent.extend(cancel_request(7, 0x0102_0304));
+        let (parsed, answered) = read_startup_from(sent).await;
+        let key = parsed.unwrap().expect("a cancel");
+        assert_eq!(key.request_packet(), cancel_request(7, 0x0102_0304));
+        assert_eq!(answered, b"N");
+    }
+
+    #[tokio::test]
+    async fn cancel_request_is_recognized_inside_tls() {
+        // The post-upgrade loop is the same code over the TLS stream.
+        let (mut ours, mut theirs) = tokio::io::duplex(64);
+        theirs.write_all(&cancel_request(9, 1)).await.unwrap();
+        let Ok(Request::Cancel(key)) = read_startup_plain(&mut ours).await else {
+            panic!("expected a cancel")
+        };
+        assert_eq!(key.request_packet(), cancel_request(9, 1));
+    }
+
+    #[tokio::test]
+    async fn malformed_cancel_and_oversized_packets_are_refused() {
+        let mut short = 12i32.to_be_bytes().to_vec();
+        short.extend_from_slice(&CANCEL_REQUEST_CODE.to_be_bytes());
+        short.extend_from_slice(&1i32.to_be_bytes());
+        assert!(read_startup_from(short).await.0.is_err());
+        let huge = (MAX_STARTUP_PACKET_LEN + 1).to_be_bytes().to_vec();
+        assert!(read_startup_from(huge).await.0.is_err());
     }
 
     #[test]

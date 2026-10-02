@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 use tokio::net::TcpStream;
 use tracing::warn;
 
+use crate::cancel::{self, CancelTarget, KeyCapture};
 use crate::registry::SchemaEntry;
 
 /// Idle time on a spliced socket before the first keepalive probe goes out.
@@ -105,6 +106,17 @@ where
         .await
         .context("replaying startup packet upstream")?;
     upstream.flush().await?;
+
+    // Watch the server's half of the startup for the session's cancel key, so
+    // a CancelRequest arriving on the pooler can find this VM. Registered for
+    // exactly as long as the splice runs. Tunnel mode is covered too: `target`
+    // is then the tunnel's local end, which the entry holds open for the
+    // session's lifetime.
+    let mut upstream = KeyCapture::new(
+        upstream,
+        cancel::global().clone(),
+        CancelTarget::Addr(entry.target),
+    );
 
     copy_bidirectional(&mut client, &mut upstream)
         .await

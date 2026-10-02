@@ -26,6 +26,11 @@ const DEFAULT_IDLE_DRAIN_WINDOW: Duration = Duration::from_secs(600);
 /// minutes), so it separates the two populations without needing to be tuned.
 const DEFAULT_FAST_BRINGUP: Duration = Duration::from_secs(5);
 
+/// Default [`Config::client_statement_timeout`]: the 2 minutes Platform's code
+/// assumes every server gives it (its RDS databases do), raising it per
+/// session around the operations it knows run longer.
+const DEFAULT_CLIENT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Clone)]
 pub struct Config {
     /// Where the pooler listens for Postgres clients.
@@ -141,6 +146,18 @@ pub struct Config {
     /// `PG_VM_POOL_ADMIT_TIMEOUT_SECS`; `0` disables the wait (fail
     /// immediately when full).
     pub admit_timeout: Duration,
+    /// Session-default `statement_timeout` for client sessions, injected into
+    /// the StartupMessage the pooler replays upstream as `options=-c
+    /// statement_timeout=<ms>` (see [`crate::startup::with_default_option`]).
+    /// Guests otherwise run with no statement timeout at all, so one runaway
+    /// query holds a backend, its locks and its I/O until the VM stops. Scoped
+    /// to client sessions on purpose: the pooler's own maintenance connections
+    /// (probes, CREATE DATABASE, CHECKPOINT, dumps, restores, replication
+    /// setup) dial the guest directly and never carry it. A client can still
+    /// `SET statement_timeout` per session, and `RESET` returns to this value.
+    /// Env `PG_VM_POOL_CLIENT_STATEMENT_TIMEOUT_SECS`; default 120, `0` (None)
+    /// leaves the guest's own setting alone.
+    pub client_statement_timeout: Option<Duration>,
     /// Size (GiB) of the per-schema persistent data disk attached at
     /// `/dev/vdb` and mounted at `/workspace` (where `PGDATA` lives). This is
     /// what makes a schema's data survive a VM stop/start/restart — without it
@@ -1112,6 +1129,7 @@ const KNOWN_VARS: &[&str] = &[
     "PG_VM_POOL_READY_TIMEOUT_SECS",
     "PG_VM_POOL_CONNECT_TIMEOUT_SECS",
     "PG_VM_POOL_ADMIT_TIMEOUT_SECS",
+    "PG_VM_POOL_CLIENT_STATEMENT_TIMEOUT_SECS",
     "PG_VM_POOL_DIRECT_CONNECT",
     "PG_VM_POOL_DATA_DISK_GB",
     "PG_VM_POOL_KEEPALIVE_SCHEMAS",
@@ -1273,6 +1291,22 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(30u64);
+        // Default 2 minutes, matching what Platform's RDS-backed databases
+        // give every session; `0` disables. A malformed value is a startup
+        // error rather than a silent fallback: this guards against runaway
+        // queries, so a typo must not quietly mean "no guard".
+        let client_statement_timeout =
+            match std::env::var("PG_VM_POOL_CLIENT_STATEMENT_TIMEOUT_SECS") {
+                Ok(v) => match v.trim().parse::<u64>() {
+                    Ok(0) => None,
+                    Ok(secs) => Some(Duration::from_secs(secs)),
+                    Err(_) => anyhow::bail!(
+                        "invalid PG_VM_POOL_CLIENT_STATEMENT_TIMEOUT_SECS {v:?}: \
+                         expected whole seconds (0 disables)"
+                    ),
+                },
+                Err(_) => Some(DEFAULT_CLIENT_STATEMENT_TIMEOUT),
+            };
         let data_disk_gb = std::env::var("PG_VM_POOL_DATA_DISK_GB")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1539,6 +1573,7 @@ impl Config {
             ready_timeout: Duration::from_secs(ready_secs),
             connect_timeout: Duration::from_secs(connect_secs),
             admit_timeout: Duration::from_secs(admit_secs),
+            client_statement_timeout,
             data_disk_gb,
             keepalive_schemas,
             direct_connect,

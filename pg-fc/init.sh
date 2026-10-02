@@ -628,6 +628,16 @@ tcp_keepalives_idle = 60
 tcp_keepalives_interval = 10
 tcp_keepalives_count = 3
 
+# Abort a running query whose client has gone. Neither setting above helps a
+# backend that is busy executing: Postgres only notices a closed socket when it
+# next reads from or writes to it, so a long query whose client disconnected
+# (gave up, timed out, was killed — or whose pooler-side splice ended) runs to
+# completion, holding its locks, I/O and connection slot the whole time. A
+# client that hung up on a 16-minute count(*) still cost the full 16 minutes.
+# Every 10s while a query runs, the backend polls its socket (Linux POLLRDHUP;
+# no network traffic) and cancels the query if the peer is gone.
+client_connection_check_interval = 10s
+
 # Lock waits and deadlocks here are almost always two client-side operations
 # racing on the same table, and the deadlock report alone names only the two
 # statements at the moment of detection. Logging the waits gives the blocked/

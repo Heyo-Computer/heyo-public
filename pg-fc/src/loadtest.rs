@@ -1183,7 +1183,7 @@ async fn writer_tunnel_preserves_postgres_auth_and_session() {
         while let Ok((socket, _)) = frontend.accept().await {
             let endpoint = endpoint.clone(); let claim = claim.clone();
             tokio::spawn(async move {
-                let (mut socket, info) = crate::startup::read_startup(socket, None).await.unwrap();
+                let crate::startup::Startup::Session(mut socket, info) = crate::startup::read_startup(socket, None).await.unwrap() else { return; };
                 if crate::auth::require_password(&mut socket, "writer-test-password").await.is_err() { return; }
                 let response = reqwest::Client::new().post(endpoint).header("Connection", "upgrade")
                     .header("Upgrade", "pg-fc-sql/1").json(&wire::WriterTunnelRequest { claim, startup: info.raw }).send().await.unwrap();
