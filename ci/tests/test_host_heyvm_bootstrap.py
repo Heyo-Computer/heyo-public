@@ -150,6 +150,27 @@ class Tests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,"executable differs"): b.wait_for_service(host,target,"heyvmd")
                 sleep.assert_not_called()
 
+    def test_systemd_executor_must_transition_to_exact_service_before_deadline(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            target=self.target(pathlib.Path(td)); exe=pathlib.Path(target["executable"]); exe.parent.mkdir(); exe.write_bytes(b"old")
+            host=FakeHost(target,b"old",b"new")
+            executor="/usr/lib/systemd/systemd-executor"
+            with patch.object(host,"proc_exe",side_effect=[executor,os.path.realpath(exe)]), patch.object(b.time,"sleep") as sleep:
+                self.assertEqual(b.wait_for_service(host,target,"heyvmd")["running_sha256"],b.sha(b"old"))
+                sleep.assert_called_once_with(1)
+            with patch.object(host,"proc_exe",return_value=executor), patch.object(b.time,"monotonic",side_effect=[0,30]), patch.object(b.time,"sleep") as sleep:
+                with self.assertRaises(b.ServiceStarting): b.wait_for_service(host,target,"heyvmd")
+                sleep.assert_not_called()
+            with patch.object(host,"proc_exe",side_effect=[executor,"/wrong/executable"]), patch.object(b.time,"sleep") as sleep:
+                with self.assertRaisesRegex(ValueError,"executable differs"): b.wait_for_service(host,target,"heyvmd")
+                sleep.assert_called_once_with(1)
+            command=host.command
+            host.command=lambda argv: command(argv).replace("path="+str(exe),"path=/wrong/service")
+            with patch.object(host,"proc_exe",return_value=executor), patch.object(b.time,"sleep") as sleep:
+                with self.assertRaisesRegex(ValueError,"executable differs"): b.wait_for_service(host,target,"heyvmd")
+                sleep.assert_not_called()
+
     def test_failure_record_captures_check_without_command_secrets(self):
         target = {"unit":"probe.service", "executable":"/usr/bin/probe"}
         host = FakeHost(target, b"old", b"new")

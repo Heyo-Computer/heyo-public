@@ -2053,6 +2053,11 @@ failures and HTTP 502/503/504 responses for 30 seconds. A reachable endpoint wit
 the wrong backend identity still fails immediately. It also waits up to 30 seconds
 for systemd activation and temporary heyvmd child processes to finish; the daemon
 must still be the sole control-group member before verification succeeds.
+For `Type=simple`, an active unit can still be running
+`/usr/lib/systemd/systemd-executor` before it executes the configured service.
+That transient process is retried within the same deadline, never accepted as
+the service. An incorrect configured executable or any other unexpected running
+executable is still rejected. The same check applies during rollback.
 Rollback journals retain
 the original exception type and installer source line, plus a separate rollback
 failure when applicable; command arguments and exception messages are not logged.

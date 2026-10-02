@@ -200,6 +200,11 @@ def observe_service(host, target, component, observed):
     # rather than incorrectly requiring their string representations to match.
     if pid > 1 and len(paths) == 1 and paths[0] == target["executable"]:
         observed["actual_executable"] = host.proc_exe(pid)
+        # Type=simple may report active before systemd's executor execs the
+        # configured binary. This is not a verified service: retry the strict
+        # identity and isolation checks within wait_for_service's deadline.
+        if observed["actual_executable"] == "/usr/lib/systemd/systemd-executor":
+            raise ServiceStarting("systemd executor has not execed the service")
     if pid <= 1 or len(paths) != 1 or paths[0] != target["executable"] or observed.get("actual_executable") != observed["resolved_executable"]:
         raise ValueError("service executable differs")
     if values.get("KillMode") != "process":
@@ -228,6 +233,7 @@ def failure_record(error):
             "unsafe Supervisor process state", "service executable differs", "unsafe service state",
             "service is activating", "unsafe service process group",
             "service main process is outside its group", "service group is not yet isolated",
+            "systemd executor has not execed the service",
         }:
             record["check"] = str(error)
     return record
