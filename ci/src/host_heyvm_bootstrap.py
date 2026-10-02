@@ -165,34 +165,72 @@ class ServiceStarting(ValueError):
 
 
 def service(host, target, component="heyvm"):
+    observed = {"unit": target["unit"], "expected_executable": target["executable"]}
+    try:
+        return observe_service(host, target, component, observed)
+    except Exception as error:
+        # Attach only explicitly selected fields, never ExecStart argv, env or
+        # subprocess output. Preserve the exception class and retry semantics.
+        error.service_observation = observed
+        raise
+
+
+def observe_service(host, target, component, observed):
     if target.get("process_manager", "systemd") == "supervisor":
         text = host.command(["supervisorctl", "pid", target["unit"]]).strip()
         if not text.isdigit() or int(text) <= 1: raise ValueError("unsafe Supervisor process state")
         pid = int(text)
-        if host.proc_exe(pid) != os.path.realpath(target["executable"]): raise ValueError("service executable differs")
+        observed.update(pid=pid, actual_executable=host.proc_exe(pid))
+        if observed["actual_executable"] != os.path.realpath(target["executable"]): raise ValueError("service executable differs")
         return {"boot_id": host.boot_id(), "pid": pid, "starttime": host.starttime(pid), "disk_sha256": sha(pathlib.Path(target["executable"]).read_bytes()), "running_sha256": host.proc_digest(pid)}
     keys = "LoadState ActiveState KillMode MainPID ExecStart ControlGroup".split()
     text = host.command(["systemctl", "show", target["unit"], "--property=" + ",".join(keys)])
     values = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+    observed.update({key: values.get(key) for key in keys if key != "ExecStart"})
     if values.get("LoadState") != "loaded": raise ValueError("unsafe service state")
     if values.get("ActiveState") == "activating": raise ServiceStarting("service is activating")
     if values.get("ActiveState") != "active": raise ValueError("unsafe service state")
     pid = int(values.get("MainPID", "0")); command = values.get("ExecStart", "")
     # systemctl show serializes ExecCommand with an authoritative path= field.
     paths = re.findall(r"(?:^|[ {;])path=([^ ;}]+)", command)
+    observed.update(exec_paths=paths, resolved_executable=os.path.realpath(target["executable"]))
     # The legacy eu1 service starts a stable symlink. Before the one-time
     # bootstrap /proc resolves that symlink to its versioned release; after the
     # atomic replacement both names are the stable path. Require both identities
     # rather than incorrectly requiring their string representations to match.
-    if pid <= 1 or len(paths) != 1 or paths[0] != target["executable"] or host.proc_exe(pid) != os.path.realpath(target["executable"]):
+    if pid > 1 and len(paths) == 1 and paths[0] == target["executable"]:
+        observed["actual_executable"] = host.proc_exe(pid)
+    if pid <= 1 or len(paths) != 1 or paths[0] != target["executable"] or observed.get("actual_executable") != observed["resolved_executable"]:
         raise ValueError("service executable differs")
     if values.get("KillMode") != "process":
         if component != "heyvmd" or values.get("KillMode") != "control-group":
             raise ValueError("unsafe service process group")
         members = host.cgroup_pids(values.get("ControlGroup", ""))
+        observed["cgroup_pids"] = sorted(members)
         if pid not in members: raise ValueError("service main process is outside its group")
         if members != {pid}: raise ServiceStarting("service group is not yet isolated")
     return {"boot_id": host.boot_id(), "pid": pid, "starttime": host.starttime(pid), "disk_sha256": sha(pathlib.Path(target["executable"]).read_bytes()), "running_sha256": host.proc_digest(pid)}
+
+
+def failure_record(error):
+    frames = []
+    frame = error.__traceback__
+    while frame is not None:
+        frames.append({"function": frame.tb_frame.f_code.co_name, "line": frame.tb_lineno})
+        frame = frame.tb_next
+    record = {"type": type(error).__name__, "line": frames[0]["line"] if frames else None,
+              "frames": frames, "recorded_at_unix": time.time()}
+    if hasattr(error, "service_observation"):
+        record["service"] = error.service_observation
+        # Only our literal check messages are safe; ValueError can also originate
+        # in parsers or host APIs and contain arbitrary response/credential data.
+        if frames and frames[-1]["function"] == "observe_service" and str(error) in {
+            "unsafe Supervisor process state", "service executable differs", "unsafe service state",
+            "service is activating", "unsafe service process group",
+            "service main process is outside its group", "service group is not yet isolated",
+        }:
+            record["check"] = str(error)
+    return record
 
 
 def wait_for_service(host, target, component="heyvm"):
@@ -343,7 +381,9 @@ def install(target, req, binary, host=None):
     except Exception as error:
         # Keep the failing source location without logging command arguments,
         # response bodies, or exception messages that may contain credentials.
-        journal["failure"] = {"type": type(error).__name__, "line": error.__traceback__.tb_lineno}
+        journal["failure"] = failure_record(error)
+        save_journal(journal_path, journal)  # Keep evidence even if rollback is interrupted.
+        print("HEYO_HOST_UPDATE_FAILURE=" + json.dumps(journal["failure"], sort_keys=True), file=sys.stderr, flush=True)
         try:
             restore(host, target, journal)
             result = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
@@ -351,7 +391,8 @@ def install(target, req, binary, host=None):
                       "backend_server_id": target["backend_server_id"], "region": target["region"]}
             journal.update(status="rolled_back", result=result); save_journal(journal_path, journal); return result
         except Exception as rollback_error:
-            journal["rollback_failure"] = {"type": type(rollback_error).__name__, "line": rollback_error.__traceback__.tb_lineno}
+            journal["rollback_failure"] = failure_record(rollback_error)
+            print("HEYO_HOST_ROLLBACK_FAILURE=" + json.dumps(journal["rollback_failure"], sort_keys=True), file=sys.stderr, flush=True)
             result = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
                       "target_alias": target["target_alias"], "status": "rollback_failed",
                       "backend_server_id": target["backend_server_id"], "region": target["region"]}
@@ -364,14 +405,15 @@ def verify_existing(target, req, host=None):
     journal_path = pathlib.Path(target["state_dir"]) / (req["operation_id"] + ".json")
     old = json.loads(journal_path.read_bytes())
     operation_hash = sha(json.dumps(req, sort_keys=True, separators=(",", ":")).encode())
-    if old.get("status") not in ("succeeded", "rolled_back") or old.get("request_sha256") != operation_hash:
+    if old.get("status") not in ("succeeded", "rolled_back", "rollback_failed") or old.get("request_sha256") != operation_hash:
         raise ValueError("no matching terminal bootstrap journal")
     config, drop = exact_files(target); daemon=req.get("component", "heyvm") == "heyvmd"
-    if old["status"] == "rolled_back":
+    if old["status"] in ("rolled_back", "rollback_failed"):
         expected = {"protocol": "host-heyvm-bootstrap-v1", "operation_id": req["operation_id"], "request_sha256": operation_hash,
                     "target_alias": target["target_alias"], "status": "rolled_back",
                     "backend_server_id": target["backend_server_id"], "region": target["region"]}
-        if old.get("result") != expected: raise ValueError("saved rollback receipt differs")
+        recorded = dict(expected, status=old["status"])
+        if old.get("result") != recorded: raise ValueError("saved rollback receipt differs")
         files = (("executable", target["executable"], MAX_HEYVM),) if daemon else (
             ("executable", target["executable"], MAX_HEYVM), ("config", target["config_json_path"], MAX_SMALL_BACKUP),
             ("drop_in", target["systemd_drop_in_path"], MAX_SMALL_BACKUP))

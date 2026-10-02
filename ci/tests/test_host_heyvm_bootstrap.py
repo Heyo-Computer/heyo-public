@@ -150,17 +150,45 @@ class Tests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,"executable differs"): b.wait_for_service(host,target,"heyvmd")
                 sleep.assert_not_called()
 
+    def test_failure_record_captures_check_without_command_secrets(self):
+        target = {"unit":"probe.service", "executable":"/usr/bin/probe"}
+        host = FakeHost(target, b"old", b"new")
+        host.command = lambda _: "LoadState=loaded\nActiveState=active\nKillMode=control-group\nMainPID=10\nControlGroup=/system.slice/probe.service\nExecStart={ path=/usr/bin/probe ; argv[]=/usr/bin/probe --token=SECRET ; }\n"
+        host.cgroup_pids = lambda _: {11, 12}
+        try:
+            b.wait_for_service(host, target, "heyvmd")
+            self.fail("expected process-group rejection")
+        except ValueError as error:
+            record = b.failure_record(error)
+        self.assertEqual(record["check"], "service main process is outside its group")
+        self.assertEqual(record["service"]["MainPID"], "10")
+        self.assertEqual(record["service"]["cgroup_pids"], [11, 12])
+        self.assertEqual(record["frames"][-1]["function"], "observe_service")
+        self.assertNotIn("SECRET", json.dumps(record))
+        self.assertNotIn("argv", json.dumps(record))
+        try:
+            raise ValueError("response contains SECRET")
+        except ValueError as error:
+            self.assertNotIn("SECRET", json.dumps(b.failure_record(error)))
+
     def test_rollback_recovery_is_read_only_and_rejects_drift(self):
         from unittest.mock import patch
-        for drift in (None,"binary","health","journal"):
+        from itertools import product
+        for status, drift in product(("rolled_back", "rollback_failed"), (None,"binary","health","journal","request","running")):
             temp,target,host,result,old,new=self.run_install("health")
             try:
                 self.assertEqual(result["status"],"rolled_back")
                 journal=pathlib.Path(target["state_dir"])/"op-1.json"
+                data=json.loads(journal.read_text())
+                data["status"]=status; data["result"]["status"]=status
+                journal.write_text(json.dumps(data))
                 if drift=="binary": pathlib.Path(target["executable"]).write_bytes(new)
+                if drift=="running": host.current=new
                 if drift=="health": host.health=lambda _: {"status":"healthy","backendId":"other","backendRegion":"eu1"}
                 if drift=="journal":
-                    data=json.loads(journal.read_text()); data["status"]="rollback_failed"; journal.write_text(json.dumps(data))
+                    data=json.loads(journal.read_text()); data["result"]["operation_id"]="other"; journal.write_text(json.dumps(data))
+                if drift=="request":
+                    data=json.loads(journal.read_text()); data["request_sha256"]="other"; journal.write_text(json.dumps(data))
                 before=journal.read_bytes(); host.calls.clear()
                 def snapshot(path,limit,**options):
                     p=pathlib.Path(path)

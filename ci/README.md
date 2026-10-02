@@ -1946,6 +1946,21 @@ actions do not change app-lb, namespaces, existing VM pages, or Retail.
 
 ### One-time native heyvm host bootstrap
 
+Host installer failures retain timestamped exception frames and allowlisted service
+observations in the operation journal. Service-check failures identify the failed
+check, observed systemd state, executable paths and process-group members when
+available. The original failure is persisted before rollback; rollback failures
+are recorded separately. Launcher logs also emit `HEYO_HOST_UPDATE_FAILURE` and
+`HEYO_HOST_ROLLBACK_FAILURE` JSON records. These omit command arguments, environment
+values, subprocess output and arbitrary exception messages. Existing historical
+failures cannot acquire observations that were not recorded at the time.
+
+Explicit bootstrap recovery can also investigate a `rollback_failed` receipt.
+It releases the runner only after read-only verification proves that the saved
+predecessor files and running executable match, the backend identity is healthy,
+and the runner reconnects. The original failed run and host journal remain
+unchanged; the recovery is recorded separately as `rollback_verified`.
+
 `ci/bootstrap-host-heyvm` is a release-only, final-step action used to install the
 managed host heyvm service before normal host maintenance is available. It accepts
 only `target`, a direct `${{ secrets.NAME }}` app-lb namespace-admin `token`, and

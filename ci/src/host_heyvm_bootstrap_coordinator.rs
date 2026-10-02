@@ -189,7 +189,7 @@ fn receipt(job:&Value,req:&Request,launcher:&str,allow_rollback:bool)->Result<Va
     ensure!(lines.len()==1,"exactly one bootstrap receipt is required"); let value:Value=serde_json::from_slice(&STANDARD.decode(lines[0])?)?;
     for (key,want) in [("protocol","host-heyvm-bootstrap-v1"),("operation_id",req.artifact.operation_id.as_str()),("request_sha256",req.request_sha256.as_str()),
         ("target_alias",req.alias.as_str()),("backend_server_id",req.target.backend_server_id.as_str()),("region",req.target.region.as_str())]{ensure!(value[key]==want,"bootstrap receipt {key} differs");}
-    if allow_rollback && value["status"]=="rolled_back" { return Ok(value); }
+    if allow_rollback && matches!(value["status"].as_str(),Some("rolled_back"|"rollback_failed")) { return Ok(value); }
     ensure!(value["status"]=="succeeded","bootstrap rolled back or failed");
     for (key,want) in [("heyvm_sha256",req.artifact.heyvm_sha256.as_str()),("config_sha256",req.config_sha256.as_str()),
         ("systemd_drop_in_sha256",req.systemd_drop_in_sha256.as_str())]{ensure!(value[key]==want,"bootstrap receipt {key} differs");}
@@ -314,7 +314,11 @@ pub async fn recover(d:&Dispatcher,run_id:&str,id:&str)->Result<Value> {
             return receipt(&job,&req,&verifier,true);
         }
     }).await??;
-    ensure!(live==original,"live verification differs from original receipt");
+    let mut expected=original.clone();
+    // A failed rollback is evidence to investigate, never evidence of recovery.
+    // The read-only verifier must now prove the exact saved predecessor is live.
+    if expected["status"]=="rollback_failed" { expected["status"]=json!("rolled_back"); }
+    ensure!(live==expected,"live verification differs from original receipt");
     ensure!(trusted(d,&req.alias).await?==req.target,"bootstrap target configuration drifted during recovery");
     reconnect_daemon(d,&req).await?;
     let rolled_back=live["status"]=="rolled_back";
@@ -398,7 +402,8 @@ mod tests {
         assert!(receipt(&job(&value),&req,"launcher",true).is_err());
         value["region"]=json!("region-a");
         value["status"]=json!("rollback_failed");
-        assert!(receipt(&job(&value),&req,"launcher",true).is_err());
+        assert!(receipt(&job(&value),&req,"launcher",false).is_err());
+        assert_eq!(receipt(&job(&value),&req,"launcher",true).unwrap(),value);
         value["status"]=json!("succeeded");
         assert!(receipt(&job(&value),&req,"launcher",true).is_err());
     }
