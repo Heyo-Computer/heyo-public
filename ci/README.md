@@ -260,6 +260,22 @@ instances must not be enabled as a regional target set. Existing singleton
 updates remain supported for this initial installation. There is no fallback
 from a refused regional request to a single-region replacement.
 
+Treat installation, registration, and a verified regional release as separate
+milestones. After installation, check each public `/healthz` revision and binary
+hash, then check authenticated `/api/lifecycle` for the shared application ID,
+the region's deployment ID, open admissions, and `regional-release-update-v1`.
+Configure the same ordered `external_service_bindings` in both Orchestrators;
+the order belongs to operator configuration, not the submitted workflow.
+Register each current deployment through `/orchestration/services/adoptions`.
+An identical replay through the peer Orchestrator must report `created: false`;
+matching database names alone do not establish shared registration state.
+
+The current protocol pins one `CI_APPLICATION_ORCHESTRATOR_URL` across CI
+instances. Two active Orchestrators do not make that URL fail over automatically.
+If it is unavailable, release observation waits; do not describe a successful
+sequential CI update as proof of full-region-outage recovery. Keep `/maintenance`
+behind operator authentication when exposing the token-protected lifecycle API.
+
 Cancellation stops new activations and settles prepared children through
 `POST /api/lifecycle/updates/{id}/cancel`. Already-submitted replacements remain
 under observation until their outcomes are known; transport errors never mean
