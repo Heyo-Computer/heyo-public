@@ -67,9 +67,11 @@ fn local_node(reg: &SchemaRegistry) -> Result<String> {
 
 pub(crate) async fn forward(mut client: ClientStream, startup: &[u8], peer: Peer, claim: wire::WriterClaim) -> Result<()> {
     if startup.len() > 10 * 1024 { bail!("startup packet too large for writer tunnel"); }
+    let cancel_target = crate::cancel::CancelTarget::Host(peer.pg_host.clone(), peer.pg_port);
     let peer_client = PeerClient::new(peer, Duration::from_secs(10))?;
     if peer_client.verified_node_info().await?.node != peer_client.name() { bail!("writer peer identity mismatch"); }
-    let mut upgraded = peer_client.writer_tunnel(&wire::WriterTunnelRequest { claim, startup: startup.to_vec() }).await?;
+    let upgraded = peer_client.writer_tunnel(&wire::WriterTunnelRequest { claim, startup: startup.to_vec() }).await?;
+    let mut upgraded = crate::cancel::KeyCapture::new(upgraded, crate::cancel::global().clone(), cancel_target); // cancels relay one hop, to the splicing peer
     tokio::io::copy_bidirectional(&mut client, &mut upgraded).await.context("proxying writer tunnel")?;
     Ok(())
 }

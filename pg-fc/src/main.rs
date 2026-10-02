@@ -6,6 +6,7 @@
 //! connection through. One isolated VM per schema, behind a single URL.
 
 mod auth;
+mod cancel;
 mod config;
 mod dashboard;
 mod dedicated;
@@ -38,7 +39,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
@@ -229,7 +230,19 @@ async fn handle_conn(
     registry: Arc<SchemaRegistry>,
     tls: Option<Arc<TlsReloader>>,
 ) -> Result<()> {
-    let (mut client, info) = startup::read_startup(client, tls.as_deref()).await?;
+    let (mut client, info) = match startup::read_startup(client, tls.as_deref()).await? {
+        startup::Startup::Session(client, info) => (client, info),
+        // A cancel for another connection's query. Routed by its key alone,
+        // ahead of auth (the secret *is* the credential, as in Postgres) and
+        // of any registry checkout, so it never takes a client slot or wakes
+        // a VM. The secret is never logged.
+        startup::Startup::Cancel(key) => {
+            if !cancel::forward(cancel::global(), &key).await? {
+                debug!("dropped a cancel for unknown backend pid {}", key.pid());
+            }
+            return Ok(());
+        }
+    };
     // Which password this client must prove, decided from its *role* alone: a
     // replication or dedicated login is challenged with its own, everyone else
     // with the shared `PG_VM_POOL_PASSWORD`. Keeping the requested database
