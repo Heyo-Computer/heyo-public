@@ -915,6 +915,7 @@ fn token_responses_are_stable() {
         deployments: vec!["*".into()],
         created_at: 1_722_400_000,
         expires_at: None,
+        minted_by: None,
         last_used_at: Some(1_722_403_600),
     };
     golden("token-summary", &fleet);
@@ -930,6 +931,7 @@ fn token_responses_are_stable() {
             deployments: vec!["sb-7f3a9c".into()],
             created_at: 1_722_400_000,
             expires_at: Some(1_722_486_400),
+            minted_by: None,
             last_used_at: None,
         },
     );
@@ -947,6 +949,7 @@ fn token_responses_are_stable() {
             deployments: vec![],
             created_at: 1_722_400_000,
             expires_at: None,
+            minted_by: None,
             last_used_at: None,
         },
     );
