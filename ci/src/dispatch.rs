@@ -7704,7 +7704,10 @@ jobs:
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        unsafe { std::env::set_var("CI_TEST_DAEMON", url); }
+        unsafe {
+            std::env::set_var("CI_TEST_DAEMON", url);
+            std::env::set_var("CI_LOCAL_RUNNER_TOKEN", "disposable-test-token");
+        }
         let workspace = tempfile::tempdir().unwrap();
         let d = test_dispatcher(workspace.path()).await;
         let runner = format!("pressure-{}", crate::vm::new_id());
@@ -7747,11 +7750,12 @@ jobs:
         // the durable eviction from completing on a fresh connection.
         let job = format!("job-{runner}-new");
         let step = format!("{job}.maintenance");
+        let operation = crate::vm::new_id();
         d.store.create_step(&step, &job, 0, "maintenance", None).await.unwrap();
-        sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) VALUES($1,$2,$1,$3,'host','test','running','draining','test','main')")
-            .bind(&run).bind(&step).bind(&job).execute(d.store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) VALUES($1,$2,$3,$4,'host','test','running','draining','test','main')")
+            .bind(&operation).bind(&step).bind(&run).bind(&job).execute(d.store.pool()).await.unwrap();
         sqlx::query("INSERT INTO ci_host_maintenance(id,runner_hd_id,request,deadline,phase) VALUES($1,$2,'{}',now()+interval '1 hour','draining')")
-            .bind(&run).bind(&runner).execute(d.store.pool()).await.unwrap();
+            .bind(&operation).bind(&runner).execute(d.store.pool()).await.unwrap();
 
         // A new controller finds the persistent eviction even though it is
         // fresh and its fingerprint is still wanted. A successful DELETE is
@@ -7777,7 +7781,10 @@ jobs:
             .bind(&runner).fetch_one(d.store.pool()).await.unwrap();
         assert!(!blocked, "confirmed cache deletion must clear the pool drain blocker");
         server.abort();
-        unsafe { std::env::remove_var("CI_TEST_DAEMON"); }
+        unsafe {
+            std::env::remove_var("CI_TEST_DAEMON");
+            std::env::remove_var("CI_LOCAL_RUNNER_TOKEN");
+        }
     }
 
     /// Lay down a run's workflow workspace and source descriptor, the way a real
