@@ -47,8 +47,22 @@ pub struct DeploymentStatus {
     pub vms: Vec<VmStatus>,
     /// Present when the spec declares `vm.workspace`.
     pub workspace: Option<WorkspaceStatus>,
+    /// Present for a site: whether its root on the LB host can serve.
+    pub site: Option<SiteRootStatus>,
     #[serde(flatten)]
     pub extra: Extra,
+}
+
+/// A site's root as the LB host sees it.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct SiteRootStatus {
+    pub root: String,
+    /// `ok`, `missing`, `not_a_directory`, `unreadable` or `empty`.
+    pub status: String,
+    pub index_present: Option<bool>,
+    /// Why it cannot serve, and how to fill it.
+    pub hint: Option<String>,
 }
 
 /// `vm.workspace`, mirrored read-only like [`MountSpec`].

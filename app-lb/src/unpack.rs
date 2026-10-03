@@ -165,6 +165,86 @@ impl Drop for Staged {
 /// rather than being an error, which is what makes `strip: 1` work on a bundle
 /// whose first entry is the bare directory `dist/`.
 pub fn stage(root: &Path, archive: &Path, strip: usize) -> Result<(Staged, Unpacked), String> {
+    let staged = begin(root)?;
+    let unpacked = extract(archive, staged.dir(), strip)?;
+    if unpacked.files == 0 {
+        return Err(format!(
+            "the bundle unpacked to no files at all{} — is it a tar (or tar.gz) of the \
+             built site?",
+            match strip {
+                0 => String::new(),
+                n => format!(" with strip_components: {n}"),
+            }
+        ));
+    }
+    Ok((staged, unpacked))
+}
+
+/// Copy the directory `src` (a git checkout, for a site's `build`) into a
+/// staging directory beside `root`, under the same rules as a bundle: regular
+/// files and directories only, `0644` plus the executable bits. `.git` is
+/// skipped at every level; it is the checkout's, not the site's.
+///
+/// **Blocking.** Call it from `spawn_blocking`.
+pub fn stage_tree(root: &Path, src: &Path) -> Result<(Staged, Unpacked), String> {
+    if !src.is_dir() {
+        return Err(format!("{} is not a directory in the checkout", src.display()));
+    }
+    let staged = begin(root)?;
+    let mut out = Unpacked::default();
+    copy_tree(src, staged.dir(), Path::new(""), &mut out)?;
+    if out.files == 0 {
+        return Err(format!(
+            "{} holds no files — is build.context the directory of the built site?",
+            src.display()
+        ));
+    }
+    Ok((staged, out))
+}
+
+fn copy_tree(src: &Path, dest: &Path, rel: &Path, out: &mut Unpacked) -> Result<(), String> {
+    let entries = std::fs::read_dir(src).map_err(|e| format!("could not read {}: {e}", src.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("could not read {}: {e}", src.display()))?;
+        let name = entry.file_name();
+        if name == ".git" {
+            continue;
+        }
+        let relative = rel.join(&name);
+        let kind = entry
+            .file_type()
+            .map_err(|e| format!("could not stat {}: {e}", relative.display()))?;
+        let target = dest.join(&name);
+        if kind.is_dir() {
+            std::fs::create_dir(&target)
+                .map_err(|e| format!("could not create {}: {e}", relative.display()))?;
+            copy_tree(&entry.path(), &target, &relative, out)?;
+        } else if kind.is_file() {
+            let bytes = std::fs::copy(entry.path(), &target)
+                .map_err(|e| format!("could not write {}: {e}", relative.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = entry.metadata().map(|m| m.permissions().mode()).unwrap_or(0) & 0o111;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644 | mode))
+                    .map_err(|e| format!("could not set permissions on {}: {e}", relative.display()))?;
+            }
+            out.files += 1;
+            out.bytes += bytes;
+        } else {
+            return Err(format!(
+                "the checkout holds {}, which is a symlink or special file. A site may only \
+                 contain files and directories — links are refused rather than copied",
+                relative.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Create the empty staging directory beside `root`, wrapped so it is removed
+/// again unless committed.
+fn begin(root: &Path) -> Result<Staged, String> {
     let parent = root.parent().ok_or_else(|| {
         format!(
             "site.root {} has no parent directory, so there is nowhere to unpack beside it",
@@ -190,26 +270,13 @@ pub fn stage(root: &Path, archive: &Path, strip: usize) -> Result<(Staged, Unpac
     std::fs::create_dir(&staging)
         .map_err(|e| format!("could not create {}: {e}", staging.display()))?;
 
-    // Constructed before the first write, so a failure anywhere below removes
-    // the staging directory on the way out.
-    let staged = Staged {
+    // Constructed before the first write, so a failure anywhere after this
+    // removes the staging directory on the way out.
+    Ok(Staged {
         root: root.to_path_buf(),
         staging,
         committed: false,
-    };
-
-    let unpacked = extract(archive, staged.dir(), strip)?;
-    if unpacked.files == 0 {
-        return Err(format!(
-            "the bundle unpacked to no files at all{} — is it a tar (or tar.gz) of the \
-             built site?",
-            match strip {
-                0 => String::new(),
-                n => format!(" with strip_components: {n}"),
-            }
-        ));
-    }
-    Ok((staged, unpacked))
+    })
 }
 
 /// A dotted sibling of `root`, named `.{root}.{what}`.

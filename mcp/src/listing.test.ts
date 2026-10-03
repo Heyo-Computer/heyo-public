@@ -38,7 +38,7 @@ const fleetOnly = (): Tool[] => buildTools(loadConfig({ APPLB_URL: "http://127.0
  * 56-name list navigable at all. The exceptions are deliberate: a tool named
  * after the *question* it answers rather than the service it happens to hit.
  */
-const PREFIXES = ["applb_", "sandbox_", "art_", "ci_", "obs_", "heyo_", "diagnose_"];
+const PREFIXES = ["applb_", "sandbox_", "art_", "repo_", "ci_", "obs_", "heyo_", "diagnose_"];
 const UNPREFIXED = ["fleet_overview", "deployment_logs"];
 
 test("every listed tool is well formed", () => {
@@ -118,7 +118,17 @@ test("a tool that advertises its own schema still agrees with the one that valid
 });
 
 test("the listing stays within its size budget", () => {
-  // Measured 2026-09-15: 66,069 bytes across 65 tools, up from 62,691 across 64.
+  // Measured 2026-10-03: 75,796 bytes across 76 tools, up from 66,069 across 65.
+  //
+  // The +9,727 is eleven new tools and one schema doc paragraph. Six are the
+  // `repo_*` tools (~5.9 KB) for the Heyo git remote, which is how a generated
+  // project gets somewhere app-lb can build it; five are artifact-store gateway
+  // tools (~3.4 KB): fetch, publish-files, list-manifests, delete-tag and
+  // set-public. The inline-file schema appears in two of them
+  // (`repo_write_files`, `art_publish_files`) because both accept the same
+  // input; about 600 bytes is the price of not making either point at the other.
+  //
+  // Earlier, 2026-09-15: 66,069 bytes across 65 tools, up from 62,691 across 64.
   //
   // The +3,378 is one new tool, `applb_security_events`, and nothing else. Its
   // description is long because the SIEM has three non-obvious properties a
@@ -133,7 +143,7 @@ test("the listing stays within its size budget", () => {
   // NOT enough for a second full spec schema: a tool that wants one shares this
   // one by pointing at it, because two copies of a 12 KB tree is a cost every
   // client pays on every connect.
-  const BUDGET = 67_000;
+  const BUDGET = 76_000;
   const bytes = JSON.stringify(toolListing(everything())).length;
   assert.ok(
     bytes <= BUDGET,

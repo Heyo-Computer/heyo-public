@@ -59,6 +59,16 @@ export const SPEC_RULES: readonly SpecRule[] = [
       "the running image came from.",
   },
   {
+    blocks: ["SiteSpec", "BuildSpec"],
+    rule:
+      "`site.root` is a directory ON THE APP-LB HOST, not on your machine: a path that " +
+      "exists only where you are registers fine and 404s every request. A site's files " +
+      "come from exactly one of `build` (a git repo: `repo`, `ref`, `context` and `auth` " +
+      "only — the checkout's `context` is copied into the root, nothing is run), " +
+      "`artifact` (a bundle from an art store) or `update` (commands on the host). " +
+      "repo_create + repo_deploy set this up from files you have.",
+  },
+  {
     blocks: ["BuildSpec"],
     rule:
       "`build` takes exactly one source: `repo` (a git remote, with `dockerfile` and " +
@@ -180,6 +190,25 @@ export function checkSpec(spec: unknown): string[] {
     );
   } else if (backends.length > 1) {
     problems.push(`Two backends (${backends.join(" and ")}); exactly one is allowed.`);
+  }
+
+  const site = (has("site") ? s.site : undefined) as Record<string, unknown> | undefined;
+  const build = (has("build") ? s.build : undefined) as Record<string, unknown> | undefined;
+  if (site && build) {
+    for (const k of ["store", "dockerfile", "image_name", "image_size_mb"]) {
+      if (build[k] !== undefined) {
+        problems.push(
+          `\`build.${k}\` does not apply to a site: a site's build copies a git checkout into ` +
+            "its root and builds no image. Use `repo`, `ref`, `context` and `auth` only.",
+        );
+      }
+    }
+  }
+  if (site && [has("build"), has("artifact"), has("update")].filter(Boolean).length > 1) {
+    problems.push(
+      "A site takes one of `build`, `artifact` or `update` — each writes the files under " +
+        "`site.root`, so two have no answer to where what is served came from.",
+    );
   }
 
   if (has("build") && has("artifact")) {

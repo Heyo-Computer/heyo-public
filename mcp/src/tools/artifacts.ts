@@ -32,13 +32,69 @@
  */
 
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import type { Config } from "../config.js";
 
 import { z } from "zod";
 import type { Clients } from "../clients/index.js";
 import { json } from "../format.js";
 import type { Tool } from "./diagnose.js";
+import { DEFAULT_EXCLUDE, decodeFiles, fileSchema, readDirectory, tarGz } from "../files.js";
+import { ServiceError } from "../http.js";
+import { bool, DESTRUCTIVE_PREFIX } from "./schema.js";
+
+/**
+ * Inline downloads above this are refused in favour of `save_to` or the
+ * gateway: a quarter MiB of base64 is already ~350k characters of context.
+ */
+const INLINE_LIMIT = 256 * 1024;
+
+const DIGEST = /^(sha256:)?[0-9a-f]{64}$/;
+
+interface Manifest {
+  kind?: string;
+  entries?: ManifestEntry[];
+}
+
+/**
+ * The blob a reference names: a tag or manifest digest through its manifest
+ * (one entry, or the one called `entry`), else a bare blob digest.
+ */
+async function resolveBlob(
+  clients: Clients,
+  reference: string,
+  entry?: string,
+): Promise<{ digest: string; name?: string; size?: number; manifest?: string }> {
+  let m: Manifest | undefined;
+  try {
+    m = (await clients.art({ path: `/manifests/${encodeURIComponent(reference)}` })) as Manifest;
+  } catch (e) {
+    if (!(e instanceof ServiceError && (e.status === 404 || e.status === 400)) || !DIGEST.test(reference)) throw e;
+  }
+  if (!m) {
+    const digest = reference.startsWith("sha256:") ? reference : `sha256:${reference}`;
+    return { digest };
+  }
+  const entries = m.entries ?? [];
+  const pick = entry ? entries.find((e) => e.name === entry) : entries.length === 1 ? entries[0] : undefined;
+  if (!pick) {
+    throw new Error(
+      `${reference} is a manifest with ${entries.length} entries (${entries.map((e) => e.name).join(", ")}); ` +
+        "name the one you want with `entry`.",
+    );
+  }
+  return { digest: pick.digest, name: pick.name, size: pick.size, manifest: reference };
+}
+
+/** Whether these bytes are text a model can read as-is. */
+function asText(bytes: Uint8Array): string | undefined {
+  try {
+    const s = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return /[\0-\x08\x0e-\x1f]/.test(s) ? undefined : s;
+  } catch {
+    return undefined;
+  }
+}
 
 /** The manifest kind for a plain collection of files. Mirrors `KIND_GENERIC`. */
 const KIND_GENERIC = "generic";
@@ -116,6 +172,71 @@ interface ManifestEntry {
   size: number;
 }
 
+interface Published {
+  blob: { digest: string; size: number; name: string };
+  manifest: { digest: string; kind: string };
+}
+
+/**
+ * The three-request publish, shared by `art_publish` and `art_publish_files`
+ * so there is exactly one place that orders it and one place that tags the
+ * manifest digest rather than the blob's.
+ */
+async function publishBytes(
+  clients: Clients,
+  tag: string,
+  bytes: Uint8Array,
+  name: string,
+  kind: string,
+  annotations?: Record<string, string>,
+): Promise<Published> {
+  const digest = sha256(bytes);
+  const entry: ManifestEntry = { name, digest, size: bytes.byteLength };
+
+  // 1. The blob, at its own hash. Raw bytes: JSON-encoding the body would
+  //    both corrupt it and change the digest it is being stored under.
+  await clients.art({
+    method: "PUT",
+    path: `/blobs/${encodeURIComponent(digest)}`,
+    rawBody: bytes,
+    contentType: "application/octet-stream",
+  });
+
+  // 2. The manifest. Its digest is a pure function of its content, so this
+  //    is idempotent too — the same manifest re-put is the same address.
+  const manifest = {
+    schema: SCHEMA_VERSION,
+    kind,
+    entries: [entry],
+    ...(annotations ? { annotations } : {}),
+  };
+  const created = await clients.art({ method: "PUT", path: "/manifests", body: manifest });
+  const manifestDigest =
+    created && typeof created === "object" && typeof (created as { digest?: unknown }).digest === "string"
+      ? (created as { digest: string }).digest
+      : undefined;
+  if (!manifestDigest) {
+    // Refusing to continue is the whole point: the next request would
+    // otherwise be a tag pointing at *something*, and the store would
+    // accept it. Better a failed publish than a tag nothing can resolve.
+    throw new Error(
+      `the store accepted the manifest but did not answer with its digest ` +
+        `(got ${json(created, 200)}). The blob at ${digest} is stored and the tag was NOT ` +
+        "moved, so nothing is pointing at a half-finished publish.",
+    );
+  }
+
+  // 3. The tag, naming the MANIFEST. `text/plain`, and the manifest digest
+  //    rather than the blob's — see this module's header.
+  await clients.art({
+    method: "PUT",
+    path: `/tags/${encodeURIComponent(tag)}`,
+    rawBody: manifestDigest,
+    contentType: "text/plain",
+  });
+  return { blob: entry, manifest: { digest: manifestDigest, kind } };
+}
+
 function publishTool(clients: Clients, http: boolean): Tool {
   return {
     name: "art_publish",
@@ -172,60 +293,19 @@ function publishTool(clients: Clients, http: boolean): Tool {
       if (!tag) throw new Error("`tag` is required — a publish nothing names is unreachable.");
 
       const bytes = await bytesOf(a, http);
-      const digest = sha256(bytes);
-      const entry: ManifestEntry = {
-        name: (a.name as string | undefined)?.trim() || tag,
-        digest,
-        size: bytes.byteLength,
-      };
-
-      // 1. The blob, at its own hash. Raw bytes: JSON-encoding the body would
-      //    both corrupt it and change the digest it is being stored under.
-      await clients.art({
-        method: "PUT",
-        path: `/blobs/${encodeURIComponent(digest)}`,
-        rawBody: bytes,
-        contentType: "application/octet-stream",
-      });
-
-      // 2. The manifest. Its digest is a pure function of its content, so this
-      //    is idempotent too — the same manifest re-put is the same address.
-      const manifest = {
-        schema: SCHEMA_VERSION,
-        kind: (a.kind as string | undefined)?.trim() || KIND_GENERIC,
-        entries: [entry],
-        ...(a.annotations ? { annotations: a.annotations } : {}),
-      };
-      const created = await clients.art({ method: "PUT", path: "/manifests", body: manifest });
-      const manifestDigest =
-        created && typeof created === "object" && typeof (created as { digest?: unknown }).digest === "string"
-          ? (created as { digest: string }).digest
-          : undefined;
-      if (!manifestDigest) {
-        // Refusing to continue is the whole point: the next request would
-        // otherwise be a tag pointing at *something*, and the store would
-        // accept it. Better a failed publish than a tag nothing can resolve.
-        throw new Error(
-          `the store accepted the manifest but did not answer with its digest ` +
-            `(got ${json(created, 200)}). The blob at ${digest} is stored and the tag was NOT ` +
-            "moved, so nothing is pointing at a half-finished publish.",
-        );
-      }
-
-      // 3. The tag, naming the MANIFEST. `text/plain`, and the manifest digest
-      //    rather than the blob's — see this module's header.
-      await clients.art({
-        method: "PUT",
-        path: `/tags/${encodeURIComponent(tag)}`,
-        rawBody: manifestDigest,
-        contentType: "text/plain",
-      });
-
+      const published = await publishBytes(
+        clients,
+        tag,
+        bytes,
+        (a.name as string | undefined)?.trim() || tag,
+        (a.kind as string | undefined)?.trim() || KIND_GENERIC,
+        a.annotations as Record<string, string> | undefined,
+      );
       return json({
         published: tag,
-        blob: { digest, size: entry.size, name: entry.name },
-        manifest: { digest: manifestDigest, kind: manifest.kind },
-        tag_points_at: manifestDigest,
+        blob: published.blob,
+        manifest: published.manifest,
+        tag_points_at: published.manifest.digest,
         // Named a tool that refuses the main case until 2026-09-10: `applb_pull`
         // is what rolls a `vm` deployment onto bytes from a store, and the tool
         // this used to name (then `applb_start_update`) applies to static and
@@ -243,8 +323,151 @@ function publishTool(clients: Clients, http: boolean): Tool {
 export function artifactTools(clients: Clients, config: Config): Tool[] {
   const enc = encodeURIComponent;
 
+  const http = Boolean(config.http);
+  const gateway = config.artGatewayUrl;
   return [
-    publishTool(clients, Boolean(config.http)),
+    publishTool(clients, http),
+
+    {
+      name: "art_publish_files",
+      description:
+        "Bundle files into a .tar.gz and publish it under a tag, the format a `site` " +
+        "deployment's `artifact` pull unpacks into its root. For an agent holding a built " +
+        "site with no tar at hand. " +
+        (http
+          ? "Give `files` inline (utf8 or base64). "
+          : "Give `files` inline, or `directory`: a folder on this machine (e.g. `dist`), " +
+            "bundled with paths relative to it. ") +
+        "Up to 64 MiB. Set `deployment` to also start applb_pull on it.",
+      schema: {
+        tag: z.string().min(1).describe("the tag to point at this bundle"),
+        files: z.array(fileSchema).optional(),
+        ...(http
+          ? {}
+          : {
+              directory: z.string().optional().describe("a folder on THIS machine to bundle"),
+              exclude: z.array(z.string()).optional().describe(`names skipped; default ${DEFAULT_EXCLUDE.join(", ")}`),
+            }),
+        annotations: z.record(z.string()).optional(),
+        deployment: z.string().optional().describe("start an app-lb pull of this tag on that deployment"),
+      },
+      handler: async (a) => {
+        const tag = String(a.tag).trim();
+        const dir = typeof a.directory === "string" ? a.directory.trim() : "";
+        const inline = (a.files as z.infer<typeof fileSchema>[] | undefined) ?? [];
+        if (dir && http) throw new Error("`directory` is not accepted over HTTP; send `files`.");
+        if (dir && inline.length) throw new Error("give `files` or `directory`, not both.");
+        const entries = dir
+          ? await readDirectory(dir, (a.exclude as string[] | undefined) ?? DEFAULT_EXCLUDE)
+          : (() => {
+              const d = decodeFiles(inline);
+              if (d.deletes.length) throw new Error("`delete` has no meaning in a bundle.");
+              if (!d.entries.length) throw new Error("no files: give `files`" + (http ? "." : " or `directory`."));
+              return d.entries;
+            })();
+        const bundle = tarGz(entries);
+        const published = await publishBytes(clients, tag, bundle, `${tag}.tar.gz`, KIND_GENERIC, a.annotations as
+          | Record<string, string>
+          | undefined);
+        let pull: unknown;
+        if (a.deployment) {
+          pull = await clients.applb({
+            method: "POST",
+            path: `/deployments/${encodeURIComponent(String(a.deployment))}/pull`,
+            body: { ref: tag },
+          });
+        }
+        return json({
+          published: tag,
+          files: entries.length,
+          bundle_bytes: bundle.byteLength,
+          ...published,
+          ...(pull ? { pull } : {}),
+          next: pull
+            ? "applb_job with the pull's id; the site serves the new files when it succeeds."
+            : "a site deployment with `artifact: {store, ref: \"" + tag + "\"}` serves this; applb_pull rolls it.",
+        });
+      },
+    },
+    {
+      name: "art_fetch",
+      description:
+        "Download from the store: a tag or manifest digest (its single entry, or `entry`), or " +
+        "a blob digest. The digest is verified. Text comes back as text, anything else as " +
+        "base64, up to 256 KiB inline" +
+        (http ? "" : "; `save_to` writes it to a file on this machine at any size") +
+        "." +
+        (gateway ? ` Larger blobs: GET ${gateway}/blobs/<digest> with your own bearer.` : ""),
+      schema: {
+        reference: z.string().describe("tag, manifest digest, or blob digest"),
+        entry: z.string().optional().describe("entry name, for a manifest with several"),
+        ...(http ? {} : { save_to: z.string().optional().describe("write the bytes to this path") }),
+      },
+      handler: async (a) => {
+        const ref = String(a.reference).trim();
+        const target = await resolveBlob(clients, ref, a.entry as string | undefined);
+        if (http && a.save_to) throw new Error("`save_to` is not accepted over HTTP.");
+        if (!a.save_to && target.size !== undefined && target.size > INLINE_LIMIT) {
+          throw new Error(
+            `${ref} is ${target.size} bytes, over the ${INLINE_LIMIT >> 10} KiB inline limit. ` +
+              (http
+                ? gateway
+                  ? `Download it from ${gateway}/blobs/${target.digest} with your bearer.`
+                  : "Download it from the store directly."
+                : "Pass `save_to`."),
+          );
+        }
+        const bytes = (await clients.art({
+          path: `/blobs/${encodeURIComponent(target.digest)}`,
+          expectBytes: true,
+        })) as Uint8Array;
+        const got = sha256(bytes);
+        if (got !== (target.digest.startsWith("sha256:") ? target.digest : `sha256:${target.digest}`)) {
+          throw new Error(`the store returned bytes hashing to ${got}, not ${target.digest}; nothing was kept.`);
+        }
+        const meta = { reference: ref, digest: target.digest, name: target.name, size: bytes.byteLength };
+        if (a.save_to) {
+          await writeFile(String(a.save_to), bytes);
+          return json({ ...meta, saved_to: a.save_to });
+        }
+        if (bytes.byteLength > INLINE_LIMIT) {
+          throw new Error(`${bytes.byteLength} bytes is over the inline limit` + (http ? "." : "; pass `save_to`."));
+        }
+        const text = asText(bytes);
+        return json(text !== undefined ? { ...meta, text } : { ...meta, base64: Buffer.from(bytes).toString("base64") }, Infinity);
+      },
+    },
+    {
+      name: "art_list_manifests",
+      description: "Every manifest in the store: digest, kind and entries.",
+      schema: {},
+      handler: async () => json(await clients.art({ path: "/manifests" })),
+    },
+    {
+      name: "art_delete_tag",
+      description:
+        DESTRUCTIVE_PREFIX +
+        "Remove a tag. The manifest and blobs stay until gc; a deployment whose `artifact.ref` " +
+        "names this tag can no longer pull.",
+      schema: { tag: z.string() },
+      handler: async (a) =>
+        json(await clients.art({ method: "DELETE", path: `/tags/${encodeURIComponent(String(a.tag))}` })),
+    },
+    {
+      name: "art_set_public",
+      description:
+        "Make a blob anonymously downloadable (`public: true`) or private again. Takes a tag, " +
+        "a single-entry manifest, or a blob digest. Anyone with the digest can then fetch it, " +
+        "so never for secrets.",
+      schema: { reference: z.string(), public: bool() },
+      handler: async (a) =>
+        json(
+          await clients.art({
+            method: a.public ? "PUT" : "DELETE",
+            path: `/public/${encodeURIComponent(String(a.reference))}`,
+          }),
+        ),
+    },
 
     {
       name: "art_list_tags",

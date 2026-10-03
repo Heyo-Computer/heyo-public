@@ -482,6 +482,7 @@ fn deployment_status_is_stable() {
         });
 
         let managed = spec.is_managed();
+        let spec_site = spec.site.as_ref().map(|s| s.root.clone());
         let kind = if spec.is_site() {
             "site"
         } else if spec.is_static() {
@@ -512,6 +513,13 @@ fn deployment_status_is_stable() {
                     vec![]
                 },
                 workspace: None,
+                // A fixed answer, not the fixture host's filesystem.
+                site: spec_site.map(|root| crate::site::RootStatus {
+                    root,
+                    status: "ok",
+                    index_present: Some(true),
+                    hint: None,
+                }),
             },
         );
     }

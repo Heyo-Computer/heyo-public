@@ -81,6 +81,17 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
         }
       ]
     },
+    "gateway": {
+      "description": "Opt-in one-hop regional gateway transport over explicit static upstreams.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewaySpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "health": {
       "description": "How app-lb decides a replica is ready to take traffic.",
       "$ref": "#/$defs/HealthCheck",
@@ -347,6 +358,11 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
       "additionalProperties": true,
       "description": "A deployment's opt-in hooks into its namespace's event feed. (Call applb_spec_schema with block \"FeedSpec\" for the full shape; everything it accepted is still accepted.)"
     },
+    "GatewaySpec": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "GatewaySpec (Call applb_spec_schema with block \"GatewaySpec\" for the full shape; everything it accepted is still accepted.)"
+    },
     "HealthCheck": {
       "description": "How a freshly-booted VM is proven ready before it joins the pool.",
       "type": "object",
@@ -561,7 +577,7 @@ export const DEPLOYMENT_SPEC_SCHEMA = {
       "description": "How a *static* (proxy_pass) deployment's backend is updated: a working directory on the app-lb host, and commands to run in it. (Call applb_spec_schema with block \"UpdateSpec\" for the full shape; everything it accepted is still accepted.)"
     },
     "VmSpec": {
-      "description": "The VM template. (8 more fields — env_from, image_download_url, image_sha256, image_size_bytes, mounts, setup_hooks, workspace, workspace_archive — omitted here for size. Call applb_spec_schema with block \"VmSpec\" for the full shape; everything it accepted is still accepted.)",
+      "description": "The VM template. (9 more fields — correlated_creates, env_from, image_download_url, image_sha256, image_size_bytes, mounts, setup_hooks, workspace, workspace_archive — omitted here for size. Call applb_spec_schema with block \"VmSpec\" for the full shape; everything it accepted is still accepted.)",
       "type": "object",
       "properties": {
         "disk_size_gb": {
@@ -721,6 +737,17 @@ export const DEPLOYMENT_SPEC_FULL = {
       "anyOf": [
         {
           "$ref": "#/$defs/FeedSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "gateway": {
+      "description": "Opt-in one-hop regional gateway transport over explicit static upstreams.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewaySpec"
         },
         {
           "type": "null"
@@ -1041,7 +1068,7 @@ export const DEPLOYMENT_SPEC_FULL = {
       ]
     },
     "BuildSpec": {
-      "description": "Where a deployment's guest image is *built* from — a Dockerfile, and the\nfiles it copies in.\n\nThis is the *source*, not the running image. A build assembles the recipe and\nits context on this host, hands them to `heyvm mvm build`, and only then\nwrites the resulting image name into [`VmSpec::image`] — so the spec always\nsays which image is actually booting, and this block says where the next one\nwill come from. Editing it never disturbs running VMs; running a build does.\n\nTwo ways to get the recipe here, and exactly one of them must be set:\n\n* **`repo`** — a git checkout. app-lb fetches `repo` at `ref` and looks for a\n  Dockerfile inside it. The original form, and the right one when the recipe\n  lives with the code it builds.\n* **`store`** — a Dockerfile manifest in an artifact store, named by `ref`.\n  app-lb fetches the manifest, writes out its `Dockerfile` and unpacks its\n  `context.tar.gz`. See [`ArtifactSpec`] for the two spellings of `store`, and\n  `art dockerfile put` in the artifacts crate for how one gets there.\n\nThe difference that matters is *what the ref pins*. A git ref pins a commit,\nand the Dockerfile is whatever that commit happens to hold; a store ref\nresolves to a manifest digest covering the recipe, the context and the\nannotations together. So a store build can say \"these exact inputs\" in a way a\nbranch name cannot, and a rollback is expressible: a tag moves, a digest does\nnot.\n\nIt remains a *build* either way, which is why this is one block and not two.\nBoth run `heyvm mvm build` and produce an image that did not exist before,\nwhich is the whole distinction from [`ArtifactSpec`] — there, the digest names\nbytes that already exist and nothing is produced at all.\n\nNote what is deliberately absent: build arguments and a registry. The image is\nan ext4 rootfs on this host, built from a Dockerfile the daemon never sees, and\n`heyvm mvm build` exposes neither `--build-arg` nor a push target for the\nlocal-only path.",
+      "description": "Where a deployment's guest image is *built* from — a Dockerfile, and the\nfiles it copies in.\n\nThis is the *source*, not the running image. A build assembles the recipe and\nits context on this host, hands them to `heyvm mvm build`, and only then\nwrites the resulting image name into [`VmSpec::image`] — so the spec always\nsays which image is actually booting, and this block says where the next one\nwill come from. Editing it never disturbs running VMs; running a build does.\n\nOn a **site** it is the files themselves: `repo` at `ref` is checked out and\nits `context` directory (default: the whole checkout, minus `.git`) is copied\ninto `site.root` with the same staged swap an artifact pull uses. Nothing is\nbuilt or run, so `store`, `dockerfile`, `image_name` and `image_size_mb` are\nrefused there. This is how a repo on a Heyo git remote becomes a site.\n\nTwo ways to get the recipe here, and exactly one of them must be set:\n\n* **`repo`** — a git checkout. app-lb fetches `repo` at `ref` and looks for a\n  Dockerfile inside it. The original form, and the right one when the recipe\n  lives with the code it builds.\n* **`store`** — a Dockerfile manifest in an artifact store, named by `ref`.\n  app-lb fetches the manifest, writes out its `Dockerfile` and unpacks its\n  `context.tar.gz`. See [`ArtifactSpec`] for the two spellings of `store`, and\n  `art dockerfile put` in the artifacts crate for how one gets there.\n\nThe difference that matters is *what the ref pins*. A git ref pins a commit,\nand the Dockerfile is whatever that commit happens to hold; a store ref\nresolves to a manifest digest covering the recipe, the context and the\nannotations together. So a store build can say \"these exact inputs\" in a way a\nbranch name cannot, and a rollback is expressible: a tag moves, a digest does\nnot.\n\nIt remains a *build* either way, which is why this is one block and not two.\nBoth run `heyvm mvm build` and produce an image that did not exist before,\nwhich is the whole distinction from [`ArtifactSpec`] — there, the digest names\nbytes that already exist and nothing is produced at all.\n\nNote what is deliberately absent: build arguments and a registry. The image is\nan ext4 rootfs on this host, built from a Dockerfile the daemon never sees, and\n`heyvm mvm build` exposes neither `--build-arg` nor a push target for the\nlocal-only path.",
       "type": "object",
       "properties": {
         "auth": {
@@ -1108,11 +1135,54 @@ export const DEPLOYMENT_SPEC_FULL = {
         }
       }
     },
+    "DiscoverySource": {
+      "type": "object",
+      "properties": {
+        "auth": {
+          "$ref": "#/$defs/SecretRef"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "auth"
+      ]
+    },
     "DiscoverySpec": {
       "type": "object",
       "properties": {
+        "region": {
+          "description": "Opt into region-scoped membership; the authority must echo this scope.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "regional": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegionalSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "service_id": {
           "type": "string"
+        },
+        "source": {
+          "description": "Managed per-deployment authority; absent preserves the host env default.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiscoverySource"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1176,6 +1246,37 @@ export const DEPLOYMENT_SPEC_FULL = {
           "default": false
         }
       }
+    },
+    "GatewayMode": {
+      "type": "string",
+      "enum": [
+        "forward",
+        "local"
+      ]
+    },
+    "GatewaySpec": {
+      "type": "object",
+      "properties": {
+        "auth": {
+          "$ref": "#/$defs/SecretRef"
+        },
+        "mode": {
+          "$ref": "#/$defs/GatewayMode"
+        },
+        "region": {
+          "description": "Destination region for forward mode; this instance's region for local mode.",
+          "type": "string"
+        },
+        "service": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "service",
+        "region",
+        "auth",
+        "mode"
+      ]
     },
     "HealthCheck": {
       "description": "How a freshly-booted VM is proven ready before it joins the pool.\n\nThis exists because the SDK's readiness signal is not trustworthy on its own\n(see `vm::wait_until_running`), so we always probe the guest ourselves.",
@@ -1476,6 +1577,29 @@ export const DEPLOYMENT_SPEC_FULL = {
         }
       ]
     },
+    "RegionalSpec": {
+      "type": "object",
+      "properties": {
+        "auth": {
+          "$ref": "#/$defs/SecretRef"
+        },
+        "backend_server_id": {
+          "type": "string"
+        },
+        "environment": {
+          "type": "string"
+        },
+        "gateway_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gateway_id",
+        "backend_server_id",
+        "environment",
+        "auth"
+      ]
+    },
     "RouteRule": {
       "description": "How a request is matched to a deployment.\n\nA rule matches when *every* populated field matches. An empty rule matches\nnothing (rejected at registration) rather than everything, so a typo can't\nsilently swallow all traffic.",
       "type": "object",
@@ -1549,7 +1673,7 @@ export const DEPLOYMENT_SPEC_FULL = {
           "default": "destroy"
         },
         "max_replicas": {
-          "description": "Ceiling on replicas the autoscaler may run. Defaults to 5. Must be 1\nwhen [`VmSpec::workspace`] is set — a single-writer workspace cannot\nhave two replicas capturing divergent copies of it.",
+          "description": "Ceiling on replicas the autoscaler may run. Defaults to 5. Must be at most 1\nwhen [`VmSpec::workspace`] is set — a single-writer workspace cannot\nhave two replicas capturing divergent copies of it.",
           "type": "integer",
           "format": "uint32",
           "default": 5,
@@ -1669,18 +1793,16 @@ export const DEPLOYMENT_SPEC_FULL = {
           ]
         },
         "root": {
-          "description": "Absolute path to the directory to serve. Nothing outside it is ever\nserved, symlinks included — see `site::resolve`.",
-          "type": "string"
+          "description": "Absolute path ON THE APP-LB HOST to the directory to serve. Nothing\noutside it is ever served, symlinks included — see `site::resolve`.\n\nOmit it to have app-lb choose `<APP_LB_SITES_DIR>/<namespace>/<id>`,\nwhich is what a site filled by `build` or `artifact` wants: the caller\ncannot see this host's filesystem, and a path that exists only on the\ncaller's machine registers fine and then 404s every request.",
+          "type": "string",
+          "default": ""
         },
         "spa": {
           "description": "Serve `index` (with a 200) for any path that matches no file, so a\nclient-side router owns the URL space. The single-page-app switch; off\nby default because it turns every typo into a 200.",
           "type": "boolean",
           "default": false
         }
-      },
-      "required": [
-        "root"
-      ]
+      }
     },
     "UpdateSpec": {
       "description": "How a *static* (proxy_pass) deployment's backend is updated: a working\ndirectory on the app-lb host, and commands to run in it.\n\nThe managed counterpart of this is [`BuildSpec`], and the asymmetry is the\npoint. A managed deployment's backend is a microVM app-lb owns, so updating\nit means producing a new image. A static deployment's backend is a process\nsomebody else runs — usually on this same host, under supervisord or systemd\n— so updating it means doing on the host what a person would otherwise ssh in\nand do: pull, build, restart.\n\nNothing in the spec changes when this runs. The upstreams are the same\naddresses; what moved is the code answering on them. That is why the job\nre-probes those addresses afterwards: \"the commands exited 0\" is not the same\nclaim as \"the service is serving\".",
@@ -1753,6 +1875,10 @@ export const DEPLOYMENT_SPEC_FULL = {
       "description": "The VM template. Mirrors `SandboxCreateOptions`, minus the fields the LB owns\n(`name` is generated per-replica; `wait_for_ready` is always zero because the\nautoscaler polls readiness itself rather than blocking its reconcile loop).\n\nNote the SDK cannot express vcpu/memory directly — `size_class` is the only\nresource knob, and the daemon resolves it host-side. It cannot express\n`mounts` either, which is why [`crate::vm::VmManager::create`] builds the\ncreate body itself rather than handing the SDK a `SandboxCreateOptions`.\n`PartialEq` is load-bearing: an in-place edit keeps the running pool only\nwhen the VM *template* is unchanged, so the update path compares old and new\n`VmSpec`s to decide whether the VMs must be rebuilt.",
       "type": "object",
       "properties": {
+        "correlated_creates": {
+          "description": "Require durable heyvmd operation receipts for autoscaler allocations.\nRequires an internal daemon credential and /sandbox-creations support;\nunknown outcomes never fall back to legacy create or name matching.",
+          "type": "boolean"
+        },
         "disk_size_gb": {
           "description": "Size of the replica's persistent data disk, mounted at `/workspace`.\n\nSeparate from the rootfs, which is fixed when the image is built and\ncannot be grown afterwards — so this is not the knob for \"the image ran\nout of space\". The disk belongs to one sandbox: a rollout, a restart or\nany `vm` edit boots a replica with a fresh one, and only\n[`WorkspaceSpec`] carries contents across.",
           "type": [
@@ -1931,7 +2057,7 @@ export const DEPLOYMENT_SPEC_FULL = {
       }
     },
     "WorkspaceSpec": {
-      "description": "A persistent, writable workspace owned by the deployment.\n\nThe fourth thing app-lb moves between a store and a guest, and the only one\nthat moves in **both directions**. A [`MountSpec`] is data the deployment\nwas *given*; a workspace is data the deployment *makes* — the agent's\nsessions, the repositories it cloned, the files it was asked to keep — and\nit has to outlive the VM that wrote it. heyvm's own `/workspace` data disk\ndoes not: it belongs to one sandbox, so every rollout, every `restart`, and\nevery rebuild that recycles the pool boots a replica with an empty one.\n\n## The lifecycle\n\n* **Seed.** When the autoscaler creates a replica it hands heyvmd the\n  workspace's current tree on this host as a writable mount at\n  [`path`](Self::path). The daemon builds the VM its own ext4 image from\n  that tree (`mke2fs -d`), so the guest writes to a block device and the\n  tree itself is only read. With no tree yet — a fresh host, or a swept\n  one — the latest snapshot is pulled from [`store`](Self::store) first;\n  with no snapshot in the store either, the workspace starts empty.\n* **Capture.** When a replica retires for any reason — drained by a\n  rollout, evicted, torn down by an edit or a deregistration, suspended by\n  `idle_action: retain` — app-lb syncs the guest, stops the VM, replays the\n  image's journal, extracts it into a new tree, and points the deployment\n  at that tree. The replacement is not created until that has happened,\n  which is the whole guarantee: the next VM boots from the last VM's final\n  state, not from whatever the store held when the host came up.\n* **Push.** Each capture is bundled (`tar.gz`, named by its sha256) and sent\n  to the store under [`ref`](Self::artifact_ref), so the workspace survives\n  the host too. A push that fails is retried; it never blocks the rollout,\n  because the tree the next VM needs is already here.\n\n## What this costs, and what it refuses\n\nA capture stops the VM, so a rollout of a workspace deployment has a gap:\nthe old replica is drained and stopped, its tree is extracted, and only then\ndoes the new one boot. That is inherent to single-writer state and it is why\n`scaling.max_replicas` **must be 1** — two replicas would each capture their\nown divergent copy and the last one to land would win. `warm_pool` must be\n`0` for the same reason, and the driver must be `firecracker`: the KVM\ndriver has its own idea of what a writable mount means when the VM stops.\n\nOwnership is flattened: the tree is extracted and rebuilt by app-lb's own\nuser, so every file comes back owned by that uid inside the guest. A\nworkload that runs as root reads and writes them regardless; one that\nchecks ownership (git's `safe.directory`, Postgres's data-directory check)\nneeds to be told. Modes, symlinks and timestamps survive.",
+      "description": "A persistent, writable workspace owned by the deployment.\n\nThe fourth thing app-lb moves between a store and a guest, and the only one\nthat moves in **both directions**. A [`MountSpec`] is data the deployment\nwas *given*; a workspace is data the deployment *makes* — the agent's\nsessions, the repositories it cloned, the files it was asked to keep — and\nit has to outlive the VM that wrote it. heyvm's own `/workspace` data disk\ndoes not: it belongs to one sandbox, so every rollout, every `restart`, and\nevery rebuild that recycles the pool boots a replica with an empty one.\n\n## The lifecycle\n\n* **Seed.** When the autoscaler creates a replica it hands heyvmd the\n  workspace's current tree on this host as a writable mount at\n  [`path`](Self::path). The daemon builds the VM its own ext4 image from\n  that tree (`mke2fs -d`), so the guest writes to a block device and the\n  tree itself is only read. With no tree yet — a fresh host, or a swept\n  one — the latest snapshot is pulled from [`store`](Self::store) first;\n  with no snapshot in the store either, the workspace starts empty.\n* **Capture.** When a replica retires for any reason — drained by a\n  rollout, evicted, torn down by an edit or a deregistration, suspended by\n  `idle_action: retain` — app-lb syncs the guest, stops the VM, replays the\n  image's journal, extracts it into a new tree, and points the deployment\n  at that tree. The replacement is not created until that has happened,\n  which is the whole guarantee: the next VM boots from the last VM's final\n  state, not from whatever the store held when the host came up.\n* **Push.** Each capture is bundled (`tar.gz`, named by its sha256) and sent\n  to the store under [`ref`](Self::artifact_ref), so the workspace survives\n  the host too. A push that fails is retried; it never blocks the rollout,\n  because the tree the next VM needs is already here.\n\n## What this costs, and what it refuses\n\nA capture stops the VM, so a rollout of a workspace deployment has a gap:\nthe old replica is drained and stopped, its tree is extracted, and only then\ndoes the new one boot. That is inherent to single-writer state and it is why\n`scaling.max_replicas` **must be at most 1** — two replicas would each capture their\nown divergent copy and the last one to land would win. `warm_pool` must be\n`0` for the same reason, and the driver must be `firecracker`: the KVM\ndriver has its own idea of what a writable mount means when the VM stops.\n\nOwnership is flattened: the tree is extracted and rebuilt by app-lb's own\nuser, so every file comes back owned by that uid inside the guest. A\nworkload that runs as root reads and writes them regardless; one that\nchecks ownership (git's `safe.directory`, Postgres's data-directory check)\nneeds to be told. Modes, symlinks and timestamps survive.",
       "type": "object",
       "properties": {
         "auth": {
@@ -1958,6 +2084,15 @@ export const DEPLOYMENT_SPEC_FULL = {
             "string",
             "null"
           ]
+        },
+        "snapshot_interval_secs": {
+          "description": "Take a snapshot at least this often, in seconds, by recycling the\nreplica: drain, capture, then resume it (`idle_action: retain`) or boot\nits replacement from the result. Unset, a snapshot is taken only when\nthe replica retires for some other reason — a VM that runs for days\nholds days of work that exist nowhere else. Each one costs the drain\nplus the capture as downtime, so at least\n[`MIN_SNAPSHOT_INTERVAL_SECS`].",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "store": {
           "description": "Where snapshots go, in one of three forms:\n\n* `s3://bucket[/prefix]` — an S3 bucket, reached with the `aws` CLI and\n  whatever credentials it finds (`APP_LB_DISK_ARCHIVE_ENDPOINT` applies\n  for an S3-compatible store). Snapshots land at\n  `<prefix>/<deployment>/<digest>.tar.gz` with a `latest` pointer.\n* `http(s)://host:port` — a remote `art serve`. Each snapshot is a blob,\n  and [`ref`](Self::artifact_ref) is the tag that names the newest.\n* an absolute path — a local `ART_ROOT`, reached through the `art` CLI.",

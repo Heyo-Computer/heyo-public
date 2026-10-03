@@ -135,6 +135,11 @@ pub struct LbConfig {
     /// full clone.
     #[serde(default = "default_build_dir")]
     pub build_dir: String,
+    /// Where app-lb keeps site roots it manages itself, such as a site built
+    /// from a git remote. A site `build` into a root under here gets its
+    /// parent directories created.
+    #[serde(default = "default_sites_dir")]
+    pub sites_dir: String,
     /// The `heyvm` CLI that turns a Dockerfile into a guest rootfs. Image
     /// building has no daemon API — it needs a local `docker`, `mke2fs` and
     /// `fakeroot` — so app-lb shells out to the binary on this host.
@@ -241,6 +246,9 @@ fn default_tls_addr() -> String {
 fn default_build_dir() -> String {
     "/var/lib/app-lb/builds".into()
 }
+fn default_sites_dir() -> String {
+    "/var/lib/app-lb/sites".into()
+}
 fn default_heyvm_bin() -> String {
     "heyvm".into()
 }
@@ -298,6 +306,7 @@ impl Default for LbConfig {
             acme_dir: default_acme_dir(),
             acme_directory: default_acme_directory(),
             build_dir: default_build_dir(),
+            sites_dir: default_sites_dir(),
             heyvm_bin: default_heyvm_bin(),
             art_bin: default_art_bin(),
             images_dir: None,
@@ -1425,6 +1434,12 @@ pub fn is_sha256_hex(s: &str) -> bool {
 /// writes the resulting image name into [`VmSpec::image`] — so the spec always
 /// says which image is actually booting, and this block says where the next one
 /// will come from. Editing it never disturbs running VMs; running a build does.
+///
+/// On a **site** it is the files themselves: `repo` at `ref` is checked out and
+/// its `context` directory (default: the whole checkout, minus `.git`) is copied
+/// into `site.root` with the same staged swap an artifact pull uses. Nothing is
+/// built or run, so `store`, `dockerfile`, `image_name` and `image_size_mb` are
+/// refused there. This is how a repo on a Heyo git remote becomes a site.
 ///
 /// Two ways to get the recipe here, and exactly one of them must be set:
 ///
@@ -3632,8 +3647,14 @@ pub enum Backend {
 /// site that needs those wants a real server behind a `proxy_pass` deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SiteSpec {
-    /// Absolute path to the directory to serve. Nothing outside it is ever
-    /// served, symlinks included — see `site::resolve`.
+    /// Absolute path ON THE APP-LB HOST to the directory to serve. Nothing
+    /// outside it is ever served, symlinks included — see `site::resolve`.
+    ///
+    /// Omit it to have app-lb choose `<APP_LB_SITES_DIR>/<namespace>/<id>`,
+    /// which is what a site filled by `build` or `artifact` wants: the caller
+    /// cannot see this host's filesystem, and a path that exists only on the
+    /// caller's machine registers fine and then 404s every request.
+    #[serde(default)]
     pub root: String,
     /// Served for a request that names a directory. Set to `""` to answer those
     /// with a 404 instead of looking for an index.
@@ -3759,12 +3780,12 @@ pub enum SpecError {
     /// A `site` alongside a `vm` or `upstreams`: a deployment serves from one
     /// place, and three ways to answer a request has no defined precedence.
     SiteWithOtherBackend,
-    /// A `build` or other guest-image-only block on a site.
+    /// A guest-image-only block or field on a site (`build.dockerfile`, …).
     NotForSites(&'static str),
     /// A site-only field set on a deployment that is not a site.
     OnlyForSites(&'static str),
-    /// A site set both `update` and `artifact`; both claim to produce the files
-    /// under `site.root`.
+    /// A site set more than one of `update`, `artifact` and `build`; each
+    /// claims to produce the files under `site.root`.
     BothSiteSources,
     /// Both a `vm` template and a static `upstreams` list were set.
     BothBackendKinds,
@@ -4039,10 +4060,11 @@ impl std::fmt::Display for SpecError {
             ),
             Self::BothSiteSources => write!(
                 f,
-                "a site sets both `update` and `artifact`: pick one — both write the files \
-                 under `site.root`, so with both there is no answer to where what is being \
-                 served came from. Run the build on this host (`update`), or unpack a bundle \
-                 somebody already built (`artifact`)"
+                "a site sets more than one of `update`, `artifact` and `build`: pick one — \
+                 each writes the files under `site.root`, so with two there is no answer to \
+                 where what is being served came from. Run the build on this host \
+                 (`update`), unpack a bundle somebody already built (`artifact`), or copy a \
+                 git checkout in (`build` with `repo`)"
             ),
             Self::NoRoutes => write!(
                 f,
@@ -4880,17 +4902,32 @@ impl DeploymentSpec {
                 return Err(SpecError::SiteWithOtherBackend);
             }
             site.validate()?;
-            // A site has no image and no pool, so a block that produces one is
-            // meaningless rather than merely unused. Rejected so a spec cannot
-            // claim something app-lb will silently ignore.
-            if self.build.is_some() {
-                return Err(SpecError::NotForSites("build"));
+            // A site's `build` is a git checkout copied into `site.root`: no
+            // Dockerfile, no image, nothing run. So only the git half of the
+            // block means anything, and the image half is refused rather than
+            // silently ignored.
+            if let Some(build) = &self.build {
+                if build.store.is_some() {
+                    return Err(SpecError::NotForSites("build.store"));
+                }
+                for (field, set) in [
+                    ("build.dockerfile", build.dockerfile.is_some()),
+                    ("build.image_name", build.image_name.is_some()),
+                    ("build.image_size_mb", build.image_size_mb.is_some()),
+                ] {
+                    if set {
+                        return Err(SpecError::NotForSites(field));
+                    }
+                }
+                build.validate()?;
             }
-            // Both of these *are* allowed, and they are the two ways a site's
-            // files get replaced: `update` runs `git pull && npm run build` in a
-            // directory on this host, `artifact` unpacks a bundle somebody else
-            // built. Never both — see [`SpecError::BothSiteSources`].
-            if self.update.is_some() && self.artifact.is_some() {
+            // The three ways a site's files get replaced: `update` runs
+            // `git pull && npm run build` in a directory on this host,
+            // `artifact` unpacks a bundle somebody else built, and `build`
+            // copies a git checkout in. At most one — see
+            // [`SpecError::BothSiteSources`].
+            let sources = [self.update.is_some(), self.artifact.is_some(), self.build.is_some()];
+            if sources.iter().filter(|s| **s).count() > 1 {
                 return Err(SpecError::BothSiteSources);
             }
             if let Some(update) = &self.update {
@@ -7341,16 +7378,40 @@ mod tests {
             assert_eq!(s.validate(), Err(SpecError::SiteWithOtherBackend));
         }
 
-        /// A `build` produces a guest image, and a site has neither an image nor
-        /// a pool — so it is a misunderstanding rather than a harmless extra.
-        /// `artifact` is *not* in this company: see below.
+        /// A site's `build` is a git checkout copied into the root. The image
+        /// half of the block (a store recipe, a Dockerfile, an image name or
+        /// size) means nothing without an image, so it is refused rather than
+        /// ignored.
         #[test]
-        fn a_build_block_is_refused_on_a_site() {
+        fn a_site_build_is_a_git_checkout_and_nothing_else() {
             let mut s = site_spec();
             s.build = Some(
-                serde_json::from_str(r#"{"repo":"https://github.com/acme/site.git"}"#).unwrap(),
+                serde_json::from_str(r#"{"repo":"https://github.com/acme/site.git","ref":"main","context":"dist"}"#)
+                    .unwrap(),
             );
-            assert_eq!(s.validate(), Err(SpecError::NotForSites("build")));
+            assert_eq!(s.validate(), Ok(()));
+
+            for (json, field) in [
+                (r#"{"store":"http://127.0.0.1:8080","ref":"x"}"#, "build.store"),
+                (r#"{"repo":"https://h/r.git","dockerfile":"Dockerfile"}"#, "build.dockerfile"),
+                (r#"{"repo":"https://h/r.git","image_name":"x"}"#, "build.image_name"),
+                (r#"{"repo":"https://h/r.git","image_size_mb":512}"#, "build.image_size_mb"),
+            ] {
+                let mut s = site_spec();
+                s.build = Some(serde_json::from_str(json).unwrap());
+                assert_eq!(s.validate(), Err(SpecError::NotForSites(field)), "{json}");
+            }
+
+            let mut s = site_spec();
+            s.build = Some(serde_json::from_str(r#"{"repo":"https://h/r.git","context":"../x"}"#).unwrap());
+            assert!(s.validate().is_err(), "the context stays inside the checkout");
+
+            let mut s = site_spec();
+            s.build = Some(serde_json::from_str(r#"{"repo":"https://h/r.git"}"#).unwrap());
+            s.artifact = Some(
+                serde_json::from_str(r#"{"store":"http://127.0.0.1:8080","ref":"x"}"#).unwrap(),
+            );
+            assert_eq!(s.validate(), Err(SpecError::BothSiteSources));
         }
 
         /// `update` *is* allowed: `git pull && npm run build` in a directory on

@@ -158,6 +158,9 @@ fn config_from_env() -> LbConfig {
     if let Ok(v) = std::env::var("APP_LB_BUILD_DIR") {
         cfg.build_dir = v;
     }
+    if let Ok(v) = std::env::var("APP_LB_SITES_DIR") {
+        cfg.sites_dir = v;
+    }
     if let Ok(v) = std::env::var("APP_LB_LXC_ENABLED") {
         cfg.lxc.enabled = matches!(
             v.trim().to_ascii_lowercase().as_str(),
@@ -938,6 +941,7 @@ fn main() {
             shell: cfg.update_shell.clone(),
             timeout: std::time::Duration::from_secs(cfg.build_timeout_secs),
             home: cfg.heyvm_home.clone(),
+            sites_dir: Some(cfg.sites_dir.clone().into()),
         },
         registry.clone(),
         autoscaler.clone(),

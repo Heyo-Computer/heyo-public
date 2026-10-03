@@ -113,6 +113,12 @@ const GROUPS = [
     match: (n) => n.startsWith("sandbox_") || n === "heyo_capacity",
   },
   {
+    title: "Git repos",
+    blurb:
+      "Repos on the Heyo git remote: somewhere a generated project can live, and what app-lb builds from.",
+    match: (n) => n.startsWith("repo_"),
+  },
+  {
     title: "The artifact store",
     blurb: "Where a deployment's bytes come from.",
     match: (n) => n.startsWith("art_") && n !== "art_request",

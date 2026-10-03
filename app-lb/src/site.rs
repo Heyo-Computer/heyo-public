@@ -24,6 +24,76 @@ use std::path::{Component, Path, PathBuf};
 /// concurrent download's full size in RSS at once.
 pub const STREAM_CHUNK: usize = 64 * 1024;
 
+/// Whether a site's root can serve anything, as the admin API reports it.
+///
+/// The root is a directory on the app-lb host. A site registered from
+/// somewhere else (an agent's sandbox, a laptop) names a path that exists
+/// *there*, so the spec validates, the deployment registers, and every request
+/// 404s with nothing to say why. This status is what says why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RootStatus {
+    pub root: String,
+    /// `ok`, `missing`, `not_a_directory`, `unreadable` or `empty`.
+    pub status: &'static str,
+    /// Whether `index` is a file in the root; `None` when no index is set or
+    /// the root cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_present: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+const FILL_HINT: &str = "site.root is a directory on the app-lb host, not on the machine that \
+    registered this deployment. Put files there with `build` (a git repo, copied in by \
+    POST /deployments/:id/build), `artifact` (a bundle from an art store, POST …/pull) or \
+    `update` (commands run on this host, POST …/update)";
+
+pub fn root_status(spec: &SiteSpec) -> RootStatus {
+    let root = Path::new(spec.root.trim());
+    let mk = |status, index_present, hint: Option<String>| RootStatus {
+        root: spec.root.clone(),
+        status,
+        index_present,
+        hint,
+    };
+    let meta = match std::fs::metadata(root) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return mk("missing", None, Some(format!("{} does not exist. {FILL_HINT}", spec.root)));
+        }
+        Err(e) => return mk("unreadable", None, Some(format!("{}: {e}", spec.root))),
+    };
+    if !meta.is_dir() {
+        return mk("not_a_directory", None, Some(format!("{} is not a directory", spec.root)));
+    }
+    let mut entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(e) => {
+            return mk(
+                "unreadable",
+                None,
+                Some(format!("{}: {e} (app-lb runs as {})", spec.root, crate::jobs::whoami())),
+            );
+        }
+    };
+    if entries.next().is_none() {
+        return mk("empty", None, Some(format!("{} is empty. {FILL_HINT}", spec.root)));
+    }
+    let index = spec.index.trim();
+    if index.is_empty() {
+        return mk("ok", None, None);
+    }
+    let present = root.join(index).is_file();
+    let hint = (!present).then(|| {
+        format!(
+            "{index} is not at the top of {}, so `/` will 404{}",
+            spec.root,
+            if spec.spa { " (and so will every SPA fallback)" } else { "" }
+        )
+    });
+    mk("ok", Some(present), hint)
+}
+
 /// What a request to a site resolved to.
 #[derive(Debug)]
 pub enum Resolved {
@@ -511,5 +581,37 @@ mod tests {
             assert_eq!(parse_range("items=0-99", 1000), Ok(None));
             assert_eq!(parse_range("bytes=0-10,20-30", 1000), Ok(None));
         }
+    }
+
+    #[test]
+    fn root_status_says_why_a_site_cannot_serve() {
+        let dir = std::env::temp_dir().join(format!("app-lb-site-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec = |root: &Path| SiteSpec {
+            root: root.display().to_string(),
+            index: "index.html".into(),
+            not_found: None,
+            spa: false,
+            cache_control: String::new(),
+        };
+        let missing = root_status(&spec(&dir));
+        assert_eq!(missing.status, "missing");
+        assert!(missing.hint.unwrap().contains("app-lb host"));
+
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(root_status(&spec(&dir)).status, "empty");
+
+        std::fs::write(dir.join("other.html"), "x").unwrap();
+        let no_index = root_status(&spec(&dir));
+        assert_eq!((no_index.status, no_index.index_present), ("ok", Some(false)));
+        assert!(no_index.hint.is_some());
+
+        std::fs::write(dir.join("index.html"), "x").unwrap();
+        assert_eq!(
+            root_status(&spec(&dir)),
+            RootStatus { root: dir.display().to_string(), status: "ok", index_present: Some(true), hint: None }
+        );
+        assert_eq!(root_status(&spec(&dir.join("other.html"))).status, "not_a_directory");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
