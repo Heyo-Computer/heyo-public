@@ -30,6 +30,7 @@ const CONFIG = {
   CI_TOKEN: "t",
   ART_URL: "http://127.0.0.1:8080",
   ART_API_KEY: "k",
+  REMOTE_URL: "http://127.0.0.1:9700",
 };
 
 const listing = () => toolListing(buildTools(loadConfig(CONFIG)));
@@ -53,6 +54,7 @@ const ARGS: Record<string, Record<string, unknown>> = {
   ci_run_logs: { run_id: "r1" },
   art_get_tag: { tag: "t" },
   art_get_manifest: { reference: "sha256:abc" },
+  repo_get: { repo: "site" },
   applb_spec_schema: { block: "VmSpec" },
   applb_security_events: { severity: "high", limit: 20 },
 };
@@ -148,6 +150,8 @@ test("the destructive set is the one app-lb's own routes imply", () => {
     "applb_purge_disk",
     "applb_purge_orphan_disks",
     "applb_sweep_disks",
+    // A tag's removal strands every deployment that pulls it.
+    "art_delete_tag",
     "ci_cancel_run",
     "ci_cleanup_failed_vms",
     "ci_destroy_vm",

@@ -1,0 +1,18 @@
+{
+  "id": "remote",
+  "routes": [
+    { "host": "git.us2.heyo.work" }
+  ],
+  "upstreams": ["127.0.0.1:9700"],
+  "health": { "path": "/healthz", "timeout_secs": 2 },
+  "update": {
+    "working_dir": "/home/sarocu/Projects/heyo-public",
+    "commands": [
+      "git pull --ff-only",
+      "cargo build --release --locked --manifest-path remote/Cargo.toml",
+      "supervisorctl restart remote"
+    ],
+    "timeout_secs": 1800,
+    "verify_timeout_secs": 60
+  }
+}

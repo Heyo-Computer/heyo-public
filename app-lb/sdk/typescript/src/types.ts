@@ -451,6 +451,17 @@ export interface DeploymentStatus {
   vms: VmStatus[];
   /** Present when the spec declares `vm.workspace`. */
   workspace?: WorkspaceStatus;
+  /** Present for a site: whether its root on the LB host can serve. */
+  site?: SiteRootStatus;
+}
+
+/** A site's root as the LB host sees it. */
+export interface SiteRootStatus {
+  root: string;
+  status: "ok" | "missing" | "not_a_directory" | "unreadable" | "empty";
+  index_present?: boolean;
+  /** Why it cannot serve, and how to fill it. */
+  hint?: string;
 }
 
 export interface UpstreamTrafficStatus {

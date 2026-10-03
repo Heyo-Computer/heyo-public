@@ -80,6 +80,21 @@ export interface Config {
   readonly obs?: ServiceConfig;
   readonly ci?: ServiceConfig;
   readonly art?: ServiceConfig;
+  /**
+   * The git remote service (`remote/`): repos on S3 that agents create and
+   * push to, and that app-lb builds from. It accepts the same credentials
+   * app-lb does (an `applb_…` token is resolved by app-lb's `/whoami`, a
+   * `heyo_api_*` key by the Heyo auth service) plus its own `hrm_…` tokens.
+   */
+  readonly remote?: ServiceConfig;
+  /**
+   * Where this server's own artifact-store gateway is reachable from outside
+   * (`HEYO_MCP_PUBLIC_URL` + `/art`), for blobs too large to pass through a
+   * tool call. HTTP mode only.
+   */
+  readonly artGatewayUrl?: string;
+  /** The namespace repo tools default to (`REMOTE_NAMESPACE`). */
+  readonly remoteNamespace?: string;
   readonly timeoutMs: number;
   /**
    * Whether this process serves over HTTP rather than stdio.
@@ -376,7 +391,15 @@ export function withForwardedAuth(
   // decides what the gate admits, and the store key stays put — which is the
   // per-hop split `artService` exists to make.
   const needsArt = gated(config.art);
-  if (!needsCloud && !needsApplb && !needsObs && !needsCi && !needsArt) return config;
+  // The git remote resolves every kind of bearer a caller can hold (its own
+  // `hrm_…`, app-lb's `applb_…`, a `heyo_api_*` key or a Heyo JWT), and each is
+  // scoped. So the caller's always speaks for itself there, for the same
+  // confused-deputy reason as app-lb: a narrow credential must not be traded
+  // up for whatever this process was configured with.
+  const needsRemote = Boolean(config.remote);
+  if (!needsCloud && !needsApplb && !needsObs && !needsCi && !needsArt && !needsRemote) {
+    return config;
+  }
 
   return {
     ...config,
@@ -385,6 +408,7 @@ export function withForwardedAuth(
     obs: needsObs ? { ...config.obs!, auth: value } : config.obs,
     ci: needsCi ? { ...config.ci!, auth: value } : config.ci,
     art: needsArt ? { ...config.art!, auth: value } : config.art,
+    remote: needsRemote ? { ...config.remote!, auth: value } : config.remote,
   };
 }
 
@@ -403,6 +427,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     obs: service(env.APP_OBS_URL, env.APP_OBS_API_TOKEN),
     ci: service(env.CI_URL, env.CI_TOKEN),
     art: artService(env.ART_URL, env.ART_API_KEY, env.ART_GATE_TOKEN, env.APPLB_TOKEN),
+    // Falls back to the app-lb token: the remote resolves `applb_…` tokens
+    // through app-lb, so the credential an agent already has is enough.
+    remote: service(env.REMOTE_URL, env.REMOTE_TOKEN?.trim() || env.APPLB_TOKEN || env.HEYO_API_KEY),
+    remoteNamespace: env.REMOTE_NAMESPACE?.trim() || env.APPLB_NAMESPACE?.trim() || undefined,
+    artGatewayUrl:
+      Number(env.HEYO_MCP_HTTP_PORT ?? "") > 0 && env.ART_URL?.trim() && env.HEYO_MCP_PUBLIC_URL?.trim()
+        ? `${trimUrl(env.HEYO_MCP_PUBLIC_URL)}/art`
+        : undefined,
     // The same test `index.ts` uses to decide which transport to start.
     http: Number(env.HEYO_MCP_HTTP_PORT ?? "") > 0,
     // Generous, but bounded. Every call here is a diagnostic or a sandbox
@@ -436,6 +468,7 @@ export function configured(config: Config): string[] {
   }
   if (config.obs) on.push("app-obs");
   if (config.ci) on.push("ci");
+  if (config.remote) on.push(`git remote (${config.remote.baseUrl})`);
   if (config.art) {
     // Both halves named, because "art is configured" is not the useful fact —
     // which of the two doors this process can open is. A store behind a gate

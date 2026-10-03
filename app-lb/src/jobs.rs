@@ -132,8 +132,9 @@ impl JobKind {
     /// predicate that answers "managed?" cannot express either.
     fn applies_to(self, backend: Backend) -> bool {
         match self {
-            // A guest image, from a Dockerfile. Only a VM has one.
-            Self::ImageBuild => backend == Backend::Vm,
+            // A guest image from a Dockerfile for a VM; a git checkout copied
+            // into the root for a site.
+            Self::ImageBuild => matches!(backend, Backend::Vm | Backend::Site),
             // A rootfs for a VM, a directory tree for a site. What a static
             // deployment proxies to is somebody else's process, with neither.
             Self::ArtifactPull => matches!(backend, Backend::Vm | Backend::Site),
@@ -579,6 +580,10 @@ pub struct JobConfig {
     pub timeout: Duration,
     /// `HOME` for child processes, when app-lb and heyvmd run as different users.
     pub home: Option<String>,
+    /// app-lb's own directory for site roots (`APP_LB_SITES_DIR`). A site
+    /// `build` whose root is inside it gets its parent directories created;
+    /// anywhere else they must already exist, as for an artifact pull.
+    pub sites_dir: Option<PathBuf>,
 }
 
 pub struct Jobs {
@@ -1174,6 +1179,9 @@ impl Jobs {
         deployment_id: &str,
         spec: &BuildSpec,
     ) -> Result<String, String> {
+        if let Some(site) = self.registry.get(deployment_id).and_then(|d| d.spec.site.clone()) {
+            return self.run_site_build(job_id, deployment_id, spec, &site).await;
+        }
         let prepared = match spec.source().ok_or_else(|| {
             // Unreachable through the admin API, which validates on registration
             // and on a ref override. Reachable by hand-editing the state file.
@@ -1249,6 +1257,78 @@ impl Jobs {
         // -- roll out --------------------------------------------------------
         self.roll_out(job_id, deployment_id, &image).await?;
         Ok(image)
+    }
+
+    /// Where app-lb keeps the site roots it manages, if anywhere.
+    pub fn sites_dir(&self) -> Option<&Path> {
+        self.cfg.sites_dir.as_deref()
+    }
+
+    /// A site's build: check the repo out and copy `build.context` (default:
+    /// the whole checkout) into `site.root` with the staged swap an artifact
+    /// pull uses. Nothing in the checkout is run, so a repo cannot execute
+    /// anything on this host by being deployed.
+    async fn run_site_build(
+        &self,
+        job_id: &str,
+        deployment_id: &str,
+        spec: &BuildSpec,
+        site: &crate::config::SiteSpec,
+    ) -> Result<String, String> {
+        let checkout = self.cfg.work_dir.join(sanitize_dir(deployment_id));
+        crate::tls::create_dir_private(&checkout)
+            .map_err(|e| format!("could not create {}: {e}", checkout.display()))?;
+        let token = self.git_token(spec.auth.as_ref())?;
+        let commit = self.checkout(job_id, &checkout, spec, token.as_ref()).await?;
+        self.update_record(job_id, |r| r.commit = Some(commit.clone()));
+
+        let src = match spec.context.as_deref().map(str::trim).filter(|c| !c.is_empty() && *c != ".") {
+            Some(c) => checkout.join(c),
+            None => checkout.clone(),
+        };
+        let root = PathBuf::from(site.root.trim());
+        if let (Some(managed), Some(parent)) = (&self.cfg.sites_dir, root.parent())
+            && root.starts_with(managed)
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+        }
+        let index = site.index.trim().to_string();
+        let context_shown = spec.context.clone().unwrap_or_else(|| ".".into());
+        self.log(job_id, format!("copying {context_shown} at {} into {}", short(&commit), root.display()));
+        let staged_root = root.clone();
+        let unpacked = tokio::task::spawn_blocking(move || {
+            let (staged, unpacked) = crate::unpack::stage_tree(&staged_root, &src)?;
+            // Checked before the swap, as a pull does, so a checkout missing
+            // its index is refused while the old tree is still serving.
+            if !index.is_empty() && !staged.dir().join(&index).is_file() {
+                return Err(format!(
+                    "{context_shown} has no {index} at its top level; set build.context to the \
+                     directory holding the built site (for example `dist`), or site.index to \
+                     the file to serve for a directory"
+                ));
+            }
+            staged.commit()?;
+            // An artifact pull's digest marker would otherwise claim this tree.
+            crate::unpack::forget_digest(&staged_root);
+            Ok::<_, String>(unpacked)
+        })
+        .await
+        .map_err(|e| format!("the copy task failed: {e}"))??;
+
+        let shown = root.display().to_string();
+        self.update_record(job_id, |r| {
+            r.site_root = Some(shown.clone());
+            r.files = Some(unpacked.files);
+            r.bytes = Some(unpacked.bytes);
+            r.verified = Some(true);
+        });
+        Ok(format!(
+            "{} file{} from {} in {shown}",
+            unpacked.files,
+            if unpacked.files == 1 { "" } else { "s" },
+            short(&commit)
+        ))
     }
 
     /// Fetch a git checkout and find the Dockerfile in it.
@@ -2582,6 +2662,10 @@ mod tests {
     }
 
     fn jobs_at(dir: &Path) -> Arc<Jobs> {
+        jobs_with_timeout(dir, Duration::ZERO)
+    }
+
+    fn jobs_with_timeout(dir: &Path, timeout: Duration) -> Arc<Jobs> {
         let registry = Arc::new(Registry::new(dir.join("state.json")));
         let secrets = Arc::new(SecretStore::new(dir.join("secrets.json"), None));
         let mounts = crate::mounts::MountStore::new(dir.join("mounts"), 0);
@@ -2601,8 +2685,64 @@ mod tests {
         Arc::new(Jobs::new(JobConfig {
             work_dir: dir.join("work"), heyvm_bin: "heyvm".into(), art_bin: "art".into(),
             images_dir: dir.join("images"), git_bin: "git".into(), mounts, shell: "sh".into(),
-            timeout: Duration::ZERO, home: None,
+            timeout, home: None, sites_dir: Some(dir.join("sites")),
         }, registry, autoscaler, secrets, None))
+    }
+
+    /// A site built from a repo: the checkout's `context` lands in the root
+    /// (created, because it is under the managed sites dir), `.git` does not,
+    /// a rebuild replaces it, and a checkout without the index is refused while
+    /// the old tree keeps serving.
+    #[tokio::test]
+    async fn a_site_build_copies_the_checkout_into_the_root() {
+        let dir = scratch("site-build");
+        let jobs = jobs_with_timeout(&dir, Duration::from_secs(30));
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("dist/css")).unwrap();
+        std::fs::write(src.join("dist/index.html"), "v1").unwrap();
+        std::fs::write(src.join("dist/css/app.css"), "body{}").unwrap();
+        std::fs::write(src.join("README.md"), "not served").unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C").arg(&src).args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+                .status().unwrap().success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "v1"]);
+
+        let root = dir.join("sites/team-a/docs");
+        let spec: crate::config::DeploymentSpec = serde_json::from_value(serde_json::json!({
+            "id": "docs", "namespace": "team-a", "routes": [{"host": "docs.local"}],
+            "site": {"root": root},
+            "build": {"repo": src, "ref": "main", "context": "dist"}
+        }))
+        .unwrap();
+        spec.validate().unwrap();
+        jobs.registry.upsert(spec.clone());
+        let build = spec.build.clone().unwrap();
+
+        let out = jobs.run_build("job", "docs", &build).await.unwrap();
+        assert!(out.starts_with("2 files"), "{out}");
+        assert_eq!(std::fs::read_to_string(root.join("index.html")).unwrap(), "v1");
+        assert!(root.join("css/app.css").is_file());
+        assert!(!root.join("README.md").exists() && !root.join(".git").exists());
+
+        std::fs::write(src.join("dist/index.html"), "v2").unwrap();
+        git(&["commit", "-qam", "v2"]);
+        jobs.run_build("job", "docs", &build).await.unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("index.html")).unwrap(), "v2");
+
+        std::fs::remove_file(src.join("dist/index.html")).unwrap();
+        git(&["commit", "-qam", "drop index"]);
+        let err = jobs.run_build("job", "docs", &build).await.unwrap_err();
+        assert!(err.contains("build.context"), "{err}");
+        assert_eq!(std::fs::read_to_string(root.join("index.html")).unwrap(), "v2", "old tree still serving");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -3021,7 +3161,7 @@ mod tests {
     #[test]
     fn a_pull_applies_to_a_vm_and_a_site_but_never_to_upstreams() {
         for (kind, expected) in [
-            (JobKind::ImageBuild, [true, false, false]),
+            (JobKind::ImageBuild, [true, false, true]),
             (JobKind::ArtifactPull, [true, false, true]),
             (JobKind::HostUpdate, [false, true, true]),
         ] {

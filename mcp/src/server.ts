@@ -23,6 +23,7 @@ import { actionTools } from "./tools/actions.js";
 import { sandboxTools } from "./tools/sandbox.js";
 import { feedTools } from "./tools/feed.js";
 import { artifactTools } from "./tools/artifacts.js";
+import { repoTools } from "./tools/repos.js";
 
 /**
  * The tools this configuration can actually serve.
@@ -57,12 +58,16 @@ import { artifactTools } from "./tools/artifacts.js";
  */
 export function buildTools(config: Config): Tool[] {
   const clients = makeClients(config);
+  const actions = actionTools(clients, config);
   return [
     ...diagnosticTools(clients, config),
     ...(cloudUsable(config) ? sandboxTools(clients) : []),
     ...feedTools(clients),
-    ...actionTools(clients, config),
+    ...actions,
     ...artifactTools(clients, config),
+    // `repo_deploy` finishes by handing a spec to `applb_deploy`, so the two
+    // cannot disagree about how a deployment is registered and built.
+    ...repoTools(clients, config, actions.find((t) => t.name === "applb_deploy")),
   ].map(validated);
 }
 
@@ -202,6 +207,9 @@ const READ_ONLY = new Set([
   "art_get_manifest",
   "art_list_blobs",
   "art_usage",
+  "art_list_manifests",
+  "repo_list",
+  "repo_get",
 ]);
 
 /**

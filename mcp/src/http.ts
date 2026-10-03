@@ -69,6 +69,12 @@ export interface RequestOptions {
    */
   expectText?: boolean;
   /**
+   * Return the response body as raw bytes. For downloads from the artifact
+   * store, whose blobs are arbitrary binary and would be corrupted by a text
+   * decode.
+   */
+  expectBytes?: boolean;
+  /**
    * A sentence attached to any error from this call, on top of whatever the
    * status alone implies.
    *
@@ -134,7 +140,8 @@ export async function request(
     clearTimeout(timer);
   }
 
-  const text = await res.text();
+  const raw = new Uint8Array(await res.arrayBuffer());
+  const text = opts.expectBytes && res.ok ? "" : new TextDecoder().decode(raw);
   if (!res.ok) {
     // Two statuses mean something more specific than they look, and both are
     // read wrong by default: a 401 from ci is the documented gate behaviour far
@@ -160,6 +167,7 @@ export async function request(
     const hint = [opts.hint, status].filter(Boolean).join("\n\n") || undefined;
     throw new ServiceError(service, res.status, path, text, hint);
   }
+  if (opts.expectBytes) return raw;
   if (!text.trim()) return null;
   if (opts.expectText) return text;
   try {

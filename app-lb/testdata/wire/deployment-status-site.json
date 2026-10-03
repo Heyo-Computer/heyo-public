@@ -59,5 +59,10 @@
   "ready": 0,
   "pending": 0,
   "total_in_flight": 0,
-  "vms": []
+  "vms": [],
+  "site": {
+    "root": "/srv/docs/dist",
+    "status": "ok",
+    "index_present": true
+  }
 }

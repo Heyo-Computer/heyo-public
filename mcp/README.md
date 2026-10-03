@@ -47,6 +47,10 @@ ci, or a cloud that is not the public one.
 | `ART_URL` | artifact store base URL |
 | `ART_API_KEY` | the store's own key, sent as `x-api-key` |
 | `ART_GATE_TOKEN` | app-token for the gate in front of the store; defaults to `APPLB_TOKEN` |
+| `REMOTE_URL` | the Heyo git remote (`remote/`) — the `repo_*` tools |
+| `REMOTE_TOKEN` | its credential; defaults to `APPLB_TOKEN` (the remote resolves `applb_…` tokens through app-lb), then `HEYO_API_KEY`. Over HTTP the caller's own bearer is always used |
+| `REMOTE_NAMESPACE` | the namespace repo tools default to; falls back to `APPLB_NAMESPACE`, then app-lb's discovered namespace |
+| `HEYO_MCP_PUBLIC_URL` | HTTP mode: this server's public base, so tools can point at the `/art` gateway for blobs too large to pass inline |
 | `HEYO_MCP_TIMEOUT_MS` | per-request bound, default 30000 |
 
 Each service is independent: configure one and its tools work while the others
@@ -56,6 +60,28 @@ surfaces there rather than inside some later call.
 
 A `Basic` value is passed through byte for byte, because app-lb compares it that
 way — a re-encoded-but-equivalent header is rejected.
+
+## From generated files to a running site
+
+An agent with files and no repo:
+
+1. `repo_create {name}` — a repo on the Heyo git remote, plus a write token and
+   the exact `git push` command.
+2. `repo_write_files {repo, message, files | directory}` — or push with git.
+3. `repo_deploy {repo, host, context: "dist"}` — stores a read token as an
+   app-lb secret, registers a `site` (or `kind: "vm"` for a Dockerfile) whose
+   `build` points at the repo, and runs the build. app-lb picks the site's root
+   on its own host; never name a path on your machine as `site.root`.
+
+## The artifact-store gateway
+
+Beyond `art_publish`: `art_publish_files` bundles files (or a local directory)
+into the `.tar.gz` a site pull unpacks; `art_fetch` downloads a tag, manifest
+entry or blob with its digest verified; `art_list_manifests`, `art_delete_tag`
+and `art_set_public` cover the rest. Over HTTP, `/art/{blobs,manifests,tags,
+labels,public,usage}…` is forwarded to the store with this server's store key
+and the caller's own bearer, so `curl -T bundle.tgz` works for anything too
+large for a tool call.
 
 ## Publishing a build
 
@@ -593,6 +619,19 @@ heyo cloud. Listed only when a usable cloud API key is configured.
 | `sandbox_kill` | **destructive** | Permanently deletes the sandbox and its disk. |
 | `heyo_capacity` | read-only | What can be told about capacity *before* booting something. |
 
+### Git repos
+
+Repos on the Heyo git remote: somewhere a generated project can live, and what app-lb builds from.
+
+| Tool | | Does |
+| --- | --- | --- |
+| `repo_create` |  | Create a git repo on the Heyo remote, the place an agent's project lives so app-lb can build it. |
+| `repo_list` | read-only | The repos in a namespace on the Heyo remote, with their clone URLs. |
+| `repo_get` | read-only | One repo: its clone URL, HEAD, every ref and its commit, and whether it is still empty. |
+| `repo_token` |  | Mint a repo token: `read` to clone or let app-lb build, `write` to push. |
+| `repo_write_files` |  | Commit files to a repo with no git on your side. |
+| `repo_deploy` |  | Deploy a repo from the Heyo remote through app-lb, in one call: mints a read token, stores it as an app-lb secret, registers (or edits) the deployment with `build` pointing at the repo, and starts the build. |
+
 ### The artifact store
 
 Where a deployment's bytes come from.
@@ -600,6 +639,11 @@ Where a deployment's bytes come from.
 | Tool | | Does |
 | --- | --- | --- |
 | `art_publish` |  | Publish a bundle to the artifact store and point a tag at it. |
+| `art_publish_files` |  | Bundle files into a .tar.gz and publish it under a tag, the format a `site` deployment's `artifact` pull unpacks into its root. |
+| `art_fetch` |  | Download from the store: a tag or manifest digest (its single entry, or `entry`), or a blob digest. |
+| `art_list_manifests` | read-only | Every manifest in the store: digest, kind and entries. |
+| `art_delete_tag` | **destructive** | Remove a tag. |
+| `art_set_public` |  | Make a blob anonymously downloadable (`public: true`) or private again. |
 | `art_list_tags` | read-only | Every tag in the store and the digest it points at. |
 | `art_get_tag` | read-only | What one tag points at. |
 | `art_get_manifest` | read-only | One manifest by digest or by tag: its kind, its entries and their digests and sizes. |
@@ -630,7 +674,7 @@ Everything without a dedicated tool. Prefer a named tool when one exists — a r
 | `ci_request` |  | Raw HTTP against ci, for endpoints without a dedicated tool above. |
 | `art_request` |  | Raw HTTP against the artifact store, for endpoints without a dedicated tool above. |
 
-_65 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
+_76 tools. Generated from the server's own listing by `scripts/gen-catalogue.mjs`; run `npm run catalogue` after adding one._
 
 <!-- END GENERATED CATALOGUE -->
 

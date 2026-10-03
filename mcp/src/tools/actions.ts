@@ -25,6 +25,19 @@ import { checkSpec, rulesFor, suffixRoutesWithoutCerts } from "../applb/rules.js
 
 const DESTRUCTIVE = DESTRUCTIVE_PREFIX;
 
+/**
+ * Whether a lookup of a deployment says "you cannot see one by that id".
+ *
+ * A 404, or the 403 app-lb gives a namespace-confined token for an id outside
+ * its reach, which it also gives for an id that does not exist yet: a
+ * confined token is never told whether a deployment it cannot reach exists.
+ * For a register-or-edit that means "register"; if the id is taken in
+ * another namespace, the POST is what refuses it.
+ */
+export function notVisible(e: ServiceError): boolean {
+  return e.status === 404 || (e.status === 403 && /not scoped to deployment/.test(e.body));
+}
+
 export function actionTools(clients: Clients, config: Config): Tool[] {
   const enc = encodeURIComponent;
 
@@ -284,7 +297,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
           exists = true;
           previousVm = current?.spec?.vm ?? current?.vm;
         } catch (e) {
-          if (!(e instanceof ServiceError && e.status === 404)) throw e;
+          if (!(e instanceof ServiceError && notVisible(e))) throw e;
         }
 
         const registered = await clients.applb({
@@ -310,13 +323,30 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
         // is what makes the wrong choice unrepresentable.
         const backend = spec.vm ? "vm" : spec.site ? "site" : "upstreams";
         const job =
-          spec.build && backend === "vm"
+          spec.build && (backend === "vm" || backend === "site")
             ? { path: "build", tool: "applb_build" }
             : spec.artifact && (backend === "vm" || backend === "site")
               ? { path: "pull", tool: "applb_pull" }
               : spec.update && (backend === "upstreams" || backend === "site")
                 ? { path: "update", tool: "applb_host_update" }
                 : undefined;
+
+        // `/jobs/:id` is a fleet-wide route a namespace token may not use;
+        // the deployment's own job list is not, and holds the same record.
+        let jobsByDeployment = false;
+        const readJob = async (dep: string, jid: string): Promise<Record<string, unknown> | undefined> => {
+          if (!jobsByDeployment) {
+            try {
+              return (await clients.applb({ path: `/jobs/${enc(jid)}` })) as Record<string, unknown>;
+            } catch (e) {
+              if (!(e instanceof ServiceError && e.status === 403)) throw e;
+              jobsByDeployment = true;
+            }
+          }
+          const list = (await clients.applb({ path: `/deployments/${enc(dep)}/jobs` })) as unknown;
+          const rows = Array.isArray(list) ? (list as Record<string, unknown>[]) : [];
+          return rows.find((r) => r.id === jid);
+        };
 
         let jobId: string | undefined;
         if (job) {
@@ -332,7 +362,7 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
             title: "No job started",
             body:
               `A ${backend} deployment with no ` +
-              (backend === "upstreams" ? "`update`" : "`build` or `artifact`") +
+              (backend === "upstreams" ? "`update`" : "`build`, `artifact` or `update`") +
               " block has nothing to roll onto; app-lb serves it as registered.",
           });
         }
@@ -342,12 +372,33 @@ export function actionTools(clients: Clients, config: Config): Tool[] {
           const deadline = Date.now() + wait * 1000;
           let last: Record<string, unknown> | undefined;
           while (Date.now() < deadline) {
-            last = (await clients.applb({ path: `/jobs/${enc(jobId)}` })) as Record<string, unknown>;
+            last = await readJob(id, jobId);
             const status = String(last?.status ?? "");
             if (status && !["queued", "running", "pending"].includes(status)) break;
             await new Promise((r) => setTimeout(r, 3000));
           }
           sections.push({ title: `Job ${jobId}`, body: last ?? "no status read" });
+        }
+
+        // A site whose root cannot serve registers fine and then 404s every
+        // request, because the root is read on the app-lb host. app-lb says so
+        // in `site`; repeat it where it will be read. Re-read after the job,
+        // which is what fills the root.
+        if (backend === "site") {
+          const now = (await clients
+            .applb({ path: `/deployments/${enc(id)}` })
+            .catch(() => registered)) as { site?: { status?: string; hint?: string } } | undefined;
+          if (now?.site && (now.site.status !== "ok" || now.site.hint)) {
+            sections.push({
+              title: `Site root: ${now.site.status}`,
+              body:
+                (now.site.hint ?? "") +
+                (spec.build || spec.artifact || spec.update
+                  ? ""
+                  : " With no `build`, `artifact` or `update`, nothing will ever fill it: " +
+                    "repo_create + repo_deploy puts a repo's files there."),
+            });
+          }
         }
 
         // TLS, which nothing else on the surface would have told them.

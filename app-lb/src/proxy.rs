@@ -129,6 +129,23 @@ async fn serve_site(session: &mut Session, spec: &crate::config::SiteSpec, path:
         }
         Resolved::NotFound(Some(page)) => (page, 404),
         Resolved::NotFound(None) => {
+            // A root with nothing in it 404s every path. Say so (to the
+            // operator in the log and the header, not the path to visitors),
+            // since "not found" for `/` is otherwise indistinguishable from a
+            // typo in the URL.
+            let health = site::root_status(spec);
+            if health.status != "ok" {
+                tracing::warn!(root = %spec.root, status = health.status, "site root cannot serve");
+                let mut header = ResponseHeader::build(404, Some(3))?;
+                let body = "not found: this site has no files deployed yet\n";
+                header.insert_header("x-applb-site", format!("root-{}", health.status.replace('_', "-")))?;
+                header.insert_header(http::header::CONTENT_LENGTH, body.len().to_string())?;
+                header.insert_header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")?;
+                session.write_response_header(Box::new(header), false).await?;
+                return session
+                    .write_response_body(Some(bytes::Bytes::from_static(body.as_bytes())), true)
+                    .await;
+            }
             return write_plain(session, 404, "not found\n").await;
         }
     };

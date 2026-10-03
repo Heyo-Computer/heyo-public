@@ -1071,6 +1071,11 @@ struct DeploymentStatus {
     /// is holding the pool at zero. See [`crate::workspace`].
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace: Option<crate::workspace::WorkspaceStatus>,
+    /// For a site: whether its root on this host can serve anything, and if
+    /// not, why. Reported on register and update too, so a spec pointing at a
+    /// path that only exists on the caller's machine is noticed at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    site: Option<crate::site::RootStatus>,
 }
 
 fn is_default_namespace_str(ns: &String) -> bool {
@@ -1090,8 +1095,8 @@ fn deployment_kind(d: &crate::deployment::Deployment) -> &'static str {
 ///
 /// At most one is ever configured, because validation refuses the combinations:
 /// a `proxy_pass` upstream has no image to build, a microVM has no host
-/// directory to run commands in, and a site takes `update` or `artifact` but
-/// never both. So this is one answer rather than three flags.
+/// directory to run commands in, and a site takes one of `update`, `artifact`
+/// or `build`. So this is one answer rather than three flags.
 fn job_kind_of(spec: &DeploymentSpec) -> Option<&'static str> {
     if spec.build.is_some() {
         Some("build")
@@ -1163,6 +1168,7 @@ fn status_of(state: &AdminState, d: &Arc<crate::deployment::Deployment>) -> Depl
     DeploymentStatus {
         rollout_revision: d.state().rollout_revision.clone(),
         workspace: state.autoscaler.workspaces().status(d),
+        site: d.spec.site.as_ref().map(crate::site::root_status),
         spec: d.spec.clone(),
         kind: deployment_kind(d),
         desired_replicas: d.desired_replicas(),
@@ -3346,6 +3352,20 @@ fn assume_host(spec: &mut DeploymentSpec, base: Option<&str>) {
     });
 }
 
+/// A site that names no `root` gets one app-lb manages:
+/// `<APP_LB_SITES_DIR>/<namespace>/<id>`. The caller cannot know this host's
+/// filesystem, and a root guessed from somewhere else is the mistake that
+/// registers and then 404s every request. With no sites dir configured the
+/// empty root is left for `validate` to refuse.
+fn assume_site_root(spec: &mut DeploymentSpec, sites_dir: Option<&std::path::Path>) {
+    let (Some(dir), Some(site)) = (sites_dir, spec.site.as_mut()) else { return };
+    if !site.root.trim().is_empty() || spec.id.trim().is_empty() {
+        return;
+    }
+    let ns = if spec.namespace.trim().is_empty() { crate::config::DEFAULT_NAMESPACE } else { spec.namespace.trim() };
+    site.root = dir.join(ns).join(spec.id.trim()).display().to_string();
+}
+
 pub(crate) fn stamp_owner(spec: &mut DeploymentSpec, caller: Option<&Caller>) {
     if let Some(Caller::Federated(g)) = caller {
         spec.account_id = g.account_for(&spec.namespace).map(str::to_string);
@@ -3428,6 +3448,7 @@ async fn register(
     // A spec that pins no hostname gets `<id>.<base>`, so a route is checked
     // and an auth callback resolves against it below.
     assume_host(&mut spec, state.deploy_base_domain.as_deref());
+    assume_site_root(&mut spec, state.jobs.sites_dir());
     // Bind secret references to the spec's namespace before anything reads
     // them; see `DeploymentSpec::normalize`.
     spec.normalize();
@@ -3572,6 +3593,7 @@ async fn update(
     assume_namespace(&mut spec, caller.as_ref().map(|c| &c.0));
     // A spec that pins no hostname gets `<id>.<base>`, as at registration.
     assume_host(&mut spec, state.deploy_base_domain.as_deref());
+    assume_site_root(&mut spec, state.jobs.sites_dir());
     spec.normalize();
     if let Err(e) = spec.validate() {
         return err(StatusCode::BAD_REQUEST, e.to_string()).into_response();
@@ -6776,7 +6798,7 @@ mod tests {
             let jobs = Arc::new(Jobs::new(crate::jobs::JobConfig {
                 work_dir: root.join("jobs"), heyvm_bin: "heyvm".into(), art_bin: "art".into(),
                 images_dir: root.join("images"), git_bin: "git".into(), mounts,
-                shell: "sh".into(), timeout: std::time::Duration::ZERO, home: None,
+                shell: "sh".into(), timeout: std::time::Duration::ZERO, home: None, sites_dir: None,
             }, registry.clone(), autoscaler.clone(), secrets.clone(), None));
             let disks = Arc::new(crate::disks::DiskStore::new(crate::disks::DiskConfig {
                 state_path: root.join("disks.json"), ttl_secs: 0, sweep_secs: 60,
@@ -8606,6 +8628,32 @@ mod tests {
             }));
             assume_host(&mut no_base, None);
             assert!(no_base.routes.is_empty());
+        }
+
+        /// A site with no root gets a managed one under the sites dir,
+        /// namespaced; a root that was named is the caller's choice and left
+        /// alone; with no sites dir the empty root reaches `validate`.
+        #[test]
+        fn a_rootless_site_gets_a_managed_root() {
+            let dir = std::path::Path::new("/var/lib/app-lb/sites");
+            let mut site = spec_json(serde_json::json!({
+                "id": "docs", "namespace": "team-a", "routes": [{ "host": "d" }], "site": {},
+            }));
+            assume_site_root(&mut site, Some(dir));
+            assert_eq!(site.site.as_ref().unwrap().root, "/var/lib/app-lb/sites/team-a/docs");
+            assert!(site.validate().is_ok());
+
+            let mut named = spec_json(serde_json::json!({
+                "id": "docs", "routes": [{ "host": "d" }], "site": { "root": "/srv/docs" },
+            }));
+            assume_site_root(&mut named, Some(dir));
+            assert_eq!(named.site.as_ref().unwrap().root, "/srv/docs");
+
+            let mut unmanaged = spec_json(serde_json::json!({
+                "id": "docs", "routes": [{ "host": "d" }], "site": {},
+            }));
+            assume_site_root(&mut unmanaged, None);
+            assert!(unmanaged.validate().is_err(), "an empty root is still refused");
         }
 
         fn host_sandbox(id: &str, account: Option<&str>) -> HostSandboxView {
