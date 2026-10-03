@@ -689,10 +689,11 @@ impl Pool {
               WHERE sandbox_id IN (
                     SELECT sandbox_id FROM ci_vm_pool
                      WHERE runner_hd_id = ANY($1)
-                       AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase<>'passed')
-                       AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase NOT IN ('passed','superseded'))
                        AND ((status = 'draining' AND eviction_requested)
-                            OR (status = 'idle' AND (NOT (fingerprint = ANY($2))
+                            OR (status = 'idle'
+                                AND NOT EXISTS (SELECT 1 FROM ci_host_maintenance h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase<>'passed')
+                                AND NOT EXISTS (SELECT 1 FROM ci_host_heyvm_bootstrap h WHERE h.runner_hd_id=ci_vm_pool.runner_hd_id AND h.phase NOT IN ('passed','superseded'))
+                                AND (NOT (fingerprint = ANY($2))
                                 OR last_used_at < now() - make_interval(secs => $3))))
                      FOR UPDATE SKIP LOCKED
               )
@@ -1813,6 +1814,47 @@ mod tests {
         in_flight.rollback().await.unwrap();
         assert_eq!(restarted.take_for_sweep(&[runner], &["live".into()], 86400)
             .await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn maintenance_retries_evictions_without_starting_new_ones() {
+        let (pool, store) = test_pool().await;
+        for bootstrap in [false, true] {
+            let runner = runner_id();
+            let run = crate::vm::new_id();
+            let wf = crate::workflow::Workflow::parse("wf.yml", "name: t\njobs:\n  build:\n    steps: [{run: 'true'}]\n").unwrap();
+            let plan = crate::plan::Plan::build(&wf).unwrap();
+            store.create_run(&run, &crate::store::RunRequest::default(), &plan).await.unwrap();
+            let job = crate::store::job_id(&run, "build");
+            let step = format!("{job}.0");
+            store.create_step(&step, &job, 0, "maintenance", None).await.unwrap();
+            sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) VALUES($1,$2,$1,$3,'host','test','running','draining','test','main')")
+                .bind(&run).bind(&step).bind(&job).execute(store.pool()).await.unwrap();
+            for name in ["evict", "idle", "claimed", "resize"] {
+                let id = sb(&runner, name);
+                pool.register(&id, &runner, "obsolete", "wf", None, &job, held()).await.unwrap();
+                if name != "claimed" { pool.release(&id).await.unwrap(); }
+                if name == "evict" { pool.take_one_for_sweep(&id, &[runner.clone()]).await.unwrap().unwrap(); }
+                if name == "resize" { pool.take_idle(&id, &[runner.clone()]).await.unwrap().unwrap(); }
+            }
+            if bootstrap {
+                sqlx::query("INSERT INTO ci_host_heyvm_bootstrap(id,runner_hd_id,request,launcher_recipe,deadline,launcher_deployment_id,phase) VALUES($1,$2,'{}','{}',now()+interval '1 hour','launcher','draining')")
+                    .bind(&run).bind(&runner).execute(store.pool()).await.unwrap();
+            } else {
+                sqlx::query("INSERT INTO ci_host_maintenance(id,runner_hd_id,request,deadline,phase) VALUES($1,$2,'{}',now()+interval '1 hour','draining')")
+                    .bind(&run).bind(&runner).execute(store.pool()).await.unwrap();
+            }
+            let restarted = Pool::new(pool.db.clone());
+            // No live fingerprints: the idle cache would otherwise be eligible.
+            for _ in 0..2 {
+                let taken = restarted.take_for_sweep(&[runner.clone()], &[], 0).await.unwrap();
+                assert_eq!(taken.iter().map(|v| v.sandbox_id.clone()).collect::<Vec<_>>(), vec![sb(&runner, "evict")]);
+            }
+            assert_eq!(pool.get(&sb(&runner, "idle")).await.unwrap().unwrap().status, "idle");
+            assert_eq!(pool.get(&sb(&runner, "claimed")).await.unwrap().unwrap().status, "claimed");
+            assert_eq!(pool.get(&sb(&runner, "resize")).await.unwrap().unwrap().status, "draining");
+        }
     }
 
     /// Sweeping marks VMs `draining` so a concurrent claim cannot take one that
