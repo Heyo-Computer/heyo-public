@@ -1169,6 +1169,11 @@ forgetting the pool row. Resize operations also use `draining`, but carry no
 eviction intent and are never selected for deletion. Pre-existing ambiguous
 draining rows are not automatically adopted as eviction requests.
 
+Host maintenance blocks new idle-cache evictions, but does not block retries of
+already-requested evictions. Those deletions must finish while maintenance is
+draining; otherwise maintenance and cleanup would wait for each other. Runner
+scope, row locking, and runtime confirmation of removal still apply.
+
 If no idle caches remain and space is
 still insufficient, the host cannot admit a new VM. This is admission headroom,
 not a disk reservation against concurrent allocations or unknown build scratch.

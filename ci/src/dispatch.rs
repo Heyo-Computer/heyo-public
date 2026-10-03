@@ -7743,6 +7743,16 @@ jobs:
         let error = d.reclaim_disk_space(&runner, 101).await.unwrap_err();
         assert!(error.to_string().contains("no idle caches left"), "{error}");
 
+        // Maintenance starts after the failed deletion. It must not prevent
+        // the durable eviction from completing on a fresh connection.
+        let job = format!("job-{runner}-new");
+        let step = format!("{job}.maintenance");
+        d.store.create_step(&step, &job, 0, "maintenance", None).await.unwrap();
+        sqlx::query("INSERT INTO ci_service_deployment(id,step_id,run_id,job_id,service_id,request_hash,status,phase,sha,git_ref) VALUES($1,$2,$1,$3,'host','test','running','draining','test','main')")
+            .bind(&run).bind(&step).bind(&job).execute(d.store.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ci_host_maintenance(id,runner_hd_id,request,deadline,phase) VALUES($1,$2,'{}',now()+interval '1 hour','draining')")
+            .bind(&run).bind(&runner).execute(d.store.pool()).await.unwrap();
+
         // A new controller finds the persistent eviction even though it is
         // fresh and its fingerprint is still wanted. A successful DELETE is
         // not enough if the follow-up absence check fails.
@@ -7763,6 +7773,9 @@ jobs:
         assert_eq!(count, 1);
         assert!(errors.is_empty());
         assert!(restarted.pool.get(&format!("{runner}-new")).await.unwrap().is_none());
+        let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ci_vm_pool WHERE runner_hd_id=$1 AND status IN ('claimed','building','draining'))")
+            .bind(&runner).fetch_one(d.store.pool()).await.unwrap();
+        assert!(!blocked, "confirmed cache deletion must clear the pool drain blocker");
         server.abort();
         unsafe { std::env::remove_var("CI_TEST_DAEMON"); }
     }

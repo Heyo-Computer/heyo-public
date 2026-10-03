@@ -299,6 +299,8 @@ jobs:
           cargo test --release --locked --bin ci dispatch::tests::delivery_racing_instance_drain_returns_to_shared_queue -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci bus::tests::an_existing_consumer_is_updated_without_losing_pending_delivery -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci dispatch::tests::durable_vm_cleanup_recovers_without_guessing_ownership -- --ignored --exact --test-threads=1
+          cargo test --release --locked --bin ci pool::tests::maintenance_retries_evictions_without_starting_new_ones -- --ignored --exact --test-threads=1
+          cargo test --release --locked --bin ci dispatch::tests::disk_pressure_rechecks_space_and_stops_at_budget -- --ignored --exact --test-threads=1
           cargo test --release --locked --bin ci web::tests::managed_frontends_preserve_auth_and_reject_wrong_boot_without_retry -- --ignored --exact --test-threads=1
 
       - name: Test CI boot and deployment templates
